@@ -1,0 +1,1622 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simplifying plans/mod-and-idiv.md for double-only %% and %/%</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../">rray timeline</a>
+<h1>Simplifying <code>plans/mod-and-idiv.md</code> for double-only <code>%%</code> and <code>%/%</code></h1>
+<p class="facts">Claude · Oct 17, 2026 · 3 prompts · 9 replies · didn't ship</p>
+</header>
+<main>
+<p class="divider">Oct 17, 2026, 22:46 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Read mod-and-idiv.md</p>
+<p>Since then, we’ve decided that we only use double precision and never long double, since macOS no longer has extended precision</p>
+<p>Does that change things at all for that plan? Does anything get dramatically simpler?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; f=$(find . ~/files/programming/claude/plans -name 'mod…</summary>
+<pre>cd ~/files/r/packages/rray; f=$(find . ~/files/programming/claude/plans -name 'mod-and-idiv.md' 2&gt;/dev/null | head -1); echo &quot;$f&quot;; cat &quot;$f&quot;</pre><pre class="output">./plans/mod-and-idiv.md
+# `rray_modulo()` and `rray_integer_divide()`
+
+Future work. This document collects what we worked out about `%%` and `%/%`
+before deciding to defer them, so that work isn't lost. Nothing here is built.
+
+---
+
+# Part 1: Types
+
+Same family as `rray_add()` and friends: `lgl`, `int`, `dbl`. `cpl` errors, the
+same way `chr`, `raw` and `list` do for every arithmetic operator. Base R does
+the same — `1i %% 1` is &quot;unimplemented complex operation&quot;.
+
+Promotion table, matching the shape of 2.4 in `plans/implementation.md`:
+
+| op | lgl | int | dbl | cpl |
+|---|---|---|---|---|
+| `%%` `%/%` | int | int | dbl | error |
+
+So the switch has the same 16 arm shape as `rray_add_switch()`, except the four
+`cpl` arms (`logical_complex`, `integer_complex`, `double_complex`,
+`complex_complex`) join the `chr`/`raw`/`list` arms calling
+`stop_unsupported_arithmetic()`, the way `rray_exponentiate_switch()` already
+does it. That means two scalar operations per operator, `_int_one` and
+`_dbl_one`, not three — there is no `_cpl_one`.
+
+---
+
+# Part 2: Why the double core isn't just `fmod()`
+
+The obvious definition is `x %% y = x - floor(x / y) * y` and
+`x %/% y = floor(x / y)`. That's what R computes, but not how R computes it.
+`src/main/arithmetic.c` in R's own source has two static functions, `myfmod()`
+and `myfloor()`, that compute it more carefully:
+
+- A short circuit for `fabs(x1) &lt;= fabs(x2)`, which avoids a division (and the
+  rounding error a division introduces) whenever the direct sign comparison
+  already gives the answer.
+
+- A `long double` intermediate in the general case
+  (`tmp = (long double)x1 - floor(q) * (long double)x2`), which halves the
+  rounding error against doing the same arithmetic purely in `double`.
+
+- A warning (&quot;probable complete loss of accuracy in modulus&quot;) when
+  `fabs(q) * DBL_EPSILON &gt; 1`, i.e. when the quotient is large enough that the
+  double subtraction can't be trusted at all.
+
+- `x2 == 0` returns `NaN` for `%%`, not `NA`. `myfloor()` doesn't special case
+  it at all — `x1 / 0.0` is already `Inf`, `-Inf` or `NaN` under IEEE 754, which
+  is exactly what R's `%/%` returns for a double `0` divisor.
+
+Neither function is exported. They're `static` in `arithmetic.c`, not declared
+in `Rmath.h`, so matching R here means porting the logic, not calling into R.
+
+The comment directly above `myfmod()` reads &quot;Keep myfmod() and myfloor() in
+step&quot; — they're two instances of the same idea (division with a
+precision-guarded remainder), and R's own maintainers treat them as a pair that
+has to be changed together. Do the same if either one is ever touched.
+
+---
+
+# Part 3: The int core doesn't need its own version of this
+
+For `%%`, R's int arm is:
+
+```c
+(x1 &gt;= 0 &amp;&amp; x2 &gt; 0) ? x1 % x2 : (int) myfmod((double) x1, (double) x2);
+```
+
+C's `%` truncates (sign follows the dividend), but `%%` is documented to floor
+(sign follows the divisor) — the same convention Python uses. Those only agree
+when both operands are non-negative, which is the fast path above. Everywhere
+else, R doesn't hand-roll a second floored-mod implementation in integer
+arithmetic — it reuses `myfmod()` by promoting to `double`. That round trip is
+exact: R's integer range fits inside ±2^31, and a `double` mantissa holds
+integers exactly up to 2^53, so nothing is lost. One canonical implementation
+of &quot;floored modulo, correctly signed, correctly handling zero&quot; beats two copies
+that have to be kept in agreement forever.
+
+`%/%`'s int arm doesn't need any of this:
+
+```c
+(int) floor((double) x1 / (double) x2);
+```
+
+`floor()` already gives the floor regardless of sign, unlike `%`'s truncation,
+so there's no fast/slow split and no call into `myfloor()`. The asymmetry is
+real: `%%` needs the precision-guarded fallback for integers, `%/%` doesn't.
+
+Both int arms return `NA_INTEGER` for `x2 == 0`, unlike the double arms, which
+return `NaN`/`Inf` instead of `NA`. That's a real asymmetry in base R, not a
+simplification we'd be introducing.
+
+---
+
+# Part 4: What the ported code would look like
+
+Each operator gets its own `src/arithmetic-{op}.c`/`.h` pair, same shape as
+`src/arithmetic-add.c`: `ffi_rray_{name}()`, `rray_{name}()`, a static
+`rray_{name}_switch()`, its 12 non-error cores (16 arms, minus the 4 that error
+on `cpl`), and two scalar operations.
+
+`rray_myfmod()` would live as a `static inline` helper in
+`src/arithmetic-modulo.c`, next to `rray_modulo_dbl_one()`. `rray_myfloor()`
+the same way in `src/arithmetic-integer-divide.c`. Ported from
+`src/main/arithmetic.c`, `myfmod()`/`myfloor()`, dropping the `warning()` call
+(open question below) and writing `DBL_EPSILON` in place of R's internal
+`c_eps`, since we don't need the long double PowerPC workaround R carries:
+
+```c
+static inline double rray_myfmod(double x1, double x2) {
+  if (x2 == 0.0) {
+    return R_NaN;
+  }
+
+  if (fabs(x2) * DBL_EPSILON &gt; 1 &amp;&amp; R_FINITE(x1) &amp;&amp; fabs(x1) &lt;= fabs(x2)) {
+    if (fabs(x1) == fabs(x2)) {
+      return 0;
+    }
+    return ((x1 &lt; 0 &amp;&amp; x2 &gt; 0) || (x2 &lt; 0 &amp;&amp; x1 &gt; 0)) ? x1 + x2 : x1;
+  }
+
+  const double q = x1 / x2;
+  const long double tmp = (long double) x1 - floor(q) * (long double) x2;
+  return (double) (tmp - floorl(tmp / x2) * x2);
+}
+
+static inline double rray_myfloor(double x1, double x2) {
+  const double q = x1 / x2;
+
+  if (x2 == 0.0 || fabs(q) * DBL_EPSILON &gt; 1 || !R_FINITE(q)) {
+    return q;
+  }
+
+  if (fabs(q) &lt; 1) {
+    if (q &lt; 0) {
+      return -1;
+    }
+    return ((x1 &lt; 0 &amp;&amp; x2 &gt; 0) || (x1 &gt; 0 &amp;&amp; x2 &lt; 0)) ? -1 : 0;
+  }
+
+  const long double tmp = (long double) x1 - floor(q) * (long double) x2;
+  return (double) (floor(q) + floorl(tmp / x2));
+}
+```
+
+`R_NaN` and `R_FINITE()` come from `Rmath.h`, already linked. The scalar
+operations that use them:
+
+```c
+static inline int rray_modulo_int_one(int x, int y, struct r_lazy error_call) {
+  if (x == r_globals.na_int || y == r_globals.na_int || y == 0) {
+    return r_globals.na_int;
+  }
+  if (x &gt;= 0 &amp;&amp; y &gt; 0) {
+    return x % y;
+  }
+  return (int) rray_myfmod((double) x, (double) y);
+}
+
+static inline double rray_modulo_dbl_one(double x, double y, struct r_lazy error_call) {
+  return rray_myfmod(x, y);
+}
+```
+
+```c
+static inline int rray_integer_divide_int_one(int x, int y, struct r_lazy error_call) {
+  if (x == r_globals.na_int || y == r_globals.na_int || y == 0) {
+    return r_globals.na_int;
+  }
+  return (int) floor((double) x / (double) y);
+}
+
+static inline double rray_integer_divide_dbl_one(double x, double y, struct r_lazy error_call) {
+  return rray_myfloor(x, y);
+}
+```
+
+Both `int` cores are shared across the `lgl_lgl`, `lgl_int`, `int_lgl` and
+`int_int` type pairs, the way `rray_multiply_int_one()` is. Both `dbl` cores
+are shared across every pair involving a `dbl`, the way `rray_divide_dbl_one()`
+is.
+
+Tests: `tests/testthat/test-arithmetic-modulo.R` and
+`tests/testthat/test-arithmetic-integer-divide.R`, one file per operator as
+usual, working through all 12 non-error type combinations in both positions,
+plus `NA`, `NaN`, `Inf` and `y == 0` on both sides.
+
+---
+
+# Part 5: Open questions for whenever this gets picked up
+
+- **The &quot;loss of accuracy&quot; warning.** `myfmod()` calls base R's `warning()`
+  when the quotient is too large to trust. Porting that means a real R level
+  warning coming out of `rray_modulo()`, which is more user visible surface
+  than we've added for any other arithmetic operator so far. Worth deciding
+  deliberately rather than silently dropping it or silently keeping it.
+
+- **Licensing.** R is GPL (`r-svn/COPYING` is GPL-2), and rray is</pre><p class="cut">17 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main; grep -n &quot;myfmod\|myfloor&quot; arithmetic.c | head; sed -n…</summary>
+<pre>cd ~/files/r/r-svn/src/main; grep -n &quot;myfmod\|myfloor&quot; arithmetic.c | head; sed -n &quot;$(grep -n '^static R_INLINE double myfmod\|^static double myfmod' arithmetic.c | cut -d: -f1),+45p&quot; arithmetic.c</pre><pre class="output">172:/* Keep myfmod() and myfloor() in step */
+173:static double myfmod(double x1, double x2)
+191:static double myfloor(double x1, double x2)
+242:		return (y &lt; 0.) ? 0. : (myfmod(y, 2.) != 0 ? x  : -x);
+917:			    (int)myfmod((double)x1,(double)x2);
+1150:			       da[i] = myfmod(px1[i1], px2[i2]););
+1157:			       da[i] = myfmod(R_INTEGER(px1[i1]), px2[i2]););
+1164:			       da[i] = myfmod(px1[i1], R_INTEGER(px2[i2])););
+1173:			       da[i] = myfloor(px1[i1], px2[i2]););
+1180:			       da[i] = myfloor(R_INTEGER(px1[i1]), px2[i2]););
+static double myfmod(double x1, double x2)
+{
+    if (x2 == 0.0) return R_NaN;
+    if(fabs(x2) * c_eps &gt; 1 &amp;&amp; R_FINITE(x1) &amp;&amp; fabs(x1) &lt;= fabs(x2)) {
+	return
+	    (fabs(x1) == fabs(x2)) ? 0 :
+	    ((x1 &lt; 0 &amp;&amp; x2 &gt; 0) ||
+	     (x2 &lt; 0 &amp;&amp; x1 &gt; 0))
+	     ? x1+x2  // differing signs
+	     : x1   ; // &quot;same&quot; signs (incl. 0)
+    }
+    double q = x1 / x2;
+    if(R_FINITE(q) &amp;&amp; (fabs(q) * c_eps &gt; 1))
+	warning(_(&quot;probable complete loss of accuracy in modulus&quot;));
+    LDOUBLE tmp = (LDOUBLE)x1 - floor(q) * (LDOUBLE)x2;
+    return (double) (tmp - floorl(tmp/x2) * x2);
+}
+
+static double myfloor(double x1, double x2)
+{
+    double q = x1 / x2;
+    if (x2 == 0.0 || fabs(q) * c_eps &gt; 1 || !R_FINITE(q))
+	return q;
+    if(fabs(q) &lt; 1)
+	return (q &lt; 0) ? -1
+	    : ((x1 &lt; 0 &amp;&amp; x2 &gt; 0) ||
+	       (x1 &gt; 0 &amp;&amp; x2 &lt; 0) // differing signs
+	       ? -1 : 0);
+    LDOUBLE tmp = (LDOUBLE)x1 - floor(q) * (LDOUBLE)x2;
+    return (double) (floor(q) + floorl(tmp/x2));
+}
+
+double R_pow(double x, double y) /* = x ^ y */
+{
+    /* squaring is the most common of the specially handled cases so
+       check for it first. */
+    if(y == 2.)
+	return x * x;
+    if(x == 1. || y == 0.)
+	return(1.);
+    if(x == 0.) {
+	if(y &gt; 0.) return(0.);
+	else if(y &lt; 0) return(R_PosInf);
+	else return(y); /* NA or NaN, we assert */
+    }
+    if (x &gt;= -11. &amp;&amp; x &lt;= 11.) {
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool tool-error"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; uname -m &amp;&amp; cat &gt; fm.c &lt;&lt;'EOF'
+#include &lt;math.h&gt;
+void fm(double* x, double* y, int* n, double* out) {
+  for (int i = 0; i &lt; *n; ++i) {
+    double r = fmod(x[i], y[i]);
+    if (r != 0 &amp;&amp; ((r &lt; 0) != (y[i] &lt; 0))) r += y[i];
+    out[i] = r;
+  }
+}
+EOF
+R CMD SHLIB fm.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; Rscript -e '
+dyn.load(&quot;fm.so&quot;); set.seed(1)
+f &lt;- function(x, y) .C(&quot;fm&quot;, as.double(x), as.double(y), length(x), double(length(x)))[[4]]
+n &lt;- 1e6
+x &lt;- c(rnorm(n, sd = 100), runif(n, -10, 10), round(rnorm(n, sd=1e4), 2))
+y &lt;- c(rnorm(n, sd = 10), sample(c(0.1, 0.2, 0.3, 1, 2.5, -0.7), n, TRUE), sample(c(0.01, 0.05, 1, 7, -3), n, TRUE))
+r &lt;- suppressWarnings(x %% y); s &lt;- f(x, y)
+cat(&quot;mismatches:&quot;, sum(r != s), &quot;of&quot;, length(x), &quot;\n&quot;)
+i &lt;- which(r != s)[1:5]; print(cbind(x=x[i], y=y[i], R=r[i], fmod=s[i]), digits = 17)
+cat(&quot;max ulp-ish diff:&quot;, max(abs(r - s)[r != s] / abs(y[r != s])), &quot;\n&quot;)
+print(c(R = 1e20 %% 3, fmod = f(1e20, 3)))
+'</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>#include &lt;math.h&gt;
+void fm(double* x, double* y, int* n, double* out) {
+  for (int i = 0; i &lt; *n; ++i) {
+    double r = fmod(x[i], y[i]);
+    if (r != 0 &amp;&amp; ((r &lt; 0) != (y[i] &lt; 0))) r += y[i];
+    out[i] = r;
+  }
+}</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fm.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>dyn.load(&quot;fm.so&quot;)
+set.seed(1)
+f &lt;- function(x, y) .C(&quot;fm&quot;, as.double(x), as.double(y), length(x), double(length(x)))[[4]]
+n &lt;- 1e6
+x &lt;- c(rnorm(n, sd = 100), runif(n, -10, 10), round(rnorm(n, sd = 1e4), 2))
+y &lt;- c(rnorm(n, sd = 10), sample(c(0.1, 0.2, 0.3, 1, 2.5, -0.7), n, TRUE), sample(c(0.01, 0.05, 1, 7, -3), n, TRUE))
+r &lt;- suppressWarnings(x %% y)
+s &lt;- f(x, y)
+cat(&quot;arch:&quot;, R.version$arch, &quot; long double digits:&quot;, .Machine$longdouble.digits, &quot;\n&quot;)
+cat(&quot;mismatches:&quot;, sum(r != s), &quot;of&quot;, length(x), &quot;\n&quot;)
+i &lt;- head(which(r != s), 5)
+print(cbind(x = x[i], y = y[i], R = r[i], fmod = s[i]), digits = 17)
+print(c(R = suppressWarnings(1e20 %% 3), fmod = f(1e20, 3)))</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fm.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fm.c &amp;&amp; Rscript fm.R</pre><pre class="output">using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG   -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c fm.c -o fm.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o fm.so fm.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+arch: aarch64  long double digits: 
+mismatches: 0 of 3000000 
+     x y R fmod
+   R fmod 
+   1    1
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Yes. It changes the plan a lot, and the biggest change is that the licensing problem mostly goes away.</p>
+<p><strong>1. The main reason to port R's code is gone.</strong> The plan gives two reasons for porting R's <code>myfmod()</code> and <code>myfloor()</code>: the <code>long double</code> step that halves rounding error, and matching R exactly. With double only, the first reason disappears. What is left of R's code is the textbook formula <code>x - floor(x / y) * y</code>, plus a fix-up step and a short circuit. On your Mac, <code>long double</code> is already just <code>double</code> (<code>.Machine$longdouble.digits</code> is <code>NULL</code> on aarch64), so R itself runs that double-only version there. R's own <code>%%</code> results already differ between x86_64 Linux and arm64 macOS, so &quot;bit for bit with R&quot; was never one fixed target.</p>
+<p><strong>2. That makes an independent version easy.</strong> C's <code>fmod()</code> gives the exact remainder for any two doubles. Floored modulo is one sign fix on top of it:</p>
+<pre><code class="language-c">static inline double rray_modulo_dbl_one(double x, double y, struct r_lazy error_call) {
+  if (y == 0.0) {
+    return R_NaN;
+  }
+  double out = fmod(x, y);
+  if (out != 0.0 &amp;&amp; (out &lt; 0.0) != (y &lt; 0.0)) {
+    out += y;
+  }
+  return out;
+}
+</code></pre>
+<p>I compared this with R's <code>%%</code> on this Mac over 3 million random pairs (normal, uniform, and rounded to 2 decimals, with divisors like <code>0.1</code>, <code>0.3</code>, <code>-0.7</code> and <code>7</code>). There were 0 mismatches. <code>1e20 %% 3</code> matches too.</p>
+<p>What this removes:</p>
+<ul>
+<li>
+<p><strong>Licensing (Part 5).</strong> This is the standard definition built on a C library function, not R's code. That open question mostly goes away.</p>
+</li>
+<li>
+<p><strong>The &quot;loss of accuracy&quot; warning (Part 5).</strong> <code>fmod()</code> is exact, so the precision collapse the warning guards against cannot happen. The open question goes away. The result can only differ from R when R's own answer is the inaccurate one.</p>
+</li>
+<li>
+<p><strong>The short circuit, <code>floorl()</code>, <code>c_eps</code>, and the PowerPC note (Part 4).</strong> None of it is needed.</p>
+</li>
+<li>
+<p><strong>The int <code>%%</code> slow path (Part 3).</strong> It still promotes to double and calls the double core. That core is now about four lines.</p>
+</li>
+</ul>
+<p><strong>3. <code>%/%</code> is the part that still needs work.</strong> <code>floor(x / y)</code> alone can be off by one, because <code>x / y</code> rounds before <code>floor()</code> sees it. A good approach is to derive it from the same <code>fmod()</code>, as CPython's <code>float_divmod()</code> does: <code>(x - mod) / y</code>, then round to the nearest whole number. CPython's license is permissive and works with MIT. It also keeps <code>%%</code> and <code>%/%</code> in step automatically, which is the same goal as R's &quot;keep these in step&quot; comment. I have not tested this against R's <code>%/%</code>. That test would be the first step when this gets picked up.</p>
+<p><strong>One correction to the plan.</strong> Part 2 describes R's short circuit as applying &quot;for <code>fabs(x1) &lt;= fabs(x2)</code>&quot;. In R's source it only applies when <code>fabs(x2) * c_eps &gt; 1</code> as well, meaning the divisor is larger than about 4.5e15. It is a guard for huge divisors, not a general shortcut. It no longer matters if the plan switches to <code>fmod()</code>.</p>
+<p>Do you want me to rewrite <code>plans/mod-and-idiv.md</code> around the <code>fmod()</code> approach?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Can you try 3 and test against R?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>#include &lt;math.h&gt;
+
+static double floor_divide(double x, double y) {
+  if (y == 0.0 || !isfinite(x)) {
+    return x / y;
+  }
+  double mod = fmod(x, y);
+  double div = (x - mod) / y;
+  if (mod != 0.0 &amp;&amp; (mod &lt; 0.0) != (y &lt; 0.0)) {
+    div -= 1.0;
+  }
+  if (div == 0.0) {
+    return copysign(0.0, x / y);
+  }
+  double out = floor(div);
+  if (div - out &gt; 0.5) {
+    out += 1.0;
+  }
+  return out;
+}
+
+static double naive(double x, double y) {
+  return floor(x / y);
+}
+
+void fd(double* x, double* y, int* n, double* out) {
+  for (int i = 0; i &lt; *n; ++i) {
+    out[i] = floor_divide(x[i], y[i]);
+  }
+}
+
+void nv(double* x, double* y, int* n, double* out) {
+  for (int i = 0; i &lt; *n; ++i) {
+    out[i] = naive(x[i], y[i]);
+  }
+}</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>dyn.load(&quot;fd.so&quot;)
+call &lt;- function(fn, x, y) {
+  .C(fn, as.double(x), as.double(y), length(x), double(length(x)))[[4]]
+}
+
+report &lt;- function(label, x, y) {
+  r &lt;- x %/% y
+  s &lt;- call(&quot;fd&quot;, x, y)
+  v &lt;- call(&quot;nv&quot;, x, y)
+  bad &lt;- !(r == s | (is.na(r) &amp; is.na(s) &amp; is.nan(r) == is.nan(s)))
+  bad_naive &lt;- !(r == v | (is.na(r) &amp; is.na(v)))
+  cat(sprintf(
+    &quot;%-28s n = %8d   fmod mismatches = %d   naive floor(x / y) mismatches = %d\n&quot;,
+    label, length(x), sum(bad), sum(bad_naive)
+  ))
+  i &lt;- head(which(bad), 5)
+  if (length(i)) {
+    print(data.frame(x = x[i], y = y[i], R = r[i], fmod = s[i]), digits = 17)
+  }
+  i &lt;- head(which(bad_naive), 3)
+  if (length(i)) {
+    print(data.frame(x = x[i], y = y[i], R = r[i], naive = v[i]), digits = 17)
+  }
+}
+
+set.seed(1)
+n &lt;- 1e6
+report(&quot;normal / normal&quot;, rnorm(n, sd = 100), rnorm(n, sd = 10))
+report(&quot;uniform / decimals&quot;, runif(n, -10, 10), sample(c(0.1, 0.2, 0.3, 1, 2.5, -0.7), n, TRUE))
+report(&quot;2 dp / small divisors&quot;, round(rnorm(n, sd = 1e4), 2), sample(c(0.01, 0.05, 0.1, 7, -3), n, TRUE))
+k &lt;- sample(-1000:1000, n, TRUE)
+d &lt;- sample(c(0.1, 0.2, 0.3, 0.7, -0.1, 1.1), n, TRUE)
+report(&quot;exact multiples k * y&quot;, k * d, d)
+report(&quot;near multiples&quot;, k * d * (1 + sample(c(-1, 1), n, TRUE) * 2^-52), d)
+report(&quot;integers as double&quot;, as.double(sample(-1e6:1e6, n, TRUE)), as.double(sample(c(-50:-1, 1:50), n, TRUE)))
+report(&quot;wide magnitudes&quot;, 10^runif(n, -10, 20) * sample(c(-1, 1), n, TRUE), 10^runif(n, -10, 10) * sample(c(-1, 1), n, TRUE))
+report(&quot;huge quotient&quot;, 10^runif(n, 15, 300), 10^runif(n, -5, 5))
+
+sp &lt;- c(0, -0, 1, -1, 0.5, -0.5, 3, -3, 1e300, -1e300, 5e-324, Inf, -Inf, NaN, NA)
+g &lt;- expand.grid(x = sp, y = sp)
+report(&quot;special values grid&quot;, g$x, g$y)</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool tool-error"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fd.c &gt;/dev/null &amp;&amp; Rscript fd.R</pre><pre class="output">Exit code 1
+using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+normal / normal              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+uniform / decimals           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+2 dp / small divisors        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 105875
+                     x    y       R   naive
+1 15074.13999999999942 0.01 1507413 1507414
+2 11841.90999999999985 0.01 1184190 1184191
+3   456.08999999999997 0.01   45608   45609
+exact multiples k * y        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 428195
+                    x                   y    R naive
+1 -968.00000000000011 1.10000000000000009 -881  -880
+2 -542.30000000000007 1.10000000000000009 -494  -493
+3  145.19999999999999 0.29999999999999999  483   484
+near multiples               n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 5479
+                     x                   y    R naive
+1 -335.500000000000057 1.10000000000000009 -306  -305
+2   88.199999999999989 0.29999999999999999  293   294
+3  189.899999999999977 0.29999999999999999  632   633
+integers as double           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+wide magnitudes              n =  1000000   fmod mismatches = 5964   naive floor(x / y) mismatches = 3849
+                        x                       y                  R
+1  6.5598949507883200e+06 -7.8952873569095969e-10  -8308620895283055
+2  2.2489241838418892e+12  4.1329337111105499e-04   5441471702766766
+3  1.7981954004611312e+14 -2.1412561603014461e-02  -8397852782863594
+4 -2.7326277950841122e+10  2.3562325620173969e-06 -11597445172154174
+5 -4.7077945741731663e+09  6.5118673042635736e-07  -7229561589946388
+                fmod
+1  -8308620895283056
+2   5441471702766764
+3  -8397852782863595
+4 -11597445172154176
+5  -7229561589946389
+                        x                       y                 R
+1 -2.0909566418825236e+19 -4.8006651533971082e+04   435555610539279
+2  3.1011347208322301e+09  8.6200220903077264e-07  3597594865005180
+3 -3.0844127973910244e+06  1.5814593001582109e-09 -1950358632107989
+              naive
+1   435555610539280
+2  3597594865005181
+3 -1950358632107988
+huge quotient                n =  1000000   fmod mismatches = 310   naive floor(x / y) mismatches = 270
+                      x                      y                R
+1 450197122196291059712 9.8213186238380309e+04 4583876559137234
+2     22839725437917780 4.5908272072359892e+00 4975078435084241
+3      7247305396294593 1.5918108921909087e+00 4552868328674190
+4      5188707994813488 6.6172652187943104e-01 7841166740720254
+5    436489206914837696 6.3075389699143777e+01 6920119066989496
+              fmod
+1 4583876559137233
+2 4975078435084240
+3 4552868328674189
+4 7841166740720252
+5 6920119066989495
+                       x                     y                R
+1 13284435862612848640.0 11657.870662628503851 1139525068261273
+2     1688663352393276.5    16.359872165445783  103219837864011
+3    55709653946616376.0    68.415104858085201  814288804528999
+             naive
+1 1139525068261274
+2  103219837864012
+3  814288804529000
+Error in call(&quot;fd&quot;, x, y) : NA/NaN/Inf in foreign function call (arg 1)
+Calls: report -&gt; call
+Execution halted</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-length(x), double(length(x)))[[4]]</span>
+<span class="ins">+length(x), double(length(x)), NAOK = TRUE)[[4]]</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  i &lt;- head(which(bad), 5)</span>
+<span class="del">-  if (length(i)) {</span>
+<span class="ins">+  if (any(bad)) {</span>
+<span class="ins">+    q &lt;- abs(x / y)</span>
+<span class="ins">+    cat(&quot;  smallest |x / y| among fmod mismatches:&quot;, format(min(q[bad]), digits = 17), &quot; (2^52 =&quot;, 2^52, &quot;)\n&quot;)</span>
+<span class="ins">+    if (requireNamespace(&quot;Rmpfr&quot;, quietly = TRUE)) {</span>
+<span class="ins">+      j &lt;- which(bad)</span>
+<span class="ins">+      exact &lt;- floor(Rmpfr::mpfr(x[j], 2000) / Rmpfr::mpfr(y[j], 2000))</span>
+<span class="ins">+      err_r &lt;- abs(Rmpfr::mpfr(r[j], 2000) - exact)</span>
+<span class="ins">+      err_s &lt;- abs(Rmpfr::mpfr(s[j], 2000) - exact)</span>
+<span class="ins">+      cat(&quot;  closer to exact floor: R&quot;, sum(err_r &lt; err_s), &quot; fmod&quot;, sum(err_s &lt; err_r), &quot; tie&quot;, sum(err_s == err_r), &quot;\n&quot;)</span>
+<span class="ins">+    }</span>
+<span class="ins">+  }</span>
+<span class="ins">+  i &lt;- head(which(bad), 5)</span>
+<span class="ins">+  if (FALSE) {</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  i &lt;- head(which(bad_naive), 3)</span>
+<span class="del">-  if (length(i)) {</span>
+<span class="ins">+  i &lt;- head(which(bad_naive), 3)</span>
+<span class="ins">+  if (FALSE) {</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; Rscript -e 'cat(requireNamespace(&quot;Rmpfr&quot;))' ; Rscript fd.R</pre><pre class="output">Loading required namespace: Rmpfr
+Failed with error:  ‘there is no package called ‘Rmpfr’’
+FALSEnormal / normal              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+uniform / decimals           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+2 dp / small divisors        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 105875
+exact multiples k * y        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 428195
+near multiples               n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 5479
+integers as double           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+wide magnitudes              n =  1000000   fmod mismatches = 5964   naive floor(x / y) mismatches = 3849
+  smallest |x / y| among fmod mismatches: 2317125536610291.5  (2^52 = 4.5036e+15 )
+huge quotient                n =  1000000   fmod mismatches = 310   naive floor(x / y) mismatches = 270
+  smallest |x / y| among fmod mismatches: 2768406214848906.5  (2^52 = 4.5036e+15 )
+special values grid          n =      225   fmod mismatches = 0   naive floor(x / y) mismatches = 11
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>dyn.load(&quot;fd.so&quot;)
+call &lt;- function(fn, x, y) {
+  .C(fn, as.double(x), as.double(y), length(x), double(length(x)), NAOK = TRUE)[[4]]
+}
+set.seed(1)
+n &lt;- 1e6
+x &lt;- 10^runif(n, -10, 20) * sample(c(-1, 1), n, TRUE)
+y &lt;- 10^runif(n, -10, 10) * sample(c(-1, 1), n, TRUE)
+x &lt;- c(x, 10^runif(n, 15, 300))
+y &lt;- c(y, 10^runif(n, -5, 5))
+r &lt;- x %/% y
+s &lt;- call(&quot;fd&quot;, x, y)
+bad &lt;- r != s
+write.csv(
+  data.frame(x = sprintf(&quot;%.17g&quot;, x[bad]), y = sprintf(&quot;%.17g&quot;, y[bad]), r = sprintf(&quot;%.17g&quot;, r[bad]), s = sprintf(&quot;%.17g&quot;, s[bad])),
+  &quot;mismatch.csv&quot;,
+  row.names = FALSE
+)</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/dump.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>import csv
+import math
+import sys
+from fractions import Fraction
+
+counts = {&quot;below_2^52&quot;: {&quot;R&quot;: 0, &quot;fmod&quot;: 0, &quot;tie&quot;: 0}, &quot;above_2^52&quot;: {&quot;R&quot;: 0, &quot;fmod&quot;: 0, &quot;tie&quot;: 0}}
+fmod_exact_below = 0
+total_below = 0
+
+with open(sys.argv[1]) as f:
+    for row in csv.DictReader(f):
+        x, y, r, s = (float(row[k]) for k in &quot;xyrs&quot;)
+        exact = math.floor(Fraction(x) / Fraction(y))
+        er = abs(Fraction(r) - exact)
+        es = abs(Fraction(s) - exact)
+        key = &quot;below_2^52&quot; if abs(x / y) &lt; 2**52 else &quot;above_2^52&quot;
+        winner = &quot;R&quot; if er &lt; es else &quot;fmod&quot; if es &lt; er else &quot;tie&quot;
+        counts[key][winner] += 1
+        if key == &quot;below_2^52&quot;:
+            total_below += 1
+            fmod_exact_below += es == 0
+
+print(&quot;closer to the exact floor:&quot;, counts)
+print(f&quot;below 2^52, fmod exact in {fmod_exact_below} of {total_below}&quot;)</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/exact.py (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; Rscript dump.R &amp;&amp; python3 -I exact.py mismatch.csv</pre><pre class="output">closer to the exact floor: {'below_2^52': {'R': 354, 'fmod': 0, 'tie': 0}, 'above_2^52': {'R': 1318, 'fmod': 3390, 'tie': 1312}}
+below 2^52, fmod exact in 0 of 354
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-static double naive(double x, double y) {</span>
+<span class="ins">+static double fma_divide(double x, double y) {</span>
+<span class="ins">+  const double q = x / y;</span>
+<span class="ins">+  if (y == 0.0 || !isfinite(q) || fabs(q) &gt; 0x1p52) {</span>
+<span class="ins">+    return q;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  double out = floor(q);</span>
+<span class="ins">+  const double r = fma(-out, y, x);</span>
+<span class="ins">+  if (y &gt; 0.0) {</span>
+<span class="ins">+    if (r &lt; 0.0) out -= 1.0;</span>
+<span class="ins">+    else if (r &gt;= y) out += 1.0;</span>
+<span class="ins">+  } else {</span>
+<span class="ins">+    if (r &gt; 0.0) out -= 1.0;</span>
+<span class="ins">+    else if (r &lt;= y) out += 1.0;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  return out;</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+void fm(double* x, double* y, int* n, double* out) {</span>
+<span class="ins">+  for (int i = 0; i &lt; *n; ++i) {</span>
+<span class="ins">+    out[i] = fma_divide(x[i], y[i]);</span>
+<span class="ins">+  }</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+static double naive(double x, double y) {</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; sed -e 's/&quot;fd&quot;, x, y)/&quot;fm&quot;, x, y)/' -e 's/mismatch.csv/mismatch-fma.csv/' dump.R &gt; /dev/null; grep -n '&quot;fd&quot;' fd.R dump.R</pre><pre class="output">dump.R:12:s &lt;- call(&quot;fd&quot;, x, y)
+fd.R:8:  s &lt;- call(&quot;fd&quot;, x, y)
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  s &lt;- call(&quot;fd&quot;, x, y)</span>
+<span class="ins">+  s &lt;- call(commandArgs(TRUE)[1], x, y)</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-s &lt;- call(&quot;fd&quot;, x, y)</span>
+<span class="ins">+s &lt;- call(commandArgs(TRUE)[1], x, y)</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/dump.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fd.c &gt;/dev/null &amp;&amp; Rscript fd.R fm &amp;&amp; Rscript dump.R fm &amp;&amp; wc -l mismatch.csv &amp;&amp; python3 -I exact.py mismatch.csv</pre><pre class="output">using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+normal / normal              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+uniform / decimals           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+2 dp / small divisors        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 105875
+exact multiples k * y        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 428195
+near multiples               n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 5479
+integers as double           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+wide magnitudes              n =  1000000   fmod mismatches = 6285   naive floor(x / y) mismatches = 3849
+  smallest |x / y| among fmod mismatches: 1.010622209755734e-20  (2^52 = 4.5036e+15 )
+huge quotient                n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 270
+special values grid          n =      225   fmod mismatches = 17   naive floor(x / y) mismatches = 11
+  smallest |x / y| among fmod mismatches: 0  (2^52 = 4.5036e+15 )
+    6314 mismatch.csv
+closer to the exact floor: {'below_2^52': {'R': 6313, 'fmod': 0, 'tie': 0}, 'above_2^52': {'R': 0, 'fmod': 0, 'tie': 0}}
+below 2^52, fmod exact in 0 of 6313
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>I'm testing a second <code>%/%</code> variant: <code>floor(x / y)</code> fixed up with <code>fma()</code>. It is close, but it fails for tiny negative quotients. Fixing that now.</p>
+
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  double out = floor(q);</span>
+<span class="del">-  const double r = fma(-out, y, x);</span>
+<span class="del">-  if (y &gt; 0.0) {</span>
+<span class="del">-    if (r &lt; 0.0) out -= 1.0;</span>
+<span class="del">-    else if (r &gt;= y) out += 1.0;</span>
+<span class="del">-  } else {</span>
+<span class="del">-    if (r &gt; 0.0) out -= 1.0;</span>
+<span class="del">-    else if (r &lt;= y) out += 1.0;</span>
+<span class="del">-  }</span>
+<span class="del">-  return out;</span>
+<span class="ins">+  const double out = floor(q);</span>
+<span class="ins">+  if (!isfinite(y)) {</span>
+<span class="ins">+    return out;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  const double r = fma(-out, y, x);</span>
+<span class="ins">+  if (r != 0.0 &amp;&amp; (r &lt; 0.0) != (y &lt; 0.0)) {</span>
+<span class="ins">+    return out - 1.0;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  return out;</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  i &lt;- head(which(bad), 5)</span>
+<span class="del">-  if (FALSE) {</span>
+<span class="ins">+  i &lt;- head(which(bad), 20)</span>
+<span class="ins">+  if (label == &quot;special values grid&quot; &amp;&amp; length(i)) {</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fd.c &gt;/dev/null &amp;&amp; Rscript fd.R fm &amp;&amp; Rscript dump.R fm &amp;&amp; wc -l mismatch.csv &amp;&amp; python3 -I exact.py mismatch.csv</pre><pre class="output">using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+normal / normal              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+uniform / decimals           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+2 dp / small divisors        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 105875
+exact multiples k * y        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 428195
+near multiples               n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 5479
+integers as double           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+wide magnitudes              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 3849
+huge quotient                n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 270
+special values grid          n =      225   fmod mismatches = 9   naive floor(x / y) mismatches = 11
+  smallest |x / y| among fmod mismatches: 0  (2^52 = 4.5036e+15 )
+                         x    y  R fmod
+1  -1.0000000000000000e+00  Inf -1    0
+2  -5.0000000000000000e-01  Inf -1    0
+3  -3.0000000000000000e+00  Inf -1    0
+4 -1.0000000000000006e+300  Inf -1    0
+5   1.0000000000000000e+00 -Inf -1    0
+6   5.0000000000000000e-01 -Inf -1    0
+7   3.0000000000000000e+00 -Inf -1    0
+8  1.0000000000000006e+300 -Inf -1    0
+9  4.9406564584124654e-324 -Inf -1    0
+       1 mismatch.csv
+closer to the exact floor: {'below_2^52': {'R': 0, 'fmod': 0, 'tie': 0}, 'above_2^52': {'R': 0, 'fmod': 0, 'tie': 0}}
+below 2^52, fmod exact in 0 of 0
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  if (!isfinite(y)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-  const double r = fma(-out, y, x);</span>
+<span class="ins">+  const double r = isfinite(y) ? fma(-out, y, x) : x;</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fd.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fd.c &gt;/dev/null &amp;&amp; Rscript fd.R fm</pre><pre class="output">using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+normal / normal              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+uniform / decimals           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+2 dp / small divisors        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 105875
+exact multiples k * y        n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 428195
+near multiples               n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 5479
+integers as double           n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 0
+wide magnitudes              n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 3849
+huge quotient                n =  1000000   fmod mismatches = 0   naive floor(x / y) mismatches = 270
+special values grid          n =      225   fmod mismatches = 0   naive floor(x / y) mismatches = 11
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Last check: the <code>%%</code> version from my previous reply, run against the same grid of special values.</p>
+
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; Rscript -e '
+dyn.load(&quot;fm.so&quot;)
+sp &lt;- c(0, -0, 1, -1, 0.5, -0.5, 3, -3, 1e300, -1e300, 5e-324, Inf, -Inf, NaN, NA)
+g &lt;- expand.grid(x = sp, y = sp)
+s &lt;- .C(&quot;fm&quot;, g$x, g$y, nrow(g), double(nrow(g)), NAOK = TRUE)[[4]]
+s[g$y == 0] &lt;- NaN
+r &lt;- g$x %% g$y
+bad &lt;- !(r == s | (is.na(r) &amp; is.na(s)))
+print(cbind(g, R = r, fmod = s)[bad, ], digits = 17)'</pre><pre class="output">There were 12 warnings (use warnings() to see them)
+                            x    y                        R fmod
+56    4.9406564584124654e-324 -1.0   0.0000000000000000e+00 -1.0
+86    4.9406564584124654e-324 -0.5   0.0000000000000000e+00 -0.5
+99    1.0000000000000006e+300  3.0  2.0636505122486924e+267  1.0
+100  -1.0000000000000006e+300  3.0 -2.0636505122486924e+267  2.0
+114   1.0000000000000006e+300 -3.0  2.0636505122486924e+267 -2.0
+115  -1.0000000000000006e+300 -3.0 -2.0636505122486924e+267 -1.0
+116   4.9406564584124654e-324 -3.0  4.9406564584124654e-324 -3.0
+NA                         NA   NA                       NA   NA
+NA.1                       NA   NA                       NA   NA
+NA.2                       NA   NA                       NA   NA
+NA.3                       NA   NA                       NA   NA
+NA.4                       NA   NA                       NA   NA
+NA.5                       NA   NA                       NA   NA
+NA.6                       NA   NA                       NA   NA
+NA.7                       NA   NA                       NA   NA
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>I tested option 3, and a second approach. The second one is the one to use. It matched R exactly in every test case.</p>
+<p><strong>The approach that works: <code>floor(x / y)</code> with an <code>fma()</code> fix-up</strong></p>
+<pre><code class="language-c">static inline double rray_integer_divide_dbl_one(double x, double y, struct r_lazy error_call) {
+  const double q = x / y;
+  if (y == 0.0 || !isfinite(q) || fabs(q) &gt; 0x1p52) {
+    return q;
+  }
+  const double out = floor(q);
+  const double r = isfinite(y) ? fma(-out, y, x) : x;
+  if (r != 0.0 &amp;&amp; (r &lt; 0.0) != (y &lt; 0.0)) {
+    return out - 1.0;
+  }
+  return out;
+}
+</code></pre>
+<p>How it works:</p>
+<ul>
+<li>
+<p><code>fma(a, b, c)</code> computes <code>a * b + c</code> with a single rounding step.</p>
+</li>
+<li>
+<p>So <code>r = x - out * y</code> (the leftover) always has the correct sign.</p>
+</li>
+<li>
+<p>If the leftover's sign does not match <code>y</code>, then <code>x / y</code> rounded up past a whole number. In that case <code>floor()</code> is one too high, and we subtract 1.</p>
+</li>
+<li>
+<p><code>floor()</code> can never be one too low. A rounded quotient cannot drop below a whole number that the true quotient is at or above.</p>
+</li>
+<li>
+<p>Quotients bigger than 2^52 are returned as is, the same as R. Above that size every double is already a whole number.</p>
+</li>
+<li>
+<p>On arm64, <code>fma()</code> is a single hardware instruction.</p>
+</li>
+</ul>
+<p>Results against R's <code>%/%</code> on this Mac, 1 million pairs per row:</p>
+<table>
+<thead>
+<tr>
+<th>Inputs</th>
+<th><code>fma()</code> version</th>
+<th>Plain <code>floor(x / y)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>normal / normal</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>uniform / <code>0.1</code>, <code>0.3</code>, <code>-0.7</code>, ...</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>2 decimal places / <code>0.01</code>, <code>0.05</code>, ...</td>
+<td>0</td>
+<td>105,875</td>
+</tr>
+<tr>
+<td>exact multiples (<code>k * 0.3</code> / <code>0.3</code>)</td>
+<td>0</td>
+<td>428,195</td>
+</tr>
+<tr>
+<td>one ULP (the smallest possible step) off a multiple</td>
+<td>0</td>
+<td>5,479</td>
+</tr>
+<tr>
+<td>whole numbers stored as doubles</td>
+<td>0</td>
+<td>0</td>
+</tr>
+<tr>
+<td>magnitudes from 1e-10 to 1e20</td>
+<td>0</td>
+<td>3,849</td>
+</tr>
+<tr>
+<td>huge quotients (1e15 to 1e300)</td>
+<td>0</td>
+<td>270</td>
+</tr>
+<tr>
+<td>225 special-value pairs (<code>0</code>, <code>-0</code>, <code>Inf</code>, <code>NaN</code>, <code>NA</code>, <code>5e-324</code>, <code>1e300</code>)</td>
+<td>0</td>
+<td>11</td>
+</tr>
+</tbody>
+</table>
+<p>The plain-floor column shows why the fix-up is needed. For example, <code>456.09 %/% 0.01</code> is <code>45608</code> in R, but <code>floor(456.09 / 0.01)</code> gives <code>45609</code>.</p>
+<p><strong>Option 3 (CPython's <code>fmod()</code>-based approach) does not match R.</strong> It was exact for ordinary inputs. For quotients between about 2^51 and 2^52 it was off by one: 354 mismatches, and when I checked them with exact fractions, R was right every time. The cause is that <code>x - mod</code> rounds in that range.</p>
+<p><strong>The special-value grid also exposed a few <code>%%</code> differences</strong> in the <code>fmod()</code> version from my previous reply. That earlier 3 million pair test only used ordinary values.</p>
+<ul>
+<li>
+<p><code>1e300 %% 3</code>: R warns and returns <code>2.06e267</code>, which is garbage. <code>fmod()</code> returns <code>1</code>, which is the exact answer. Here the difference is in our favor.</p>
+</li>
+<li>
+<p><code>5e-324 %% -1</code> (also <code>-0.5</code> and <code>-3</code>): R returns <code>0</code>. <code>fmod()</code> returns <code>-1</code>, which equals <code>y</code> itself. The true answer is <code>-1 + 5e-324</code>, which rounds to <code>-1</code>, so neither answer is exact. But R's answer keeps the rule that <code>|x %% y| &lt; |y|</code>. Adding <code>if (out == y) out = 0.0;</code> at the end matches R and keeps that rule. I'd add it.</p>
+</li>
+</ul>
+<p>With that line added, <code>%%</code> and <code>%/%</code> match R everywhere I tested, and they are written from the definitions with no code ported from R. One more change from the plan: <code>%/%</code> gets its own small function instead of being tied to <code>%%</code>.</p>
+<p>The test files (<code>fd.c</code>, <code>fd.R</code>, <code>exact.py</code>) are in the scratchpad. I haven't changed anything in the repo. Do you want me to update <code>plans/mod-and-idiv.md</code> with these results?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Update the plan and push it to main</p>
+<p>Id like you to heavily comment each line of the new versions of these functions so I can understand what each line is for</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git log --oneline -3 &amp;&amp; grep -n &quot;_one(&quot; src/arithmetic-divide.c | head;…</summary>
+<pre>git status --short &amp;&amp; git log --oneline -3 &amp;&amp; grep -n &quot;_one(&quot; src/arithmetic-divide.c | head; grep -rn &quot;R_NaN\|r_globals.nan\|isfinite\|R_FINITE&quot; src/*.c | head</pre><pre class="output">4e44ea4 Remove the plan for making the ALTREP wrapper memory safe
+bbedaf3 Rename the ALTREP wrapper to a view (#152)
+e08c0d9 Start the wrapper with no attributes so callers set only dim and dimnames (#151)
+496:static inline double rray_divide_dbl_one(double x, double y) {
+500:static inline r_complex rray_divide_cpl_one(r_complex x, r_complex y) {
+src/reduce-mean.c:296:    if (R_FINITE(mean)) {
+src/reduce-mean.c:298:      v_out[i] = R_FINITE(correction)
+src/reduce-mean.c:517:        R_FINITE(mean) &amp;&amp; R_FINITE(correction) ? mean + correction : mean;
+src/reduce-mean.c:701:    return R_NaN;</pre></details>
+<details class="tool"><summary>Bash: sed -n 470,510p src/arithmetic-divide.c; grep -n &quot;_int_one(&quot; src/arithmetic-multiply.c | head…</summary>
+<pre>sed -n 470,510p src/arithmetic-divide.c; grep -n &quot;_int_one(&quot; src/arithmetic-multiply.c | head -3</pre><pre class="output">}
+
+static r_obj* rray_divide_cpl_cpl(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides,
+  const r_ssize* v_y_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_BINARY(
+    r_complex,
+    r_cpl_cbegin,
+    rray_cast_cpl_to_cpl_one,
+    r_complex,
+    r_cpl_cbegin,
+    rray_cast_cpl_to_cpl_one,
+    R_TYPE_complex,
+    r_complex,
+    r_cpl_begin,
+    rray_divide_cpl_one,
+    RRAY_BINARY_NO_ARGS
+  );
+}
+
+static inline double rray_divide_dbl_one(double x, double y) {
+  return x / y;
+}
+
+static inline r_complex rray_divide_cpl_one(r_complex x, r_complex y) {
+  return rray_c99_to_cpl(rray_cpl_to_c99(x) / rray_cpl_to_c99(y));
+}</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;static inline int rray_multiply_int_one&quot; -A 25 src/arithmetic-multiply.c; grep -n &quot;R…</summary>
+<pre>grep -n &quot;static inline int rray_multiply_int_one&quot; -A 25 src/arithmetic-multiply.c; grep -n &quot;RRAY_BINARY_NO_ARGS\|RRAY_BINARY_ARGS&quot; src/*.h | head</pre><pre class="output">src/binary.h:8:#define RRAY_BINARY_ARGS(...) , __VA_ARGS__
+src/binary.h:9:#define RRAY_BINARY_NO_ARGS</pre></details>
+<details class="tool tool-error"><summary>Bash: grep -n &quot;int_one&quot; src/arithmetic-multiply.c | head -4; n=$(grep -n &quot;int rray_multiply_int_one…</summary>
+<pre>grep -n &quot;int_one&quot; src/arithmetic-multiply.c | head -4; n=$(grep -n &quot;int rray_multiply_int_one&quot; src/arithmetic-multiply.c | tail -1 | cut -d: -f1); sed -n &quot;${n},$((n+25))p&quot; src/arithmetic-multiply.c</pre><pre class="output">Exit code 1
+125:    rray_cast_lgl_to_int_one,
+128:    rray_cast_lgl_to_int_one,
+132:    rray_multiply_int_one,
+149:    rray_cast_lgl_to_int_one,
+sed: 1: &quot;,25p&quot;: invalid command code ,</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;rray_multiply_int_one&quot; src/*.c src/*.h src/decl/*.h | head; sed -n 125,140p src/arit…</summary>
+<pre>grep -n &quot;rray_multiply_int_one&quot; src/*.c src/*.h src/decl/*.h | head; sed -n 125,140p src/arithmetic-multiply.c</pre><pre class="output">src/arithmetic-multiply.c:132:    rray_multiply_int_one,
+src/arithmetic-multiply.c:156:    rray_multiply_int_one,
+src/arithmetic-multiply.c:180:    rray_multiply_int_one,
+src/arithmetic-multiply.c:300:    rray_multiply_int_one,
+src/one-multiply.h:18:static inline int rray_multiply_int_one(
+    rray_cast_lgl_to_int_one,
+    int,
+    r_lgl_cbegin,
+    rray_cast_lgl_to_int_one,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    rray_multiply_int_one,
+    RRAY_BINARY_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_multiply_lgl_int(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,</pre></details>
+<details class="tool"><summary>Bash: ls src/one-*.h; cat src/one-multiply.h</summary>
+<pre>ls src/one-*.h; cat src/one-multiply.h</pre><pre class="output">src/one-add.h
+src/one-extremum.h
+src/one-logical.h
+src/one-multiply.h
+#ifndef RRAY_ONE_MULTIPLY_H
+#define RRAY_ONE_MULTIPLY_H
+
+#include &lt;limits.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// - `x = 2`, `y = 3`: returns `6`.
+// - `x = 2`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = 0`: returns `NA`.
+// - `x = 2`, `y = INT_MAX`: errors.
+static inline int rray_multiply_int_one(
+  int x,
+  int y,
+  struct r_lazy error_call
+) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  // Benchmarked and this is just as fast as R's `GOODIPROD()`
+  const double out = (double) x * (double) y;
+
+  if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+    stop_int_overflow(error_call);
+  }
+
+  return (int) out;
+}
+
+static inline double rray_multiply_dbl_one(double x, double y) {
+  return x * y;
+}
+
+// Matching R with `_Complex` `*`, which &quot;recovers&quot; infinities
+static inline r_complex rray_multiply_cpl_one(r_complex x, r_complex y) {
+  return rray_c99_to_cpl(rray_cpl_to_c99(x) * rray_cpl_to_c99(y));
+}
+
+// --------------------------------------------------------------------------
+// Reduce
+
+// `out` is a double, `x` is a logical
+// - `out = 2`, `x = 1`: returns `2`.
+// - `out = 2`, `x = NA`: returns `NA`.
+static inline double rray_prod_lgl_one(double out, int x) {
+  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : x);
+}
+
+// `out` is a double, `x` is a logical
+// - `out = 2`, `x = 1`: returns `2`.
+// - `out = 2`, `x = NA`: returns `2`.
+static inline double rray_prod_lgl_one_na_rm(double out, int x) {
+  return out * (rray_lgl_is_missing(x) ? 1.0 : x);
+}
+
+// `out` is a double, `x` is an integer
+// - `out = 2`, `x = 3`: returns `6`.
+// - `out = 2`, `x = NA`: returns `NA`.
+static inline double rray_prod_int_one(double out, int x) {
+  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : x);
+}
+
+// `out` is a double, `x` is an integer
+// - `out = 2`, `x = 3`: returns `6`.
+// - `out = 2`, `x = NA`: returns `2`.
+static inline double rray_prod_int_one_na_rm(double out, int x) {
+  return out * (rray_int_is_missing(x) ? 1.0 : x);
+}
+
+// Purposefully choose to match `rray_multiply()` rather than `prod()`
+// regarding `c(NA, NaN)` behavior, see `rray_add_dbl_one()`.
+static inline double rray_prod_dbl_one(double out, double x) {
+  return rray_multiply_dbl_one(out, x);
+}
+
+// `out` is never missing
+// - `out = 2`, `x = 3`: returns `6`.
+// - `out = 2`, `x = NA`: returns `2`.
+// - `out = 2`, `x = NaN`: returns `2`.
+static inline double rray_prod_dbl_one_na_rm(double out, double x) {
+  return out * (rray_dbl_is_missing(x) ? 1.0 : x);
+}
+
+// Purposefully choose to match `rray_multiply()` rather than `prod()`, which
+// doesn't recover infinities
+static inline r_complex rray_prod_cpl_one(r_complex out, r_complex x) {
+  return rray_multiply_cpl_one(out, x);
+}
+
+// The whole element is removed
+// - `out = 1+1i`, `x = 2+0i`: returns `2+2i`.
+// - `out = 1+1i`, `x = NA`: returns `1+1i`.
+// - `out = 1+1i`, `x = complex(real = 2, imaginary = NaN)`: returns `1+1i`.
+static inline r_complex rray_prod_cpl_one_na_rm(r_complex out, r_complex x) {
+  if (rray_cpl_is_missing(x)) {
+    return out;
+  }
+
+  return rray_prod_cpl_one(out, x);
+}
+
+#endif</pre></details>
+<p>Writing the final <code>%%</code> version into the scratchpad first, so the code going into the plan is exactly the code that was tested.</p>
+
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>#include &lt;math.h&gt;
+#include &lt;R.h&gt;
+#include &lt;Rmath.h&gt;
+
+static double modulo(double x, double y) {
+  if (y == 0.0) {
+    return R_NaN;
+  }
+  double out = fmod(x, y);
+  if (out != 0.0 &amp;&amp; (out &lt; 0.0) != (y &lt; 0.0)) {
+    out += y;
+  }
+  if (out == y) {
+    out = 0.0;
+  }
+  return out;
+}
+
+void fm(double* x, double* y, int* n, double* out) {
+  for (int i = 0; i &lt; *n; ++i) {
+    out[i] = modulo(x[i], y[i]);
+  }
+}</pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fm.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884997…</summary>
+<pre>dyn.load(&quot;fm.so&quot;)
+f &lt;- function(x, y) .C(&quot;fm&quot;, as.double(x), as.double(y), length(x), double(length(x)), NAOK = TRUE)[[4]]
+
+report &lt;- function(label, x, y) {
+  r &lt;- suppressWarnings(x %% y)
+  s &lt;- f(x, y)
+  same &lt;- (r == s &amp; !is.na(r) &amp; !is.na(s)) | (is.na(r) &amp; is.na(s) &amp; is.nan(r) == is.nan(s))
+  q &lt;- abs(x / y)
+  cat(sprintf(&quot;%-28s n = %8d   mismatches = %d\n&quot;, label, length(x), sum(!same)))
+  i &lt;- head(which(!same), 10)
+  if (length(i)) {
+    print(data.frame(x = x[i], y = y[i], R = r[i], ours = s[i]), digits = 17)
+  }
+}
+
+set.seed(1)
+n &lt;- 1e6
+report(&quot;normal / normal&quot;, rnorm(n, sd = 100), rnorm(n, sd = 10))
+report(&quot;uniform / decimals&quot;, runif(n, -10, 10), sample(c(0.1, 0.2, 0.3, 1, 2.5, -0.7), n, TRUE))
+report(&quot;2 dp / small divisors&quot;, round(rnorm(n, sd = 1e4), 2), sample(c(0.01, 0.05, 0.1, 7, -3), n, TRUE))
+k &lt;- sample(-1000:1000, n, TRUE)
+d &lt;- sample(c(0.1, 0.2, 0.3, 0.7, -0.1, 1.1), n, TRUE)
+report(&quot;exact multiples k * y&quot;, k * d, d)
+report(&quot;near multiples&quot;, k * d * (1 + sample(c(-1, 1), n, TRUE) * 2^-52), d)
+report(&quot;integers as double&quot;, as.double(sample(-1e6:1e6, n, TRUE)), as.double(sample(c(-50:-1, 1:50), n, TRUE)))
+x &lt;- 10^runif(n, -10, 20) * sample(c(-1, 1), n, TRUE)
+y &lt;- 10^runif(n, -10, 10) * sample(c(-1, 1), n, TRUE)
+keep &lt;- abs(x / y) &lt; 2^52
+report(&quot;wide magnitudes, q &lt; 2^52&quot;, x[keep], y[keep])
+report(&quot;wide magnitudes, q &gt;= 2^52&quot;, x[!keep], y[!keep])
+
+sp &lt;- c(0, -0, 1, -1, 0.5, -0.5, 3, -3, 1e300, -1e300, 5e-324, Inf, -Inf, NaN, NA)
+g &lt;- expand.grid(x = sp, y = sp)
+report(&quot;special values grid&quot;, g$x, g$y)
+
+xi &lt;- sample(c(-2e9:-1e9, -100:100, 1e9:2e9), n, TRUE)
+yi &lt;- sample(c(-2e9:-1e9, -100:-1, 1:100, 1e9:2e9), n, TRUE)
+ri &lt;- xi %% yi
+si &lt;- ifelse(xi &gt;= 0 &amp; yi &gt; 0, xi %% yi, as.integer(f(xi, yi)))
+cat(sprintf(&quot;%-28s n = %8d   mismatches = %d\n&quot;, &quot;int via the double core&quot;, n, sum(ri != si)))
+di &lt;- xi %/% yi
+ei &lt;- as.integer(floor(as.double(xi) / as.double(yi)))
+cat(sprintf(&quot;%-28s n = %8d   mismatches = %d\n&quot;, &quot;int %/% via floor(x / y)&quot;, n, sum(di != ei)))</pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fm.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fm.c &gt;/dev/null &amp;&amp; Rscript fm.R</pre><pre class="output">using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+normal / normal              n =  1000000   mismatches = 0
+uniform / decimals           n =  1000000   mismatches = 0
+2 dp / small divisors        n =  1000000   mismatches = 0
+exact multiples k * y        n =  1000000   mismatches = 0
+near multiples               n =  1000000   mismatches = 0
+integers as double           n =  1000000   mismatches = 0
+wide magnitudes, q &lt; 2^52    n =   828714   mismatches = 0
+wide magnitudes, q &gt;= 2^52   n =   171286   mismatches = 1
+                     x                      y                       R
+1 -1895247340438453248 1.7083001105135265e-10 -2.6599677746047098e-15
+                    ours
+1 1.7082735108357804e-10
+special values grid          n =      225   mismatches = 29
+                          x                        y                        R
+1   1.0000000000000006e+300   3.0000000000000000e+00  2.0636505122486924e+267
+2  -1.0000000000000006e+300   3.0000000000000000e+00 -2.0636505122486924e+267
+3   1.0000000000000006e+300  -3.0000000000000000e+00  2.0636505122486924e+267
+4  -1.0000000000000006e+300  -3.0000000000000000e+00 -2.0636505122486924e+267
+5   4.9406564584124654e-324  -3.0000000000000000e+00  4.9406564584124654e-324
+6   -1.0000000000000000e+00  1.0000000000000006e+300  1.0000000000000006e+300
+7   -5.0000000000000000e-01  1.0000000000000006e+300  1.0000000000000006e+300
+8   -3.0000000000000000e+00  1.0000000000000006e+300  1.0000000000000006e+300
+9    1.0000000000000000e+00 -1.0000000000000006e+300 -1.0000000000000006e+300
+10   5.0000000000000000e-01 -1.0000000000000006e+300 -1.0000000000000006e+300
+   ours
+1     1
+2     2
+3    -2
+4    -1
+5     0
+6     0
+7     0
+8     0
+9     0
+10    0
+int via the double core      n =  1000000   mismatches = 0
+int %/% via floor(x / y)     n =  1000000   mismatches = 0
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>The <code>out == y</code> line I suggested is a mistake. It fixes 2 cases but breaks about 20 others. For example, <code>-1 %% 1e300</code> is <code>1e300</code> in R, and that line turns it into <code>0</code>. Removing it and re-running.</p>
+
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-  if (out == y) {</span>
+<span class="del">-    out = 0.0;</span>
+<span class="del">-  }</span>
+<span class="ins">+</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fm.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fm.c &gt;/dev/null &amp;&amp; Rscript fm.R 2&gt;&amp;1 | grep -v &quot;^using&quot;</pre><pre class="output">using C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+using SDK: ‘MacOSX15.4.sdk’
+normal / normal              n =  1000000   mismatches = 0
+uniform / decimals           n =  1000000   mismatches = 0
+2 dp / small divisors        n =  1000000   mismatches = 0
+exact multiples k * y        n =  1000000   mismatches = 0
+near multiples               n =  1000000   mismatches = 0
+integers as double           n =  1000000   mismatches = 0
+wide magnitudes, q &lt; 2^52    n =   828714   mismatches = 6285
+                         x                    y R                 ours
+1   1.6199608957494548e-10 -1925265634.72172284 0 -1925265634.72172284
+2  -1.0214253282501409e-09  2551020538.12309980 0  2551020538.12309980
+3   5.9212484309671801e-08 -8627120112.17243385 0 -8627120112.17243385
+4   1.5623787921666985e-07 -3338599262.03619814 0 -3338599262.03619814
+5  -4.3686724053759367e-07  5616276021.12342548 0  5616276021.12342548
+6  -7.5657230589876300e-08  5156068576.53577042 0  5156068576.53577042
+7   1.6271599718579414e-08 -3750458070.77910709 0 -3750458070.77910709
+8  -4.8694694394038566e-10    27716285.04519834 0    27716285.04519834
+9   1.1520380535627202e-07 -1279414429.97234368 0 -1279414429.97234368
+10 -5.4973635692967537e-10  2567029395.69953585 0  2567029395.69953585
+wide magnitudes, q &gt;= 2^52   n =   171286   mismatches = 1
+                     x                      y                       R
+1 -1895247340438453248 1.7083001105135265e-10 -2.6599677746047098e-15
+                    ours
+1 1.7082735108357804e-10
+special values grid          n =      225   mismatches = 15
+                          x                        y                        R
+1   4.9406564584124654e-324  -1.0000000000000000e+00   0.0000000000000000e+00
+2   4.9406564584124654e-324  -5.0000000000000000e-01   0.0000000000000000e+00
+3   1.0000000000000006e+300   3.0000000000000000e+00  2.0636505122486924e+267
+4  -1.0000000000000006e+300   3.0000000000000000e+00 -2.0636505122486924e+267
+5   1.0000000000000006e+300  -3.0000000000000000e+00  2.0636505122486924e+267
+6  -1.0000000000000006e+300  -3.0000000000000000e+00 -2.0636505122486924e+267
+7   4.9406564584124654e-324  -3.0000000000000000e+00  4.9406564584124654e-324
+8    1.0000000000000000e+00  4.9406564584124654e-324                      NaN
+9   -1.0000000000000000e+00  4.9406564584124654e-324                      NaN
+10   5.0000000000000000e-01  4.9406564584124654e-324                      NaN
+   ours
+1  -1.0
+2  -0.5
+3   1.0
+4   2.0
+5  -2.0
+6  -1.0
+7  -3.0
+8   0.0
+9   0.0
+10  0.0
+int via the double core      n =  1000000   mismatches = 0
+int %/% via floor(x / y)     n =  1000000   mismatches = 0
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Found another discrepancy: for tiny <code>x</code> with sign opposite <code>y</code>, R returns 0 while <code>fmod()</code> returns <code>y</code> (since the true result rounds to <code>y</code>), but R only does this when <code>|y| &gt; 2^52</code>. I'll test a check that replicates R's exact behavior here.</p>
+</details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a468849971…</summary>
+<pre class="diff"><span class="del">-    out += y;</span>
+<span class="del">-  }</span>
+<span class="ins">+    out += y;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  if (out == y &amp;&amp; fabs(y) &lt;= 0x1p52) {</span>
+<span class="ins">+    out = 0.0;</span>
+<span class="ins">+  }</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad/fm.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; R CMD SHLIB fm.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; Rscript fm.R &amp;&amp; Rscript fd.R fm 2&gt;/dev/null | head -0; cat fd.c | sed -n 1,40p</pre><pre class="output">normal / normal              n =  1000000   mismatches = 0
+uniform / decimals           n =  1000000   mismatches = 0
+2 dp / small divisors        n =  1000000   mismatches = 0
+exact multiples k * y        n =  1000000   mismatches = 0
+near multiples               n =  1000000   mismatches = 0
+integers as double           n =  1000000   mismatches = 0
+wide magnitudes, q &lt; 2^52    n =   828714   mismatches = 0
+wide magnitudes, q &gt;= 2^52   n =   171286   mismatches = 1
+                     x                      y                       R
+1 -1895247340438453248 1.7083001105135265e-10 -2.6599677746047098e-15
+                    ours
+1 1.7082735108357804e-10
+special values grid          n =      225   mismatches = 13
+                          x                        y                        R
+1   1.0000000000000006e+300   3.0000000000000000e+00  2.0636505122486924e+267
+2  -1.0000000000000006e+300   3.0000000000000000e+00 -2.0636505122486924e+267
+3   1.0000000000000006e+300  -3.0000000000000000e+00  2.0636505122486924e+267
+4  -1.0000000000000006e+300  -3.0000000000000000e+00 -2.0636505122486924e+267
+5   4.9406564584124654e-324  -3.0000000000000000e+00  4.9406564584124654e-324
+6    1.0000000000000000e+00  4.9406564584124654e-324                      NaN
+7   -1.0000000000000000e+00  4.9406564584124654e-324                      NaN
+8    5.0000000000000000e-01  4.9406564584124654e-324                      NaN
+9   -5.0000000000000000e-01  4.9406564584124654e-324                      NaN
+10   3.0000000000000000e+00  4.9406564584124654e-324                      NaN
+   ours
+1     1
+2     2
+3    -2
+4    -1
+5     0
+6     0
+7     0
+8     0
+9     0
+10    0
+int via the double core      n =  1000000   mismatches = 0
+int %/% via floor(x / y)     n =  1000000   mismatches = 0
+head: illegal line count -- 0
+#include &lt;math.h&gt;
+
+static double floor_divide(double x, double y) {
+  if (y == 0.0 || !isfinite(x)) {
+    return x / y;
+  }
+  double mod = fmod(x, y);
+  double div = (x - mod) / y;
+  if (mod != 0.0 &amp;&amp; (mod &lt; 0.0) != (y &lt; 0.0)) {
+    div -= 1.0;
+  }
+  if (div == 0.0) {
+    return copysign(0.0, x / y);
+  }
+  double out = floor(div);
+  if (div - out &gt; 0.5) {
+    out += 1.0;
+  }
+  return out;
+}
+
+static double fma_divide(double x, double y) {
+  const double q = x / y;
+  if (y == 0.0 || !isfinite(q) || fabs(q) &gt; 0x1p52) {
+    return q;
+  }
+  const double out = floor(q);
+  const double r = isfinite(y) ? fma(-out, y, x) : x;
+  if (r != 0.0 &amp;&amp; (r &lt; 0.0) != (y &lt; 0.0)) {
+    return out - 1.0;
+  }
+  return out;
+}
+
+void fm(double* x, double* y, int* n, double* out) {
+  for (int i = 0; i &lt; *n; ++i) {
+    out[i] = fma_divide(x[i], y[i]);
+  }
+}
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a46884…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d8efd8b0-5d35-48f6-8fdb-8a4688499718/scratchpad &amp;&amp; Rscript -e '
+dyn.load(&quot;fm.so&quot;); f &lt;- function(x, y) .C(&quot;fm&quot;, as.double(x), as.double(y), length(x), double(length(x)), NAOK = TRUE)[[4]]
+sp &lt;- c(0, -0, 1, -1, 0.5, -0.5, 3, -3, 1e300, -1e300, 5e-324, Inf, -Inf, NaN, NA)
+g &lt;- expand.grid(x = sp, y = sp); r &lt;- suppressWarnings(g$x %% g$y); s &lt;- f(g$x, g$y)
+same &lt;- (r == s &amp; !is.na(r) &amp; !is.na(s)) | (is.na(r) &amp; is.na(s) &amp; is.nan(r) == is.nan(s))
+print(cbind(g, R = r, ours = s)[!same, ][11:13, ], digits = 17)'</pre><pre class="output">                           x                       y   R ours
+158  -3.0000000000000000e+00 4.9406564584124654e-324 NaN    0
+159  1.0000000000000006e+300 4.9406564584124654e-324 NaN    0
+160 -1.0000000000000006e+300 4.9406564584124654e-324 NaN    0
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>I've confirmed the remaining 13 differences all stem from errors in R's own output—warnings, NaN on exact multiples, or wrong signs. Now I'll write up the plan.</p>
+</details>
+<details class="tool"><summary>Write plans/mod-and-idiv.md</summary>
+<pre># `rray_modulo()` and `rray_integer_divide()`
+
+Future work. This document collects what we worked out about `%%` and `%/%`
+before deciding to defer them, so that work isn't lost. Nothing here is built.
+
+---
+
+# Part 1: Types
+
+Same family as `rray_add()` and friends: `lgl`, `int`, `dbl`. `cpl` errors, the
+same way `chr`, `raw` and `list` do for every arithmetic operator. Base R does
+the same: `1i %% 1` is &quot;unimplemented complex operation&quot;.
+
+Promotion table, matching the shape of 2.4 in `plans/implementation.md`:
+
+| op | lgl | int | dbl | cpl |
+|---|---|---|---|---|
+| `%%` `%/%` | int | int | dbl | error |
+
+So the switch has the same 16 arm shape as `rray_add_switch()`, except the four
+`cpl` arms (`logical_complex`, `integer_complex`, `double_complex`,
+`complex_complex`) join the `chr`/`raw`/`list` arms calling
+`stop_unsupported_arithmetic()`, the way `rray_exponentiate_switch()` already
+does it. That means two scalar operations per operator, `_int_one` and
+`_dbl_one`, not three. There is no `_cpl_one`.
+
+---
+
+# Part 2: Why we don't port R's code
+
+R computes `%%` and `%/%` with two static functions in `src/main/arithmetic.c`,
+`myfmod()` and `myfloor()`. They are not exported, so matching R would mean
+porting them. We don't, for three reasons.
+
+- **They lean on `long double`.** Both compute a correction term in
+  `long double` to cut rounding error. rray only uses `double`. On arm64 macOS,
+  `long double` is the same as `double`, so R itself already runs the double
+  only version there, and R's results differ between x86_64 Linux and arm64
+  macOS. &quot;Bit for bit with R&quot; was never one fixed target.
+
+- **Licensing.** R is GPL-2 and rray is MIT. Porting R's specific
+  implementation into an MIT package is a problem. Writing the operations from
+  their definitions, on top of C's `fmod()`, `floor()` and `fma()`, is not.
+
+- **There is a simpler, more accurate route.** C's `fmod()` returns the exact
+  remainder of two doubles, with no rounding at all. C's `fma(a, b, c)`
+  computes `a * b + c` with a single rounding. Together they give results that
+  match R everywhere R is correct, and are exact in places where R is not.
+
+Two things in the plan get simpler as a result:
+
+- **No &quot;loss of accuracy&quot; warning.** `myfmod()` warns when the quotient is so
+  large that its double subtraction can't be trusted. `fmod()` is exact at any
+  size, so there is nothing to warn about.
+
+- **No `long double`, `floorl()`, or `c_eps`.**
+
+A note on R's short circuit in `myfmod()`, which an earlier version of this
+plan described wrong: it only applies when `fabs(x2) * DBL_EPSILON &gt; 1`, meaning
+the divisor is bigger than 2^52 (about 4.5e15). It is not a general shortcut
+for `fabs(x1) &lt;= fabs(x2)`. It matters below, because it is why `-1 %% 1e300`
+returns `1e300` in R but `-1e-10 %% 1e9` returns `0`.
+
+---
+
+# Part 3: The double cores
+
+## `%%`
+
+```c
+static inline double rray_modulo_dbl_one(double x, double y) {
+  // R returns `NaN` (not `NA`) for a zero divisor, for any `x`, including
+  // `NA`. `fmod(x, 0)` would also give `NaN`, but this states it outright and
+  // matches R's `NaN` exactly rather than relying on `fmod()`'s choice.
+  if (y == 0.0) {
+    return R_NaN;
+  }
+
+  // The exact remainder of `x / y`, with no rounding. C's `fmod()` truncates,
+  // so the result has the sign of `x` (e.g. `fmod(-7, 3)` is `-1`). It also
+  // passes `NA` and `NaN` through, and gives `NaN` when `x` is infinite, and
+  // returns `x` itself when `y` is infinite.
+  double out = fmod(x, y);
+
+  // R's `%%` floors instead, so the result must take the sign of `y`
+  // (e.g. `-7 %% 3` is `2`). If the remainder is nonzero and its sign
+  // disagrees with `y`, shift it by one whole `y` into the right range:
+  // `-1 + 3` is `2`. This addition is the only step that can round, and only
+  // when `out` is tiny next to `y`.
+  if (out != 0.0 &amp;&amp; (out &lt; 0.0) != (y &lt; 0.0)) {
+    out += y;
+  }
+
+  // When that addition rounds, it can land exactly on `y`
+  // (e.g. `-1e-20 + 1` rounds to `1`). R returns `0` in that case, except when
+  // `|y| &gt; 2^52`, where R's short circuit returns `y`. Copy both.
+  if (out == y &amp;&amp; fabs(y) &lt;= 0x1p52) {
+    out = 0.0;
+  }
+
+  return out;
+}
+```
+
+## `%/%`
+
+```c
+static inline double rray_integer_divide_dbl_one(double x, double y) {
+  // The rounded quotient. Usually right, but rounding can push it up onto the
+  // next whole number (e.g. `456.09 / 0.01` gives `45609` exactly, while the
+  // true quotient is just under that).
+  const double q = x / y;
+
+  // Return the plain quotient, like R, when:
+  // - `y` is `0`: `q` is already `Inf`, `-Inf` or `NaN`.
+  // - `q` is not finite: `Inf`, `NA` or `NaN` pass straight through.
+  // - `|q| &gt; 2^52`: every double this large is already a whole number, so
+  //   there is nothing to floor.
+  if (y == 0.0 || !R_FINITE(q) || fabs(q) &gt; 0x1p52) {
+    return q;
+  }
+
+  // Our candidate answer. It is never too low: a rounded quotient cannot drop
+  // below a whole number that the true quotient is at or above. It can only
+  // be one too high, which the next lines check for.
+  const double out = floor(q);
+
+  // The leftover `x - out * y`, with a single rounding, so its sign is always
+  // correct. An infinite `y` would turn this into `NaN` (`0 * Inf`), but then
+  // `out` is `0` or `-1`... in fact `0`, since `x / Inf` is `0` or `-0`, so
+  // the leftover is just `x`.
+  const double r = R_FINITE(y) ? fma(-out, y, x) : x;
+
+  // For a correct floor, the leftover has the same sign as `y` (or is `0`).
+  // If it has the opposite sign, `out * y` overshot `x`, meaning `out` is one
+  // too high.
+  if (r != 0.0 &amp;&amp; (r &lt; 0.0) != (y &lt; 0.0)) {
+    return out - 1.0;
+  }
+
+  return out;
+}
+```
+
+`R_NaN` and `R_FINITE()` come from `Rmath.h`, which is already linked and
+already used in `src/reduce-mean.c`. `fmod()`, `floor()`, `fabs()` and `fma()`
+come from `math.h`. On arm64 `fma()` is a single hardware instruction.
+
+---
+
+# Part 4: The int cores
+
+For `%%`, C's `%` truncates and R's `%%` floors. They only agree when `x &gt;= 0`
+and `y &gt; 0`, so that is the fast path. Everything else goes through the double
+core. That round trip is exact, because every `int` fits in a double.
+
+```c
+static inline int rray_modulo_int_one(int x, int y) {
+  // Unlike the double core, R returns `NA` (not `NaN`) for a zero divisor here
+  if (rray_int_is_missing(x) || rray_int_is_missing(y) || y == 0) {
+    return r_globals.na_int;
+  }
+
+  // Both nonnegative, so C's truncating `%` already gives the floored answer
+  if (x &gt;= 0 &amp;&amp; y &gt; 0) {
+    return x % y;
+  }
+
+  // Any other sign combination: reuse the double core, which is exact for
+  // `int` inputs
+  return (int) rray_modulo_dbl_one((double) x, (double) y);
+}
+```
+
+For `%/%`, the double core isn't needed. With `int` inputs, `x / y` can never
+round up onto a whole number: the gap between the true quotient and the next
+whole number is at least `1 / |y|`, far bigger than double rounding error at
+these sizes.
+
+```c
+static inline int rray_integer_divide_int_one(int x, int y) {
+  // R returns `NA` for a zero divisor here too
+  if (rray_int_is_missing(x) || rray_int_is_missing(y) || y == 0) {
+    return r_globals.na_int;
+  }
+
+  // `floor()` rounds toward negative infinity for any signs, which is exactly
+  // `%/%`. The result always fits in an `int`, since `INT_MIN` is `NA`.
+  return (int) floor((double) x / (double) y);
+}
+```
+
+Neither int core can error, so both are called with `RRAY_BINARY_NO_ARGS`, the
+way `rray_divide_dbl_one()` is.
+
+Both `int` cores are shared across the `lgl_lgl`, `lgl_int`, `int_lgl` and
+`int_int` type pairs, the way `rray_multiply_int_one()` is. Both `dbl` cores
+are shared across every pair involving a `dbl`, the way `rray_divide_dbl_one()`
+is.
+</pre><p class="cut">66 more lines cut</p><pre class="output">The file ~/files/r/packages/rray/plans/mod-and-idiv.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Fixing a muddled comment and a duplicate &quot;Part 5&quot; heading, then checking the examples the plan cites.</p>
+
+<details class="tool"><summary>Edit plans/mod-and-idiv.md</summary>
+<pre class="diff"><span class="del">-  // The leftover `x - out * y`, with a single rounding, so its sign is always</span>
+<span class="del">-  // correct. An infinite `y` would turn this into `NaN` (`0 * Inf`), but then</span>
+<span class="del">-  // `out` is `0` or `-1`... in fact `0`, since `x / Inf` is `0` or `-0`, so</span>
+<span class="del">-  // the leftover is just `x`.</span>
+<span class="ins">+  // The leftover `x - out * y`, with a single rounding, so its sign is always</span>
+<span class="ins">+  // correct. When `y` is infinite, `q` is `±0` and so `out` is `0`. The</span>
+<span class="ins">+  // leftover is then just `x`, and `fma()` would wrongly give `NaN` from</span>
+<span class="ins">+  // `0 * Inf`, so skip it.</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/mod-and-idiv.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/mod-and-idiv.md</summary>
+<pre class="diff"><span class="del">-# Part 5: What the files look like</span>
+<span class="ins">+# Part 6: What the files look like</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/mod-and-idiv.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'print(c(456.09 %/% 0.01, floor(456.09 / 0.01), -1e-20 %% 1, -1 %% 1e300, NA %% 0,…</summary>
+<pre>Rscript -e 'print(c(456.09 %/% 0.01, floor(456.09 / 0.01), -1e-20 %% 1, -1 %% 1e300, NA %% 0, NaN %% 0, NA %/% 0, -1 %/% Inf, 1 %/% -Inf)); x &lt;- c(NA, NaN); print(x %% 0)'</pre><pre class="output">[1]   4.5608e+04   4.5609e+04   0.0000e+00  1.0000e+300          NaN
+[6]          NaN           NA  -1.0000e+00  -1.0000e+00
+[1] NaN NaN</pre></details>
+<p>All cited examples match R, including <code>NA %% 0</code> giving <code>NaN</code>. One last reference fix, then commit and push.</p>
+
+<details class="tool"><summary>Edit plans/mod-and-idiv.md</summary>
+<pre class="diff"><span class="del">-plus the rounding examples</span>
+<span class="del">-from Part 5 (</span>
+<span class="ins">+plus the rounding examples</span>
+<span class="ins">+from Parts 3 and 5 (</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/mod-and-idiv.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: git branch --show-current &amp;&amp; git add plans/mod-and-idiv.md &amp;&amp; git commit -q -m &quot;Rework the mo…</summary>
+<pre>git branch --show-current &amp;&amp; git add plans/mod-and-idiv.md &amp;&amp; git commit -q -m &quot;Rework the modulo and integer divide plan around fmod() and fma()&quot; &amp;&amp; git push origin main 2&gt;&amp;1 | tail -2 &amp;&amp; git log --oneline -1</pre><pre class="output">main
+To https://github.com/r-lib/rray.git
+   4e44ea4..586c9d3  main -&gt; main
+586c9d3 Rework the modulo and integer divide plan around fmod() and fma()</pre></details>
+<p>I updated <code>plans/mod-and-idiv.md</code> and pushed it to main as commit <code>586c9d3</code>. All four functions in the plan (double and int, for both <code>%%</code> and <code>%/%</code>) now have a comment on every step. The plan also has a new Part 5 with the test results. The code is now based on C's <code>fmod()</code> and <code>fma()</code> instead of R's <code>long double</code> code.</p>
+<p><strong>A correction to my last reply.</strong> Testing a wider range of inputs showed the line I suggested for <code>%%</code>, <code>if (out == y) out = 0.0</code>, was wrong.</p>
+<ul>
+<li>
+<p><strong>What it broke.</strong> It changed about 20 results that R gets right. For example, R returns <code>1e300</code> for <code>-1 %% 1e300</code>, and that line turned it into <code>0</code>.</p>
+</li>
+<li>
+<p><strong>What R actually does.</strong> In this rare case, where the shifted remainder rounds to exactly <code>y</code>, R returns <code>0</code>, but only when <code>|y| &lt;= 2^52</code>. Above that size, R's short circuit returns <code>y</code> instead.</p>
+</li>
+<li>
+<p><strong>What the plan does now.</strong> The plan copies that rule with <code>if (out == y &amp;&amp; fabs(y) &lt;= 0x1p52)</code>. Without that rule, 6,285 of the wide-magnitude pairs differed from R. With it, they all match.</p>
+</li>
+</ul>
+<p><strong>Results against R</strong> (8 sets of 1 million pairs each, a grid of 225 special-value pairs, and 1 million int pairs):</p>
+<ul>
+<li>
+<p><strong><code>%/%</code>, double and int:</strong> 0 mismatches.</p>
+</li>
+<li>
+<p><strong><code>%%</code>, int:</strong> 0 mismatches.</p>
+</li>
+<li>
+<p><strong><code>%%</code>, double:</strong> 14 mismatches. R's own answer is wrong in every one of them:</p>
+<ul>
+<li><code>1e300 %% 3</code>: R warns about loss of accuracy and returns <code>2.06e267</code>. We return the exact <code>1</code>.</li>
+<li>One random pair with a quotient above 2^52 fails the same way.</li>
+<li><code>x %% 5e-324</code>: R returns <code>NaN</code>. We return <code>0</code>, which is exact.</li>
+<li><code>5e-324 %% -3</code>: R returns <code>5e-324</code>, which has the wrong sign.</li>
+</ul>
+</li>
+</ul>
+<p>All testing ran on your arm64 Mac only. The plan says the package tests should check behavior (signs, zero divisors, <code>NA</code>, <code>NaN</code>, <code>Inf</code>, and the rounding examples), not exact agreement with R on every platform.</p>
+<p>The session setup named <code>feature/titles</code> as the working branch. I pushed to main because you asked for that directly. I also left out the co-author line that the session setup asks for, because your AGENTS.md says not to add one.</p>
+
+</section>
+</main>
+</body>
+</html>

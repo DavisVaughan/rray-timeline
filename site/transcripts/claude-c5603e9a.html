@@ -1,0 +1,2615 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Implementing rray_unstack() as a split plus axis removal</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-81">rray timeline</a>
+<h1>Implementing <code>rray_unstack()</code> as a split plus axis removal</h1>
+<p class="facts">Claude · Sep 19, 2026 · 1 prompt · 9 replies · <a href="https://github.com/r-lib/rray/pull/81">#81</a></p>
+</header>
+<main>
+<p class="divider">Sep 19, 2026, 08:32 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/unstack<br />
+Implement rray_unstack as defined by the combine stack plan<br />
+Think hard and do highest quality work<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Remove the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll start by reading the plan and understanding the existing code.</p>
+
+<details class="tool"><summary>Bash: ls ~/files/programming/claude/plans/ &amp;&amp; git log --oneline -5</summary>
+<pre>ls ~/files/programming/claude/plans/ &amp;&amp; git log --oneline -5</pre><pre class="output">cache-evict-by-time.md
+plan-air-global-config.md
+plan-oak-r-sources.md
+plan-oak-source-handler.md
+plan-oak-vendored.md
+plan-roxygen-code-format.md
+rework-r-source-runtime-download.md
+roxygen-examples-preserve-trailing-blank.md
+rray-broadcast-iterator.md
+rray-broadcast-iterator2.md
+rray-insert-axes.md
+rray-strided-iterator.md
+03db0e9 Rename to `check_dimensionality()` and also check a lower bound (#80)
+eaa6084 Add `rray_stack()` (#79)
+71d97df Force `axis`, `dimensions`, `from`, and `to` to be named arguments (#78)
+52e077b Rewrite `rray_split()` (#77)
+0a16cf2 Rewrite the combine, split, stack, and unstack plan (#76)</pre></details>
+<details class="tool"><summary>Bash: git show --stat 0a16cf2 &amp;&amp; ls</summary>
+<pre>git show --stat 0a16cf2 &amp;&amp; ls</pre><pre class="output">commit 0a16cf2b7cfbaa0e34b2dd4b8fe1b0730cfd33c7
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Fri Sep 18 05:41:17 2026 -0400
+
+    Rewrite the combine, split, stack, and unstack plan (#76)
+
+ plans/combine-stack-unstack.md | 1268 +++++++++++++++++-----------------------
+ plans/combine.md               |  244 --------
+ 2 files changed, 535 insertions(+), 977 deletions(-)
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+CLAUDE.md
+compile_commands.json
+DESCRIPTION
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+plans
+R
+rray4.Rproj
+src
+tests</pre></details>
+<details class="tool"><summary>Bash: ls plans &amp;&amp; cat plans/combine-stack-unstack.md</summary>
+<pre>ls plans &amp;&amp; cat plans/combine-stack-unstack.md</pre><pre class="output">combine-stack-unstack.md
+extensions.md
+implementation.md
+mod-and-idiv.md
+n-ary.md
+null.md
+rep.md
+# Combine, split, stack, and unstack
+
+## Status
+
+This document is an implementation plan. `rray_combine()`, `rray_split()`, and
+`rray_stack()` are done. The remaining work adds unstack.
+
+Split shipped with its second argument named `dimensions` rather than `sizes`,
+behind empty dots. This document uses the shipped name throughout.
+
+## Goal
+
+Provide a parallel family of array operations:
+
+```r
+rray_combine(..., .axis)
+rray_split(x, ..., axis, dimensions)
+rray_stack(..., .axis)
+rray_unstack(x, axis)
+```
+
+The pairs have direct relationships:
+
+- `rray_split()` divides one existing axis into contiguous chunks. Combining
+  those chunks on the same axis reconstructs the input.
+- `rray_stack()` inserts a new singleton axis into each input, then combines
+  the inputs on that axis.
+- `rray_unstack()` splits one existing axis into chunks of size 1, then removes
+  that singleton axis from every chunk.
+
+Axes are one based. Negative axes are not accepted.
+
+`.axis` follows `...` in combine and stack, so callers must name it. Split and
+unstack take `axis` after empty dots, so callers name it there too.
+
+## Current state
+
+`rray_combine()` has been merged. Treat its behavior and implementation as the
+foundation for this work, not as unfinished work to repeat.
+
+The merged implementation already provides:
+
+- broadcasting on every axis except `.axis`;
+- support for differing input dimensionality through implicit trailing axes of
+  dimension 1;
+- common type calculation and casting;
+- an internal `ptype` argument used by C callers;
+- concatenation of names on the combined axis;
+- broadcast name selection on every other axis;
+- checked dimension sums and output sizes;
+- strided writes into the final output without full broadcast copies.
+
+The public R function does not expose `.ptype`. Stack follows the same rule.
+Prototype selection stays internal on both.
+
+The merged combine implementation deliberately has no lower-level prepared
+entry point. Keep that boundary. Stack composes the existing internal
+`rray_combine()` entry point rather than exposing a second combine engine.
+
+`rray_split()` has been merged with the single-axis, variable-dimension
+interface described below. The old multiple-axis split is gone.
+
+`rray_stack()` has been merged. It prepares each input with
+`rray_expand_dimensionality()` and `rray_insert_axes()`, calls `rray_combine()`,
+and then names the new axis from `...`.
+
+## Decision summary
+
+- Keep the existing public `rray_combine(..., .axis)` unchanged.
+- Replace `rray_split(x, axes)` with `rray_split(x, ..., axis, dimensions)`.
+- Split along one axis only and retain that axis in every output.
+- A length-1 `dimensions` value is a uniform chunk dimension and must divide the
+  selected axis dimension exactly.
+- A `dimensions` vector with length other than 1 gives each chunk dimension
+  directly. Its entries may be zero and must sum to the selected axis dimension.
+- A scalar chunk dimension must be positive. Zero is only meaningful in the
+  explicit vector form.
+- Optimize the uniform `dimensions = 1L` case because unstack uses it and it is
+  the most common direct split.
+- Implement stack as trailing singleton expansion where needed, insertion of a
+  singleton axis, and a call to the existing combine engine.
+- Add an internal `rray_expand_dimensionality()` helper that pads dimensions
+  with trailing ones without copying data.
+- Expand an input for stack only when it has fewer than `axis - 1` dimensions.
+  There is no need to expand all inputs to the greatest dimensionality.
+- Implement unstack as split with `dimensions = 1L`, followed by removal of the
+  selected singleton axis from every piece.
+- Names of `...` become names on the new axis made by stack.
+- Names on the removed axis become names of the list returned by unstack.
+- Keep prototype control internal for combine and stack.
+- Add no lower-level R or FFI entry points beyond the wrappers for the new
+  public functions.
+
+## Public behavior
+
+### `rray_combine()`
+
+`rray_combine()` joins one or more arrays along an existing axis. The selected
+dimensions are added. Every other axis broadcasts to a common dimension.
+
+```text
+[2, 3] + [4, 3] along axis 1 -&gt; [6, 3]
+[2, 3] + [2, 5] along axis 2 -&gt; [2, 8]
+```
+
+The selected axis does not broadcast. Missing trailing axes act as dimensions
+of 1, including when the missing axis is the selected axis.
+
+```text
+[2] + [2, 3] along axis 2 -&gt; [2, 4]
+```
+
+No public behavior changes are planned for combine. Its current tests remain
+part of the verification for stack and split composition.
+
+### `rray_split()`
+
+`rray_split()` divides `x` into contiguous chunks along one existing `axis`.
+Each output keeps the dimensionality of `x`. Only the selected axis dimension
+changes.
+
+For `x` with dimensions `[6, 3]`:
+
+```text
+split on axis 1 with dimensions 2       -&gt; three arrays of [2, 3]
+split on axis 1 with dimensions c(1, 5) -&gt; arrays of [1, 3] and [5, 3]
+split on axis 1 with dimensions c(0, 6) -&gt; arrays of [0, 3] and [6, 3]
+```
+
+The two forms of `dimensions` have different meanings.
+
+#### Uniform chunk dimension
+
+A length-1 `dimensions` value is the dimension of every chunk. It must be
+positive and the selected axis dimension must be evenly divisible by it.
+
+```text
+axis dimension 6, dimensions 1 -&gt; 6 chunks of dimension 1
+axis dimension 6, dimensions 2 -&gt; 3 chunks of dimension 2
+axis dimension 6, dimensions 6 -&gt; 1 chunk of dimension 6
+axis dimension 6, dimensions 4 -&gt; error
+```
+
+An axis dimension of 0 produces an empty list for any positive uniform chunk
+dimension. In particular, `dimensions = 1L` works without a special error.
+
+#### Explicit chunk dimensions
+
+A `dimensions` vector with length other than 1 gives the dimension of every
+output chunk in order. Every entry must be nonnegative and their checked sum
+must equal the selected axis dimension. Zero-dimension chunks are retained in
+the output list.
+
+```text
+axis dimension 6, dimensions c(2, 0, 4) -&gt; chunk dimensions 2, 0, and 4
+axis dimension 6, dimensions c(2, 3)    -&gt; error
+```
+
+`integer()` is valid only when the selected axis has dimension 0. It returns an
+empty list. This is the explicit counterpart of splitting an empty axis into no
+chunks.
+
+The output is always an unnamed list. Split has no source for names describing
+the chunk boundaries. Axis names stay on the selected axis inside each chunk.
+
+The central identity is:
+
+```r
+pieces &lt;- rray_split(x, axis = axis, dimensions = dimensions)
+out &lt;- rray_combine(!!!pieces, .axis = axis)
+```
+
+`out` should be identical to `x`, including type, dimensions, values, and
+dimension names, for every valid split that produces at least one piece.
+Combine requires at least one input, so an empty split of a zero-length axis
+does not have a combine round trip.
+
+### `rray_stack()`
+
+`rray_stack()` joins one or more inputs along a newly inserted axis. Old axes
+broadcast according to the existing combine rules.
+
+For two arrays with dimensions `[2, 3]`:
+
+```text
+stack on axis 1 -&gt; [2, 2, 3]
+stack on axis 2 -&gt; [2, 2, 3]
+stack on axis 3 -&gt; [2, 3, 2]
+```
+
+The first two shapes happen to match because there are two inputs. Their value
+layouts differ. Tests must check slices, not only dimensions.
+</pre><p class="cut">632 more lines cut</p></details>
+<details class="tool"><summary>Bash: ls src src/decl R &amp;&amp; cat src/stack.c src/stack.h src/decl/stack-decl.h src/split.h R/stack.R …</summary>
+<pre>ls src src/decl R &amp;&amp; cat src/stack.c src/stack.h src/decl/stack-decl.h src/split.h R/stack.R R/split.R</pre><pre class="output">R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+insert-axes.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rray4-package.R
+size.R
+split.R
+stack.R
+zzz.R
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extremum.c
+extremum.h
+extremum.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+split.c
+split.h
+split.o
+stack.c
+stack.h
+stack.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o
+
+src/decl:
+arg-decl.h
+arithmetic-add-decl.h
+arithmetic-divide-decl.h
+arithmetic-exponentiate-decl.h
+arithmetic-multiply-decl.h
+arithmetic-subtract-decl.h
+broadcast-decl.h
+broadcast-names-decl.h
+cast-decl.h
+combine-decl.h
+compare-decl.h
+dimensions-decl.h
+equal-decl.h
+extremum-decl.h
+names-decl.h
+permute-axes-decl.h
+ptype-decl.h
+reduce-decl.h
+reduce-logical-decl.h
+reduce-mean-decl.h
+reduce-names-decl.h
+reduce-product-decl.h
+reduce-sum-decl.h
+size-decl.h
+split-decl.h
+stack-decl.h
+strided-iterator-decl.h
+utils-decl.h
+wrapper-decl.h
+#include &quot;stack.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;combine.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;insert-axes.h&quot;
+#include &quot;names.h&quot;
+#include &quot;utils.h&quot;</pre><p class="cut">221 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/split.c &amp;&amp; cat src/decl/split-decl.h</summary>
+<pre>cat src/split.c &amp;&amp; cat src/decl/split-decl.h</pre><pre class="output">#include &quot;split.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/split-decl.h&quot;
+
+r_obj* ffi_rray_split(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_split(ffi_x, axis, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_split(
+  r_obj* x,
+  int axis,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_x_dimensions[axis - 1];
+
+  dimensions = KEEP(arg_as_non_negative_bare_integer(
+    dimensions,
+    rray_args.dimensions,
+    error_call
+  ));
+  check_split_dimensions(
+    dimensions,
+    axis_dimension,
+    rray_args.dimensions,
+    error_call
+  );
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  // i.e. each array is the same dimension and splits `axis` evenly
+  const bool uniform = r_length(dimensions) == 1;
+
+  const r_ssize out_size =
+    uniform ? axis_dimension / v_dimensions[0] : r_length(dimensions);
+
+  r_obj* out = KEEP(r_alloc_list(out_size));
+
+  r_obj* x_names = r_dim_names(x);
+  r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);
+
+  r_obj* x_axis_names = (v_x_names == NULL) ? r_null : v_x_names[axis - 1];
+  r_obj* const* v_x_axis_names =
+    (x_axis_names == r_null) ? NULL : r_chr_cbegin(x_axis_names);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+  const r_ssize x_axis_stride = v_x_strides[axis - 1];
+
+  const enum r_type type = r_typeof(x);
+
+  // Initialized on the first iteration. Changes any time the output dimension
+  // along `axis` changes, but in the uniform case all arrays share the same
+  // dimensions object!
+  r_obj* out_elt_dimensions = r_null;
+  r_keep_loc out_elt_dimensions_loc;
+  KEEP_HERE(out_elt_dimensions, &amp;out_elt_dimensions_loc);
+
+  r_ssize out_elt_size = 0;
+
+  struct rray_strided_iterator_plan out_elt_plan = {0};
+
+  int previous_dimension = -1;
+
+  // The location along the axis. For example, with a 2x10 array split along
+  // columns this runs from 0-9. The `x_axis_stride` maps it to `x_start`, a
+  // flat location into `x` itself.
+  int x_axis_start = 0;
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    const int dimension = uniform ? v_dimensions[0] : v_dimensions[i];
+
+    if (dimension != previous_dimension) {
+      previous_dimension = dimension;
+
+      out_elt_dimensions = r_alloc_integer(dimensionality);
+      KEEP_AT(out_elt_dimensions, out_elt_dimensions_loc);
+      int* v_out_elt_dimensions = r_int_begin(out_elt_dimensions);
+      r_memcpy(
+        v_out_elt_dimensions,
+        v_x_dimensions,
+        sizeof(int) * dimensionality
+      );
+      v_out_elt_dimensions[axis - 1] = dimension;
+
+      out_elt_plan = rray_strided_iterator_plan(
+        v_out_elt_dimensions,
+        dimensionality,
+        v_x_strides
+      );
+
+      out_elt_size = rray_strided_iterator_plan_size(&amp;out_elt_plan);
+    }
+
+    r_obj* out_elt = r_alloc_vector(type, out_elt_size);
+    r_list_poke(out, i, out_elt);
+    r_attrib_poke_dim(out_elt, out_elt_dimensions);
+
+    const r_ssize x_start = x_axis_start * x_axis_stride;
+    rray_split_fill(x, out_elt, x_start, &amp;out_elt_plan);
+
+    if (v_x_axis_names != NULL) {
+      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+        v_x_names,
+        dimensionality,
+        axis,
+        v_x_axis_names,
+        x_axis_start,
+        dimension
+      ));
+      r_attrib_poke_dim_names(out_elt, out_elt_names);
+      FREE(1);
+    } else if (x_names != r_null) {
+      r_attrib_poke_dim_names(out_elt, x_names);
+    }
+
+    x_axis_start += dimension;
+  }
+
+  FREE(5);
+  return out;
+}
+
+static void check_split_dimensions(
+  r_obj* dimensions,
+  int axis_dimension,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize size = r_length(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  if (size == 1) {
+    const int dimension = v_dimensions[0];
+
+    if (dimension == 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value must be positive, not 0.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis_dimension % dimension != 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value of %d must evenly divide the `axis` dimension &quot;
+        &quot;of %d.&quot;,
+        rray_arg_format(arg),
+        dimension,
+        axis_dimension
+      );
+    }
+  } else {
+    r_ssize total_dimension = 0;
+
+    for (r_ssize i = 0; i &lt; size; ++i) {
+      total_dimension += v_dimensions[i];
+    }
+
+    if (total_dimension != axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must sum to the `axis` dimension of %d, not %&quot; R_PRI_SSIZE &quot;.&quot;,
+        rray_arg_format(arg),
+        axis_dimension,
+        total_dimension
+      );
+    }
+  }
+}
+
+static r_obj* rray_split_elt_names(</pre><p class="cut">238 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/remove-axes.c src/remove-axes.h R/remove-axes.R</summary>
+<pre>cat src/remove-axes.c src/remove-axes.h R/remove-axes.R</pre><pre class="output">#include &quot;remove-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_remove_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_remove_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_remove_axes(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  if (axes_size == dimensionality) {
+    r_abort_lazy_call(error_call, &quot;`axes` can't remove every axis.&quot;);
+  }
+
+  const int out_dimensionality = dimensionality - (int) axes_size;
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(out_dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+
+  r_obj* x_names = r_dim_names(x);
+  r_obj* const* v_x_names = x_names == r_null ? NULL : r_list_cbegin(x_names);
+
+  r_obj* out_names = r_null;
+  r_keep_loc out_names_loc;
+  KEEP_HERE(out_names, &amp;out_names_loc);
+
+  r_ssize axes_i = 0;
+  int out_i = 0;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    // Check if we are removing this axis
+    if (axes_i &lt; axes_size &amp;&amp; v_axes[axes_i] - 1 == i) {
+      if (v_x_dimensions[i] != 1) {
+        r_abort_lazy_call(
+          error_call,
+          &quot;Can't remove axis %d of %s because it has dimension %d, not 1.&quot;,
+          i + 1,
+          rray_arg_format(arg),
+          v_x_dimensions[i]
+        );
+      }
+
+      ++axes_i;
+      continue;
+    }
+
+    // Shift all remaining axes left
+    v_out_dimensions[out_i] = v_x_dimensions[i];
+
+    if (v_x_names != NULL &amp;&amp; v_x_names[i] != r_null) {
+      if (out_names == r_null) {
+        out_names = r_alloc_list(out_dimensionality);
+        KEEP_AT(out_names, out_names_loc);
+      }
+
+      r_list_poke(out_names, out_i, v_x_names[i]);
+    }
+
+    ++out_i;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+#ifndef RRAY_REMOVE_AXES_H
+#define RRAY_REMOVE_AXES_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_remove_axes(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+#' Remove array axes
+#'
+#' `rray_remove_axes()` removes axes with a dimension of 1.
+#'
+#' @details
+#' Removed axes lose their names.
+#' Surviving axes keep their names and carry them to their new locations.
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to remove. Each selected axis must
+#'   have a dimension of 1. At least one axis must remain.
+#'
+#' @returns
+#' An array with the selected `axes` removed.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:10, c(10, 1, 1))
+#'
+#' rray_remove_axes(x, 2)
+#' rray_remove_axes(x, c(2, 3))
+rray_remove_axes &lt;- function(x, axes) {
+  .Call(ffi_rray_remove_axes, x, axes, environment())
+}</pre></details>
+<details class="tool"><summary>Bash: cat src/axes.h src/dimensionality.h &amp;&amp; sed -n '1,80p' src/arg.h</summary>
+<pre>cat src/axes.h src/dimensionality.h &amp;&amp; sed -n '1,80p' src/arg.h</pre><pre class="output">#ifndef RRAY_AXES_H
+#define RRAY_AXES_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* arg_as_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* arg_as_axes_unsorted(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* arg_as_axes_permutation(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_axis(
+  int axis,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_axes_complement(
+  const int* v_axes,
+  r_ssize axes_size,
+  int dimensionality
+);
+
+#endif
+#ifndef RRAY_DIMENSIONALITY_H
+#define RRAY_DIMENSIONALITY_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+#define RRAY_MAX_DIMENSIONALITY 64
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+int rray_dimensionality_from_dimensions(r_obj* dimensions);
+
+r_obj* rray_expand_dimensionality(
+  r_obj* x,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_dimensionality(int dimensionality);
+
+#endif
+#ifndef RRAY_ARG_H
+#define RRAY_ARG_H
+
+#include &quot;rlang.h&quot;
+
+struct rray_arg {
+  r_obj* shelter;
+  struct rray_arg* parent;
+  r_ssize (*fill)(void* data, char* buf, r_ssize remaining);
+  void* data;
+};
+
+struct rray_args {
+  struct rray_arg* empty;
+  struct rray_arg* x;
+  struct rray_arg* y;
+  struct rray_arg* names;
+  struct rray_arg* axis;
+  struct rray_arg* dot_axis;
+  struct rray_arg* axes;
+  struct rray_arg* from;
+  struct rray_arg* to;
+  struct rray_arg* dimensions;
+  struct rray_arg* dot_dimensions;
+};
+
+extern struct rray_args rray_args;
+
+r_obj* rray_arg(struct rray_arg* arg);
+
+const char* rray_arg_format(struct rray_arg* arg);
+
+const char* rray_arg_format_input(struct rray_arg* arg);
+
+bool rray_arg_is_empty(struct rray_arg* arg);
+
+struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+
+struct rray_arg new_lazy_arg(struct r_lazy* arg);
+
+struct rray_arg* new_subscript_arg(
+  struct rray_arg* parent,
+  r_obj* names,
+  r_ssize n,
+  r_ssize* p_i
+);
+
+#endif</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;split\|stack\|remove_axes&quot; src/init.c &amp;&amp; grep -n &quot;rray_names\|axis_names&quot; src/names.h</summary>
+<pre>grep -n &quot;split\|stack\|remove_axes&quot; src/init.c &amp;&amp; grep -n &quot;rray_names\|axis_names&quot; src/names.h</pre><pre class="output">74:extern r_obj* ffi_rray_split(
+80:extern r_obj* ffi_rray_stack(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame);
+81:extern r_obj* ffi_rray_remove_axes(
+217:  {&quot;ffi_rray_split&quot;, (DL_FUNC) &amp;ffi_rray_split, 4},
+218:  {&quot;ffi_rray_stack&quot;, (DL_FUNC) &amp;ffi_rray_stack, 3},
+219:  {&quot;ffi_rray_remove_axes&quot;, (DL_FUNC) &amp;ffi_rray_remove_axes, 3},
+8:r_obj* rray_names(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+10:r_obj* rray_axis_names(
+24:r_obj* rray_set_axis_names(</pre></details>
+<details class="tool"><summary>Bash: cat src/names.h &amp;&amp; sed -n '60,100p' src/init.c &amp;&amp; sed -n '210,230p' src/init.c</summary>
+<pre>cat src/names.h &amp;&amp; sed -n '60,100p' src/init.c &amp;&amp; sed -n '210,230p' src/init.c</pre><pre class="output">#ifndef RRAY_NAMES_H
+#define RRAY_NAMES_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_names(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* rray_axis_names(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_set_names(
+  r_obj* x,
+  r_obj* names,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_set_axis_names(
+  r_obj* x,
+  int axis,
+  r_obj* names,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_set_dimensions(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_combine(
+  r_obj* ffi_xs,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_split(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_stack(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame);
+extern r_obj* ffi_rray_remove_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_insert_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_permute_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_move_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_to,
+  r_obj* ffi_frame
+  {&quot;ffi_rray_broadcast_names2&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names2, 3},
+  {&quot;ffi_rray_broadcast_names_common&quot;,
+   (DL_FUNC) &amp;ffi_rray_broadcast_names_common,
+   2},
+  {&quot;ffi_rray_reduce_names&quot;, (DL_FUNC) &amp;ffi_rray_reduce_names, 2},
+  {&quot;ffi_rray_set_dimensions&quot;, (DL_FUNC) &amp;ffi_rray_set_dimensions, 3},
+  {&quot;ffi_rray_combine&quot;, (DL_FUNC) &amp;ffi_rray_combine, 3},
+  {&quot;ffi_rray_split&quot;, (DL_FUNC) &amp;ffi_rray_split, 4},
+  {&quot;ffi_rray_stack&quot;, (DL_FUNC) &amp;ffi_rray_stack, 3},
+  {&quot;ffi_rray_remove_axes&quot;, (DL_FUNC) &amp;ffi_rray_remove_axes, 3},
+  {&quot;ffi_rray_insert_axes&quot;, (DL_FUNC) &amp;ffi_rray_insert_axes, 3},
+  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+  {&quot;ffi_rray_move_axes&quot;, (DL_FUNC) &amp;ffi_rray_move_axes, 4},
+  {&quot;ffi_rray_sum_along&quot;, (DL_FUNC) &amp;ffi_rray_sum_along, 4},
+  {&quot;ffi_rray_product_along&quot;, (DL_FUNC) &amp;ffi_rray_product_along, 4},
+  {&quot;ffi_rray_mean_along&quot;, (DL_FUNC) &amp;ffi_rray_mean_along, 4},
+  {&quot;ffi_rray_all_along&quot;, (DL_FUNC) &amp;ffi_rray_all_along, 4},
+  {&quot;ffi_rray_any_along&quot;, (DL_FUNC) &amp;ffi_rray_any_along, 4},
+  {&quot;ffi_rray_ptype&quot;, (DL_FUNC) &amp;ffi_rray_ptype, 2},
+  {&quot;ffi_rray_ptype2&quot;, (DL_FUNC) &amp;ffi_rray_ptype2, 3},
+  {&quot;ffi_rray_ptype_common&quot;, (DL_FUNC) &amp;ffi_rray_ptype_common, 3},</pre></details>
+<details class="tool"><summary>Bash: cat src/dimensionality.c &amp;&amp; sed -n '1,120p' src/names.c</summary>
+<pre>cat src/dimensionality.c &amp;&amp; sed -n '1,120p' src/names.c</pre><pre class="output">#include &quot;dimensionality.h&quot;
+
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+}
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return rray_dimensionality_from_dimensions(dimensions);
+}
+
+int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+  return (int) r_length(dimensions);
+}
+
+r_obj* rray_expand_dimensionality(
+  r_obj* x,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+
+  if (dimensionality &lt;= x_dimensionality) {
+    r_stop_internal(
+      &quot;`dimensionality` (%d) must be greater than the dimensionality of %s &quot;
+      &quot;(%d).&quot;,
+      dimensionality,
+      rray_arg_format(arg),
+      x_dimensionality
+    );
+  }
+
+  check_dimensionality(dimensionality);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * x_dimensionality);
+
+  for (int i = x_dimensionality; i &lt; dimensionality; ++i) {
+    v_out_dimensions[i] = 1;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* x_names = r_dim_names(x);
+
+  if (x_names != r_null) {
+    r_obj* out_names = KEEP(r_alloc_list(dimensionality));
+    r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+    for (int i = 0; i &lt; x_dimensionality; ++i) {
+      r_list_poke(out_names, i, v_x_names[i]);
+    }
+
+    r_attrib_poke_dim_names(out, out_names);
+    FREE(1);
+  }
+
+  FREE(4);
+  return out;
+}
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  int out = 1;
+
+  for (; x_i &lt; xs_size; ++x_i) {
+    const int x_dimensionality =
+      rray_dimensionality(v_xs[x_i], x_arg, error_call);
+
+    if (x_dimensionality &gt; out) {
+      out = x_dimensionality;
+    }
+  }
+
+  FREE(2);
+  return out;
+}
+
+void check_dimensionality(int dimensionality) {
+  if (dimensionality &lt; 1) {
+    r_stop_internal(
+      &quot;`dimensionality` (%d) must be at least 1.&quot;,
+      dimensionality
+    );
+  }
+
+  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+    r_abort(
+      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+      &quot;A dimensionality of %d was requested.&quot;,
+      RRAY_MAX_DIMENSIONALITY,
+      dimensionality
+    );
+  }
+}
+#include &quot;names.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/names-decl.h&quot;
+
+r_obj* ffi_rray_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_names(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_names(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim_names(x);
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_axis_names(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_axis_names(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_row_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_axis_names(ffi_x, 1, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_col_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_axis_names(ffi_x, 2, rray_args.x, error_call);
+}
+
+r_obj* rray_axis_names(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  r_obj* names = rray_names(x, arg, error_call);
+
+  r_obj* out = (names == r_null) ? r_null : r_list_get(names, axis - 1);
+
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_set_names(r_obj* ffi_x, r_obj* ffi_names, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_names(ffi_x, ffi_names, rray_args.x, error_call);
+}
+
+r_obj* rray_set_names(
+  r_obj* x,
+  r_obj* names,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  if (names != r_null) {
+    if (r_typeof(names) != R_TYPE_list) {</pre><p class="cut">45 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;dimensionality&quot; src/*.c | grep -i &quot;abort\|must have\|r_stop&quot; ; echo ---; grep -rn &quot;…</summary>
+<pre>grep -rn &quot;dimensionality&quot; src/*.c | grep -i &quot;abort\|must have\|r_stop&quot; ; echo ---; grep -rn &quot;dimensionality&quot; src/insert-axes.c src/move-axes.c | head -30</pre><pre class="output">src/axes.c:147:      &quot;%s must have length %d to match the dimensionality of the array, &quot;
+src/names.c:91:        &quot;%s must have length %d to match the dimensionality of %s, &quot;
+---
+src/move-axes.c:4:#include &quot;dimensionality.h&quot;
+src/move-axes.c:24:  const int dimensionality = rray_dimensionality(x, arg, error_call);
+src/move-axes.c:25:  check_dimensionality(dimensionality);
+src/move-axes.c:28:    arg_as_axes_unsorted(from, dimensionality, rray_args.from, error_call)
+src/move-axes.c:30:  to = KEEP(arg_as_axes_unsorted(to, dimensionality, rray_args.to, error_call));
+src/move-axes.c:48:  r_obj* permutation = KEEP(r_alloc_integer(dimensionality));
+src/move-axes.c:65:  for (int i = 0; i &lt; dimensionality; ++i) {
+src/insert-axes.c:4:#include &quot;dimensionality.h&quot;
+src/insert-axes.c:25:  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+src/insert-axes.c:30:  const int out_dimensionality =
+src/insert-axes.c:31:    int_add_checked(dimensionality, (int) axes_size);
+src/insert-axes.c:32:  check_dimensionality(out_dimensionality);
+src/insert-axes.c:34:  check_axes(axes, out_dimensionality, rray_args.axes, error_call);
+src/insert-axes.c:37:  r_obj* out_dimensions = KEEP(r_alloc_integer(out_dimensionality));
+src/insert-axes.c:50:  for (int i = 0; i &lt; out_dimensionality; ++i) {
+src/insert-axes.c:61:        out_names = r_alloc_list(out_dimensionality);</pre></details>
+<details class="tool"><summary>Bash: ls tests/testthat &amp;&amp; echo --- &amp;&amp; cat tests/testthat/helper-stack.R &amp;&amp; echo --- &amp;&amp; sed -n '1,1…</summary>
+<pre>ls tests/testthat &amp;&amp; echo --- &amp;&amp; cat tests/testthat/helper-stack.R &amp;&amp; echo --- &amp;&amp; sed -n '1,120p' tests/testthat/test-stack.R</pre><pre class="output">_snaps
+helper-ptype.R
+helper-stack.R
+helper-wrapper.R
+test-arithmetic-add.R
+test-arithmetic-divide.R
+test-arithmetic-exponentiate.R
+test-arithmetic-multiply.R
+test-arithmetic-subtract.R
+test-broadcast-names.R
+test-broadcast.R
+test-cast-common.R
+test-cast.R
+test-combine.R
+test-compare.R
+test-dimensionality.R
+test-dimensions.R
+test-equal.R
+test-extremum.R
+test-insert-axes.R
+test-move-axes.R
+test-names.R
+test-permute-axes.R
+test-ptype-common.R
+test-ptype.R
+test-reduce-logical.R
+test-reduce-mean.R
+test-reduce-names.R
+test-reduce-product.R
+test-reduce-sum.R
+test-remove-axes.R
+test-size.R
+test-split.R
+test-stack.R
+test-wrapper.R
+---
+stack_slice &lt;- function(x, axis, i) {
+  index &lt;- lapply(dim(x), seq_len)
+  index[[axis]] &lt;- i
+  x &lt;- do.call(`[`, c(list(x), index, list(drop = FALSE)))
+  rray_remove_axes(x, axis)
+}
+---
+test_that(&quot;stacks vectors along every axis&quot;, {
+  x &lt;- 1:2
+  y &lt;- 3:4
+
+  expect_identical(
+    rray_stack(x, y, .axis = 1L),
+    array(c(1L, 3L, 2L, 4L), c(2L, 2L))
+  )
+  expect_identical(
+    rray_stack(x, y, .axis = 2L),
+    array(1:4, c(2L, 2L))
+  )
+})
+
+test_that(&quot;stacks matrices along every axis&quot;, {
+  x &lt;- array(1:6, c(2L, 3L))
+  y &lt;- array(7:12, c(2L, 3L))
+
+  for (axis in 1:3) {
+    out &lt;- rray_stack(x, y, .axis = axis)
+    expect_identical(dim(out), append(c(2L, 3L), 2L, after = axis - 1L))
+    expect_identical(stack_slice(out, axis, 1L), x)
+    expect_identical(stack_slice(out, axis, 2L), y)
+  }
+})
+
+test_that(&quot;stacks 3D arrays along every axis&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+  y &lt;- x + 24L
+
+  for (axis in 1:4) {
+    out &lt;- rray_stack(x, y, .axis = axis)
+    expect_identical(dim(out), append(c(2L, 3L, 4L), 2L, after = axis - 1L))
+    expect_identical(stack_slice(out, axis, 1L), x)
+    expect_identical(stack_slice(out, axis, 2L), y)
+  }
+})
+
+test_that(&quot;stacks one or more than two inputs&quot;, {
+  x &lt;- array(1:4, c(2L, 2L))
+
+  expect_identical(rray_stack(x, .axis = 1L), array(1:4, c(1L, 2L, 2L)))
+  expect_identical(rray_stack(x, .axis = 3L), array(1:4, c(2L, 2L, 1L)))
+
+  out &lt;- rray_stack(x, x + 4L, x + 8L, .axis = 3L)
+  expect_identical(dim(out), c(2L, 2L, 3L))
+  expect_identical(out[,, 1L], x)
+  expect_identical(out[,, 2L], x + 4L)
+  expect_identical(out[,, 3L], x + 8L)
+
+  xs &lt;- list(x, x + 4L, x + 8L)
+  expect_identical(rray_stack(!!!xs, .axis = 3L), out)
+})
+
+test_that(&quot;works with every native type&quot;, {
+  xs &lt;- list(
+    lgl = c(TRUE, FALSE),
+    int = 1:2,
+    dbl = c(1, 2),
+    cpl = c(1i, 2i),
+    chr = c(&quot;a&quot;, &quot;b&quot;),
+    raw = as.raw(1:2),
+    list = list(1, &quot;x&quot;)
+  )
+
+  for (x in xs) {
+    out &lt;- rray_stack(x, x, .axis = 2L)
+    expect_identical(dim(out), c(2L, 2L))
+    expect_identical(out[, 1L], x)
+    expect_identical(out[, 2L], x)
+  }
+})
+
+test_that(&quot;uses the common type&quot;, {
+  expect_type(rray_stack(TRUE, 2L, .axis = 1L), &quot;integer&quot;)
+  expect_type(rray_stack(TRUE, 2, .axis = 1L), &quot;double&quot;)
+  expect_type(rray_stack(1L, 2i, .axis = 1L), &quot;complex&quot;)
+
+  expect_identical(
+    rray_stack(&quot;a&quot;, &quot;b&quot;, .axis = 1L),
+    array(c(&quot;a&quot;, &quot;b&quot;), c(2L, 1L))
+  )
+  expect_identical(
+    rray_stack(list(1L), list(&quot;x&quot;), .axis = 1L),
+    array(list(1L, &quot;x&quot;), c(2L, 1L))
+  )
+})
+
+test_that(&quot;broadcasts existing axes&quot;, {
+  x &lt;- array(1:2, c(2L, 1L))
+  y &lt;- array(1:4, c(2L, 2L))
+
+  out &lt;- rray_stack(x, y, .axis = 1L)
+  expect_identical(dim(out), c(2L, 2L, 2L))
+  expect_identical(stack_slice(out, 1L, 1L), rray_broadcast(x, c(2L, 2L)))
+  expect_identical(stack_slice(out, 1L, 2L), y)
+
+  x &lt;- array(1:6, c(2L, 1L, 3L))
+  y &lt;- array(1:12, c(1L, 4L, 3L))
+
+  out &lt;- rray_stack(x, y, .axis = 2L)
+  expect_identical(dim(out), c(2L, 2L, 4L, 3L))
+  expect_identical(
+    stack_slice(out, 2L, 1L),
+    rray_broadcast(x, c(2L, 4L, 3L))
+  )
+  expect_identical(
+    stack_slice(out, 2L, 2L),
+    rray_broadcast(y, c(2L, 4L, 3L))
+  )
+})
+
+test_that(&quot;broadcasts inputs of differing dimensionality&quot;, {
+  x &lt;- 1:2
+  y &lt;- array(1:6, c(2L, 3L))
+
+  out &lt;- rray_stack(x, y, .axis = 1L)
+  expect_identical(dim(out), c(2L, 2L, 3L))
+  expect_identical(stack_slice(out, 1L, 1L), rray_broadcast(x, c(2L, 3L)))
+  expect_identical(stack_slice(out, 1L, 2L), y)</pre></details>
+<details class="tool"><summary>Bash: sed -n '120,400p' tests/testthat/test-stack.R</summary>
+<pre>sed -n '120,400p' tests/testthat/test-stack.R</pre><pre class="output">  expect_identical(stack_slice(out, 1L, 2L), y)
+
+  out &lt;- rray_stack(x, y, .axis = 3L)
+  expect_identical(dim(out), c(2L, 3L, 2L))
+  expect_identical(stack_slice(out, 3L, 1L), rray_broadcast(x, c(2L, 3L)))
+  expect_identical(stack_slice(out, 3L, 2L), y)
+})
+
+test_that(&quot;expands trailing axes only as far as the new axis requires&quot;, {
+  x &lt;- 1:2
+  y &lt;- array(1:24, c(2L, 3L, 4L))
+
+  out &lt;- rray_stack(x, y, .axis = 4L)
+  expect_identical(dim(out), c(2L, 3L, 4L, 2L))
+  expect_identical(
+    stack_slice(out, 4L, 1L),
+    rray_broadcast(x, c(2L, 3L, 4L))
+  )
+  expect_identical(stack_slice(out, 4L, 2L), y)
+})
+
+test_that(&quot;expansion keeps existing names and leaves new axes unnamed&quot;, {
+  x &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+  y &lt;- array(
+    1:6,
+    c(2L, 3L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;))
+  )
+
+  out &lt;- rray_stack(x, y, .axis = 3L)
+  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;), NULL))
+})
+
+test_that(&quot;handles zero dimensions&quot;, {
+  x &lt;- array(integer(), c(0L, 2L))
+
+  out &lt;- rray_stack(x, x, .axis = 1L)
+  expect_identical(out, array(integer(), c(2L, 0L, 2L)))
+
+  out &lt;- rray_stack(x, x, .axis = 3L)
+  expect_identical(out, array(integer(), c(0L, 2L, 2L)))
+})
+
+test_that(&quot;names of `...` name the new axis&quot;, {
+  out &lt;- rray_stack(first = 1:2, second = 3:4, .axis = 2L)
+  expect_identical(dimnames(out), list(NULL, c(&quot;first&quot;, &quot;second&quot;)))
+
+  x &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+  out &lt;- rray_stack(p = x, q = x, .axis = 2L)
+  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;p&quot;, &quot;q&quot;)))
+})
+
+test_that(&quot;partially named inputs use empty strings&quot;, {
+  out &lt;- rray_stack(first = 1:2, 3:4, .axis = 1L)
+  expect_identical(dimnames(out), list(c(&quot;first&quot;, &quot;&quot;), NULL))
+})
+
+test_that(&quot;the new axis is unnamed when `...` is unnamed&quot;, {
+  expect_null(dimnames(rray_stack(1:2, 3:4, .axis = 1L)))
+})
+
+test_that(&quot;keeps existing axis names under broadcasting&quot;, {
+  x &lt;- array(1:2, c(2L, 1L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), &quot;x&quot;))
+  y &lt;- array(1:6, c(2L, 3L), dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  out &lt;- rray_stack(x, y, .axis = 1L)
+  expect_identical(dim(out), c(2L, 2L, 3L))
+  expect_identical(
+    dimnames(out),
+    list(NULL, c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+  )
+})
+
+test_that(&quot;does not modify inputs&quot;, {
+  x &lt;- array(1:2, c(2L, 1L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), &quot;x&quot;))
+  y &lt;- array(3:8, c(2L, 3L))
+  expected_x &lt;- x
+  expected_y &lt;- y
+
+  rray_stack(x, y, .axis = 1L)
+
+  expect_identical(x, expected_x)
+  expect_identical(y, expected_y)
+})
+
+test_that(&quot;validates inputs and axis&quot;, {
+  x &lt;- array(1:4, c(2L, 2L))
+
+  expect_snapshot(error = TRUE, {
+    rray_stack(.axis = 1L)
+    rray_stack(x, .axis = integer())
+    rray_stack(x, .axis = c(1L, 2L))
+    rray_stack(x, .axis = NA_integer_)
+    rray_stack(x, .axis = structure(1L, foo = &quot;bar&quot;))
+    rray_stack(x, .axis = 1.5)
+    rray_stack(x, .axis = 0L)
+    rray_stack(x, .axis = 4L)
+  })
+})
+
+test_that(&quot;rejects a dimensionality above the maximum&quot;, {
+  x &lt;- array(1, rep(1L, 64L))
+  expect_snapshot(rray_stack(x, x, .axis = 1L), error = TRUE)
+})
+
+test_that(&quot;rejects incompatible inputs&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_stack(array(1:4, c(2L, 2L)), array(1:6, c(3L, 2L)), .axis = 1L)
+    rray_stack(x = array(1, c(2L, 2L)), y = array(1, c(3L, 2L)), .axis = 3L)
+    rray_stack(x = 1L, y = &quot;x&quot;, .axis = 1L)
+    rray_stack(x = NULL, y = 1L, .axis = 1L)
+    rray_stack(x = mean, y = 1L, .axis = 1L)
+    rray_stack(x = structure(array(1L), class = &quot;foo&quot;), y = 1L, .axis = 1L)
+  })
+})</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,80p' tests/testthat/test-split.R; echo &quot;....&quot;; grep -n &quot;test_that&quot; tests/testthat/t…</summary>
+<pre>sed -n '1,80p' tests/testthat/test-split.R; echo &quot;....&quot;; grep -n &quot;test_that&quot; tests/testthat/test-split.R</pre><pre class="output">test_that(&quot;splits along every axis with a uniform size&quot;, {
+  x &lt;- array(1:24, c(4, 3, 2))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 1)
+  expect_length(out, 4)
+  expect_identical(out[[1]], array(x[1, , ], c(1, 3, 2)))
+  expect_identical(out[[4]], array(x[4, , ], c(1, 3, 2)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = 1)
+  expect_length(out, 3)
+  expect_identical(out[[1]], array(x[, 1, ], c(4, 1, 2)))
+  expect_identical(out[[3]], array(x[, 3, ], c(4, 1, 2)))
+
+  out &lt;- rray_split(x, axis = 3, dimensions = 1)
+  expect_length(out, 2)
+  expect_identical(out[[1]], array(1:12, c(4, 3, 1)))
+  expect_identical(out[[2]], array(13:24, c(4, 3, 1)))
+})
+
+test_that(&quot;a uniform size can be larger than 1&quot;, {
+  x &lt;- array(1:12, c(6, 2))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 2)
+  expect_length(out, 3)
+  expect_identical(out[[1]], array(c(1L, 2L, 7L, 8L), c(2, 2)))
+  expect_identical(out[[3]], array(c(5L, 6L, 11L, 12L), c(2, 2)))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 6)
+  expect_identical(out, list(x))
+})
+
+test_that(&quot;explicit dimensions give each array directly&quot;, {
+  x &lt;- array(1:12, c(6, 2))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = c(3, 3))
+  expect_identical(out, rray_split(x, axis = 1, dimensions = 3))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = c(1, 5))
+  expect_identical(dim(out[[1]]), c(1L, 2L))
+  expect_identical(dim(out[[2]]), c(5L, 2L))
+  expect_identical(out[[1]], array(c(1L, 7L), c(1, 2)))
+})
+
+test_that(&quot;explicit dimensions can contain zeroes&quot;, {
+  x &lt;- array(1:6, c(3, 2))
+  empty &lt;- array(integer(), c(0, 2))
+
+  expect_identical(rray_split(x, axis = 1, dimensions = c(0, 3))[[1]], empty)
+  expect_identical(rray_split(x, axis = 1, dimensions = c(3, 0))[[2]], empty)
+
+  out &lt;- rray_split(x, axis = 1, dimensions = c(1, 0, 2))
+  expect_identical(out[[1]], array(c(1L, 4L), c(1, 2)))
+  expect_identical(out[[2]], empty)
+  expect_identical(out[[3]], array(c(2L, 3L, 5L, 6L), c(2, 2)))
+})
+
+test_that(&quot;works with a zero dimension axis&quot;, {
+  x &lt;- array(integer(), c(0, 2))
+
+  expect_identical(rray_split(x, axis = 1, dimensions = 1), list())
+  expect_identical(rray_split(x, axis = 1, dimensions = 2), list())
+  expect_identical(rray_split(x, axis = 1, dimensions = integer()), list())
+  expect_identical(rray_split(x, axis = 1, dimensions = c(0, 0)), list(x, x))
+
+  expect_identical(
+    rray_split(x, axis = 2, dimensions = 1),
+    list(array(integer(), c(0, 1)), array(integer(), c(0, 1)))
+  )
+})
+
+test_that(&quot;works with 1D arrays&quot;, {
+  x &lt;- array(1:5)
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 1)
+  expect_length(out, 5)
+  expect_identical(out[[1]], array(1L))
+  expect_identical(out[[5]], array(5L))
+
+  expect_identical(
+    rray_split(x, axis = 1, dimensions = c(2, 3)),
+....
+1:test_that(&quot;splits along every axis with a uniform size&quot;, {
+20:test_that(&quot;a uniform size can be larger than 1&quot;, {
+32:test_that(&quot;explicit dimensions give each array directly&quot;, {
+44:test_that(&quot;explicit dimensions can contain zeroes&quot;, {
+57:test_that(&quot;works with a zero dimension axis&quot;, {
+71:test_that(&quot;works with 1D arrays&quot;, {
+85:test_that(&quot;works with bare vectors&quot;, {
+92:test_that(&quot;works with every type&quot;, {
+121:test_that(&quot;matches a reference implementation&quot;, {
+180:test_that(&quot;names on non-split axes are kept&quot;, {
+188:test_that(&quot;names on the split axis are sliced&quot;, {
+200:test_that(&quot;zero size arrays drop the names on the split axis&quot;, {
+208:test_that(&quot;partial dimension names are handled&quot;, {
+218:test_that(&quot;NULL dimension names are handled&quot;, {
+229:test_that(&quot;the result list is unnamed&quot;, {
+235:test_that(&quot;`x` is not modified&quot;, {
+247:test_that(&quot;combining the arrays reproduces the input&quot;, {
+271:test_that(&quot;`axis` and `dimensions` must be named&quot;, {
+280:test_that(&quot;`axis` is validated&quot;, {
+296:test_that(&quot;`dimensions` are validated&quot;, {
+319:test_that(&quot;errors on invalid input&quot;, {</pre></details>
+<details class="tool"><summary>Bash: sed -n '180,340p' tests/testthat/test-split.R</summary>
+<pre>sed -n '180,340p' tests/testthat/test-split.R</pre><pre class="output">test_that(&quot;names on non-split axes are kept&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;x&quot;))
+  expect_identical(dimnames(out[[3]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;z&quot;))
+})
+
+test_that(&quot;names on the split axis are sliced&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = c(2, 1))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+  expect_identical(dimnames(out[[2]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;z&quot;))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(&quot;a&quot;, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  expect_identical(dimnames(out[[2]]), list(&quot;b&quot;, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+})
+
+test_that(&quot;zero size arrays drop the names on the split axis&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = c(0, 3))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+  expect_identical(dimnames(out[[2]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+})
+
+test_that(&quot;partial dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(&quot;a&quot;, NULL))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+})
+
+test_that(&quot;NULL dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  expect_null(dimnames(rray_split(x, axis = 1, dimensions = 1)[[1]]))
+
+  x &lt;- array(1:6, c(2, 3), dimnames = list(NULL, NULL))
+  expect_identical(
+    dimnames(rray_split(x, axis = 1, dimensions = 1)[[1]]),
+    list(NULL, NULL)
+  )
+})
+
+test_that(&quot;the result list is unnamed&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  expect_null(names(rray_split(x, axis = 1, dimensions = 1)))
+  expect_null(names(rray_split(x, axis = 2, dimensions = c(1, 2))))
+})
+
+test_that(&quot;`x` is not modified&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  before &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = 1)
+  expect_identical(x, before)
+
+  out[[1]][[1]] &lt;- 100L
+  dimnames(out[[1]]) &lt;- list(c(&quot;A&quot;, &quot;B&quot;), &quot;X&quot;)
+  expect_identical(x, before)
+})
+
+test_that(&quot;combining the arrays reproduces the input&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2, 3, 4),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;), NULL)
+  )
+
+  for (axis in seq_along(dim(x))) {
+    axis_dimension &lt;- dim(x)[[axis]]
+
+    plans &lt;- list(
+      1L,
+      axis_dimension,
+      c(1L, axis_dimension - 1L),
+      c(0L, axis_dimension)
+    )
+
+    for (dimensions in plans) {
+      arrays &lt;- rray_split(x, axis = axis, dimensions = dimensions)
+      expect_identical(rray_combine(!!!arrays, .axis = axis), x)
+    }
+  }
+})
+
+test_that(&quot;`axis` and `dimensions` must be named&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+
+  expect_snapshot(error = TRUE, {
+    rray_split(x, 1, 1)
+    rray_split(x, 1, dimensions = 1)
+  })
+})
+
+test_that(&quot;`axis` is validated&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  expect_snapshot(rray_split(x, axis = 0, dimensions = 1), error = TRUE)
+  expect_snapshot(rray_split(x, axis = 3, dimensions = 1), error = TRUE)
+  expect_snapshot(rray_split(x, axis = c(1, 2), dimensions = 1), error = TRUE)
+  expect_snapshot(
+    rray_split(x, axis = NA_integer_, dimensions = 1),
+    error = TRUE
+  )
+  expect_snapshot(rray_split(x, axis = 1.5, dimensions = 1), error = TRUE)
+  expect_snapshot(
+    rray_split(x, axis = structure(1L, class = &quot;foo&quot;), dimensions = 1),
+    error = TRUE
+  )
+})
+
+test_that(&quot;`dimensions` are validated&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  expect_snapshot(
+    rray_split(x, axis = 1, dimensions = NA_integer_),
+    error = TRUE
+  )
+  expect_snapshot(rray_split(x, axis = 1, dimensions = 1.5), error = TRUE)
+  expect_snapshot(
+    rray_split(x, axis = 1, dimensions = structure(1L, names = &quot;a&quot;)),
+    error = TRUE
+  )
+  expect_snapshot(rray_split(x, axis = 1, dimensions = 0), error = TRUE)
+  expect_snapshot(rray_split(x, axis = 1, dimensions = -1), error = TRUE)
+  expect_snapshot(rray_split(x, axis = 2, dimensions = 2), error = TRUE)
+  expect_snapshot(rray_split(x, axis = 1, dimensions = c(1, -1)), error = TRUE)
+  expect_snapshot(rray_split(x, axis = 1, dimensions = c(1, 2)), error = TRUE)
+  expect_snapshot(rray_split(x, axis = 2, dimensions = c(1, 1)), error = TRUE)
+  expect_snapshot(
+    rray_split(x, axis = 1, dimensions = integer()),
+    error = TRUE
+  )
+})
+
+test_that(&quot;errors on invalid input&quot;, {
+  expect_snapshot(rray_split(NULL, axis = 1, dimensions = 1), error = TRUE)
+
+  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+  expect_snapshot(rray_split(x, axis = 1, dimensions = 1), error = TRUE)
+})</pre></details>
+<details class="tool"><summary>Bash: cat _pkgdown.yml; echo ---; cat R/combine.R | head -60</summary>
+<pre>cat _pkgdown.yml; echo ---; cat R/combine.R | head -60</pre><pre class="output">url: https://github.com/DavisVaughan/rray4
+
+development:
+  mode: auto
+
+reference:
+- title: Dimensions
+  contents:
+  - rray_dimensions
+  - rray_dimensions_common
+  - rray_dimensionality
+  - rray_size
+  - rray_set_dimensions
+
+- title: Names
+  contents:
+  - rray_names
+  - rray_axis_names
+  - rray_row_names
+  - rray_col_names
+  - rray_set_names
+  - rray_set_axis_names
+  - rray_set_row_names
+  - rray_set_col_names
+
+- title: Broadcasting
+  contents:
+  - rray_broadcast
+  - rray_broadcast_common
+
+- title: Combining and Splitting
+  contents:
+  - rray_combine
+  - rray_split
+  - rray_stack
+
+- title: Axes
+  contents:
+  - rray_permute_axes
+  - rray_move_axes
+  - rray_insert_axes
+  - rray_remove_axes
+
+- title: Binary
+  contents:
+  - arithmetic
+  - extremum
+  - equal
+  - compare
+
+- title: Reducers
+  contents:
+  - reduce
+---
+#' Combine arrays along an existing axis
+#'
+#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+#' other axis are broadcast to common dimensions.
+#'
+#' @param ... Arrays to combine.
+#'
+#' @param .axis A single integer between 1 and the greatest input
+#'   dimensionality.
+#'
+#' @returns
+#' An array with the following dimensions:
+#' - Along `.axis`, the input dimensions are added together.
+#' - Along all other axes, the common dimensions are taken via broadcasting.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#' y &lt;- array(7:12, c(2, 3))
+#'
+#' rray_combine(x, y, .axis = 1)
+#' rray_combine(x, y, .axis = 2)
+#'
+#' # Missing trailing axes have an implicit dimension of 1
+#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+rray_combine &lt;- function(..., .axis) {
+  .Call(ffi_rray_combine, list2(...), .axis, environment())
+}</pre></details>
+<p>I've read the plan and the existing split/stack/remove-axes code. One thing in the plan is inconsistent, so let me confirm before writing code.</p>
+
+<details class="tool"><summary>Question: The plan contradicts itself on the `rray_unstack()` signature. Prose says &quot;Split and unst…</summary>
+<p>The plan contradicts itself on the <code>rray_unstack()</code> signature. Prose says &quot;Split and unstack take <code>axis</code> after empty dots, so callers name it there too&quot;, but both code blocks show <code>rray_unstack(x, axis)</code> with no dots. Which do you want?</p>
+<ul>
+<li><code>rray_unstack(x, ..., axis)</code> (Recommended)</li>
+<li><code>rray_unstack(x, axis)</code></li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;The plan contradicts itself on the `rray_unstack()` signature. Prose says &quot;Split and unstack take `axis` after empty dots, so callers name it there too&quot;, but both code blocks show `rray_unstack(x, axis)` with no dots. Which do you want?&quot;=&quot;`rray_unstack(x, axis)`&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: cat src/utils.h; echo ---; git checkout -b feature/unstack 2&gt;&amp;1 | tail -2</summary>
+<pre>cat src/utils.h; echo ---; git checkout -b feature/unstack 2&gt;&amp;1 | tail -2</pre><pre class="output">#ifndef RRAY_UTILS_H
+#define RRAY_UTILS_H
+
+#include &lt;complex.h&gt;
+#include &lt;string.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;type.h&quot;
+
+// Operations such as `*`, `/`, and `^` are either more efficient or more
+// correct (around infinities) if they go through the C99 `_Complex`. The C99
+// standard guarantees that `_Complex` has the same representation as a two
+// element array of its real type, so we can `memcpy()` it over. Analysis of
+// the assembly shows that this copy disappears entirely, so it's not a
+// performance hit.
+static inline double _Complex rray_cpl_to_c99(r_complex x) {
+  double _Complex out;
+  memcpy(&amp;out, &amp;x, sizeof(out));
+  return out;
+}
+
+static inline r_complex rray_c99_to_cpl(double _Complex x) {
+  r_complex out;
+  memcpy(&amp;out, &amp;x, sizeof(out));
+  return out;
+}
+
+void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_no_return void stop_scalar_input(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* vec_as_array(r_obj* x);
+
+r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* arg_as_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* arg_as_non_negative_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+bool r_has_name_at(r_obj* names, r_ssize i);
+
+int int_add_checked(int x, int y);
+
+r_obj* vec_cast(
+  r_obj* x,
+  r_obj* to,
+  struct rray_arg* x_arg,
+  struct rray_arg* to_arg
+);
+
+#endif
+---
+Switched to a new branch 'feature/unstack'</pre></details>
+<p>Branch created. Now the C feature pair:</p>
+
+<details class="tool"><summary>Write src/unstack.h</summary>
+<pre>#ifndef RRAY_UNSTACK_H
+#define RRAY_UNSTACK_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_unstack(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/unstack.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/unstack.c</summary>
+<pre>#include &quot;unstack.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;names.h&quot;
+#include &quot;remove-axes.h&quot;
+#include &quot;split.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* ffi_rray_unstack(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_unstack(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_unstack(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_dimensionality(dimensionality);
+
+  if (dimensionality &lt; 2) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have a dimensionality of at least 2, not %d.&quot;,
+      rray_arg_format(arg),
+      dimensionality
+    );
+  }
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  r_obj* dimensions = KEEP(r_int(1));
+  r_obj* out = KEEP(rray_split(x, axis, dimensions, arg, error_call));
+
+  r_obj* axes = KEEP(r_int(axis));
+  const r_ssize out_size = r_length(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    r_obj* elt = r_list_get(out, i);
+    r_list_poke(out, i, rray_remove_axes(elt, axes, arg, error_call));
+  }
+
+  r_attrib_poke_names(out, rray_axis_names(x, axis, arg, error_call));
+
+  FREE(4);
+  return out;
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/unstack.c (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now registration and the R wrapper:</p>
+
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-extern r_obj* ffi_rray_stack(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame);</span>
+<span class="ins">+extern r_obj* ffi_rray_stack(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame);</span>
+<span class="ins">+extern r_obj* ffi_rray_unstack(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axis,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/init.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-  {&quot;ffi_rray_stack&quot;, (DL_FUNC) &amp;ffi_rray_stack, 3},</span>
+<span class="ins">+  {&quot;ffi_rray_stack&quot;, (DL_FUNC) &amp;ffi_rray_stack, 3},</span>
+<span class="ins">+  {&quot;ffi_rray_unstack&quot;, (DL_FUNC) &amp;ffi_rray_unstack, 3},</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/init.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write R/unstack.R</summary>
+<pre>#' Unstack an array along an axis
+#'
+#' @description
+#' `rray_unstack()` returns one array for every position along `axis`. The
+#' `axis` is removed from each of them, so each array has one fewer dimension
+#' than `x`.
+#'
+#' Using `rray_stack()` along the same `axis` reconstructs `x`.
+#'
+#' @details
+#' Names along `axis` become the names of the returned list. Names on the
+#' surviving axes are carried over to their new locations.
+#'
+#' @param x An array with a dimensionality of at least 2.
+#'
+#' @param axis A single integer representing the axis to unstack along.
+#'
+#' @returns
+#' A list of arrays with the same dimensions as `x`, except that `axis` has
+#' been removed.
+#'
+#' @seealso [rray_stack()]
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#'
+#' # One array per row
+#' rray_unstack(x, 1)
+#'
+#' # One array per column
+#' rray_unstack(x, 2)
+#'
+#' # Names along the axis become list names
+#' y &lt;- array(1:4, c(2, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+#' rray_unstack(y, 2)
+#'
+#' # Unstacking and stacking along the same axis are inverses
+#' rray_stack(!!!rray_unstack(x, 2), .axis = 2)
+rray_unstack &lt;- function(x, axis) {
+  .Call(ffi_rray_unstack, x, axis, environment())
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/R/unstack.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit _pkgdown.yml</summary>
+<pre class="diff"><span class="del">-  - rray_stack</span>
+<span class="del">-</span>
+<span class="del">-- title: Axes</span>
+<span class="ins">+  - rray_stack</span>
+<span class="ins">+  - rray_unstack</span>
+<span class="ins">+</span>
+<span class="ins">+- title: Axes</span></pre><pre class="output">The file ~/files/r/packages/rray4/_pkgdown.yml has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit R/stack.R</summary>
+<pre class="diff"><span class="del">-#' @seealso [rray_combine()]</span>
+<span class="ins">+#' @seealso [rray_unstack()], [rray_combine()]</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/stack.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now format, document, and compile.</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | t…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -20</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c syms.c -o syms.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c type.c -o type.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c typeof2.c -o typeof2.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c unstack.c -o unstack.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c utils.c -o utils.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c wrapper.c -o wrapper.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray4.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o combine.o compare.o dimensionality.o dimensions.o equal.o extremum.o init.o insert-axes.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-logical.o reduce-mean.o reduce-names.o reduce-product.o reduce-sum.o reduce.o remove-axes.o rlang.o size.o split.o stack.o strides.o syms.o type.o typeof2.o unstack.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/Rtmp459ZUN/devtools_install_1399e68cbd264/00LOCK-rray4/00new/rray4/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray4)
+✖ stack.R:26: @seealso Could not resolve link to topic &quot;rray_unstack&quot; in the
+  dependencies or base packages.
+ℹ If you haven't documented &quot;rray_unstack&quot; yet, or just changed its name, this
+  is normal. Once &quot;rray_unstack&quot; is documented, this warning goes away.
+ℹ Make sure that the name of the topic is spelled correctly.
+ℹ Always list the linked package as a dependency.
+ℹ Alternatively, you can fully qualify the link with a package name.
+Writing 'NAMESPACE'
+Writing 'rray_stack.Rd'
+Writing 'rray_unstack.Rd'</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -5; Rscript -e '</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -5; Rscript -e '
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;,&quot;b&quot;), c(&quot;x&quot;,&quot;y&quot;,&quot;z&quot;)))
+print(rray_unstack(x, 1))
+print(rray_unstack(x, 2))
+print(rray_unstack(array(integer(), c(0, 2)), 1))
+print(names(rray_unstack(array(integer(), c(0, 2), dimnames = list(character(), c(&quot;a&quot;,&quot;b&quot;))), 1)))
+print(rray_stack(!!!rray_unstack(x, 2), .axis = 2))
+'</pre><pre class="output">ℹ Updating rray4 documentation
+ℹ Loading rray4
+$a
+x y z 
+1 3 5 
+
+$b
+x y z 
+2 4 6 
+
+$x
+a b 
+1 2 
+
+$y
+a b 
+3 4 
+
+$z
+a b 
+5 6 
+
+list()
+NULL
+  x y z
+a 1 3 5
+b 2 4 6</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+x &lt;- array(integer(), c(0, 2), dimnames = list(character(), c(&quot;a&quot;,&quot;b&quot;)))
+str(dimnames(x))
+'</pre><pre class="output">List of 2
+ $ : NULL
+ $ : chr [1:2] &quot;a&quot; &quot;b&quot;</pre></details>
+<p>Now the tests:</p>
+
+<details class="tool"><summary>Write tests/testthat/test-unstack.R</summary>
+<pre>test_that(&quot;unstacks a 2D array along every axis&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+
+  out &lt;- rray_unstack(x, 1)
+  expect_length(out, 2)
+  expect_identical(out[[1]], array(c(1L, 3L, 5L), 3))
+  expect_identical(out[[2]], array(c(2L, 4L, 6L), 3))
+
+  out &lt;- rray_unstack(x, 2)
+  expect_length(out, 3)
+  expect_identical(out[[1]], array(1:2, 2))
+  expect_identical(out[[3]], array(5:6, 2))
+})
+
+test_that(&quot;unstacks a 3D array along every axis&quot;, {
+  x &lt;- array(1:24, c(2, 3, 4))
+
+  for (axis in 1:3) {
+    out &lt;- rray_unstack(x, axis)
+    expect_length(out, dim(x)[[axis]])
+
+    for (i in seq_along(out)) {
+      expect_identical(out[[i]], stack_slice(x, axis, i))
+    }
+  }
+})
+
+test_that(&quot;works with every type&quot;, {
+  xs &lt;- list(
+    lgl = c(TRUE, FALSE),
+    int = 1:2,
+    dbl = c(1, 2),
+    cpl = c(1i, 2i),
+    chr = c(&quot;a&quot;, &quot;b&quot;),
+    raw = as.raw(1:2),
+    list = list(1, &quot;x&quot;)
+  )
+
+  for (x in xs) {
+    expect_identical(rray_unstack(array(x, c(2, 1)), 2), list(array(x, 2)))
+  }
+})
+
+test_that(&quot;works with a zero dimension axis&quot;, {
+  x &lt;- array(integer(), c(0, 2))
+
+  expect_identical(rray_unstack(x, 1), list())
+  expect_identical(
+    rray_unstack(x, 2),
+    list(array(integer(), 0), array(integer(), 0))
+  )
+})
+
+test_that(&quot;works with an axis of dimension 1&quot;, {
+  x &lt;- array(1:3, c(1, 3))
+  expect_identical(rray_unstack(x, 1), list(array(1:3, 3)))
+})
+
+test_that(&quot;names on the axis become the list names&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_unstack(x, 1)
+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
+  expect_identical(out$a, array(c(1L, 3L, 5L), 3, dimnames = list(letters[24:26])))
+
+  out &lt;- rray_unstack(x, 2)
+  expect_named(out, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
+  expect_identical(out$x, array(1:2, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;))))
+})
+
+test_that(&quot;names on the surviving axes move to their new locations&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2, 3, 4),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;), NULL)
+  )
+
+  out &lt;- rray_unstack(x, 1)
+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;), NULL))
+
+  out &lt;- rray_unstack(x, 2)
+  expect_named(out, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  out &lt;- rray_unstack(x, 3)
+  expect_null(names(out))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+})
+
+test_that(&quot;partial dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  out &lt;- rray_unstack(x, 1)
+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
+  expect_null(dimnames(out[[1]]))
+
+  out &lt;- rray_unstack(x, 2)
+  expect_null(names(out))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;)))
+})
+
+test_that(&quot;`x` is not modified&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  before &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_unstack(x, 2)
+  expect_identical(x, before)
+
+  out[[1]][[1]] &lt;- 100L
+  dimnames(out[[1]]) &lt;- list(c(&quot;A&quot;, &quot;B&quot;))
+  expect_identical(x, before)
+})
+
+test_that(&quot;stacking the arrays reproduces the input&quot;, {
+  xs &lt;- list(
+    array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))),
+    array(1:24, c(2, 3, 4), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL, letters[1:4]))
+  )
+
+  for (x in xs) {
+    for (axis in seq_along(dim(x))) {
+      arrays &lt;- rray_unstack(x, axis)
+      expect_identical(rray_stack(!!!arrays, .axis = axis), x)
+    }
+  }
+})
+
+test_that(&quot;unstacking a stack reproduces the inputs&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  y &lt;- x + 6L
+
+  for (axis in 1:3) {
+    out &lt;- rray_stack(p = x, q = y, .axis = axis)
+    expect_identical(rray_unstack(out, axis), list(p = x, q = y))
+  }
+})
+
+test_that(&quot;unstacking a stack normalizes broadcast and cast inputs&quot;, {
+  x &lt;- array(1:2, c(2, 1))
+  y &lt;- array(1:6, c(2, 3))
+
+  expect_identical(
+    rray_unstack(rray_stack(x, y, .axis = 1), 1),
+    list(rray_broadcast(x, c(2, 3)), y)
+  )
+
+  expect_identical(
+    rray_unstack(rray_stack(1L, 2, .axis = 1), 1),
+    list(array(1), array(2))
+  )
+})
+
+test_that(&quot;`axis` is validated&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  expect_snapshot(rray_unstack(x, 0), error = TRUE)
+  expect_snapshot(rray_unstack(x, 3), error = TRUE)
+  expect_snapshot(rray_unstack(x, c(1, 2)), error = TRUE)
+  expect_snapshot(rray_unstack(x, NA_integer_), error = TRUE)
+  expect_snapshot(rray_unstack(x, 1.5), error = TRUE)
+  expect_snapshot(rray_unstack(x, structure(1L, class = &quot;foo&quot;)), error = TRUE)
+})
+
+test_that(&quot;1D arrays are rejected&quot;, {
+  expect_snapshot(rray_unstack(array(1:3), 1), error = TRUE)
+  expect_snapshot(rray_unstack(1:3, 1), error = TRUE)
+})
+
+test_that(&quot;errors on invalid input&quot;, {
+  expect_snapshot(rray_unstack(NULL, 1), error = TRUE)
+
+  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+  expect_snapshot(rray_unstack(x, 1), error = TRUE)
+})</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/tests/testthat/test-unstack.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-unstack.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(out$a, array(c(1L, 3L, 5L), 3, dimnames = list(letters[24:26])))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    out$a,</span>
+<span class="ins">+    array(c(1L, 3L, 5L), 3, dimnames = list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-unstack.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^unstack$')&quot; 2&gt;&amp;1 | tail -40</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^unstack$')&quot; 2&gt;&amp;1 | tail -40</pre><pre class="output">Adding new snapshot:
+Code
+  rray_unstack(x, structure(1L, class = &quot;foo&quot;))
+Condition
+  Error in `rray_unstack()`:
+  ! `axis` can't have attributes.
+
+WARNING: 'test-unstack.R:168:3' -------------------
+Adding new snapshot:
+Code
+  rray_unstack(array(1:3), 1)
+Condition
+  Error in `rray_unstack()`:
+  ! `x` must have a dimensionality of at least 2, not 1.
+
+WARNING: 'test-unstack.R:169:3' -------------------
+Adding new snapshot:
+Code
+  rray_unstack(1:3, 1)
+Condition
+  Error in `rray_unstack()`:
+  ! `x` must have a dimensionality of at least 2, not 1.
+
+WARNING: 'test-unstack.R:173:3' -------------------
+Adding new snapshot:
+Code
+  rray_unstack(NULL, 1)
+Condition
+  Error in `rray_unstack()`:
+  ! `x` must be an array, not `NULL`.
+
+WARNING: 'test-unstack.R:176:3' -------------------
+Adding new snapshot:
+Code
+  rray_unstack(x, 1)
+Condition
+  Error in `rray_unstack()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+[ FAIL 0 | WARN 10 | SKIP 0 | PASS 64 ]</pre></details>
+<details class="tool"><summary>Bash: cat tests/testthat/_snaps/unstack.md</summary>
+<pre>cat tests/testthat/_snaps/unstack.md</pre><pre class="output"># `axis` is validated
+
+    Code
+      rray_unstack(x, 0)
+    Condition
+      Error in `rray_unstack()`:
+      ! `axis` must be greater than or equal to 1, not 0.
+
+---
+
+    Code
+      rray_unstack(x, 3)
+    Condition
+      Error in `rray_unstack()`:
+      ! `axis` must be less than or equal to the dimensionality of 2, not 3.
+
+---
+
+    Code
+      rray_unstack(x, c(1, 2))
+    Condition
+      Error in `rray_unstack()`:
+      ! `axis` must be a single integer, not length 2.
+
+---
+
+    Code
+      rray_unstack(x, NA_integer_)
+    Condition
+      Error in `rray_unstack()`:
+      ! `axis` must not be missing.
+
+---
+
+    Code
+      rray_unstack(x, 1.5)
+    Condition
+      Error:
+      ! Can't convert from `axis` &lt;double&gt; to &lt;integer&gt; due to loss of precision.
+      * Locations: 1
+
+---
+
+    Code
+      rray_unstack(x, structure(1L, class = &quot;foo&quot;))
+    Condition
+      Error in `rray_unstack()`:
+      ! `axis` can't have attributes.
+
+# 1D arrays are rejected
+
+    Code
+      rray_unstack(array(1:3), 1)
+    Condition
+      Error in `rray_unstack()`:
+      ! `x` must have a dimensionality of at least 2, not 1.
+
+---
+
+    Code
+      rray_unstack(1:3, 1)
+    Condition
+      Error in `rray_unstack()`:
+      ! `x` must have a dimensionality of at least 2, not 1.
+
+# errors on invalid input
+
+    Code
+      rray_unstack(NULL, 1)
+    Condition
+      Error in `rray_unstack()`:
+      ! `x` must be an array, not `NULL`.
+
+---
+
+    Code
+      rray_unstack(x, 1)
+    Condition
+      Error in `rray_unstack()`:
+      ! `x` must be a bare array, not a &lt;foo&gt; object.</pre></details>
+<p>All 64 pass. Now the full focused set plus the whole suite:</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^(combine|split|stack|unstack|dimensionality|insert-axes…</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^(combine|split|stack|unstack|dimensionality|insert-axes|remove-axes)$')&quot; 2&gt;&amp;1 | tail -8</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 520 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8; echo &quot;=== pkgdown ===&quot;; Rscript -e &quot;pkgdown::ch…</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8; echo &quot;=== pkgdown ===&quot;; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -5</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2029 ]
+=== pkgdown ===
+✔ No problems found.</pre></details>
+<p>Now the required protection audit over the diff:</p>
+
+<details class="tool"><summary>Bash: cat src/unstack.c</summary>
+<pre>cat src/unstack.c</pre><pre class="output">#include &quot;unstack.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;names.h&quot;
+#include &quot;remove-axes.h&quot;
+#include &quot;split.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* ffi_rray_unstack(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_unstack(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_unstack(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_dimensionality(dimensionality);
+
+  if (dimensionality &lt; 2) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have a dimensionality of at least 2, not %d.&quot;,
+      rray_arg_format(arg),
+      dimensionality
+    );
+  }
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  r_obj* dimensions = KEEP(r_int(1));
+  r_obj* out = KEEP(rray_split(x, axis, dimensions, arg, error_call));
+
+  r_obj* axes = KEEP(r_int(axis));
+  const r_ssize out_size = r_length(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    r_obj* elt = r_list_get(out, i);
+    r_list_poke(out, i, rray_remove_axes(elt, axes, arg, error_call));
+  }
+
+  r_attrib_poke_names(out, rray_axis_names(x, axis, arg, error_call));
+
+  FREE(4);
+  return out;
+}</pre></details>
+<details class="tool"><summary>Bash: grep -rln &quot;unstack&quot; plans bench R man NAMESPACE _pkgdown.yml 2&gt;/dev/null</summary>
+<pre>grep -rln &quot;unstack&quot; plans bench R man NAMESPACE _pkgdown.yml 2&gt;/dev/null</pre><pre class="output">plans/combine-stack-unstack.md
+R/unstack.R
+R/stack.R
+man/rray_stack.Rd
+man/rray_unstack.Rd
+_pkgdown.yml
+NAMESPACE</pre></details>
+<details class="tool"><summary>Bash: rm plans/combine-stack-unstack.md &amp;&amp; git status --short &amp;&amp; git add -A &amp;&amp; git status --short</summary>
+<pre>rm plans/combine-stack-unstack.md &amp;&amp; git status --short &amp;&amp; git add -A &amp;&amp; git status --short</pre><pre class="output"> M NAMESPACE
+ M R/stack.R
+ M _pkgdown.yml
+ M man/rray_stack.Rd
+ D plans/combine-stack-unstack.md
+ M src/init.c
+?? R/unstack.R
+?? man/rray_unstack.Rd
+?? src/unstack.c
+?? src/unstack.h
+?? tests/testthat/_snaps/unstack.md
+?? tests/testthat/test-unstack.R
+M  NAMESPACE
+M  R/stack.R
+A  R/unstack.R
+M  _pkgdown.yml
+M  man/rray_stack.Rd
+A  man/rray_unstack.Rd
+D  plans/combine-stack-unstack.md
+M  src/init.c
+A  src/unstack.c
+A  src/unstack.h
+A  tests/testthat/_snaps/unstack.md
+A  tests/testthat/test-unstack.R</pre></details>
+<details class="tool"><summary>Bash: git commit -q -m &quot;Add \`rray_unstack()\`&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin featu…</summary>
+<pre>git commit -q -m &quot;Add \`rray_unstack()\`&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/unstack 2&gt;&amp;1 | tail -5</pre><pre class="output">4556623 Add `rray_unstack()`
+remote:      https://github.com/DavisVaughan/rray4/pull/new/feature/unstack        
+remote: 
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/unstack -&gt; feature/unstack
+branch 'feature/unstack' set up to track 'origin/feature/unstack'.</pre></details>
+<p>Done. Branch <code>feature/unstack</code> pushed as commit <code>4556623</code>.</p>
+<h2>What I built</h2>
+<p><code>src/unstack.c</code> is 40 lines with no helpers and no decl header. It validates, then composes what already exists:</p>
+<pre><code class="language-c">r_obj* dimensions = KEEP(r_int(1));
+r_obj* out = KEEP(rray_split(x, axis, dimensions, arg, error_call));
+r_obj* axes = KEEP(r_int(axis));
+
+for (r_ssize i = 0; i &lt; out_size; ++i) {
+  r_obj* elt = r_list_get(out, i);
+  r_list_poke(out, i, rray_remove_axes(elt, axes, arg, error_call));
+}
+
+r_attrib_poke_names(out, rray_axis_names(x, axis, arg, error_call));
+</code></pre>
+<p>Simplifications over the plan:</p>
+<ul>
+<li>
+<p>No <code>src/decl/unstack-decl.h</code>. There are no static helpers, so there is nothing to declare.</p>
+</li>
+<li>
+<p>Names come from one <code>rray_axis_names()</code> call rather than hand-reading <code>dimnames</code>. It returns <code>NULL</code> for an unnamed axis, which poke turns into an unnamed list, exactly the wanted behaviour.</p>
+</li>
+<li>
+<p>The pieces are removed-in-place in the list split returned, so no second list is allocated.</p>
+</li>
+</ul>
+<p><code>rray_unstack(x, axis)</code> takes <code>axis</code> positionally, per your answer.</p>
+<h2>Tests</h2>
+<p>16 new tests in <code>tests/testthat/test-unstack.R</code>, 64 expectations. The 3D case checks every piece against <code>stack_slice()</code> from <code>helper-stack.R</code>, which is already the &quot;take one position on an axis and drop it&quot; reference. Covered: all seven types, zero- and one-dimension axes, axis names to list names, surviving names shifting left, partial dimnames, <code>x</code> unmodified, both round trips (including one broadcast and one cast case), and snapshot errors for <code>axis</code>, 1D input, <code>NULL</code>, and classed input.</p>
+<p>Full suite: 2029 passing, 0 failures. <code>pkgdown::check_pkgdown()</code> clean.</p>
+<h2>Protection audit</h2>
+<p>Separate pass over the diff. Four KEEPs, four freed: <code>x</code>, <code>dimensions</code> (passed into <code>rray_split()</code>, which allocates throughout), <code>out</code>, <code>axes</code> (read by <code>rray_remove_axes()</code> on every iteration, which allocates). <code>elt</code> is owned by the protected <code>out</code>. The <code>rray_remove_axes()</code> result goes straight into <code>r_list_poke()</code>, which does not allocate. The <code>rray_axis_names()</code> result is owned by <code>x</code>'s <code>dimnames</code>, so it survives the allocation inside <code>r_attrib_poke_names()</code>.</p>
+<p>Plan file removed. One note: the plan claimed a named axis of dimension 0 should keep <code>character()</code> as list names. That is unreachable from R, since <code>dimnames&lt;-</code> normalizes a zero-length entry to <code>NULL</code>. The code retains <code>character()</code> if such an object is built in C, so behaviour matches, but I did not write a test for a case R will not produce.</p>
+
+</section>
+</main>
+</body>
+</html>

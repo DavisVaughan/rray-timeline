@@ -1,0 +1,1732 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keeping titles in rray_split() and rray_unstack()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-157">rray timeline</a>
+<h1>Keeping titles in <code>rray_split()</code> and <code>rray_unstack()</code></h1>
+<p class="facts">Claude · Oct 18, 2026 · 2 prompts · 11 replies · <a href="https://github.com/r-lib/rray/pull/157">#157</a></p>
+</header>
+<main>
+<p class="divider">Oct 18, 2026, 19:40 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/titles<br />
+Implement plans/titles.md part 4<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Check this section off in the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat plans/titles.md &amp;&amp; git log --oneline -5 &amp;&amp; ls src R tests/testthat</summary>
+<pre>cat plans/titles.md &amp;&amp; git log --oneline -5 &amp;&amp; ls src R tests/testthat</pre><pre class="output"># Titles plan
+
+## Goal
+
+Every function that takes one array and returns one array should keep the
+titles of `x` wherever its axes keep their meaning. Titles are the names on
+the dimnames list:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+
+rray_titles(x)
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+```
+
+Binary and n-ary functions are out of scope until we settle how names combine
+across inputs. See [Out of scope](#out-of-scope).
+
+## Rules
+
+These were decided up front and apply to every step.
+
+- A title labels an axis, not its positions. An axis that keeps its identity
+  keeps its title, even when it loses its names. `rray_sum(x, axes = 2)` keeps
+  title `&quot;B&quot;` on axis 2.
+
+- The result has a titles vector exactly when `x` has one. A new axis gets
+  the title `&quot;&quot;`. An all `&quot;&quot;` titles vector is never turned into `NULL`. This
+  matches `rray_set_axis_title(x, axis, NULL)`, which already leaves `&quot;&quot;` in
+  place.
+
+- Titles can exist with no axis names at all. The dimnames list is then all
+  `NULL` elements, like `list(A = NULL, B = NULL)`. Every helper must handle
+  this case, which is the main trap: most names helpers only allocate their
+  output list when some axis has names.
+
+- A function that drops all names drops all titles. Today that is
+  `rray_extract()`, `rray_index()`, and `rray_set_dimensions()`.
+
+- `rray_set_names(x, names)` replaces the whole dimnames list. The names of
+  `names` become the titles of `x`, so an unnamed list drops them and `NULL`
+  clears everything.
+
+- `rray_broadcast()` is left alone for now, see [Out of scope](#out-of-scope).
+
+## Current state
+
+From running each function on `x` above:
+
+| Function | Titles today | After this plan |
+|---|---|---|
+| `rray_slice()`, `rray_slice_axis()`, `rray_slice_rows()`, `rray_slice_columns()` | Dropped | Kept |
+| `rray_reverse()`, `rray_roll()`, `rray_rep()`, `rray_rep_each()` | Dropped | Kept |
+| `rray_sum()`, `rray_prod()`, `rray_mean()`, `rray_min()`, `rray_max()`, `rray_all()`, `rray_any()` | Dropped | Kept, including on reduced axes |
+| `rray_locate_max()`, `rray_locate_min()` | Dropped | Kept, including on the located axis |
+| `rray_roll_each()` | Dropped | Kept, including on `axis` |
+| `rray_permute_axes()`, `rray_move_axes()` | Dropped | Reordered with the axes |
+| `rray_insert_axes()` | Dropped | Kept, `&quot;&quot;` on new axes |
+| `rray_remove_axes()` | Dropped | Kept, removed axes lose theirs |
+| `rray_split()` | Kept only when `axis` has no names | Always kept |
+| `rray_unstack()` | Kept only when `axis` has no names | Always kept, minus `axis` |
+| `rray_set_axis_names()`, `rray_set_row_names()`, `rray_set_column_names()` | Dropped | Kept |
+| `rray_set_names()` | Taken from `names` | Unchanged, now documented and tested |
+| `rray_cumulative_*()` | Kept | Unchanged, already tested |
+| `rray_cast()` | Kept | Unchanged, add a test |
+| `rray_slice_assign()` and friends, `rray_extract_assign()` | Kept | Unchanged, add a test |
+| `rray_extract()`, `rray_index()`, `rray_set_dimensions()` | Dropped | Unchanged, add a test |
+| `rray_broadcast()` | Kept only on a no-op | Unchanged |
+
+## Implementation pattern
+
+Each step adds titles to an existing names helper rather than adding a new
+code path. The pattern is the same everywhere:
+
+1. Read `x_titles = r_names(x_names)` next to the existing `x_names`. It is
+   protected through `x`.
+
+2. If `x_titles != r_null`, allocate the output names list up front instead of
+   lazily, so a titles-only input still gets a list.
+
+3. Either reuse `x_titles` unchanged (when the result has the same axes as
+   `x`) or build an `out_titles` character vector in the same loop that builds
+   the output names (when axes move, appear, or disappear).
+
+4. Poke the titles onto the output list with `r_attrib_poke_names()`.
+
+`r_alloc_character()` fills with `&quot;&quot;`, so new axes need no explicit poke.
+
+Per the `AGENTS.md` protection review, `out_titles` is allocated while the
+output list is live, so `KEEP()` it until it is poked onto the list.
+
+## Steps
+
+Each step is one pull request, merged before the next one starts. Every step
+adds a `&quot;titles are kept&quot;` test next to the existing names tests for each
+function it touches, following the existing cumulative tests. Each test covers
+two inputs:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+y &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = NULL, B = NULL, C = NULL))
+```
+
+`y` is the titles-only case. It catches helpers that skip allocating their
+output list when no axis has names.
+
+Where a function's roxygen already describes what happens to names, add one
+short sentence about titles next to it.
+
+### 1. Slice names
+
+`rray_slice_names()` in `src/slice.c` covers every function built on
+`rray_slice()`:
+
+- `rray_slice()`
+
+- `rray_slice_axis()`, `rray_slice_rows()`, `rray_slice_columns()`
+
+- `rray_reverse()`
+
+- `rray_roll()`
+
+- `rray_rep()`, `rray_rep_each()`
+
+Slicing never adds, removes, or moves axes, so the titles of `x` are reused
+unchanged. `rray_slice_names()` takes `x_names` instead of `v_x_names` and
+pokes `r_names(x_names)` onto its output. It already allocates its output
+whenever `x_names` exists, so the titles-only case needs no extra work.
+
+```r
+rray_titles(rray_slice(x, 1, TRUE, TRUE))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+
+rray_titles(rray_rep(x, times = 2, axes = 1))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+```
+
+Tests go in `test-slice.R`, `test-reverse.R`, `test-roll.R`, and
+`test-rep.R`.
+
+### 2. Reduce names
+
+`rray_reduce_names()` in `src/reduce-names.c` covers:
+
+- `rray_sum()`, `rray_prod()`, `rray_mean()`, `rray_min()`, `rray_max()`,
+  `rray_all()`, `rray_any()`
+
+- `rray_locate_max()`, `rray_locate_min()`
+
+- `rray_roll_each()`
+
+Reduced axes stay at dimension 1, so the result has the same axes as `x` and
+reuses its titles unchanged. The output list is allocated lazily today, so it
+moves up front when `x_titles` exists.
+
+```r
+rray_titles(rray_sum(x, axes = 2))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+
+rray_names(rray_sum(y, axes = 2))
+# $A
+# NULL
+#
+# $B
+# NULL
+#
+# $C
+# NULL
+```
+
+`rray_reduce_names()` has its own internal tests in `test-reduce-names.R`. Add
+titles cases there, and one test per family in `test-reduce-sum.R`,
+`test-reduce-mean.R`, `test-reduce-prod.R`, `test-reduce-extremum.R`,
+`test-reduce-logical.R`, `test-locate.R`, and `test-roll.R`.
+
+### 3. Axis reshaping
+
+These move axes around, so each builds `out_titles` in the loop it already
+uses for names.
+
+#### `rray_permute_axes()`
+
+`rray_permute_axes_names()` in `src/permute-axes.c` already allocates its
+output whenever `x_names` exists. Add the titles in the same loop:
+
+```text
+out_titles[i] = x_titles[axes[i] - 1]
+```
+
+```r
+rray_titles(rray_permute_axes(x, c(3, 1, 2)))
+# [1] &quot;C&quot; &quot;A&quot; &quot;B&quot;
+```
+
+#### `rray_move_axes()`
+
+Built on `rray_permute_axes()`, so it needs no change. Add a test only.
+
+```r
+rray_titles(rray_move_axes(x, from = 1, to = 3))</pre><p class="cut">487 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/split.c src/decl/split-decl.h &amp;&amp; cat R/split.R R/unstack.R &amp;&amp; cat tests/testthat/test…</summary>
+<pre>cat src/split.c src/decl/split-decl.h &amp;&amp; cat R/split.R R/unstack.R &amp;&amp; cat tests/testthat/test-split.R tests/testthat/test-unstack.R &amp;&amp; git show 9642413 --stat</pre><pre class="output">#include &quot;split.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/split-decl.h&quot;
+
+r_obj* ffi_rray_split(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_split(ffi_x, axis, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_split(
+  r_obj* x,
+  int axis,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_x_dimensions[axis - 1];
+
+  dimensions = KEEP(arg_as_non_negative_bare_integer(
+    dimensions,
+    rray_args.dimensions,
+    error_call
+  ));
+  check_split_dimensions(
+    dimensions,
+    axis_dimension,
+    rray_args.dimensions,
+    error_call
+  );
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  // i.e. each array is the same dimension and splits `axis` evenly
+  const bool uniform = r_length(dimensions) == 1;
+
+  const r_ssize out_size =
+    uniform ? axis_dimension / v_dimensions[0] : r_length(dimensions);
+
+  r_obj* out = KEEP(r_alloc_list(out_size));
+
+  r_obj* x_names = r_dim_names(x);
+  r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);
+
+  r_obj* x_axis_names = (v_x_names == NULL) ? r_null : v_x_names[axis - 1];
+  r_obj* const* v_x_axis_names =
+    (x_axis_names == r_null) ? NULL : r_chr_cbegin(x_axis_names);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+  const r_ssize x_axis_stride = v_x_strides[axis - 1];
+
+  const enum r_type type = r_typeof(x);
+
+  // Initialized on the first iteration. Changes any time the output dimension
+  // along `axis` changes, but in the uniform case all arrays share the same
+  // dimensions object!
+  r_obj* out_elt_dimensions = r_null;
+  r_keep_loc out_elt_dimensions_loc;
+  KEEP_HERE(out_elt_dimensions, &amp;out_elt_dimensions_loc);
+
+  struct rray_run_iterator it;
+
+  int previous_dimension = -1;
+
+  // The location along the axis. For example, with a 2x10 array split along
+  // columns this runs from 0-9. The `x_axis_stride` maps it to `x_start`, a
+  // flat location into `x` itself.
+  int x_axis_start = 0;
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    const int dimension = uniform ? v_dimensions[0] : v_dimensions[i];
+
+    if (dimension == previous_dimension) {
+      rray_run_iterator_reset1(&amp;it);
+    } else {
+      previous_dimension = dimension;
+
+      out_elt_dimensions = r_alloc_integer(dimensionality);
+      KEEP_AT(out_elt_dimensions, out_elt_dimensions_loc);
+      int* v_out_elt_dimensions = r_int_begin(out_elt_dimensions);
+      r_memcpy(
+        v_out_elt_dimensions,
+        v_x_dimensions,
+        sizeof(int) * dimensionality
+      );
+      v_out_elt_dimensions[axis - 1] = dimension;
+
+      rray_run_iterator_init1(
+        &amp;it,
+        v_out_elt_dimensions,
+        dimensionality,
+        v_x_strides
+      );
+    }
+
+    r_obj* out_elt = r_alloc_vector(type, rray_run_iterator_size(&amp;it));
+    r_list_poke(out, i, out_elt);
+    r_attrib_poke_dim(out_elt, out_elt_dimensions);
+
+    const r_ssize x_start = x_axis_start * x_axis_stride;
+    rray_split_fill(x, out_elt, x_start, &amp;it);
+
+    if (v_x_axis_names != NULL) {
+      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+        v_x_names,
+        dimensionality,
+        axis,
+        v_x_axis_names,
+        x_axis_start,
+        dimension
+      ));
+      r_attrib_poke_dim_names(out_elt, out_elt_names);
+      FREE(1);
+    } else if (x_names != r_null) {
+      r_attrib_poke_dim_names(out_elt, x_names);
+    }
+
+    x_axis_start += dimension;
+  }
+
+  FREE(5);
+  return out;
+}
+
+static void check_split_dimensions(
+  r_obj* dimensions,
+  int axis_dimension,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize size = r_length(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  if (size == 1) {
+    const int dimension = v_dimensions[0];
+
+    if (dimension == 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value must be positive, not 0.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis_dimension % dimension != 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value of %d must evenly divide the `axis` dimension &quot;
+        &quot;of %d.&quot;,
+        rray_arg_format(arg),
+        dimension,
+        axis_dimension
+      );
+    }
+  } else {
+    r_ssize total_dimension = 0;
+
+    for (r_ssize i = 0; i &lt; size; ++i) {
+      total_dimension += v_dimensions[i];
+    }
+
+    if (total_dimension != axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must sum to the `axis` dimension of %d, not %&quot; R_PRI_SSIZE &quot;.&quot;,
+        rray_arg_format(arg),
+        axis_dimension,
+        total_dimension
+      );
+    }
+  }
+}
+
+static void rray_split_fill(
+  r_obj* x,</pre><p class="cut">843 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/split.c src/decl/split-decl.h</summary>
+<pre>cat src/split.c src/decl/split-decl.h</pre><pre class="output">#include &quot;split.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/split-decl.h&quot;
+
+r_obj* ffi_rray_split(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_split(ffi_x, axis, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_split(
+  r_obj* x,
+  int axis,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_x_dimensions[axis - 1];
+
+  dimensions = KEEP(arg_as_non_negative_bare_integer(
+    dimensions,
+    rray_args.dimensions,
+    error_call
+  ));
+  check_split_dimensions(
+    dimensions,
+    axis_dimension,
+    rray_args.dimensions,
+    error_call
+  );
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  // i.e. each array is the same dimension and splits `axis` evenly
+  const bool uniform = r_length(dimensions) == 1;
+
+  const r_ssize out_size =
+    uniform ? axis_dimension / v_dimensions[0] : r_length(dimensions);
+
+  r_obj* out = KEEP(r_alloc_list(out_size));
+
+  r_obj* x_names = r_dim_names(x);
+  r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);
+
+  r_obj* x_axis_names = (v_x_names == NULL) ? r_null : v_x_names[axis - 1];
+  r_obj* const* v_x_axis_names =
+    (x_axis_names == r_null) ? NULL : r_chr_cbegin(x_axis_names);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+  const r_ssize x_axis_stride = v_x_strides[axis - 1];
+
+  const enum r_type type = r_typeof(x);
+
+  // Initialized on the first iteration. Changes any time the output dimension
+  // along `axis` changes, but in the uniform case all arrays share the same
+  // dimensions object!
+  r_obj* out_elt_dimensions = r_null;
+  r_keep_loc out_elt_dimensions_loc;
+  KEEP_HERE(out_elt_dimensions, &amp;out_elt_dimensions_loc);
+
+  struct rray_run_iterator it;
+
+  int previous_dimension = -1;
+
+  // The location along the axis. For example, with a 2x10 array split along
+  // columns this runs from 0-9. The `x_axis_stride` maps it to `x_start`, a
+  // flat location into `x` itself.
+  int x_axis_start = 0;
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    const int dimension = uniform ? v_dimensions[0] : v_dimensions[i];
+
+    if (dimension == previous_dimension) {
+      rray_run_iterator_reset1(&amp;it);
+    } else {
+      previous_dimension = dimension;
+
+      out_elt_dimensions = r_alloc_integer(dimensionality);
+      KEEP_AT(out_elt_dimensions, out_elt_dimensions_loc);
+      int* v_out_elt_dimensions = r_int_begin(out_elt_dimensions);
+      r_memcpy(
+        v_out_elt_dimensions,
+        v_x_dimensions,
+        sizeof(int) * dimensionality
+      );
+      v_out_elt_dimensions[axis - 1] = dimension;
+
+      rray_run_iterator_init1(
+        &amp;it,
+        v_out_elt_dimensions,
+        dimensionality,
+        v_x_strides
+      );
+    }
+
+    r_obj* out_elt = r_alloc_vector(type, rray_run_iterator_size(&amp;it));
+    r_list_poke(out, i, out_elt);
+    r_attrib_poke_dim(out_elt, out_elt_dimensions);
+
+    const r_ssize x_start = x_axis_start * x_axis_stride;
+    rray_split_fill(x, out_elt, x_start, &amp;it);
+
+    if (v_x_axis_names != NULL) {
+      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+        v_x_names,
+        dimensionality,
+        axis,
+        v_x_axis_names,
+        x_axis_start,
+        dimension
+      ));
+      r_attrib_poke_dim_names(out_elt, out_elt_names);
+      FREE(1);
+    } else if (x_names != r_null) {
+      r_attrib_poke_dim_names(out_elt, x_names);
+    }
+
+    x_axis_start += dimension;
+  }
+
+  FREE(5);
+  return out;
+}
+
+static void check_split_dimensions(
+  r_obj* dimensions,
+  int axis_dimension,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize size = r_length(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  if (size == 1) {
+    const int dimension = v_dimensions[0];
+
+    if (dimension == 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value must be positive, not 0.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis_dimension % dimension != 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value of %d must evenly divide the `axis` dimension &quot;
+        &quot;of %d.&quot;,
+        rray_arg_format(arg),
+        dimension,
+        axis_dimension
+      );
+    }
+  } else {
+    r_ssize total_dimension = 0;
+
+    for (r_ssize i = 0; i &lt; size; ++i) {
+      total_dimension += v_dimensions[i];
+    }
+
+    if (total_dimension != axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must sum to the `axis` dimension of %d, not %&quot; R_PRI_SSIZE &quot;.&quot;,
+        rray_arg_format(arg),
+        axis_dimension,
+        total_dimension
+      );
+    }
+  }
+}
+
+static void rray_split_fill(
+  r_obj* x,</pre><p class="cut">215 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show bbe7cc7 -- src/ R/ | head -150; git show 9642413 -- tests/ | head -120</summary>
+<pre>git show bbe7cc7 -- src/ R/ | head -150; git show 9642413 -- tests/ | head -120</pre><pre class="output">commit bbe7cc7184f3839852e65024cfbd95d086a868c3
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 18 13:48:25 2026 -0400
+
+    Keep titles in rray_slice() and the functions built on it (#154)
+
+diff --git a/R/rep.R b/R/rep.R
+index f36e21d..1521303 100644
+--- a/R/rep.R
++++ b/R/rep.R
+@@ -16,7 +16,8 @@
+ #'
+ #' @details
+ #' Names repeat alongside the data, so a repeated axis can come back with
+-#' duplicate names. Every other axis keeps its names untouched.
++#' duplicate names. Every other axis keeps its names untouched. The titles of
++#' `x` are kept.
+ #'
+ #' @inheritParams rlang::args_dots_empty
+ #'
+diff --git a/R/reverse.R b/R/reverse.R
+index fa1cd78..7a10f54 100644
+--- a/R/reverse.R
++++ b/R/reverse.R
+@@ -5,7 +5,7 @@
+ #'
+ #' @details
+ #' Names on a reversed axis move with the data. Every other axis keeps its names
+-#' untouched.
++#' untouched. The titles of `x` are kept.
+ #'
+ #' @inheritParams rlang::args_dots_empty
+ #'
+diff --git a/R/roll.R b/R/roll.R
+index ef64b1b..70be91f 100644
+--- a/R/roll.R
++++ b/R/roll.R
+@@ -45,7 +45,7 @@
+ #'
+ #' Since a uniform roll is a slice, names on a rolled axis move with the data,
+ #' just like they do in `rray_slice()`. Every other axis keeps its names
+-#' untouched.
++#' untouched. The titles of `x` are kept.
+ #'
+ #' @section Roll each:
+ #' `rray_roll_each()` rolls along a single `axis`, but each row, column, and so
+diff --git a/R/slice.R b/R/slice.R
+index e1d791d..becba2a 100644
+--- a/R/slice.R
++++ b/R/slice.R
+@@ -68,7 +68,7 @@
+ #'   `rray_slice_columns()` return an array with the same type and
+ #'   dimensionality as `x`. The dimension of each axis is the number of
+ #'   positions selected on it. The names of each axis are selected along with
+-#'   the values.
++#'   the values. The titles of `x` are kept.
+ #'
+ #' - The `_assign` versions return `x` with the selected positions replaced.
+ #'   The type, dimensions, and names of `x` are kept.
+diff --git a/src/decl/slice-decl.h b/src/decl/slice-decl.h
+index 404941d..3d9e92c 100644
+--- a/src/decl/slice-decl.h
++++ b/src/decl/slice-decl.h
+@@ -1,5 +1,5 @@
+ static r_obj* rray_slice_names(
+-  r_obj* const* v_x_names,
++  r_obj* x_names,
+   const int* v_dimensions,
+   int dimensionality,
+   const int* const* v_v_locations
+diff --git a/src/slice.c b/src/slice.c
+index 21cce0e..d438b23 100644
+--- a/src/slice.c
++++ b/src/slice.c
+@@ -189,7 +189,7 @@ r_obj* rray_slice(
+   r_attrib_poke_dim(out, dimensions);
+ 
+   r_obj* names = KEEP_N(
+-    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),
++    rray_slice_names(x_names, v_dimensions, dimensionality, v_v_locations),
+     &amp;n_prot
+   );
+ 
+@@ -202,16 +202,19 @@ r_obj* rray_slice(
+ }
+ 
+ static r_obj* rray_slice_names(
+-  r_obj* const* v_x_names,
++  r_obj* x_names,
+   const int* v_dimensions,
+   int dimensionality,
+   const int* const* v_v_locations
+ ) {
+-  if (v_x_names == NULL) {
++  if (x_names == r_null) {
+     return r_null;
+   }
+ 
++  r_obj* const* v_x_names = r_list_cbegin(x_names);
++
+   r_obj* out = KEEP(r_alloc_list(dimensionality));
++  r_attrib_poke_names(out, r_names(x_names));
+ 
+   for (int axis = 0; axis &lt; dimensionality; ++axis) {
+     r_obj* x_axis_names = v_x_names[axis];
+commit 96424133b0fd7ed00fd87b10945f00fa2a733181
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 18 15:40:13 2026 -0400
+
+    Keep titles in `rray_permute_axes()`, `rray_insert_axes()`, and `rray_remove_axes()` (#156)
+
+diff --git a/tests/testthat/test-insert-axes.R b/tests/testthat/test-insert-axes.R
+index cdc5687..8b6bc2f 100644
+--- a/tests/testthat/test-insert-axes.R
++++ b/tests/testthat/test-insert-axes.R
+@@ -97,6 +97,24 @@ test_that(&quot;unnamed axes remain unnamed&quot;, {
+   expect_identical(rray_insert_axes(x, 2L), array(1:6, c(2L, 1L, 3L)))
+ })
+ 
++test_that(&quot;titles are kept, and inserted axes get empty titles&quot;, {
++  x &lt;- array(
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
++  )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
++
++  expect_identical(
++    rray_titles(rray_insert_axes(x, 2L)),
++    c(&quot;A&quot;, &quot;&quot;, &quot;B&quot;, &quot;C&quot;)
++  )
++  expect_identical(
++    dimnames(rray_insert_axes(y, c(1L, 5L))),
++    list(NULL, A = NULL, B = NULL, C = NULL, NULL)
++  )
++})
++
+ test_that(&quot;does not modify the input&quot;, {
+   x &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;a&quot;, &quot;b&quot;))
+   expected &lt;- x
+diff --git a/tests/testthat/test-move-axes.R b/tests/testthat/test-move-axes.R
+index e146a45..c3c4d82 100644
+--- a/tests/testthat/test-move-axes.R
++++ b/tests/testthat/test-move-axes.R
+@@ -58,6 +58,24 @@ test_that(&quot;names travel with their axis&quot;, {
+   expect_identical(rray_names(out), list(c(&quot;d&quot;, &quot;e&quot;, &quot;f&quot;), &quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;)))
+ })
+ 
++test_that(&quot;titles travel with their axis&quot;, {
++  x &lt;- array(
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
++  )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
++
++  expect_identical(
++    rray_titles(rray_move_axes(x, from = 1L, to = 3L)),
++    c(&quot;B&quot;, &quot;C&quot;, &quot;A&quot;)
++  )
++  expect_identical(
++    dimnames(rray_move_axes(y, from = 1L, to = 3L)),
++    list(B = NULL, C = NULL, A = NULL)
++  )
++})
++
+ test_that(&quot;works with zero-size arrays&quot;, {
+   x &lt;- array(integer(), c(0L, 3L, 2L))
+ 
+diff --git a/tests/testthat/test-permute-axes.R b/tests/testthat/test-permute-axes.R
+index 1e50c23..549c40b 100644
+--- a/tests/testthat/test-permute-axes.R
++++ b/tests/testthat/test-permute-axes.R
+@@ -66,14 +66,22 @@ test_that(&quot;unnamed axes remain unnamed&quot;, {
+   expect_identical(rray_names(out), list(NULL, c(&quot;a&quot;, &quot;b&quot;)))
+ })
+ 
+-test_that(&quot;outer names of `dimnames()` are dropped&quot;, {
++test_that(&quot;titles travel with their axis&quot;, {
+   x &lt;- array(
+-    1:6,
+-    c(2L, 3L),
+-    dimnames = list(rows = c(&quot;a&quot;, &quot;b&quot;), cols = c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
+   )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
+ 
+-  expect_named(dimnames(rray_permute_axes(x, c(2L, 1L))), NULL)
++  expect_identical(
++    rray_titles(rray_permute_axes(x, c(3L, 1L, 2L))),
++    c(&quot;C&quot;, &quot;A&quot;, &quot;B&quot;)
++  )
++  expect_identical(
++    dimnames(rray_permute_axes(y, c(3L, 1L, 2L))),
++    list(C = NULL, A = NULL, B = NULL)
++  )
+ })
+ </pre><p class="cut">25 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;r_clone\|shallow_duplicate&quot; src/*.c | head; cat R/split.R | sed -n 1,60p; cat R/uns…</summary>
+<pre>grep -rn &quot;r_clone\|shallow_duplicate&quot; src/*.c | head; cat R/split.R | sed -n 1,60p; cat R/unstack.R | sed -n 1,50p; grep -n &quot;test_that&quot; tests/testthat/test-split.R tests/testthat/test-unstack.R</pre><pre class="output">src/clone.c:4:r_obj* r_clone_data(r_obj* x) {
+src/extract-assign.c:76:  r_obj* out = KEEP(r_clone_data(x));
+src/slice-assign.c:135:  r_obj* out = KEEP_N(r_clone_data(x), &amp;n_prot);
+src/roll-each.c:46:  r_obj* n_broadcast_dimensions = KEEP(r_clone(x_dimensions));
+src/titles.c:184:  r_obj* new_names = KEEP(r_clone(names));
+src/titles.c:208:  r_obj* new_titles = KEEP(r_clone(old_titles));
+src/view.c:123:// Powers `Rf_duplicate()` and `Rf_shallow_duplicate()`
+src/view.c:131:    return r_clone_data(view_data(x));
+#' Split an array along an axis
+#'
+#' @description
+#' `rray_split()` divides `x` into contiguous arrays along an `axis`.
+#'
+#' Using `rray_combine()` along the same `axis` reconstructs `x`.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer representing the axis to split on.
+#'
+#' @param dimensions One of:
+#'
+#'   - A single positive integer, used as the dimension of every array. It must
+#'     evenly divide the dimension of `x` along `axis`.
+#'
+#'   - A vector of positive (or zero) integers, giving the dimension of each
+#'     array directly. They must sum to the dimension of `x` along `axis`.
+#'
+#' @returns
+#' A list of arrays each with the same dimensions as `x`, except along `axis`.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:12, c(6, 2))
+#'
+#' # Three arrays of two rows
+#' rray_split(x, axis = 1, dimensions = 2)
+#'
+#' # Arrays of one and five rows
+#' rray_split(x, axis = 1, dimensions = c(1, 5))
+#'
+#' # One array per column
+#' rray_split(x, axis = 2, dimensions = 1)
+#'
+#' # Arrays of dimension zero are allowed in the explicit form
+#' rray_split(x, axis = 2, dimensions = c(0, 2))
+#'
+#' # Splitting and combining along the same axis are inverses
+#' rray_combine(!!!rray_split(x, axis = 1, dimensions = 3), .axis = 1)
+rray_split &lt;- function(x, ..., axis, dimensions) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_split, x, axis, dimensions, environment())
+}
+#' Unstack an array
+#'
+#' @description
+#' `rray_unstack()` splits an array along `axis` and then removes that `axis`
+#' from each of the resulting arrays. The result is a list of arrays that have
+#' a dimensionality 1 less than `x` itself.
+#'
+#' Using [rray_stack()] along the same `axis` reconstructs `x`.
+#'
+#' @details
+#' Names along `axis` become the names of the returned list. Names on the
+#' surviving axes are carried over to their new locations.
+#'
+#' Because the dimensionality is reduced by 1, `x` must have a dimensionality
+#' of at least 2 to begin with.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer representing the axis to unstack along.
+#'
+#' @returns
+#' A list of arrays with the same dimensions as `x`, except that `axis` has
+#' been removed.
+#'
+#' @seealso [rray_stack()]
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#'
+#' # One array per row
+#' rray_unstack(x, axis = 1)
+#'
+#' # One array per column
+#' rray_unstack(x, axis = 2)
+#'
+#' # Names along the axis become list names
+#' y &lt;- array(1:4, c(2, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+#' rray_unstack(y, axis = 2)
+#'
+#' # Unstacking and stacking along the same axis are inverses
+#' rray_stack(!!!rray_unstack(x, axis = 2), .axis = 2)
+rray_unstack &lt;- function(x, ..., axis) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_unstack, x, axis, environment())
+}
+tests/testthat/test-split.R:1:test_that(&quot;splits along every axis with a uniform size&quot;, {
+tests/testthat/test-split.R:20:test_that(&quot;a uniform size can be larger than 1&quot;, {
+tests/testthat/test-split.R:32:test_that(&quot;explicit dimensions give each array directly&quot;, {
+tests/testthat/test-split.R:44:test_that(&quot;explicit dimensions can contain zeroes&quot;, {
+tests/testthat/test-split.R:57:test_that(&quot;works with a zero dimension axis&quot;, {
+tests/testthat/test-split.R:71:test_that(&quot;works with 1D arrays&quot;, {
+tests/testthat/test-split.R:85:test_that(&quot;works with bare vectors&quot;, {
+tests/testthat/test-split.R:92:test_that(&quot;works with every type&quot;, {
+tests/testthat/test-split.R:121:test_that(&quot;matches a reference implementation&quot;, {
+tests/testthat/test-split.R:180:test_that(&quot;names on non-split axes are kept&quot;, {
+tests/testthat/test-split.R:188:test_that(&quot;names on the split axis are sliced&quot;, {
+tests/testthat/test-split.R:200:test_that(&quot;zero size arrays drop the names on the split axis&quot;, {
+tests/testthat/test-split.R:208:test_that(&quot;partial dimension names are handled&quot;, {
+tests/testthat/test-split.R:218:test_that(&quot;NULL dimension names are handled&quot;, {
+tests/testthat/test-split.R:229:test_that(&quot;the result list is unnamed&quot;, {
+tests/testthat/test-split.R:235:test_that(&quot;`x` is not modified&quot;, {
+tests/testthat/test-split.R:247:test_that(&quot;combining the arrays reproduces the input&quot;, {
+tests/testthat/test-split.R:271:test_that(&quot;`axis` and `dimensions` must be named&quot;, {
+tests/testthat/test-split.R:280:test_that(&quot;`axis` is validated&quot;, {
+tests/testthat/test-split.R:296:test_that(&quot;`dimensions` are validated&quot;, {
+tests/testthat/test-split.R:319:test_that(&quot;errors on invalid input&quot;, {
+tests/testthat/test-unstack.R:1:test_that(&quot;unstacks a 2D array along every axis&quot;, {
+tests/testthat/test-unstack.R:15:test_that(&quot;unstacks a 3D array along every axis&quot;, {
+tests/testthat/test-unstack.R:28:test_that(&quot;works with every type&quot;, {
+tests/testthat/test-unstack.R:47:test_that(&quot;works with a zero dimension axis&quot;, {
+tests/testthat/test-unstack.R:57:test_that(&quot;works with an axis of dimension 1&quot;, {
+tests/testthat/test-unstack.R:62:test_that(&quot;names on the axis become the list names&quot;, {
+tests/testthat/test-unstack.R:77:test_that(&quot;names on the surviving axes move to their new locations&quot;, {
+tests/testthat/test-unstack.R:97:test_that(&quot;partial dimension names are handled&quot;, {
+tests/testthat/test-unstack.R:109:test_that(&quot;`x` is not modified&quot;, {
+tests/testthat/test-unstack.R:121:test_that(&quot;stacking the arrays reproduces the input&quot;, {
+tests/testthat/test-unstack.R:135:test_that(&quot;unstacking a stack reproduces the inputs&quot;, {
+tests/testthat/test-unstack.R:145:test_that(&quot;unstacking a stack normalizes broadcast and cast inputs&quot;, {
+tests/testthat/test-unstack.R:160:test_that(&quot;`axis` is validated&quot;, {
+tests/testthat/test-unstack.R:173:test_that(&quot;`axis` must be named&quot;, {
+tests/testthat/test-unstack.R:177:test_that(&quot;1D arrays are rejected&quot;, {
+tests/testthat/test-unstack.R:182:test_that(&quot;errors on invalid input&quot;, {</pre></details>
+<p>I've read the plan, <code>src/split.c</code>, and the existing tests. Now checking <code>src/unstack.c</code> and the split names tests before asking my questions.</p>
+
+<details class="tool"><summary>Bash: sed -n 175,235p tests/testthat/test-split.R; sed -n 60,110p tests/testthat/test-unstack.R; ca…</summary>
+<pre>sed -n 175,235p tests/testthat/test-split.R; sed -n 60,110p tests/testthat/test-unstack.R; cat src/unstack.c | sed -n 1,200p</pre><pre class="output">      }
+    }
+  }
+})
+
+test_that(&quot;names on non-split axes are kept&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;x&quot;))
+  expect_identical(dimnames(out[[3]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;z&quot;))
+})
+
+test_that(&quot;names on the split axis are sliced&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = c(2, 1))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+  expect_identical(dimnames(out[[2]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;z&quot;))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(&quot;a&quot;, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  expect_identical(dimnames(out[[2]]), list(&quot;b&quot;, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+})
+
+test_that(&quot;zero size arrays drop the names on the split axis&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = c(0, 3))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+  expect_identical(dimnames(out[[2]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+})
+
+test_that(&quot;partial dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  out &lt;- rray_split(x, axis = 1, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(&quot;a&quot;, NULL))
+
+  out &lt;- rray_split(x, axis = 2, dimensions = 1)
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+})
+
+test_that(&quot;NULL dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  expect_null(dimnames(rray_split(x, axis = 1, dimensions = 1)[[1]]))
+
+  x &lt;- array(1:6, c(2, 3), dimnames = list(NULL, NULL))
+  expect_identical(
+    dimnames(rray_split(x, axis = 1, dimensions = 1)[[1]]),
+    list(NULL, NULL)
+  )
+})
+
+test_that(&quot;the result list is unnamed&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  expect_null(names(rray_split(x, axis = 1, dimensions = 1)))
+  expect_null(names(rray_split(x, axis = 2, dimensions = c(1, 2))))
+})
+
+test_that(&quot;`x` is not modified&quot;, {
+})
+
+test_that(&quot;names on the axis become the list names&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+  out &lt;- rray_unstack(x, axis = 1)
+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
+  expect_identical(
+    out$a,
+    array(c(1L, 3L, 5L), 3, dimnames = list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  )
+
+  out &lt;- rray_unstack(x, axis = 2)
+  expect_named(out, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
+  expect_identical(out$x, array(1:2, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;))))
+})
+
+test_that(&quot;names on the surviving axes move to their new locations&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2, 3, 4),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;), NULL)
+  )
+
+  out &lt;- rray_unstack(x, axis = 1)
+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;), NULL))
+
+  out &lt;- rray_unstack(x, axis = 2)
+  expect_named(out, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  out &lt;- rray_unstack(x, axis = 3)
+  expect_null(names(out))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+})
+
+test_that(&quot;partial dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  out &lt;- rray_unstack(x, axis = 1)
+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
+  expect_null(dimnames(out[[1]]))
+
+  out &lt;- rray_unstack(x, axis = 2)
+  expect_null(names(out))
+  expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;)))
+})
+
+test_that(&quot;`x` is not modified&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+#include &quot;unstack.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;names.h&quot;
+#include &quot;remove-axes.h&quot;
+#include &quot;split.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* ffi_rray_unstack(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_unstack(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_unstack(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_dimensionality(dimensionality);
+
+  if (dimensionality &lt; 2) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have a dimensionality of at least 2, not %d.&quot;,
+      rray_arg_format(arg),
+      dimensionality
+    );
+  }
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  r_obj* dimensions = KEEP(r_int(1));
+  r_obj* out = KEEP(rray_split(x, axis, dimensions, arg, error_call));
+
+  r_obj* axes = KEEP(r_int(axis));
+  const r_ssize out_size = r_length(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    r_obj* elt = r_list_get(out, i);
+    r_list_poke(out, i, rray_remove_axes(elt, axes, arg, error_call));
+  }
+
+  r_obj* names = KEEP(rray_axis_names(x, axis, arg, error_call));
+  if (names != r_null) {
+    r_attrib_poke_names(out, names);
+  }
+
+  FREE(5);
+  return out;
+}</pre></details>
+<p>I've read everything part 4 touches. The change is small: one helper in <code>src/split.c</code> drops the titles, and <code>rray_unstack()</code> should then work with no code change. Two choices before I start:</p>
+
+<details class="tool"><summary>Question: `rray_split_elt_names()` copies `x_names` element by element, then replaces the `axis` el…</summary>
+<p><code>rray_split_elt_names()</code> copies <code>x_names</code> element by element, then replaces the <code>axis</code> element. To keep titles, should I swap the copy loop for <code>r_clone(x_names)</code> (a shallow copy, which keeps the names attribute for free), or keep the loop and poke <code>r_names(x_names)</code> on, like step 1 did in <code>rray_slice_names()</code>?</p>
+<ul>
+<li>r_clone() (Recommended)</li>
+<li>Loop + poke names</li>
+</ul>
+<p>Plan says add a titles sentence only where roxygen already talks about names. <code>rray_unstack()</code> has a names paragraph, <code>rray_split()</code> has none. What should the docs get?</p>
+<ul>
+<li>Unstack only (Recommended)</li>
+<li>Both</li>
+<li>Neither</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;`rray_split_elt_names()` copies `x_names` element by element, then replaces the `axis` element. To keep titles, should I swap the copy loop for `r_clone(x_names)` (a shallow copy, which keeps the names attribute for free), or keep the loop and poke `r_names(x_names)` on, like step 1 did in `rray_slice_names()`?&quot;=&quot;Loop + poke names&quot;, &quot;Plan says add a titles sentence only where roxygen already talks about names. `rray_unstack()` has a names paragraph, `rray_split()` has none. What should the docs get?&quot;=&quot;Unstack only (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool tool-error"><summary>Bash: git checkout -b feature/titles &amp;&amp; python3 - &lt;&lt;'EOF'</summary>
+<pre>git checkout -b feature/titles &amp;&amp; python3 - &lt;&lt;'EOF'
+import re
+p='src/split.c'
+s=open(p).read()
+s=s.replace(&quot;&quot;&quot;      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+        v_x_names,
+        dimensionality,&quot;&quot;&quot;,&quot;&quot;&quot;      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+        x_names,
+        dimensionality,&quot;&quot;&quot;)
+s=s.replace(&quot;&quot;&quot;static r_obj* rray_split_elt_names(
+  r_obj* const* v_x_names,
+  int dimensionality,
+  int axis,
+  r_obj* const* v_x_axis_names,
+  int x_axis_start,
+  int dimension
+) {
+  r_obj* out = KEEP(r_alloc_list(dimensionality));
+&quot;&quot;&quot;,&quot;&quot;&quot;static r_obj* rray_split_elt_names(
+  r_obj* x_names,
+  int dimensionality,
+  int axis,
+  r_obj* const* v_x_axis_names,
+  int x_axis_start,
+  int dimension
+) {
+  r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+  r_obj* out = KEEP(r_alloc_list(dimensionality));
+  r_attrib_poke_names(out, r_names(x_names));
+&quot;&quot;&quot;)
+open(p,'w').write(s)
+p='src/decl/split-decl.h'
+s=open(p).read()
+s=s.replace(&quot;&quot;&quot;static r_obj* rray_split_elt_names(
+  r_obj* const* v_x_names,&quot;&quot;&quot;,&quot;&quot;&quot;static r_obj* rray_split_elt_names(
+  r_obj* x_names,&quot;&quot;&quot;)
+open(p,'w').write(s)
+EOF
+git diff</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Bash: git branch --show-current</summary>
+<pre>git branch --show-current</pre><pre class="output">main</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/titles</summary>
+<pre>git checkout -b feature/titles</pre><pre class="output">Switched to a new branch 'feature/titles'</pre></details>
+<details class="tool"><summary>Read src/split.c</summary>
+<pre class="output">60	  r_obj* out = KEEP(r_alloc_list(out_size));
+61	
+62	  r_obj* x_names = r_dim_names(x);
+63	  r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);
+64	
+65	  r_obj* x_axis_names = (v_x_names == NULL) ? r_null : v_x_names[axis - 1];
+66	  r_obj* const* v_x_axis_names =
+67	    (x_axis_names == r_null) ? NULL : r_chr_cbegin(x_axis_names);
+68	
+69	  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+70	  rray_fill_strides_from_dimensions(
+71	    v_x_dimensions,
+72	    dimensionality,
+73	    v_x_strides
+74	  );
+75	  const r_ssize x_axis_stride = v_x_strides[axis - 1];
+76	
+77	  const enum r_type type = r_typeof(x);
+78	
+79	  // Initialized on the first iteration. Changes any time the output dimension
+80	  // along `axis` changes, but in the uniform case all arrays share the same
+81	  // dimensions object!
+82	  r_obj* out_elt_dimensions = r_null;
+83	  r_keep_loc out_elt_dimensions_loc;
+84	  KEEP_HERE(out_elt_dimensions, &amp;out_elt_dimensions_loc);
+85	
+86	  struct rray_run_iterator it;
+87	
+88	  int previous_dimension = -1;
+89	
+90	  // The location along the axis. For example, with a 2x10 array split along
+91	  // columns this runs from 0-9. The `x_axis_stride` maps it to `x_start`, a
+92	  // flat location into `x` itself.
+93	  int x_axis_start = 0;
+94	
+95	  for (r_ssize i = 0; i &lt; out_size; ++i) {
+96	    const int dimension = uniform ? v_dimensions[0] : v_dimensions[i];
+97	
+98	    if (dimension == previous_dimension) {
+99	      rray_run_iterator_reset1(&amp;it);
+100	    } else {
+101	      previous_dimension = dimension;
+102	
+103	      out_elt_dimensions = r_alloc_integer(dimensionality);
+104	      KEEP_AT(out_elt_dimensions, out_elt_dimensions_loc);
+105	      int* v_out_elt_dimensions = r_int_begin(out_elt_dimensions);
+106	      r_memcpy(
+107	        v_out_elt_dimensions,
+108	        v_x_dimensions,
+109	        sizeof(int) * dimensionality
+110	      );
+111	      v_out_elt_dimensions[axis - 1] = dimension;
+112	
+113	      rray_run_iterator_init1(
+114	        &amp;it,
+115	        v_out_elt_dimensions,
+116	        dimensionality,
+117	        v_x_strides
+118	      );
+119	    }
+120	
+121	    r_obj* out_elt = r_alloc_vector(type, rray_run_iterator_size(&amp;it));
+122	    r_list_poke(out, i, out_elt);
+123	    r_attrib_poke_dim(out_elt, out_elt_dimensions);
+124	
+125	    const r_ssize x_start = x_axis_start * x_axis_stride;
+126	    rray_split_fill(x, out_elt, x_start, &amp;it);
+127	
+128	    if (v_x_axis_names != NULL) {
+129	      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+130	        v_x_names,
+131	        dimensionality,
+132	        axis,
+133	        v_x_axis_names,
+134	        x_axis_start,
+135	        dimension
+136	      ));
+137	      r_attrib_poke_dim_names(out_elt, out_elt_names);
+138	      FREE(1);
+139	    } else if (x_names != r_null) {</pre></details>
+<details class="tool"><summary>Read src/decl/split-decl.h</summary>
+<pre class="output">55	);
+56	
+57	static r_obj* rray_split_elt_names(
+58	  r_obj* const* v_x_names,
+59	  int dimensionality,
+60	  int axis,
+61	  r_obj* const* v_x_axis_names,
+62	  int x_axis_start,
+63	  int dimension
+64	);
+65	</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-      r_obj* out_elt_names = KEEP(rray_split_elt_names(</span>
+<span class="del">-        v_x_names,</span>
+<span class="ins">+      r_obj* out_elt_names = KEEP(rray_split_elt_names(</span>
+<span class="ins">+        x_names,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/split.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-  r_obj* const* v_x_names,</span>
+<span class="del">-  int dimensionality,</span>
+<span class="del">-  int axis,</span>
+<span class="del">-  r_obj* const* v_x_axis_names,</span>
+<span class="del">-  int x_axis_start,</span>
+<span class="del">-  int dimension</span>
+<span class="del">-) {</span>
+<span class="del">-  r_obj* out = KEEP(r_alloc_list(dimensionality));</span>
+<span class="ins">+  r_obj* x_names,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  int axis,</span>
+<span class="ins">+  r_obj* const* v_x_axis_names,</span>
+<span class="ins">+  int x_axis_start,</span>
+<span class="ins">+  int dimension</span>
+<span class="ins">+) {</span>
+<span class="ins">+  r_obj* const* v_x_names = r_list_cbegin(x_names);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_list(dimensionality));</span>
+<span class="ins">+  r_attrib_poke_names(out, r_names(x_names));</span></pre><pre class="output">The file ~/files/r/packages/rray/src/split.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/decl/split-decl.h</summary>
+<pre class="diff"><span class="del">-  r_obj* const* v_x_names,</span>
+<span class="ins">+  r_obj* x_names,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/decl/split-decl.h has been updated successfully.</pre></details>
+<p>The diagnostics were taken mid-edit; the decl header ones are expected since it has no includes. Now the docs and tests.</p>
+
+<details class="tool"><summary>Edit R/unstack.R</summary>
+<pre class="diff"><span class="del">-#' surviving axes are carried over to their new locations.</span>
+<span class="ins">+#' surviving axes are carried over to their new locations, as are their titles.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/unstack.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-split.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;the result list is unnamed&quot;, {</span>
+<span class="ins">+test_that(&quot;titles are kept&quot;, {</span>
+<span class="ins">+  x &lt;- array(</span>
+<span class="ins">+    1:24,</span>
+<span class="ins">+    c(2L, 3L, 4L),</span>
+<span class="ins">+    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_split(x, axis = 1, dimensions = 1)</span>
+<span class="ins">+  expect_identical(dimnames(out[[1]]), list(A = &quot;a&quot;, B = NULL, C = NULL))</span>
+<span class="ins">+  expect_identical(dimnames(out[[2]]), list(A = &quot;b&quot;, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_split(x, axis = 2, dimensions = c(0, 3))</span>
+<span class="ins">+  expect_identical(rray_titles(out[[1]]), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+  expect_identical(rray_titles(out[[2]]), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_split(y, axis = 1, dimensions = 1)</span>
+<span class="ins">+  expect_identical(dimnames(out[[1]]), list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;the result list is unnamed&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-split.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-unstack.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;partial dimension names are handled&quot;, {</span>
+<span class="ins">+test_that(&quot;titles on the surviving axes are kept&quot;, {</span>
+<span class="ins">+  x &lt;- array(</span>
+<span class="ins">+    1:24,</span>
+<span class="ins">+    c(2L, 3L, 4L),</span>
+<span class="ins">+    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_unstack(x, axis = 1)</span>
+<span class="ins">+  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(out$a), list(B = NULL, C = NULL))</span>
+<span class="ins">+  expect_identical(dimnames(out$b), list(B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_unstack(x, axis = 2)</span>
+<span class="ins">+  expect_identical(dimnames(out[[1]]), list(A = c(&quot;a&quot;, &quot;b&quot;), C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_unstack(y, axis = 1)</span>
+<span class="ins">+  expect_identical(dimnames(out[[1]]), list(B = NULL, C = NULL))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;partial dimension names are handled&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-unstack.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: awk 'length &gt; 80 {print FILENAME&quot;: &quot;FNR&quot;: &quot;length}' R/unstack.R; clang-format -i src/*.c src/…</summary>
+<pre>awk 'length &gt; 80 {print FILENAME&quot;: &quot;FNR&quot;: &quot;length}' R/unstack.R; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -5 &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(split|unstack)')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o clone.o combine.o compare.o cumulative-extremum.o cumulative-logical.o cumulative-prod.o cumulative-sum.o cumulative.o dimensionality.o dimensions.o equal.o extract-assign.o extract-subscript.o extract.o extremum.o if-else.o index.o init.o insert-axes.o locate.o logical.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-extremum.o reduce-logical.o reduce-mean.o reduce-names.o reduce-prod.o reduce-sum.o reduce.o remove-axes.o rep-each.o rep.o reverse.o rlang.o roll-each.o roll.o size.o slice-assign.o slice-axis.o slice-subscript.o slice.o split.o stack.o strides.o subscript.o syms.o titles.o type.o typeof2.o unstack.o utils.o view.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpHezOUX/devtools_install_589a1e8fc09d/00LOCK-rray/00new/rray/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray)
+Writing 'rray_unstack.Rd'
+ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 319 ]</pre></details>
+<p>Focused tests pass. Running the full suite and doing the protection review on the diff.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; git diff</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; git diff</pre><pre class="output">SKIP: 'test-reduce-sum.R:518:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 7743 ]
+diff --git a/R/unstack.R b/R/unstack.R
+index d27cc70..761a4e8 100644
+--- a/R/unstack.R
++++ b/R/unstack.R
+@@ -9,7 +9,7 @@
+ #'
+ #' @details
+ #' Names along `axis` become the names of the returned list. Names on the
+-#' surviving axes are carried over to their new locations.
++#' surviving axes are carried over to their new locations, as are their titles.
+ #'
+ #' Because the dimensionality is reduced by 1, `x` must have a dimensionality
+ #' of at least 2 to begin with.
+diff --git a/man/rray_unstack.Rd b/man/rray_unstack.Rd
+index a49c36f..773a35f 100644
+--- a/man/rray_unstack.Rd
++++ b/man/rray_unstack.Rd
+@@ -26,7 +26,7 @@ Using \code{\link[=rray_stack]{rray_stack()}} along the same \code{axis} reconst
+ }
+ \details{
+ Names along \code{axis} become the names of the returned list. Names on the
+-surviving axes are carried over to their new locations.
++surviving axes are carried over to their new locations, as are their titles.
+ 
+ Because the dimensionality is reduced by 1, \code{x} must have a dimensionality
+ of at least 2 to begin with.
+diff --git a/src/decl/split-decl.h b/src/decl/split-decl.h
+index 9e65bcd..fe9e5e5 100644
+--- a/src/decl/split-decl.h
++++ b/src/decl/split-decl.h
+@@ -55,7 +55,7 @@ static void rray_split_fill_list(
+ );
+ 
+ static r_obj* rray_split_elt_names(
+-  r_obj* const* v_x_names,
++  r_obj* x_names,
+   int dimensionality,
+   int axis,
+   r_obj* const* v_x_axis_names,
+diff --git a/src/split.c b/src/split.c
+index ae7a021..e719e0c 100644
+--- a/src/split.c
++++ b/src/split.c
+@@ -127,7 +127,7 @@ r_obj* rray_split(
+ 
+     if (v_x_axis_names != NULL) {
+       r_obj* out_elt_names = KEEP(rray_split_elt_names(
+-        v_x_names,
++        x_names,
+         dimensionality,
+         axis,
+         v_x_axis_names,
+@@ -326,14 +326,17 @@ static void rray_split_fill_list(
+ #undef RRAY_SPLIT_FILL_BARRIER
+ 
+ static r_obj* rray_split_elt_names(
+-  r_obj* const* v_x_names,
++  r_obj* x_names,
+   int dimensionality,
+   int axis,
+   r_obj* const* v_x_axis_names,
+   int x_axis_start,
+   int dimension
+ ) {
++  r_obj* const* v_x_names = r_list_cbegin(x_names);
++
+   r_obj* out = KEEP(r_alloc_list(dimensionality));
++  r_attrib_poke_names(out, r_names(x_names));
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     r_list_poke(out, i, v_x_names[i]);
+diff --git a/tests/testthat/test-split.R b/tests/testthat/test-split.R
+index 35ede29..89fcca5 100644
+--- a/tests/testthat/test-split.R
++++ b/tests/testthat/test-split.R
+@@ -226,6 +226,26 @@ test_that(&quot;NULL dimension names are handled&quot;, {
+   )
+ })
+ 
++test_that(&quot;titles are kept&quot;, {
++  x &lt;- array(
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
++  )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
++
++  out &lt;- rray_split(x, axis = 1, dimensions = 1)
++  expect_identical(dimnames(out[[1]]), list(A = &quot;a&quot;, B = NULL, C = NULL))
++  expect_identical(dimnames(out[[2]]), list(A = &quot;b&quot;, B = NULL, C = NULL))
++
++  out &lt;- rray_split(x, axis = 2, dimensions = c(0, 3))
++  expect_identical(rray_titles(out[[1]]), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))
++  expect_identical(rray_titles(out[[2]]), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))
++
++  out &lt;- rray_split(y, axis = 1, dimensions = 1)
++  expect_identical(dimnames(out[[1]]), list(A = NULL, B = NULL, C = NULL))
++})
++
+ test_that(&quot;the result list is unnamed&quot;, {
+   x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+   expect_null(names(rray_split(x, axis = 1, dimensions = 1)))
+diff --git a/tests/testthat/test-unstack.R b/tests/testthat/test-unstack.R
+index 8f04627..b657d27 100644
+--- a/tests/testthat/test-unstack.R
++++ b/tests/testthat/test-unstack.R
+@@ -94,6 +94,26 @@ test_that(&quot;names on the surviving axes move to their new locations&quot;, {
+   expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+ })
+ 
++test_that(&quot;titles on the surviving axes are kept&quot;, {
++  x &lt;- array(
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
++  )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
++
++  out &lt;- rray_unstack(x, axis = 1)
++  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
++  expect_identical(dimnames(out$a), list(B = NULL, C = NULL))
++  expect_identical(dimnames(out$b), list(B = NULL, C = NULL))
++
++  out &lt;- rray_unstack(x, axis = 2)
++  expect_identical(dimnames(out[[1]]), list(A = c(&quot;a&quot;, &quot;b&quot;), C = NULL))
++
++  out &lt;- rray_unstack(y, axis = 1)
++  expect_identical(dimnames(out[[1]]), list(B = NULL, C = NULL))
++})
++
+ test_that(&quot;partial dimension names are handled&quot;, {
+   x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))</pre></details>
+<p>All 7743 tests pass. To make sure the new tests actually catch the bug, I'll run them against the old C code.</p>
+
+<details class="tool"><summary>Bash: git stash push src/ -q &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(split|unstack)')&quot; 2&gt;&amp;1 | gre…</summary>
+<pre>git stash push src/ -q &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(split|unstack)')&quot; 2&gt;&amp;1 | grep -E &quot;FAIL|Failure&quot; | head; git stash pop -q &amp;&amp; git status --short</pre><pre class="output">FAILURE: 'test-split.R:238:3' ---------------------
+FAILURE: 'test-split.R:239:3' ---------------------
+FAILURE: 'test-unstack.R:107:3' -------------------
+FAILURE: 'test-unstack.R:108:3' -------------------
+[ FAIL 4 | WARN 0 | SKIP 0 | PASS 315 ]
+ M R/unstack.R
+ M man/rray_unstack.Rd
+ M src/decl/split-decl.h
+ M src/split.c
+ M tests/testthat/test-split.R
+ M tests/testthat/test-unstack.R</pre></details>
+<p>Without the fix the new tests fail, as they should. Checking the box in the plan, then committing and pushing.</p>
+
+<details class="tool"><summary>Edit plans/titles.md</summary>
+<pre class="diff"><span class="del">-- [ ] 4. Split and unstack</span>
+<span class="ins">+- [x] 4. Split and unstack</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/titles.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; &gt;/dev/null 2&gt;&amp;1; git status --short &amp;&amp; git add …</summary>
+<pre>Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; &gt;/dev/null 2&gt;&amp;1; git status --short &amp;&amp; git add -A &amp;&amp; git commit -q -m 'Keep titles in `rray_split()` and `rray_unstack()`' &amp;&amp; git log --format=%B -1 &amp;&amp; git push -u origin feature/titles 2&gt;&amp;1 | tail -3</pre><pre class="output"> M R/unstack.R
+ M man/rray_unstack.Rd
+ M plans/titles.md
+ M src/decl/split-decl.h
+ M src/split.c
+ M tests/testthat/test-split.R
+ M tests/testthat/test-unstack.R
+Keep titles in `rray_split()` and `rray_unstack()`
+
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/titles -&gt; feature/titles
+branch 'feature/titles' set up to track 'origin/feature/titles'.</pre></details>
+<p>Part 4 is done. <code>rray_split()</code> and <code>rray_unstack()</code> now keep titles. I committed on the new <code>feature/titles</code> branch as <code>Keep titles in `rray_split()` and `rray_unstack()`</code> and pushed it.</p>
+<p><strong>The fix:</strong> titles were lost in one place. When the split axis has names, <code>rray_split_elt_names()</code> in <code>src/split.c</code> builds a new dimnames list, and that new list had no titles. As you chose, I kept its copy loop and added <code>r_attrib_poke_names(out, r_names(x_names))</code>. It now takes <code>x_names</code> instead of <code>v_x_names</code>, which matches what step 1 did to <code>rray_slice_names()</code>. When the split axis has no names, the function already reused <code>x_names</code> as is, so that path was fine.</p>
+<p><strong><code>rray_unstack()</code></strong> needed no code change. It splits, then removes the axis, and step 3 already made removing an axis keep the other titles.</p>
+<p><strong>Docs:</strong> in the <code>rray_unstack()</code> details, I added &quot;as are their titles&quot; to the sentence about surviving axes and ran <code>devtools::document()</code>. <code>rray_split()</code> docs are untouched.</p>
+<p><strong>Tests:</strong></p>
+<ul>
+<li>
+<p>I added a <code>&quot;titles are kept&quot;</code> test to <code>test-split.R</code> and a <code>&quot;titles on the surviving axes are kept&quot;</code> test to <code>test-unstack.R</code>. Each runs on both the <code>x</code> input (axis names and titles) and the <code>y</code> input (titles only).</p>
+</li>
+<li>
+<p>The split test also covers a piece of size 0. R turns that piece's axis names into <code>NULL</code>, but the titles survive.</p>
+</li>
+<li>
+<p>Without the C change, 4 of the new expectations fail. With it, the full suite passes: 7743 passed, 0 failed, 6 skipped.</p>
+</li>
+</ul>
+<p><strong>Checks:</strong></p>
+<ul>
+<li>
+<p><strong>Memory safety:</strong> <code>x_names</code> and its titles stay protected through <code>x</code>, and <code>out</code> is protected before anything is added to it, so the change is safe from garbage collection.</p>
+</li>
+<li>
+<p><strong>Formatting:</strong> I ran <code>clang-format</code> and <code>air format .</code>.</p>
+</li>
+<li>
+<p><strong>Plan:</strong> step 4 is checked off in <code>plans/titles.md</code>.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In split pass through v_x_names and x_titles instead of</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;x_titles&quot; src/*.c | head -20</summary>
+<pre>grep -n &quot;x_titles&quot; src/*.c | head -20</pre><pre class="output">src/permute-axes.c:270:  r_obj* x_titles = r_names(x_names);
+src/permute-axes.c:271:  r_obj* const* v_x_titles = x_titles == r_null ? NULL : r_chr_cbegin(x_titles);
+src/permute-axes.c:276:  if (v_x_titles != NULL) {
+src/permute-axes.c:286:    if (v_x_titles != NULL) {
+src/permute-axes.c:287:      r_chr_poke(out_titles, i, v_x_titles[axis]);
+src/insert-axes.c:43:  r_obj* x_titles = x_names == r_null ? r_null : r_names(x_names);
+src/insert-axes.c:44:  r_obj* const* v_x_titles = x_titles == r_null ? NULL : r_chr_cbegin(x_titles);
+src/insert-axes.c:64:    if (v_x_titles != NULL) {
+src/insert-axes.c:75:      r_chr_poke(out_titles, i, v_x_titles[x_i]);
+src/reduce-names.c:38:  r_obj* x_titles = r_names(x_names);
+src/reduce-names.c:39:  if (x_titles != r_null) {
+src/reduce-names.c:42:    r_attrib_poke_names(out, x_titles);
+src/remove-axes.c:43:  r_obj* x_titles = x_names == r_null ? r_null : r_names(x_names);
+src/remove-axes.c:44:  r_obj* const* v_x_titles = x_titles == r_null ? NULL : r_chr_cbegin(x_titles);
+src/remove-axes.c:75:    if (v_x_titles != NULL) {
+src/remove-axes.c:86:      r_chr_poke(out_titles, out_i, v_x_titles[i]);</pre></details>
+<p>I'll follow the pattern in <code>src/insert-axes.c</code>: read <code>x_titles</code> next to <code>x_names</code> in <code>rray_split()</code>, then pass both <code>v_x_names</code> and <code>x_titles</code> to the helper.</p>
+
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-  r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);</span>
+<span class="ins">+  r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);</span>
+<span class="ins">+  r_obj* x_titles = (x_names == r_null) ? r_null : r_names(x_names);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-      r_obj* out_elt_names = KEEP(rray_split_elt_names(</span>
+<span class="del">-        x_names,</span>
+<span class="del">-        dimensionality,</span>
+<span class="ins">+      r_obj* out_elt_names = KEEP(rray_split_elt_names(</span>
+<span class="ins">+        v_x_names,</span>
+<span class="ins">+        x_titles,</span>
+<span class="ins">+        dimensionality,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-  r_obj* x_names,</span>
+<span class="del">-  int dimensionality,</span>
+<span class="del">-  int axis,</span>
+<span class="del">-  r_obj* const* v_x_axis_names,</span>
+<span class="del">-  int x_axis_start,</span>
+<span class="del">-  int dimension</span>
+<span class="del">-) {</span>
+<span class="del">-  r_obj* const* v_x_names = r_list_cbegin(x_names);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out = KEEP(r_alloc_list(dimensionality));</span>
+<span class="del">-  r_attrib_poke_names(out, r_names(x_names));</span>
+<span class="ins">+  r_obj* const* v_x_names,</span>
+<span class="ins">+  r_obj* x_titles,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  int axis,</span>
+<span class="ins">+  r_obj* const* v_x_axis_names,</span>
+<span class="ins">+  int x_axis_start,</span>
+<span class="ins">+  int dimension</span>
+<span class="ins">+) {</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_list(dimensionality));</span>
+<span class="ins">+  r_attrib_poke_names(out, x_titles);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/decl/split-decl.h</summary>
+<pre class="diff"><span class="del">-  r_obj* x_names,</span>
+<span class="ins">+  r_obj* const* v_x_names,</span>
+<span class="ins">+  r_obj* x_titles,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/decl/split-decl.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Those diagnostics were taken before the header edit landed. Formatting, building, and testing:</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; git diff</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; git diff</pre><pre class="output">[ FAIL 0 | WARN 0 | SKIP 6 | PASS 7743 ]
+diff --git a/src/decl/split-decl.h b/src/decl/split-decl.h
+index fe9e5e5..40a4bb9 100644
+--- a/src/decl/split-decl.h
++++ b/src/decl/split-decl.h
+@@ -55,7 +55,8 @@ static void rray_split_fill_list(
+ );
+ 
+ static r_obj* rray_split_elt_names(
+-  r_obj* x_names,
++  r_obj* const* v_x_names,
++  r_obj* x_titles,
+   int dimensionality,
+   int axis,
+   r_obj* const* v_x_axis_names,
+diff --git a/src/split.c b/src/split.c
+index e719e0c..2d096c8 100644
+--- a/src/split.c
++++ b/src/split.c
+@@ -61,6 +61,7 @@ r_obj* rray_split(
+ 
+   r_obj* x_names = r_dim_names(x);
+   r_obj* const* v_x_names = (x_names == r_null) ? NULL : r_list_cbegin(x_names);
++  r_obj* x_titles = (x_names == r_null) ? r_null : r_names(x_names);
+ 
+   r_obj* x_axis_names = (v_x_names == NULL) ? r_null : v_x_names[axis - 1];
+   r_obj* const* v_x_axis_names =
+@@ -127,7 +128,8 @@ r_obj* rray_split(
+ 
+     if (v_x_axis_names != NULL) {
+       r_obj* out_elt_names = KEEP(rray_split_elt_names(
+-        x_names,
++        v_x_names,
++        x_titles,
+         dimensionality,
+         axis,
+         v_x_axis_names,
+@@ -326,17 +328,16 @@ static void rray_split_fill_list(
+ #undef RRAY_SPLIT_FILL_BARRIER
+ 
+ static r_obj* rray_split_elt_names(
+-  r_obj* x_names,
++  r_obj* const* v_x_names,
++  r_obj* x_titles,
+   int dimensionality,
+   int axis,
+   r_obj* const* v_x_axis_names,
+   int x_axis_start,
+   int dimension
+ ) {
+-  r_obj* const* v_x_names = r_list_cbegin(x_names);
+-
+   r_obj* out = KEEP(r_alloc_list(dimensionality));
+-  r_attrib_poke_names(out, r_names(x_names));
++  r_attrib_poke_names(out, x_titles);
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     r_list_poke(out, i, v_x_names[i]);</pre></details>
+<p>The full suite still passes (7743). <code>x_titles</code> is an attribute of <code>x_names</code>, so it stays protected through <code>x</code>, same as before. Committing as a new commit on top (no amend):</p>
+
+<details class="tool"><summary>Bash: git commit -qam 'Pass `v_x_names` and `x_titles` to `rray_split_elt_names()`' &amp;&amp; git push ori…</summary>
+<pre>git commit -qam 'Pass `v_x_names` and `x_titles` to `rray_split_elt_names()`' &amp;&amp; git push origin feature/titles 2&gt;&amp;1 | tail -1</pre><pre class="output">   a7c5b26..7c158f3  feature/titles -&gt; feature/titles</pre></details>
+<p><code>rray_split_elt_names()</code> now takes <code>v_x_names</code> and <code>x_titles</code> instead of <code>x_names</code>.</p>
+<ul>
+<li>
+<p><strong>In <code>rray_split()</code>:</strong> <code>x_titles</code> is read right below <code>v_x_names</code>, as <code>(x_names == r_null) ? r_null : r_names(x_names)</code>. That is the same guarded form used in <code>src/insert-axes.c</code> and <code>src/remove-axes.c</code>.</p>
+</li>
+<li>
+<p><strong>In the helper:</strong> it no longer works out <code>v_x_names</code> itself. It just pokes <code>x_titles</code> onto the list it builds.</p>
+</li>
+</ul>
+<p>All tests still pass. I pushed this to <code>feature/titles</code> as a separate commit, <code>Pass `v_x_names` and `x_titles` to `rray_split_elt_names()`</code>, on top of the first one. I didn't amend the first commit. If you'd rather have a single commit, you can squash them.</p>
+
+</section>
+</main>
+</body>
+</html>

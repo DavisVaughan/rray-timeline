@@ -1,0 +1,1328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renaming arg_as_integer() to arg_as_bare_integer()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-77">rray timeline</a>
+<h1>Renaming <code>arg_as_integer()</code> to <code>arg_as_bare_integer()</code></h1>
+<p class="facts">Claude · Sep 18, 2026 · 1 prompt · 8 replies · <a href="https://github.com/r-lib/rray/pull/77">#77</a></p>
+</header>
+<main>
+<p class="divider">Sep 18, 2026, 15:21 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Change arg_as_integer to arg_as_bare_integer and include the attribute check (will need an error call now)</p>
+<p>Remove attribute check from check_axes()</p>
+<p>Rename arg_as_non_negative_integer to arg as non negative bare integer</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll start by finding the relevant code.</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;arg_as_integer\|arg_as_non_negative_integer\|check_axes&quot; --include=*.R --include=*.…</summary>
+<pre>grep -rn &quot;arg_as_integer\|arg_as_non_negative_integer\|check_axes&quot; --include=*.R --include=*.c --include=*.h --include=*.Rd . | grep -v &quot;^./src/rlang/&quot;</pre><pre class="output">(eval):1: no matches found: --include=*.R</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;arg_as_integer\|arg_as_non_negative_integer\|check_axes&quot; --include=&quot;*.R&quot; --include=…</summary>
+<pre>grep -rn &quot;arg_as_integer\|arg_as_non_negative_integer\|check_axes&quot; --include=&quot;*.R&quot; --include=&quot;*.c&quot; --include=&quot;*.h&quot; . | grep -v &quot;src/rlang/&quot;</pre><pre class="output">src/utils.h:42:r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg);
+src/utils.h:46:r_obj* arg_as_non_negative_integer(
+src/axes.c:12:  axes = KEEP(arg_as_integer(axes, arg));
+src/axes.c:13:  check_axes(axes, dimensionality, arg, error_call);
+src/axes.c:18:void check_axes(
+src/axes.c:85:  axes = KEEP(arg_as_integer(axes, arg));
+src/axes.c:156:  axes = KEEP(arg_as_integer(axes, arg));
+src/dimensions.c:365:  dimensions = KEEP(arg_as_non_negative_integer(dimensions, arg, error_call));
+src/insert-axes.c:27:  axes = KEEP(arg_as_integer(axes, rray_args.axes));
+src/insert-axes.c:34:  check_axes(axes, out_dimensionality, rray_args.axes, error_call);
+src/split.c:42:    arg_as_non_negative_integer(dimensions, rray_args.dimensions, error_call)
+src/utils.c:75:r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {
+src/utils.c:84:  x = KEEP(arg_as_integer(x, arg));
+src/utils.c:109:r_obj* arg_as_non_negative_integer(
+src/utils.c:114:  x = KEEP(arg_as_integer(x, arg));
+src/axes.h:29:void check_axes(</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -n '1,140p' src/utils.c &amp;&amp; echo ===== &amp;&amp; sed -n '30,60p' src/utils.h</summary>
+<pre>sed -n '1,140p' src/utils.c &amp;&amp; echo ===== &amp;&amp; sed -n '30,60p' src/utils.h</pre><pre class="output">Exit code 1
+#include &quot;utils.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;syms.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/utils-decl.h&quot;
+
+// Normalize a vector into an array
+//
+// - Turns length into `dim`
+// - Turns `names` into `dimnames`
+// - Clears `names`
+//
+// Since we are only modifying attributes,
+// we use a lightweight wrapper
+r_obj* vec_as_array(r_obj* x) {
+  if (r_dim(x) != r_null) {
+    return x;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+
+  const r_ssize size = r_length(x);
+  r_obj* dimensions = r_int(r_ssize_as_integer(size));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* axis_names = r_names(x);
+  if (axis_names != r_null) {
+    KEEP(axis_names);
+    r_obj* names = KEEP(r_alloc_list(1));
+    r_list_poke(names, 0, axis_names);
+    r_attrib_poke_dim_names(out, names);
+    r_attrib_zap(out, r_syms.names);
+    FREE(2);
+  }
+
+  FREE(1);
+  return out;
+}
+
+void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  if (r_is_object(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be a bare array, not %s.&quot;,
+      rray_arg_format_input(arg),
+      r_obj_type_friendly(x)
+    );
+  }
+}
+
+r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  if (rray_typeof(x) == RRAY_TYPE_scalar) {
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  return vec_as_array(x);
+}
+
+r_no_return void stop_scalar_input(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;%s must be an array, not %s.&quot;,
+    rray_arg_format_input(arg),
+    r_obj_type_friendly(x)
+  );
+}
+
+r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {
+  if (r_typeof(x) == R_TYPE_integer) {
+    return x;
+  }
+
+  return vec_cast(x, r_globals.empty_int, arg, NULL);
+}
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  x = KEEP(arg_as_integer(x, arg));
+
+  if (r_attrib_has_any(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  if (r_length(x) != 1) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be a single integer, not length %&quot; R_PRIdXLEN_T &quot;.&quot;,
+      rray_arg_format(arg),
+      r_length(x)
+    );
+  }
+
+  const int out = r_int_get(x, 0);
+
+  FREE(1);
+  return out;
+}
+
+r_obj* arg_as_non_negative_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  x = KEEP(arg_as_integer(x, arg));
+
+  if (r_attrib_has_any(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  const r_ssize size = r_length(x);
+  const int* v_x = r_int_cbegin(x);
+
+  for (r_ssize i = 0; i &lt; size; ++i) {
+    const int elt = v_x[i];
+
+    if (elt == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (elt &lt; 0) {
+      r_abort_lazy_call(
+        error_call,
+(eval):1: ==== not found</pre></details>
+<details class="tool"><summary>Bash: sed -n '140,200p' src/utils.c; echo &quot;=====&quot;; sed -n '1,70p' src/utils.h; echo &quot;=====&quot;; cat sr…</summary>
+<pre>sed -n '140,200p' src/utils.c; echo &quot;=====&quot;; sed -n '1,70p' src/utils.h; echo &quot;=====&quot;; cat src/decl/utils-decl.h</pre><pre class="output">        error_call,
+        &quot;%s must not contain negative values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+  }
+
+  FREE(1);
+  return x;
+}
+
+bool r_has_name_at(r_obj* names, r_ssize i) {
+  if (r_typeof(names) != R_TYPE_character) {
+    return false;
+  }
+
+  const r_ssize n = r_length(names);
+
+  if (i &gt;= n) {
+    r_stop_internal(
+      &quot;`i` of %&quot; R_PRI_SSIZE &quot; can't be past the end of %&quot; R_PRI_SSIZE &quot;.&quot;,
+      i,
+      n
+    );
+  }
+
+  return r_str_is_name(r_chr_get(names, i));
+}
+
+int int_add_checked(int x, int y) {
+  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; INT_MIN - y)) {
+    r_abort(&quot;Can't add %d and %d, the result doesn't fit in an integer.&quot;, x, y);
+  }
+
+  return x + y;
+}
+
+r_obj* vec_cast(
+  r_obj* x,
+  r_obj* to,
+  struct rray_arg* x_arg,
+  struct rray_arg* to_arg
+) {
+  r_obj* x_arg_chr = KEEP(rray_arg(x_arg));
+  r_obj* to_arg_chr = KEEP(rray_arg(to_arg));
+
+  r_obj* mask = KEEP(r_alloc_environment(4, r_envs.global));
+
+  r_env_bind(mask, r_syms.x, x);
+  r_env_bind(mask, rray_syms.to, to);
+  r_env_bind(mask, rray_syms.x_arg, x_arg_chr);
+  r_env_bind(mask, rray_syms.to_arg, to_arg_chr);
+
+  r_obj* out = r_eval(vec_cast_call, mask);
+
+  FREE(3);
+  return out;
+}
+
+r_obj* vec_cast_call = NULL;
+
+=====
+#ifndef RRAY_UTILS_H
+#define RRAY_UTILS_H
+
+#include &lt;complex.h&gt;
+#include &lt;string.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;type.h&quot;
+
+// Operations such as `*`, `/`, and `^` are either more efficient or more
+// correct (around infinities) if they go through the C99 `_Complex`. The C99
+// standard guarantees that `_Complex` has the same representation as a two
+// element array of its real type, so we can `memcpy()` it over. Analysis of
+// the assembly shows that this copy disappears entirely, so it's not a
+// performance hit.
+static inline double _Complex rray_cpl_to_c99(r_complex x) {
+  double _Complex out;
+  memcpy(&amp;out, &amp;x, sizeof(out));
+  return out;
+}
+
+static inline r_complex rray_c99_to_cpl(double _Complex x) {
+  r_complex out;
+  memcpy(&amp;out, &amp;x, sizeof(out));
+  return out;
+}
+
+void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_no_return void stop_scalar_input(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* vec_as_array(r_obj* x);
+
+r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg);
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* arg_as_non_negative_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+bool r_has_name_at(r_obj* names, r_ssize i);
+
+int int_add_checked(int x, int y);
+
+r_obj* vec_cast(
+  r_obj* x,
+  r_obj* to,
+  struct rray_arg* x_arg,
+  struct rray_arg* to_arg
+);
+
+#endif
+=====
+extern r_obj* vec_cast_call;</pre></details>
+<p>Now let me look at <code>axes.c</code> and the other call sites.</p>
+
+<details class="tool"><summary>Bash: sed -n '1,180p' src/axes.c</summary>
+<pre>sed -n '1,180p' src/axes.c</pre><pre class="output">#include &quot;axes.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* arg_as_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  axes = KEEP(arg_as_integer(axes, arg));
+  check_axes(axes, dimensionality, arg, error_call);
+  FREE(1);
+  return axes;
+}
+
+void check_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  if (r_attrib_has_any(axes)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  const r_ssize axes_size = r_length(axes);
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (i &gt; 0 &amp;&amp; axis &lt;= v_axes[i - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must be in strictly increasing order.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+  }
+}
+
+r_obj* arg_as_axes_unsorted(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_max_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_integer(axes, arg));
+
+  if (r_attrib_has_any(axes)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  const r_ssize axes_size = r_length(axes);
+
+  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (v_seen[axis - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain %d more than once.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    v_seen[axis - 1] = true;
+  }
+
+  FREE(1);
+  return axes;
+}
+
+r_obj* arg_as_axes_permutation(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_max_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_integer(axes, arg));
+
+  if (r_attrib_has_any(axes)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  const r_ssize axes_size = r_length(axes);
+
+  if (axes_size != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have length %d to match the dimensionality of the array, &quot;
+      &quot;not length %&quot; R_PRIdXLEN_T &quot;.&quot;,
+      rray_arg_format(arg),
+      dimensionality,
+      axes_size
+    );
+  }
+
+  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};</pre></details>
+<details class="tool"><summary>Bash: sed -n '180,240p' src/axes.c; echo &quot;=====insert-axes&quot;; sed -n '1,45p' src/insert-axes.c; echo…</summary>
+<pre>sed -n '180,240p' src/axes.c; echo &quot;=====insert-axes&quot;; sed -n '1,45p' src/insert-axes.c; echo &quot;=====dimensions&quot;; sed -n '350,380p' src/dimensions.c; echo &quot;=====split&quot;; sed -n '25,55p' src/split.c</pre><pre class="output">  const int* v_axes = r_int_cbegin(axes);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (v_seen[axis - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain axis %d more than once.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    v_seen[axis - 1] = true;
+  }
+
+  FREE(1);
+  return axes;
+}
+
+void check_axis(
+  int axis,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  if (axis == r_globals.na_int) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must not be missing.&quot;,
+      rray_arg_format(arg)
+=====insert-axes
+#include &quot;insert-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_insert_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_insert_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_insert_axes(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_integer(axes, rray_args.axes));
+  const r_ssize axes_size = r_length(axes);
+
+  const int out_dimensionality =
+    int_add_checked(dimensionality, (int) axes_size);
+  check_max_dimensionality(out_dimensionality);
+
+  check_axes(axes, out_dimensionality, rray_args.axes, error_call);
+  const int* v_axes = r_int_cbegin(axes);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(out_dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+
+  r_obj* x_names = r_dim_names(x);
+  r_obj* const* v_x_names = x_names == r_null ? NULL : r_list_cbegin(x_names);
+
+  r_obj* out_names = r_null;
+  r_keep_loc out_names_loc;
+  KEEP_HERE(out_names, &amp;out_names_loc);
+=====dimensions
+    &quot;Can't find common dimensions at axis %d. &quot;
+    &quot;%s has dimension %d and %s has dimension %d.&quot;,
+    axis,
+    rray_arg_format(x_arg),
+    x,
+    rray_arg_format(y_arg),
+    y
+  );
+}
+
+r_obj* arg_as_dimensions(
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  dimensions = KEEP(arg_as_non_negative_integer(dimensions, arg, error_call));
+
+  if (rray_dimensionality_from_dimensions(dimensions) == 0) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have at least one element.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  FREE(1);
+  return dimensions;
+}
+=====split
+  int axis,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_max_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_x_dimensions[axis - 1];
+
+  dimensions = KEEP(
+    arg_as_non_negative_integer(dimensions, rray_args.dimensions, error_call)
+  );
+  check_split_dimensions(
+    dimensions,
+    axis_dimension,
+    rray_args.dimensions,
+    error_call
+  );
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  const bool uniform = r_length(dimensions) == 1;
+
+  const r_ssize out_size =
+    uniform ? axis_dimension / v_dimensions[0] : r_length(dimensions);</pre></details>
+<p>Now making the edits:</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'PY'</summary>
+<pre>python3 - &lt;&lt;'PY'
+import re, pathlib
+
+p = pathlib.Path(&quot;src/utils.c&quot;)
+s = p.read_text()
+
+old = '''r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {
+  if (r_typeof(x) == R_TYPE_integer) {
+    return x;
+  }
+
+  return vec_cast(x, r_globals.empty_int, arg, NULL);
+}
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  x = KEEP(arg_as_integer(x, arg));
+
+  if (r_attrib_has_any(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  if (r_length(x) != 1) {'''
+
+new = '''r_obj* arg_as_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  if (r_typeof(x) != R_TYPE_integer) {
+    x = vec_cast(x, r_globals.empty_int, arg, NULL);
+  }
+  KEEP(x);
+
+  if (r_attrib_has_any(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  FREE(1);
+  return x;
+}
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+
+  if (r_length(x) != 1) {'''
+
+assert old in s
+s = s.replace(old, new)
+
+old2 = '''r_obj* arg_as_non_negative_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  x = KEEP(arg_as_integer(x, arg));
+
+  if (r_attrib_has_any(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  const r_ssize size = r_length(x);'''
+
+new2 = '''r_obj* arg_as_non_negative_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+
+  const r_ssize size = r_length(x);'''
+
+assert old2 in s
+s = s.replace(old2, new2)
+p.write_text(s)
+print(&quot;utils.c ok&quot;)
+PY</pre><pre class="output">Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/utils.c</summary>
+<pre class="output">70	    rray_arg_format_input(arg),
+71	    r_obj_type_friendly(x)
+72	  );
+73	}
+74	
+75	r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {
+76	  if (r_typeof(x) == R_TYPE_integer) {
+77	    return x;
+78	  }
+79	
+80	  return vec_cast(x, r_globals.empty_int, arg, NULL);
+81	}
+82	
+83	int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+84	  x = KEEP(arg_as_integer(x, arg));
+85	
+86	  if (r_attrib_has_any(x)) {
+87	    r_abort_lazy_call(
+88	      error_call,
+89	      &quot;%s can't have attributes.&quot;,
+90	      rray_arg_format(arg)
+91	    );
+92	  }
+93	
+94	  if (r_length(x) != 1) {
+95	    r_abort_lazy_call(
+96	      error_call,
+97	      &quot;%s must be a single integer, not length %&quot; R_PRIdXLEN_T &quot;.&quot;,
+98	      rray_arg_format(arg),
+99	      r_length(x)
+100	    );
+101	  }
+102	
+103	  const int out = r_int_get(x, 0);
+104	
+105	  FREE(1);
+106	  return out;
+107	}
+108	
+109	r_obj* arg_as_non_negative_integer(
+110	  r_obj* x,
+111	  struct rray_arg* arg,
+112	  struct r_lazy error_call
+113	) {
+114	  x = KEEP(arg_as_integer(x, arg));
+115	
+116	  if (r_attrib_has_any(x)) {
+117	    r_abort_lazy_call(
+118	      error_call,
+119	      &quot;%s can't have attributes.&quot;,
+120	      rray_arg_format(arg)
+121	    );
+122	  }
+123	
+124	  const r_ssize size = r_length(x);
+125	  const int* v_x = r_int_cbegin(x);
+126	
+127	  for (r_ssize i = 0; i &lt; size; ++i) {
+128	    const int elt = v_x[i];
+129	
+130	    if (elt == r_globals.na_int) {
+131	      r_abort_lazy_call(
+132	        error_call,
+133	        &quot;%s must not contain missing values.&quot;,
+134	        rray_arg_format(arg)
+135	      );
+136	    }
+137	
+138	    if (elt &lt; 0) {
+139	      r_abort_lazy_call(
+140	        error_call,
+141	        &quot;%s must not contain negative values.&quot;,
+142	        rray_arg_format(arg)
+143	      );
+144	    }
+145	  }
+146	
+147	  FREE(1);
+148	  return x;
+149	}</pre></details>
+<details class="tool"><summary>Edit src/utils.c</summary>
+<pre class="diff"><span class="del">-r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {</span>
+<span class="del">-  if (r_typeof(x) == R_TYPE_integer) {</span>
+<span class="del">-    return x;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return vec_cast(x, r_globals.empty_int, arg, NULL);</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {</span>
+<span class="del">-  x = KEEP(arg_as_integer(x, arg));</span>
+<span class="del">-</span>
+<span class="del">-  if (r_attrib_has_any(x)) {</span>
+<span class="del">-    r_abort_lazy_call(</span>
+<span class="del">-      error_call,</span>
+<span class="del">-      &quot;%s can't have attributes.&quot;,</span>
+<span class="del">-      rray_arg_format(arg)</span>
+<span class="del">-    );</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  if (r_length(x) != 1) {</span>
+<span class="ins">+r_obj* arg_as_bare_integer(</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  if (r_typeof(x) != R_TYPE_integer) {</span>
+<span class="ins">+    x = vec_cast(x, r_globals.empty_int, arg, NULL);</span>
+<span class="ins">+  }</span>
+<span class="ins">+  KEEP(x);</span>
+<span class="ins">+</span>
+<span class="ins">+  if (r_attrib_has_any(x)) {</span>
+<span class="ins">+    r_abort_lazy_call(</span>
+<span class="ins">+      error_call,</span>
+<span class="ins">+      &quot;%s can't have attributes.&quot;,</span>
+<span class="ins">+      rray_arg_format(arg)</span>
+<span class="ins">+    );</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(1);</span>
+<span class="ins">+  return x;</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {</span>
+<span class="ins">+  x = KEEP(arg_as_bare_integer(x, arg, error_call));</span>
+<span class="ins">+</span>
+<span class="ins">+  if (r_length(x) != 1) {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/utils.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/utils.c</summary>
+<pre class="diff"><span class="del">-r_obj* arg_as_non_negative_integer(</span>
+<span class="del">-  r_obj* x,</span>
+<span class="del">-  struct rray_arg* arg,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-) {</span>
+<span class="del">-  x = KEEP(arg_as_integer(x, arg));</span>
+<span class="del">-</span>
+<span class="del">-  if (r_attrib_has_any(x)) {</span>
+<span class="del">-    r_abort_lazy_call(</span>
+<span class="del">-      error_call,</span>
+<span class="del">-      &quot;%s can't have attributes.&quot;,</span>
+<span class="del">-      rray_arg_format(arg)</span>
+<span class="del">-    );</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize size = r_length(x);</span>
+<span class="ins">+r_obj* arg_as_non_negative_bare_integer(</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  x = KEEP(arg_as_bare_integer(x, arg, error_call));</span>
+<span class="ins">+</span>
+<span class="ins">+  const r_ssize size = r_length(x);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/utils.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now the header:</p>
+
+<details class="tool"><summary>Read src/utils.h</summary>
+<pre class="output">40	r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+41	
+42	r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg);
+43	
+44	int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+45	
+46	r_obj* arg_as_non_negative_integer(
+47	  r_obj* x,
+48	  struct rray_arg* arg,
+49	  struct r_lazy error_call
+50	);
+51	</pre></details>
+<details class="tool"><summary>Edit src/utils.h</summary>
+<pre class="diff"><span class="del">-r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg);</span>
+<span class="del">-</span>
+<span class="del">-int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);</span>
+<span class="del">-</span>
+<span class="del">-r_obj* arg_as_non_negative_integer(</span>
+<span class="del">-  r_obj* x,</span>
+<span class="del">-  struct rray_arg* arg,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-);</span>
+<span class="ins">+r_obj* arg_as_bare_integer(</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span>
+<span class="ins">+</span>
+<span class="ins">+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* arg_as_non_negative_bare_integer(</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/utils.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now <code>axes.c</code>: update the three call sites and drop the now-redundant attribute checks.</p>
+
+<details class="tool"><summary>Read src/axes.c</summary>
+<pre class="output">1	#include &quot;axes.h&quot;
+2	
+3	#include &quot;dimensionality.h&quot;
+4	#include &quot;utils.h&quot;
+5	
+6	r_obj* arg_as_axes(
+7	  r_obj* axes,
+8	  int dimensionality,
+9	  struct rray_arg* arg,
+10	  struct r_lazy error_call
+11	) {
+12	  axes = KEEP(arg_as_integer(axes, arg));
+13	  check_axes(axes, dimensionality, arg, error_call);
+14	  FREE(1);
+15	  return axes;
+16	}
+17	
+18	void check_axes(
+19	  r_obj* axes,
+20	  int dimensionality,
+21	  struct rray_arg* arg,
+22	  struct r_lazy error_call
+23	) {
+24	  if (r_attrib_has_any(axes)) {
+25	    r_abort_lazy_call(
+26	      error_call,
+27	      &quot;%s can't have attributes.&quot;,
+28	      rray_arg_format(arg)
+29	    );
+30	  }
+31	
+32	  const r_ssize axes_size = r_length(axes);
+33	
+34	  const int* v_axes = r_int_cbegin(axes);
+35	</pre></details>
+<details class="tool"><summary>Edit src/axes.c</summary>
+<pre class="diff"><span class="del">-  axes = KEEP(arg_as_integer(axes, arg));</span>
+<span class="del">-  check_axes(axes, dimensionality, arg, error_call);</span>
+<span class="del">-  FREE(1);</span>
+<span class="del">-  return axes;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-void check_axes(</span>
+<span class="del">-  r_obj* axes,</span>
+<span class="del">-  int dimensionality,</span>
+<span class="del">-  struct rray_arg* arg,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-) {</span>
+<span class="del">-  if (r_attrib_has_any(axes)) {</span>
+<span class="del">-    r_abort_lazy_call(</span>
+<span class="del">-      error_call,</span>
+<span class="del">-      &quot;%s can't have attributes.&quot;,</span>
+<span class="del">-      rray_arg_format(arg)</span>
+<span class="del">-    );</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize axes_size = r_length(axes);</span>
+<span class="ins">+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));</span>
+<span class="ins">+  check_axes(axes, dimensionality, arg, error_call);</span>
+<span class="ins">+  FREE(1);</span>
+<span class="ins">+  return axes;</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+void check_axes(</span>
+<span class="ins">+  r_obj* axes,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  const r_ssize axes_size = r_length(axes);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/axes.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Read src/axes.c</summary>
+<pre class="output">64	      );
+65	    }
+66	  }
+67	}
+68	
+69	r_obj* arg_as_axes_unsorted(
+70	  r_obj* axes,
+71	  int dimensionality,
+72	  struct rray_arg* arg,
+73	  struct r_lazy error_call
+74	) {
+75	  check_max_dimensionality(dimensionality);
+76	
+77	  axes = KEEP(arg_as_integer(axes, arg));
+78	
+79	  if (r_attrib_has_any(axes)) {
+80	    r_abort_lazy_call(
+81	      error_call,
+82	      &quot;%s can't have attributes.&quot;,
+83	      rray_arg_format(arg)
+84	    );
+85	  }
+86	
+87	  const r_ssize axes_size = r_length(axes);
+88	</pre></details>
+<details class="tool"><summary>Edit src/axes.c</summary>
+<pre class="diff"><span class="del">-  axes = KEEP(arg_as_integer(axes, arg));</span>
+<span class="del">-</span>
+<span class="del">-  if (r_attrib_has_any(axes)) {</span>
+<span class="del">-    r_abort_lazy_call(</span>
+<span class="del">-      error_call,</span>
+<span class="del">-      &quot;%s can't have attributes.&quot;,</span>
+<span class="del">-      rray_arg_format(arg)</span>
+<span class="del">-    );</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize axes_size = r_length(axes);</span>
+<span class="ins">+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));</span>
+<span class="ins">+</span>
+<span class="ins">+  const r_ssize axes_size = r_length(axes);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/axes.c has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now <code>insert-axes.c</code>, <code>dimensions.c</code>, and <code>split.c</code>:</p>
+
+<details class="tool"><summary>Edit src/insert-axes.c</summary>
+<pre class="diff"><span class="del">-  axes = KEEP(arg_as_integer(axes, rray_args.axes));</span>
+<span class="ins">+  axes = KEEP(arg_as_bare_integer(axes, rray_args.axes, error_call));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/insert-axes.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-  dimensions = KEEP(arg_as_non_negative_integer(dimensions, arg, error_call));</span>
+<span class="ins">+  dimensions =</span>
+<span class="ins">+    KEEP(arg_as_non_negative_bare_integer(dimensions, arg, error_call));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    arg_as_non_negative_integer(dimensions, rray_args.dimensions, error_call)</span>
+<span class="ins">+    arg_as_non_negative_bare_integer(</span>
+<span class="ins">+      dimensions,</span>
+<span class="ins">+      rray_args.dimensions,</span>
+<span class="ins">+      error_call</span>
+<span class="ins">+    )</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output"> src/axes.c        | 30 +++---------------------------
+ src/dimensions.c  |  3 ++-
+ src/insert-axes.c |  2 +-
+ src/split.c       |  8 +++++---
+ src/utils.c       | 36 +++++++++++++++++-------------------
+ src/utils.h       |  8 ++++++--
+ 6 files changed, 34 insertions(+), 53 deletions(-)</pre></details>
+<p>Now build and test.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; 2&gt;&amp;1 | tail -20</summary>
+<pre>Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; 2&gt;&amp;1 | tail -20</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -40</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -40</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1878 ]</pre></details>
+<details class="tool"><summary>Bash: git diff</summary>
+<pre>git diff</pre><pre class="output">diff --git a/src/axes.c b/src/axes.c
+index 7a45e98..eaff10a 100644
+--- a/src/axes.c
++++ b/src/axes.c
+@@ -9,7 +9,7 @@ r_obj* arg_as_axes(
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+-  axes = KEEP(arg_as_integer(axes, arg));
++  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+   check_axes(axes, dimensionality, arg, error_call);
+   FREE(1);
+   return axes;
+@@ -21,14 +21,6 @@ void check_axes(
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+-  if (r_attrib_has_any(axes)) {
+-    r_abort_lazy_call(
+-      error_call,
+-      &quot;%s can't have attributes.&quot;,
+-      rray_arg_format(arg)
+-    );
+-  }
+-
+   const r_ssize axes_size = r_length(axes);
+ 
+   const int* v_axes = r_int_cbegin(axes);
+@@ -82,15 +74,7 @@ r_obj* arg_as_axes_unsorted(
+ ) {
+   check_max_dimensionality(dimensionality);
+ 
+-  axes = KEEP(arg_as_integer(axes, arg));
+-
+-  if (r_attrib_has_any(axes)) {
+-    r_abort_lazy_call(
+-      error_call,
+-      &quot;%s can't have attributes.&quot;,
+-      rray_arg_format(arg)
+-    );
+-  }
++  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+ 
+   const r_ssize axes_size = r_length(axes);
+ 
+@@ -153,15 +137,7 @@ r_obj* arg_as_axes_permutation(
+ ) {
+   check_max_dimensionality(dimensionality);
+ 
+-  axes = KEEP(arg_as_integer(axes, arg));
+-
+-  if (r_attrib_has_any(axes)) {
+-    r_abort_lazy_call(
+-      error_call,
+-      &quot;%s can't have attributes.&quot;,
+-      rray_arg_format(arg)
+-    );
+-  }
++  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+ 
+   const r_ssize axes_size = r_length(axes);
+ 
+diff --git a/src/dimensions.c b/src/dimensions.c
+index 7ad94d7..d144201 100644
+--- a/src/dimensions.c
++++ b/src/dimensions.c
+@@ -362,7 +362,8 @@ r_obj* arg_as_dimensions(
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+-  dimensions = KEEP(arg_as_non_negative_integer(dimensions, arg, error_call));
++  dimensions =
++    KEEP(arg_as_non_negative_bare_integer(dimensions, arg, error_call));
+ 
+   if (rray_dimensionality_from_dimensions(dimensions) == 0) {
+     r_abort_lazy_call(
+diff --git a/src/insert-axes.c b/src/insert-axes.c
+index c8608cf..011686e 100644
+--- a/src/insert-axes.c
++++ b/src/insert-axes.c
+@@ -24,7 +24,7 @@ r_obj* rray_insert_axes(
+   const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+   const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+ 
+-  axes = KEEP(arg_as_integer(axes, rray_args.axes));
++  axes = KEEP(arg_as_bare_integer(axes, rray_args.axes, error_call));
+   const r_ssize axes_size = r_length(axes);
+ 
+   const int out_dimensionality =
+diff --git a/src/split.c b/src/split.c
+index 038c63d..b1e94e4 100644
+--- a/src/split.c
++++ b/src/split.c
+@@ -38,9 +38,11 @@ r_obj* rray_split(
+   check_axis(axis, dimensionality, rray_args.axis, error_call);
+   const int axis_dimension = v_x_dimensions[axis - 1];
+ 
+-  dimensions = KEEP(
+-    arg_as_non_negative_integer(dimensions, rray_args.dimensions, error_call)
+-  );
++  dimensions = KEEP(arg_as_non_negative_bare_integer(
++    dimensions,
++    rray_args.dimensions,
++    error_call
++  ));
+   check_split_dimensions(
+     dimensions,
+     axis_dimension,
+diff --git a/src/utils.c b/src/utils.c
+index c14c872..c62a280 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -72,16 +72,15 @@ r_no_return void stop_scalar_input(
+   );
+ }
+ 
+-r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {
+-  if (r_typeof(x) == R_TYPE_integer) {
+-    return x;
++r_obj* arg_as_bare_integer(
++  r_obj* x,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++) {
++  if (r_typeof(x) != R_TYPE_integer) {
++    x = vec_cast(x, r_globals.empty_int, arg, NULL);
+   }
+-
+-  return vec_cast(x, r_globals.empty_int, arg, NULL);
+-}
+-
+-int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+-  x = KEEP(arg_as_integer(x, arg));
++  KEEP(x);
+ 
+   if (r_attrib_has_any(x)) {
+     r_abort_lazy_call(
+@@ -91,6 +90,13 @@ int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+     );
+   }
+ 
++  FREE(1);
++  return x;
++}
++
++int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
++  x = KEEP(arg_as_bare_integer(x, arg, error_call));
++
+   if (r_length(x) != 1) {
+     r_abort_lazy_call(
+       error_call,
+@@ -106,20 +112,12 @@ int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+   return out;
+ }
+ 
+-r_obj* arg_as_non_negative_integer(
++r_obj* arg_as_non_negative_bare_integer(
+   r_obj* x,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+-  x = KEEP(arg_as_integer(x, arg));
+-
+-  if (r_attrib_has_any(x)) {
+-    r_abort_lazy_call(
+-      error_call,
+-      &quot;%s can't have attributes.&quot;,
+-      rray_arg_format(arg)
+-    );
+-  }
++  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+ 
+   const r_ssize size = r_length(x);
+   const int* v_x = r_int_cbegin(x);
+diff --git a/src/utils.h b/src/utils.h
+index 97ce8a7..0328c9b 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -39,11 +39,15 @@ r_obj* vec_as_array(r_obj* x);
+ 
+ r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+ 
+-r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg);
++r_obj* arg_as_bare_integer(
++  r_obj* x,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++);
+ 
+ int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+ 
+-r_obj* arg_as_non_negative_integer(
++r_obj* arg_as_non_negative_bare_integer(
+   r_obj* x,
+   struct rray_arg* arg,
+   struct r_lazy error_call</pre></details>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</summary>
+<pre>git status --short &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</pre><pre class="output"> M src/axes.c
+ M src/dimensions.c
+ M src/insert-axes.c
+ M src/split.c
+ M src/utils.c
+ M src/utils.h
+?? bench/combine.R
+?? bench/split.R
+origin/feature/split</pre></details>
+<details class="tool"><summary>Bash: git add src &amp;&amp; git commit -m &quot;Move the attribute check into \`arg_as_bare_integer()\`&quot; &amp;&amp; git…</summary>
+<pre>git add src &amp;&amp; git commit -m &quot;Move the attribute check into \`arg_as_bare_integer()\`&quot; &amp;&amp; git push</pre><pre class="output">[feature/split a7c7e5f] Move the attribute check into `arg_as_bare_integer()`
+ 6 files changed, 34 insertions(+), 53 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   001643d..a7c7e5f  feature/split -&gt; feature/split</pre></details>
+<p>Done. Committed as <code>a7c7e5f</code> and pushed to <code>feature/split</code>. All 1878 tests pass, no snapshot churn.</p>
+<p>What changed:</p>
+<ul>
+<li>
+<p><code>arg_as_integer()</code> → <code>arg_as_bare_integer()</code>, now takes <code>error_call</code> and does the attribute check itself.</p>
+</li>
+<li>
+<p><code>arg_as_non_negative_integer()</code> → <code>arg_as_non_negative_bare_integer()</code>.</p>
+</li>
+<li>
+<p>Removed the attribute check from <code>check_axes()</code>.</p>
+</li>
+</ul>
+<p>One thing beyond your list: the same attribute check was also duplicated in <code>arg_as_axes_unsorted()</code>, <code>arg_as_axes_permutation()</code>, <code>arg_as_int()</code>, and <code>arg_as_non_negative_bare_integer()</code>. Those all call <code>arg_as_bare_integer()</code> first, so they were dead after the move and I dropped them too. Same message, same <code>error_call</code>, so no visible change.</p>
+<p>The only behaviour shift is ordering in <code>rray_insert_axes()</code>: the attribute check on <code>axes</code> now fires before <code>check_max_dimensionality()</code> instead of after. No test covered that pair.</p>
+
+</section>
+</main>
+</body>
+</html>

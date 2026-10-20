@@ -1,0 +1,861 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renaming v_index_strides to v_indices_strides in rray_index()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-85">rray timeline</a>
+<h1>Renaming <code>v_index_strides</code> to <code>v_indices_strides</code> in <code>rray_index()</code></h1>
+<p class="facts">Codex · Sep 23, 2026 · 4 prompts · 10 replies · <a href="https://github.com/r-lib/rray/pull/85">#85</a></p>
+</header>
+<main>
+<p class="divider">Sep 23, 2026, 14:37 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Let’s call v_index_strides as v_indices_strides and lift out local v_index_strides variables where we can after indexing it once</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll trace every <code>v_index_strides</code> use, rename it to <code>v_indices_strides</code>, and lift repeated indexed values into local constants where that makes the code clearer. Then I’ll format and run the focused tests.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;v_index_strides|index_strides&quot; .</summary>
+<pre>$ rg -n &quot;v_index_strides|index_strides&quot; .</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+./src/index.c:15:  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+./src/index.c:247:      plan.v_index_strides[axis][i] = v_strides[axis];
+./src/index.c:285:        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
+./src/index.c:294:        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
+./plans/index-optimize.md:295:        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
+./plans/index-optimize.md:304:        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
+./plans/index-optimize.md:311:`plan-&gt;v_index_strides[0][k]`. Emit the run body twice, once with that stride
+./plans/index-optimize.md:317:#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_index_strides[0][K]
+./plans/index-optimize.md:350:    if (plan.v_index_strides[0][i] != 1) {
+./plans/index-optimize.md:447:    plan.v_index_strides,
+./plans/index-optimize.md:455:`v_index_strides[axis][i]` is indexed point axis first, so each axis is a</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,340p' src/index.c &amp;&amp; git status --short</summary>
+<pre>$ sed -n '1,340p' src/index.c &amp;&amp; git status --short</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;index.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+struct rray_index_plan {
+  r_ssize size;
+  int x_dimensionality;
+  int dimensionality;
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+  const int* v_indices[RRAY_MAX_DIMENSIONALITY];
+};
+
+#include &quot;decl/index-decl.h&quot;
+
+r_obj* ffi_rray_index(r_obj* ffi_x, r_obj* ffi_indices, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_index(
+    ffi_x,
+    ffi_indices,
+    rray_args.x,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_index(
+  r_obj* x,
+  r_obj* indices,
+  struct rray_arg* x_arg,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+
+  r_obj* x_dimensions = KEEP(r_dim(x));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(x_dimensionality);
+
+  indices = KEEP(rray_as_index_arrays(
+    indices,
+    v_x_dimensions,
+    x_dimensionality,
+    indices_arg,
+    error_call
+  ));
+
+  r_obj* dimensions =
+    KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+
+  const struct rray_index_plan plan =
+    rray_index_plan(x_dimensions, indices, dimensions, error_call);
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_index_lgl(x, &amp;plan);
+    break;
+  case R_TYPE_integer:
+    out = rray_index_int(x, &amp;plan);
+    break;
+  case R_TYPE_double:
+    out = rray_index_dbl(x, &amp;plan);
+    break;
+  case R_TYPE_complex:
+    out = rray_index_cpl(x, &amp;plan);
+    break;
+  case R_TYPE_raw:
+    out = rray_index_raw(x, &amp;plan);
+    break;
+  case R_TYPE_character:
+    out = rray_index_chr(x, &amp;plan);
+    break;
+  case R_TYPE_list:
+    out = rray_index_list(x, &amp;plan);
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP(out);
+  r_attrib_poke_dim(out, dimensions);
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_as_index_arrays(
+  r_obj* indices,
+  const int* v_dimensions,
+  int dimensionality,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  r_obj* const* v_indices = r_list_cbegin(indices);
+  const r_ssize indices_size = r_length(indices);
+
+  if (indices_size != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Must supply exactly %d coordinate array%s to `...`, not %&quot; R_PRI_SSIZE
+      &quot;.&quot;,
+      dimensionality,
+      dimensionality == 1 ? &quot;&quot; : &quot;s&quot;,
+      indices_size
+    );
+  }
+
+  if (r_names(indices) != r_null) {
+    r_abort_lazy_call(error_call, &quot;All elements of `...` must be unnamed.&quot;);
+  }
+
+  r_obj* out = KEEP(r_alloc_list(indices_size));
+
+  r_ssize i = 0;
+  struct rray_arg* index_arg =
+    new_subscript_arg(indices_arg, r_null, indices_size, &amp;i);
+  KEEP(index_arg-&gt;shelter);
+
+  for (; i &lt; indices_size; ++i) {
+    r_obj* index =
+      rray_as_index_array(v_indices[i], v_dimensions[i], index_arg, error_call);
+    r_list_poke(out, i, index);
+  }
+
+  FREE(2);
+  return out;
+}
+
+r_obj* ffi_rray_as_index_array(
+  r_obj* ffi_x,
+  r_obj* ffi_dimension,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int dimension =
+    arg_as_int(ffi_dimension, rray_args.dimension, error_call);
+  return rray_as_index_array(ffi_x, dimension, rray_args.x, error_call);
+}
+
+r_obj* rray_as_index_array(
+  r_obj* x,
+  int dimension,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+
+  if (r_typeof(x) != R_TYPE_integer) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be an integer array, not %s.&quot;,
+      rray_arg_format_input(arg),
+      r_obj_type_friendly(x)
+    );
+  }
+
+  x = KEEP(vec_as_array(x));
+
+  const r_ssize size = r_length(x);
+  const int* v_x = r_int_cbegin(x);
+
+  for (r_ssize i = 0; i &lt; size; ++i) {
+    const int elt = v_x[i];
+
+    if (elt == r_globals.na_int) {
+      continue;
+    }
+    if (elt &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must only contain positive values or missing values.&quot;,
+        rray_arg_format_input(arg)
+      );
+    }
+    if (elt &gt; dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain values greater than %d.&quot;,
+        rray_arg_format_input(arg),
+        dimension
+      );
+    }
+  }
+
+  FREE(1);
+  return x;</pre><p class="cut">144 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '260,330p' plans/index-optimize.md; sed -n '430,465p' plans/index-optimize.md; rg -n &quot;…</summary>
+<pre>$ sed -n '260,330p' plans/index-optimize.md; sed -n '430,465p' plans/index-optimize.md; rg -n &quot;v_.*strides\[axis\]&quot; src --glob '*.[ch]'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+  case 4:                                                                      \
+    RRAY_INDEX_ATOMIC_LOOP(MISSING, 4);                                        \
+    break;                                                                     \
+  default:                                                                     \
+    RRAY_INDEX_ATOMIC_LOOP(MISSING, plan-&gt;x_dimensionality);                   \
+    break;                                                                     \
+  }                                                                            \
+```
+
+Stop at 4. Each case is a full copy of the loop body for all seven storage
+types across both macros, so the object file grows quickly, and the
+proof of concept shows the returns are already flat by 4.
+
+## Step 2: walk the first axis as a run
+
+This is the largest single win and the piece `src/index.c` was missing all
+along. The rest of the package already works this way. `src/strided-iterator.h`
+documents it under &quot;First axis runs&quot; and &quot;Fixed zero stride paths&quot;, and index
+was the one operation still carrying the point vector on every element.
+
+Pull the first axis out into an inner run, and only advance the later axes
+between runs. Add a sibling to `rray_index_plan_next()` that skips axis 0:
+
+```c
+static inline void rray_index_plan_next_run(
+  const struct rray_index_plan* plan,
+  int* v_point,
+  r_ssize* v_index_locations,
+  const int x_dimensionality
+) {
+  for (int axis = 1; axis &lt; plan-&gt;dimensionality; ++axis) {
+    ++v_point[axis];
+
+    if (v_point[axis] &lt; plan-&gt;v_dimensions[axis]) {
+      for (int i = 0; i &lt; x_dimensionality; ++i) {
+        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
+      }
+      break;
+    }
+
+    v_point[axis] = 0;
+
+    for (int i = 0; i &lt; x_dimensionality; ++i) {
+      v_index_locations[i] -=
+        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
+    }
+  }
+}
+```
+
+Inside a run, coordinate array `k` advances by the fixed stride
+`plan-&gt;v_index_strides[0][k]`. Emit the run body twice, once with that stride
+and once with a literal 1, exactly as the existing iterators pass a literal 0
+for fixed strides:
+
+```c
+#define RRAY_INDEX_STRIDE_ONE(K) 1
+#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_index_strides[0][K]
+
+#define RRAY_INDEX_ATOMIC_RUN(MISSING, X_DIMENSIONALITY, STRIDE)               \
+  for (r_ssize j = 0; j &lt; run_size; ++j) {                                     \
+    r_ssize location = 0;                                                      \
+                                                                               \
+    for (int k = 0; k &lt; X_DIMENSIONALITY; ++k) {                               \
+      const int index =                                                        \
+        plan-&gt;v_indices[k][v_index_locations[k] + j * STRIDE(k)];              \
+                                                                               \
+      if (index == r_globals.na_int) {                                         \
+        location = -1;                                                         \
+        break;                                                                 \
+      }                                                                        \
+      ++out_axis;
+      v_dimensions[out_axis] = right_dimension;
+      for (int i = 0; i &lt; count; ++i) {
+        v_strides[out_axis][i] = v_strides[axis][i];
+      }
+    }
+  }
+
+  return out_axis + 1;
+}
+```
+
+The call site is one statement at the end of `rray_index_plan()`:
+
+```c
+  plan.dimensionality = rray__strided_iterator_axes_coalescen(
+    plan.v_dimensions,
+    plan.v_index_strides,
+    dimensionality,
+    x_dimensionality
+  );
+```
+
+Three things happen to already be right, which is why this drops in cleanly.
+
+`v_index_strides[axis][i]` is indexed point axis first, so each axis is a
+contiguous row. Comparing two axes is a row scan and merging is a row copy. No
+layout change is needed.
+
+`plan.v_dimensions` is already `r_ssize` rather than `int`, so merged
+dimensions cannot overflow.
+
+`plan.dimensionality` is only ever read by `rray_index_plan_next()`. The result
+dimensions come from the separate `dimensions` object poked on at
+`src/index.c:91`, and the output is written contiguously at `i`. So the plan's
+dimensionality is already a pure iteration concept and shrinking it is
+src/permute-axes.c:52:    v_strides[i] = v_x_strides[axis];
+src/index.c:247:      plan.v_index_strides[axis][i] = v_strides[axis];
+src/index.c:269:    out += (r_ssize) (index - 1) * plan-&gt;v_x_strides[axis];
+src/index.c:285:        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
+src/index.c:294:        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
+src/strided-iterator.h:247:      START += PLAN-&gt;v_strides[axis];                                          \
+src/strided-iterator.h:251:    START -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides[axis];           \
+src/strided-iterator.h:402:    const r_ssize right_stride = v_strides[axis];</pre></details>
+<details class="tool"><summary>Bash: git diff -- src/index.c plans/index-optimize.md; git log -5 --oneline -- src/index.c</summary>
+<pre>$ git diff -- src/index.c plans/index-optimize.md; git log -5 --oneline -- src/index.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+d7247d7 Return -1 from `rray_index_plan_location()` for missing coordinates
+23401df Extract `rray_as_index_arrays()`
+4f4a851 Move `struct rray_index_plan` into `index.c`
+77e497b Iterate over the coordinate count in `rray_index_plan()`
+5cf0ff9 Inline the coordinate count check</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining v_indices_strides naming and usage</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining v_indices_strides naming and usage</strong></p>
+<p><strong>Analyzing loop order for stride pointer optimization</strong></p>
+</details>
+<p>The field is axis-first, so the useful local is one row of strides for the current axis. I’ll keep that local singular (<code>v_index_strides</code>) and rename the full matrix plural (<code>v_indices_strides</code>).</p>
+
+<details class="tool"><summary>Edit src/index.c (+1 more)</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/index.c</span>
+<span class="hunk">@@</span>
+<span class="del">-  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+  r_ssize v_indices_strides[RRAY_MAX_DIMENSIONALITY]</span>
+<span class="ins">+                            [RRAY_MAX_DIMENSIONALITY];</span>
+<span class="hunk">@@</span>
+<span class="del">-      plan.v_index_strides[axis][i] = v_strides[axis];</span>
+<span class="ins">+      plan.v_indices_strides[axis][i] = v_strides[axis];</span>
+<span class="hunk">@@</span>
+   r_ssize* v_index_locations
+ ) {
+   for (int axis = 0; axis &lt; plan-&gt;dimensionality; ++axis) {
+<span class="ins">+    const r_ssize* v_index_strides = plan-&gt;v_indices_strides[axis];</span>
+<span class="ins">+</span>
+     ++v_point[axis];
+ 
+     if (v_point[axis] &lt; plan-&gt;v_dimensions[axis]) {
+       for (int i = 0; i &lt; plan-&gt;x_dimensionality; ++i) {
+<span class="del">-        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];</span>
+<span class="ins">+        v_index_locations[i] += v_index_strides[i];</span>
+       }
+       break;
+<span class="hunk">@@</span>
+     for (int i = 0; i &lt; plan-&gt;x_dimensionality; ++i) {
+       v_index_locations[i] -=
+<span class="del">-        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];</span>
+<span class="ins">+        (plan-&gt;v_dimensions[axis] - 1) * v_index_strides[i];</span>
+     }
+   }
+ }
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index-optimize.md</span>
+<span class="hunk">@@</span>
+<span class="del">-        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];</span>
+<span class="ins">+        v_index_locations[i] += plan-&gt;v_indices_strides[axis][i];</span>
+<span class="hunk">@@</span>
+<span class="del">-        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];</span>
+<span class="ins">+        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_indices_strides[axis][i];</span>
+<span class="hunk">@@</span>
+<span class="del">-`plan-&gt;v_index_strides[0][k]`. Emit the run body twice, once with that stride</span>
+<span class="ins">+`plan-&gt;v_indices_strides[0][k]`. Emit the run body twice, once with that stride</span>
+<span class="hunk">@@</span>
+<span class="del">-#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_index_strides[0][K]</span>
+<span class="ins">+#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_indices_strides[0][K]</span>
+<span class="hunk">@@</span>
+<span class="del">-    if (plan.v_index_strides[0][i] != 1) {</span>
+<span class="ins">+    if (plan.v_indices_strides[0][i] != 1) {</span>
+<span class="hunk">@@</span>
+<span class="del">-    plan.v_index_strides,</span>
+<span class="ins">+    plan.v_indices_strides,</span>
+<span class="hunk">@@</span>
+<span class="del">-`v_index_strides[axis][i]` is indexed point axis first, so each axis is a</span>
+<span class="ins">+`v_indices_strides[axis][i]` is indexed point axis first, so each axis is a</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h</summary>
+<pre>$ clang-format -i src/*.c src/*.h</pre><pre class="output">Script completed
+Wall time 0.4 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: air format .</summary>
+<pre>$ air format .</pre><pre class="output">Script completed
+Wall time 0.4 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: git status --short; git diff --check; git diff -- src/index.c plans/index-optimize.md; rg -n …</summary>
+<pre>$ git status --short; git diff --check; git diff -- src/index.c plans/index-optimize.md; rg -n &quot;v_index_strides|v_indices_strides&quot; .</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+ M plans/index-optimize.md
+ M src/index.c
+diff --git a/plans/index-optimize.md b/plans/index-optimize.md
+index 0dc764a..b949b21 100644
+--- a/plans/index-optimize.md
++++ b/plans/index-optimize.md
+@@ -292,7 +292,7 @@ static inline void rray_index_plan_next_run(
+ 
+     if (v_point[axis] &lt; plan-&gt;v_dimensions[axis]) {
+       for (int i = 0; i &lt; x_dimensionality; ++i) {
+-        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
++        v_index_locations[i] += plan-&gt;v_indices_strides[axis][i];
+       }
+       break;
+     }
+@@ -301,20 +301,20 @@ static inline void rray_index_plan_next_run(
+ 
+     for (int i = 0; i &lt; x_dimensionality; ++i) {
+       v_index_locations[i] -=
+-        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
++        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_indices_strides[axis][i];
+     }
+   }
+ }
+ ```
+ 
+ Inside a run, coordinate array `k` advances by the fixed stride
+-`plan-&gt;v_index_strides[0][k]`. Emit the run body twice, once with that stride
++`plan-&gt;v_indices_strides[0][k]`. Emit the run body twice, once with that stride
+ and once with a literal 1, exactly as the existing iterators pass a literal 0
+ for fixed strides:
+ 
+ ```c
+ #define RRAY_INDEX_STRIDE_ONE(K) 1
+-#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_index_strides[0][K]
++#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_indices_strides[0][K]
+ 
+ #define RRAY_INDEX_ATOMIC_RUN(MISSING, X_DIMENSIONALITY, STRIDE)               \
+   for (r_ssize j = 0; j &lt; run_size; ++j) {                                     \
+@@ -347,7 +347,7 @@ Store the unit stride test on the plan rather than checking it in the loop:
+   plan.unit_run = true;
+ 
+   for (int i = 0; i &lt; x_dimensionality; ++i) {
+-    if (plan.v_index_strides[0][i] != 1) {
++    if (plan.v_indices_strides[0][i] != 1) {
+       plan.unit_run = false;
+       break;
+     }
+@@ -444,7 +444,7 @@ The call site is one statement at the end of `rray_index_plan()`:
+ ```c
+   plan.dimensionality = rray__strided_iterator_axes_coalescen(
+     plan.v_dimensions,
+-    plan.v_index_strides,
++    plan.v_indices_strides,
+     dimensionality,
+     x_dimensionality
+   );
+@@ -452,7 +452,7 @@ The call site is one statement at the end of `rray_index_plan()`:
+ 
+ Three things happen to already be right, which is why this drops in cleanly.
+ 
+-`v_index_strides[axis][i]` is indexed point axis first, so each axis is a
++`v_indices_strides[axis][i]` is indexed point axis first, so each axis is a
+ contiguous row. Comparing two axes is a row scan and merging is a row copy. No
+ layout change is needed.
+ 
+diff --git a/src/index.c b/src/index.c
+index 0d3c649..324c347 100644
+--- a/src/index.c
++++ b/src/index.c
+@@ -12,7 +12,7 @@ struct rray_index_plan {
+   int dimensionality;
+   r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+-  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
++  r_ssize v_indices_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+   const int* v_indices[RRAY_MAX_DIMENSIONALITY];
+ };
+ 
+@@ -244,7 +244,7 @@ static struct rray_index_plan rray_index_plan(
+     );
+ 
+     for (int axis = 0; axis &lt; dimensionality; ++axis) {
+-      plan.v_index_strides[axis][i] = v_strides[axis];
++      plan.v_indices_strides[axis][i] = v_strides[axis];
+     }
+ 
+     plan.v_indices[i] = r_int_cbegin(index);
+@@ -278,11 +278,13 @@ static inline void rray_index_plan_next(
+   r_ssize* v_index_locations
+ ) {
+   for (int axis = 0; axis &lt; plan-&gt;dimensionality; ++axis) {
++    const r_ssize* v_index_strides = plan-&gt;v_indices_strides[axis];
++
+     ++v_point[axis];
+ 
+     if (v_point[axis] &lt; plan-&gt;v_dimensions[axis]) {
+       for (int i = 0; i &lt; plan-&gt;x_dimensionality; ++i) {
+-        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
++        v_index_locations[i] += v_index_strides[i];
+       }
+       break;
+     }
+@@ -291,7 +293,7 @@ static inline void rray_index_plan_next(
+ 
+     for (int i = 0; i &lt; plan-&gt;x_dimensionality; ++i) {
+       v_index_locations[i] -=
+-        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
++        (plan-&gt;v_dimensions[axis] - 1) * v_index_strides[i];
+     }
+   }
+ }
+./src/index.c:15:  r_ssize v_indices_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+./src/index.c:247:      plan.v_indices_strides[axis][i] = v_strides[axis];
+./src/index.c:281:    const r_ssize* v_index_strides = plan-&gt;v_indices_strides[axis];
+./src/index.c:287:        v_index_locations[i] += v_index_strides[i];
+./src/index.c:296:        (plan-&gt;v_dimensions[axis] - 1) * v_index_strides[i];
+./plans/index-optimize.md:295:        v_index_locations[i] += plan-&gt;v_indices_strides[axis][i];
+./plans/index-optimize.md:304:        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_indices_strides[axis][i];
+./plans/index-optimize.md:311:`plan-&gt;v_indices_strides[0][k]`. Emit the run body twice, once with that stride
+./plans/index-optimize.md:317:#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_indices_strides[0][K]
+./plans/index-optimize.md:350:    if (plan.v_indices_strides[0][i] != 1) {
+./plans/index-optimize.md:447:    plan.v_indices_strides,
+./plans/index-optimize.md:455:`v_indices_strides[axis][i]` is indexed point axis first, so each axis is a</pre></details>
+<details class="tool"><summary>Bash: rg -n &quot;v_[a-z_]*strides = .*v_[a-z_]*strides\[&quot; src --glob '*.[ch]'</summary>
+<pre>$ rg -n &quot;v_[a-z_]*strides = .*v_[a-z_]*strides\[&quot; src --glob '*.[ch]'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+src/index.c:281:    const r_ssize* v_index_strides = plan-&gt;v_indices_strides[axis];</pre></details>
+<p>The rename is complete in both the implementation and the optimization plan. The only practical row local is in <code>rray_index_plan_next()</code>, where both the increment and reset paths now reuse the indexed row. No <code>r_obj*</code> values changed, so the required protection review has no affected values.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^index')&quot;</summary>
+<pre>$ Rscript -e &quot;devtools::test(filter = '^index')&quot;</pre><pre class="output">Script completed
+Wall time 8.4 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | index                                                          
+⠙ |         12 | index                                                          
+⠼ |         25 | index                                                          
+⠸ |         34 | index                                                          
+✔ |         38 | index
+
+══ Results ═════════════════════════════════════════════════════════════════════
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 38 ]</pre></details>
+<p>Renamed the matrix to <code>v_indices_strides</code> in src/index.c and the optimization plan.</p>
+<p>Lifted the current axis row into local <code>v_index_strides</code> in <code>rray_index_plan_next()</code>.</p>
+<p>Validation:</p>
+<ul>
+<li><code>clang-format -i src/*.c src/*.h</code></li>
+<li><code>air format .</code></li>
+<li>Index tests: 38 passed, 0 failed</li>
+<li><code>git diff --check</code>: clean</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Hmm does that make sense with how they are indexed?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing naming conventions for strides</strong></p>
+<p><strong>Clarifying stride matrix naming and indexing</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing naming conventions for strides</strong></p>
+<p><strong>Clarifying stride matrix naming and indexing</strong></p>
+</details>
+<p>Not entirely. The matrix is indexed as:</p>
+<pre><code class="language-c">v_indices_strides[output_axis][index]
+</code></pre>
+<p>After indexing once by <code>output_axis</code>, the row still contains strides for all index arrays. Calling that row <code>v_index_strides</code> suggests it belongs to one index, which is misleading.</p>
+<p>The local should remain:</p>
+<pre><code class="language-c">const r_ssize* v_indices_strides = plan-&gt;v_indices_strides[axis];
+</code></pre>
+<p>A singular <code>v_index_strides</code> local would only fit an index-first layout:</p>
+<pre><code class="language-c">v_indices_strides[index][output_axis]
+</code></pre>
+<p>The current axis-first layout is better for the hot iteration loop because each row is contiguous.</p>
+
+</section>
+<p class="divider">Sep 23, 2026, 16:23 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Ah so maybe v_indices_strides but the local variable is v_axis_indices_strides?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>Yes. <code>v_indices_strides</code> names the full matrix, and <code>v_axis_indices_strides</code> accurately names the row selected for one output axis. I’ll update the local to that.</p>
+
+<details class="tool"><summary>Edit src/index.c</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/index.c</span>
+<span class="hunk">@@</span>
+<span class="del">-    const r_ssize* v_index_strides = plan-&gt;v_indices_strides[axis];</span>
+<span class="ins">+    const r_ssize* v_axis_indices_strides = plan-&gt;v_indices_strides[axis];</span>
+<span class="hunk">@@</span>
+<span class="del">-        v_index_locations[i] += v_index_strides[i];</span>
+<span class="ins">+        v_index_locations[i] += v_axis_indices_strides[i];</span>
+<span class="hunk">@@</span>
+       v_index_locations[i] -=
+<span class="del">-        (plan-&gt;v_dimensions[axis] - 1) * v_index_strides[i];</span>
+<span class="ins">+        (plan-&gt;v_dimensions[axis] - 1) * v_axis_indices_strides[i];</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; Rscript -e &quot;devtools::…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; Rscript -e &quot;devtools::test(filter = '^index')&quot;</pre><pre class="output">Script completed
+Wall time 5.9 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | index                                                          
+⠙ |         12 | index                                                          
+⠼ |         25 | index                                                          
+⠸ |         34 | index                                                          
+✔ |         38 | index
+
+══ Results ═════════════════════════════════════════════════════════════════════
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 38 ]</pre></details>
+<p>Yes, that matches the indexing:</p>
+<pre><code class="language-c">const r_ssize* v_axis_indices_strides =
+  plan-&gt;v_indices_strides[axis];
+</code></pre>
+<p>Updated and formatted. All 38 index tests pass.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll review the final diff, commit only these naming changes with the required one-line message, then push the current branch.</p>
+
+<details class="tool"><summary>Bash: git status --short; git diff --check; git diff --stat; git diff -- src/index.c plans/index-op…</summary>
+<pre>$ git status --short; git diff --check; git diff --stat; git diff -- src/index.c plans/index-optimize.md; git branch --show-current</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ M plans/index-optimize.md
+ M src/index.c
+ plans/index-optimize.md | 14 +++++++-------
+ src/index.c             | 10 ++++++----
+ 2 files changed, 13 insertions(+), 11 deletions(-)
+diff --git a/plans/index-optimize.md b/plans/index-optimize.md
+index 0dc764a..b949b21 100644
+--- a/plans/index-optimize.md
++++ b/plans/index-optimize.md
+@@ -292,7 +292,7 @@ static inline void rray_index_plan_next_run(
+ 
+     if (v_point[axis] &lt; plan-&gt;v_dimensions[axis]) {
+       for (int i = 0; i &lt; x_dimensionality; ++i) {
+-        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
++        v_index_locations[i] += plan-&gt;v_indices_strides[axis][i];
+       }
+       break;
+     }
+@@ -301,20 +301,20 @@ static inline void rray_index_plan_next_run(
+ 
+     for (int i = 0; i &lt; x_dimensionality; ++i) {
+       v_index_locations[i] -=
+-        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
++        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_indices_strides[axis][i];
+     }
+   }
+ }
+ ```
+ 
+ Inside a run, coordinate array `k` advances by the fixed stride
+-`plan-&gt;v_index_strides[0][k]`. Emit the run body twice, once with that stride
++`plan-&gt;v_indices_strides[0][k]`. Emit the run body twice, once with that stride
+ and once with a literal 1, exactly as the existing iterators pass a literal 0
+ for fixed strides:
+ 
+ ```c
+ #define RRAY_INDEX_STRIDE_ONE(K) 1
+-#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_index_strides[0][K]
++#define RRAY_INDEX_STRIDE_RUNTIME(K) plan-&gt;v_indices_strides[0][K]
+ 
+ #define RRAY_INDEX_ATOMIC_RUN(MISSING, X_DIMENSIONALITY, STRIDE)               \
+   for (r_ssize j = 0; j &lt; run_size; ++j) {                                     \
+@@ -347,7 +347,7 @@ Store the unit stride test on the plan rather than checking it in the loop:
+   plan.unit_run = true;
+ 
+   for (int i = 0; i &lt; x_dimensionality; ++i) {
+-    if (plan.v_index_strides[0][i] != 1) {
++    if (plan.v_indices_strides[0][i] != 1) {
+       plan.unit_run = false;
+       break;
+     }
+@@ -444,7 +444,7 @@ The call site is one statement at the end of `rray_index_plan()`:
+ ```c
+   plan.dimensionality = rray__strided_iterator_axes_coalescen(
+     plan.v_dimensions,
+-    plan.v_index_strides,
++    plan.v_indices_strides,
+     dimensionality,
+     x_dimensionality
+   );
+@@ -452,7 +452,7 @@ The call site is one statement at the end of `rray_index_plan()`:
+ 
+ Three things happen to already be right, which is why this drops in cleanly.
+ 
+-`v_index_strides[axis][i]` is indexed point axis first, so each axis is a
++`v_indices_strides[axis][i]` is indexed point axis first, so each axis is a
+ contiguous row. Comparing two axes is a row scan and merging is a row copy. No
+ layout change is needed.
+ 
+diff --git a/src/index.c b/src/index.c
+index 0d3c649..512136f 100644
+--- a/src/index.c
++++ b/src/index.c
+@@ -12,7 +12,7 @@ struct rray_index_plan {
+   int dimensionality;
+   r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+-  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
++  r_ssize v_indices_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+   const int* v_indices[RRAY_MAX_DIMENSIONALITY];
+ };
+ 
+@@ -244,7 +244,7 @@ static struct rray_index_plan rray_index_plan(
+     );
+ 
+     for (int axis = 0; axis &lt; dimensionality; ++axis) {
+-      plan.v_index_strides[axis][i] = v_strides[axis];
++      plan.v_indices_strides[axis][i] = v_strides[axis];
+     }
+ 
+     plan.v_indices[i] = r_int_cbegin(index);
+@@ -278,11 +278,13 @@ static inline void rray_index_plan_next(
+   r_ssize* v_index_locations
+ ) {
+   for (int axis = 0; axis &lt; plan-&gt;dimensionality; ++axis) {
++    const r_ssize* v_axis_indices_strides = plan-&gt;v_indices_strides[axis];
++
+     ++v_point[axis];
+ 
+     if (v_point[axis] &lt; plan-&gt;v_dimensions[axis]) {
+       for (int i = 0; i &lt; plan-&gt;x_dimensionality; ++i) {
+-        v_index_locations[i] += plan-&gt;v_index_strides[axis][i];
++        v_index_locations[i] += v_axis_indices_strides[i];
+       }
+       break;
+     }
+@@ -291,7 +293,7 @@ static inline void rray_index_plan_next(
+ 
+     for (int i = 0; i &lt; plan-&gt;x_dimensionality; ++i) {
+       v_index_locations[i] -=
+-        (plan-&gt;v_dimensions[axis] - 1) * plan-&gt;v_index_strides[axis][i];
++        (plan-&gt;v_dimensions[axis] - 1) * v_axis_indices_strides[i];
+     }
+   }
+ }
+feature/index</pre></details>
+<details class="tool"><summary>Bash: git add src/index.c plans/index-optimize.md &amp;&amp; git commit -m &quot;Clarify index stride names&quot;</summary>
+<pre>$ git add src/index.c plans/index-optimize.md &amp;&amp; git commit -m &quot;Clarify index stride names&quot;</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+fatal: Unable to create '~/files/r/packages/rray4/.git/index.lock': Operation not permitted</pre></details>
+<details class="tool"><summary>Bash: git add src/index.c plans/index-optimize.md &amp;&amp; git commit -m &quot;Clarify index stride names&quot;</summary>
+<pre>$ git add src/index.c plans/index-optimize.md &amp;&amp; git commit -m &quot;Clarify index stride names&quot;</pre><pre class="output">Script completed
+Wall time 6.3 seconds
+Output:
+
+[feature/index 9bf301e] Clarify index stride names
+ 2 files changed, 13 insertions(+), 11 deletions(-)</pre></details>
+<p>Committed as <code>9bf301e</code> (<code>Clarify index stride names</code>). I’m pushing <code>feature/index</code> now.</p>
+
+<details class="tool"><summary>Bash: git push</summary>
+<pre>$ git push</pre><pre class="output">Script completed
+Wall time 11.0 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   fff977e..9bf301e  feature/index -&gt; feature/index</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch</summary>
+<pre>$ git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/index...origin/feature/index</pre></details>
+<p>Committed and pushed.</p>
+<ul>
+<li>Commit: <code>9bf301e Clarify index stride names</code></li>
+<li>Branch: <code>feature/index</code></li>
+<li>Working tree is clean and matches <code>origin/feature/index</code></li>
+</ul>
+
+</section>
+</main>
+</body>
+</html>

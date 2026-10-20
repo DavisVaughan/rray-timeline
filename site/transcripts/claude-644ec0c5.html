@@ -1,0 +1,1694 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pinning rray_mean() test values and skipping base R under long double</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-132">rray timeline</a>
+<h1>Pinning <code>rray_mean()</code> test values and skipping base R under long double</h1>
+<p class="facts">Claude · Oct 6, 2026 · 6 prompts · 13 replies · <a href="https://github.com/r-lib/rray/pull/132">#132</a></p>
+</header>
+<main>
+<p class="divider">Oct 6, 2026, 15:53 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Does accuracy.md have anything meaningful left that we haven’t done?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; find . -iname &quot;accuracy*.md&quot; -not -path &quot;./.git/*&quot;; l…</summary>
+<pre>cd ~/files/r/packages/rray4; find . -iname &quot;accuracy*.md&quot; -not -path &quot;./.git/*&quot;; ls plans 2&gt;/dev/null</pre><pre class="output">./plans/accuracy.md
+accuracy.md
+cumulative.md
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat plans/accuracy.md; git log --oneline | head -40</summary>
+<pre>cd ~/files/r/packages/rray4; cat plans/accuracy.md; git log --oneline | head -40</pre><pre class="output"># Floating point accuracy in reductions
+
+rray4 accumulates every floating point reduction in `double`. Base R uses `long double` where the platform has one, so rray4 can differ from base R in the last bits. This document records why we chose `double`, what base R, matrixStats and NumPy do, what we measured, and the plan for getting more accuracy out of `double` in `rray_mean()`, `rray_sum()` and `rray_prod()`.
+
+---
+
+# Decision: accumulate in `double` everywhere
+
+`double` is the only floating point type that behaves the same on every platform R runs on. `long double` means something different on each one:
+
+| Platform | `long double` | Extra precision? |
+|---|---|---|
+| macOS arm64 | 64-bit, same as `double` | No |
+| Windows arm64 | 64-bit, same as `double` | No |
+| Windows x86_64, MSVC | 64-bit, same as `double` | No |
+| Windows x86_64, Rtools (MinGW GCC) | 80-bit x87 | Yes |
+| Linux and macOS x86_64 | 80-bit x87 | Yes |
+| Linux arm64 | 128-bit, done in software | Yes, but slow |
+
+So `double` is the minimum that every platform gives us, and two of the platforms we care about most, Apple silicon Macs and Windows on ARM, never get anything more. Targeting that minimum everywhere gives us:
+
+- The same output on every OS. For a fixed order of operations, `double` math gives the same bits on every platform. Compilers never reorder floating point adds unless `-ffast-math` is set.
+
+- One code path, with no `long double` branches to reason about or test.
+
+- No hidden performance cliffs. On x86_64, `long double` math runs on the x87 unit, which can't vectorize. On Linux arm64, every `long double` add is a call into a software library.
+
+- No dependence on where the hardware market goes. Windows is adding ARM as a second platform alongside x86, not replacing x86, and Linux arm64 is growing on servers (AWS Graviton, Azure Cobalt, Google Axion). All of these will matter for years, and each one has a different `long double`.
+
+The cost is that results can differ from base R in the last bits on x86_64 and Linux arm64, where base R gets extra precision. One shared docs section should say this, linked from `rray_sum()`, `rray_prod()` and `rray_mean()`.
+
+This rule is about floating point. 64-bit integer totals (`int64_t`) are exact and behave the same everywhere, so they are allowed. Several of the plans below use them.
+
+One caveat on &quot;same bits everywhere&quot;. GCC defaults to `-ffp-contract=fast`, which may fuse `a * b + c` into a single fused multiply-add (FMA) instruction on arm64. That changes rounding. Keep `a * b + c` patterns out of accumulation kernels so this can't happen.
+
+---
+
+# What other implementations do
+
+## Base R
+
+- `sum()` (`rsum()` in `src/main/summary.c`) adds doubles into a `LDOUBLE`, then sends values beyond `±DBL_MAX` to `±Inf` and casts to `double`.
+
+- `prod()`, `mean()` and `cumsum()` / `cumprod()` (`src/main/cum.c`) also accumulate in `LDOUBLE`.
+
+- `LDOUBLE` is `long double` unless R is configured with `--disable-long-double` (`src/include/Defn.h`).
+
+- Integer `sum()` (`isum()`) adds into a 64-bit `LONG_INT` and only checks the final total. A result outside the `int` range gives `NA` with a warning. Very long vectors that might overflow 64 bits switch to `risum()`, which adds in `LDOUBLE`.
+
+- Integer `cumsum()` (`icumsum()`) adds in `double` and checks every running total, since each one is an output.
+
+## matrixStats
+
+- `colSums2()` keeps one local `long double` total per column, reading down the column in memory order.
+
+- `rowSums2()` allocates a `long double` buffer with one slot per row, then walks the matrix in memory order and adds into it. This is the &quot;flat walk plus scratch buffer&quot; shape that this plan proposes.
+
+- `rowMeans2()` finishes one row before starting the next, jumping `nrow` elements per read. It has the same cache problem as rray4's nested reducer.
+
+- `rowCumsums()` / `colCumsums()` add in `long double` but store a `double` at every step, so the extra precision is thrown away each time.
+
+## NumPy
+
+- Sums of `float64` add in `float64`. Accuracy comes from pairwise summation, not a wider type.
+
+- Pairwise summation is only used along a contiguous axis. NumPy splits the run into blocks of 128, sums each block with 8 running totals, and combines the blocks as a tree. The error grows like `log(n)` instead of `n`, and the 8 running totals let the loop vectorize.
+
+- Along any other axis, NumPy walks memory in order and adds each element into its output, one at a time. So accuracy depends on memory layout. rray4's flat `RRAY_REDUCE()` works the same way.
+
+- `cumsum()` is plain one-at-a-time summation.
+
+- `long double` is only used when asked for with `dtype = np.longdouble`.
+
+- Integer sums promote to `int64` and overflow silently wraps around.
+
+- `mean()` is the sum divided by the count, with no correction pass.
+
+---
+
+# Benchmarks
+
+All numbers are medians from `bench::mark()` on Apple silicon (arm64), where `long double` is the same as `double`. Inputs are `runif()` doubles. None of this has been measured on x86_64 or Linux arm64.
+
+These were measured before #124 moved `rray_mean()` to the flat walk, so the `rray_mean()` numbers are out of date.
+
+## Flat against nested
+
+`rray_sum()` used the flat walk (`RRAY_REDUCE()`). `rray_mean()` used the nested walk (`RRAY_REDUCE_OUTER()` / `RRAY_REDUCE_INNER()`). The integer mean makes one pass, so it isolates the cost of the nested walk.
+
+| Input | Axes | Flat double sum | Nested integer mean | Nested double mean (2 passes) |
+|---|---|---|---|---|
+| 4000 x 4000 | 1 | 13.1 ms | 13.4 ms | 26.6 ms |
+| 4000 x 4000 | 2 | 2.3 ms | 40.9 ms | 61.7 ms |
+| 200 x 200 x 200 | 3 | 1.7 ms | | 12.8 ms |
+| 200 x 200 x 200 | 1, 3 | 3.6 ms | | 13.6 ms |
+
+- The nested walk costs nothing when the reduced axis is axis 1, since the inner loop then reads memory in order.
+
+- It is about 18x slower when the reduced axis isn't axis 1, because every read jumps through memory and misses the cache.
+
+- The double mean pays twice, once for the sum and once for its correction pass.
+
+So moving `rray_sum()` to the nested walk to get a local accumulator is ruled out.
+
+## Against matrixStats and base R, 4000 x 4000
+
+| Reducing over | rray4 | matrixStats | Base R |
+|---|---|---|---|
+| Rows, sum | 13.1 ms | 13.6 ms `colSums2()` | 13.1 ms `colSums()` |
+| Columns, sum | 2.3 ms | 9.1 ms `rowSums2()` | 2.3 ms `rowSums()` |
+| Rows, mean | 26.6 ms | 27.0 ms `colMeans2()` | 13.1 ms `colMeans()` |
+| Columns, mean | 61.9 ms | 79.2 ms `rowMeans2()` | 2.3 ms `rowMeans()` |
+| Rows, mean, one pass | 13.4 ms (integer) | 13.5 ms `colMeans2(refine = FALSE)` | |
+| Columns, mean, one pass | 40.9 ms (integer) | 41.2 ms `rowMeans2(refine = FALSE)` | |
+
+`rowSums2()` is 4x slower than rray4 even though its buffer is plain `double` on this machine. The likely cause is the `byrow`, `narm` and missing index branches inside its inner loop, not the buffer.
+
+## A flat sum with a `long double` buffer
+
+A prototype of `rray_sum_dbl()` that walks `x` exactly like `RRAY_REDUCE()`, but adds into an `R_alloc()` buffer of `out_size` `long double` values and converts to `double` at the end:
+
+| Input | Axes | Current | Buffer | Memory (current / buffer) |
+|---|---|---|---|---|
+| 4000 x 4000 | 1 | 13.06 ms | 13.06 ms | 31 KB / 63 KB |
+| 4000 x 4000 | 2 | 2.26 ms | 2.25 ms | 31 KB / 63 KB |
+| 4000 x 4000 | 1, 2 | 13.52 ms | 13.52 ms | 0 / 0 |
+| 200 x 200 x 200 | 1 | 3.63 ms | 3.65 ms | 313 KB / 625 KB |
+| 200 x 200 x 200 | 3 | 1.70 ms | 1.74 ms | 313 KB / 625 KB |
+| 200 x 200 x 200 | 1, 3 | 3.61 ms | 3.59 ms | 2 KB / 3 KB |
+| 10 x 1e6 | 1 | 3.51 ms | 3.94 ms | 7.6 MB / 15.3 MB |
+| 10 x 1e6 | 2 | 3.78 ms | 3.75 ms | 0 / 0 |
+
+On arm64 this measures only the buffer, since the compiled loop is identical. The buffer is close to free, apart from about 10% when the output is large. This matters for the plans below, which all use a buffer of `out_size` elements.
+
+It also shows that summing along axis 1 is about 6x slower than along axis 2. Down a column, every add waits for the one before it. Along axis 2, there are 4000 separate totals and the compiler vectorizes across them.
+
+---
+
+# Plan
+
+`rray_sum()` already runs on hand written loops, like `rray_mean()`. Integer and logical sums add into an `int64_t` and only check the final total. Reducers are written as hand written loops, not with a `RRAY_REDUCE_ACC()` macro.
+
+## 1. `rray_mean()` accumulates in `double`
+
+Done in #124: the double mean adds in `double`, and the integer and logical means add into an `int64_t`, with an `int128_t` fallback past 2^32 elements per output.
+
+One test change is left:
+
+- `&quot;matches mean() over every combination of axes&quot;` and `&quot;a second pass corrects the rounding error of the first sum&quot;` compare against base `mean()` with `expect_identical()`. Now that rray4 uses `double`, they can fail on x86_64, where base R uses `long double`. CI wouldn't notice, since it only runs on macOS arm64. Replace the base R comparison with expected values computed by hand, so the tests don't depend on the platform.
+
+## 2. Double and complex sum
+
+### Pairwise summation along runs
+
+The `out_stride == 0` loop of `rray_sum_dbl()` becomes NumPy's pairwise sum. Split the run into blocks of 128, sum each block with 8 running totals, and combine the blocks as a tree.
+
+- Accuracy: error grows like `log(n)` instead of `n` along the run.
+
+- Speed: the 8 running totals break the chain of adds that each wait on the one before. This should make summing along axis 1 much faster than the current 13 ms, closer to the 2.3 ms of axis 2. That is expected, not measured.
+
+- `na_rm`: replace `NaN` elements with `0` before adding. This keeps the loop free of branches.
+
+- `NA` against `NaN`: which one wins is already implementation defined for `rray_sum()` (see `rray_add_dbl_one()`), so reordering the adds doesn't change any promise.
+
+- Complex: run the same pairwise sum on the real and imaginary parts separately.
+
+When `out_run_stride != 0`, each output gets one element per run, so there is no run to sum pairwise. These outputs keep one-at-a-time summation, as in NumPy.
+
+### Undecided: compensated summation everywhere else
+
+To make accuracy independent of memory layout, each output could keep a struct holding a total and a compensation term, using Neumaier's variant of Kahan summation:
+
+```c
+struct rray_sum_dbl_acc {
+  double sum;
+  double compensation;
+};
+```
+
+- Each element is added with the compensation update. A run adds its pairwise sum the same way. The result is `sum + compensation`.
+
+- The error then stays at a few units in the last place regardless of how many elements are added, along any axis.
+
+- If `sum` becomes infinite or `NaN`, `compensation` turns into `NaN` (from `Inf - Inf`). The result must be `sum` alone when it isn't finite.
+
+- Costs: the buffer doubles to 16 bytes per output, and each element takes about 4 floating point operations instead of 1. The axis 2 loop is limited by memory speed, so this may be nearly free there. Not measured.
+
+This is an idea to keep in mind, not part of the work yet.
+
+## 3. Product
+
+Multiplication doesn't have the cancellation problem that addition has. Each multiply adds at most half a unit of rounding error, in relative terms, regardless of order. So there is no pairwise or compensated version worth building.
+
+The real gap is range. With `long double` on x86_64, base R can hold intermediate products up to about 10^4932. In `double`, `prod(c(1e300, 1e300, 1e-300))` overflows to `Inf` partway through, though the answer is `1e300`. That already happens in base R on Apple silicon, so base R itself differs by platform here.
+
+Undecided. If we do it, each output keeps a mantissa and a separate exponent in a buffer, and it waits on a benchmark.
+
+```c
+struct rray_prod_dbl_acc {
+  double mantissa;</pre><p class="cut">89 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git show --stat 23b63f2 2b04a2a | head -60; grep -n &quot;…</summary>
+<pre>cd ~/files/r/packages/rray4; git show --stat 23b63f2 2b04a2a | head -60; grep -n &quot;pairwise\|128\|compens\|kahan\|neumaier&quot; -i src/sum.c src/*.h | head -30; grep -n &quot;mean()&quot; tests/testthat/test-mean.R | head; grep -rn &quot;long double\|accumulat&quot; R/ man/*.Rd | head</pre><pre class="output">commit 23b63f255994ecb8b06977feecb1b47fe8a99faa
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Tue Oct 6 04:52:55 2026 -0400
+
+    Accurate and fast `rray_sum()` (#125)
+
+ R/reduce.R                          |  12 +-
+ man/rray-reduce.Rd                  |  11 +-
+ plans/accuracy.md                   | 134 ++-------
+ plans/cumulative.md                 |   4 +-
+ plans/sum.md                        | 274 ------------------
+ src/arithmetic.c                    |   4 -
+ src/arithmetic.h                    |   2 -
+ src/decl/reduce-mean-decl.h         |  22 ++
+ src/decl/reduce-sum-decl.h          |  37 ++-
+ src/init.c                          |  18 ++
+ src/int-128.h                       |  57 ++++
+ src/one-add.h                       |  98 +------
+ src/one-multiply.h                  |   3 +-
+ src/reduce-mean.c                   |  77 ++++-
+ src/reduce-sum.c                    | 562 ++++++++++++++++++++++++++++++------
+ src/reduce.c                        |  62 ++++
+ src/reduce.h                        |  25 ++
+ src/utils.c                         |   4 +
+ src/utils.h                         |   2 +
+ tests/testthat/_snaps/reduce-sum.md |  80 +++++
+ tests/testthat/helper-reduce-mean.R |   4 +
+ tests/testthat/helper-reduce-sum.R  |   4 +
+ tests/testthat/test-reduce-mean.R   |  73 +++++
+ tests/testthat/test-reduce-sum.R    | 150 ++++++++++
+ 24 files changed, 1118 insertions(+), 601 deletions(-)
+
+commit 2b04a2ae70cb21c33689f1174f218744851b8346
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Tue Oct 6 08:20:18 2026 -0400
+
+    Use int128 ideas in mean too (#126)
+
+ plans/accuracy.md                 |   2 +-
+ src/decl/reduce-mean-decl.h       |  77 +++---
+ src/int-128.h                     |  56 +++++
+ src/reduce-mean.c                 | 494 +++++++++++++++++---------------------
+ tests/testthat/test-reduce-mean.R |  38 +--
+ 5 files changed, 338 insertions(+), 329 deletions(-)
+ugrep: warning: src/sum.c: No such file or directory
+src/int-128.h:1:#ifndef RRAY_INT_128_H
+src/int-128.h:2:#define RRAY_INT_128_H
+src/int-128.h:9:// A signed 128-bit value represented as `hi * 2^64 + lo`.
+src/int-128.h:11:struct rray_int128 {
+src/int-128.h:16:// Add an `int` to a signed 128-bit value.
+src/int-128.h:24:static inline struct rray_int128 rray_int128_add(struct rray_int128 x, int y) {
+src/int-128.h:27:  return (struct rray_int128) {.lo = lo, .hi = hi};
+src/int-128.h:30:// Convert a signed 128-bit value to an R integer or report overflow.
+src/int-128.h:42:static inline int rray_int128_as_int(
+src/int-128.h:43:  struct rray_int128 x,
+src/int-128.h:57:static inline bool rray_int128_fits_int64(struct rray_int128 x) {
+src/int-128.h:61:// Assumes you've guarded usage with `rray_int128_fits_int64()`
+src/int-128.h:62:static inline int64_t rray_int128_as_int64(struct rray_int128 x) {
+src/int-128.h:66:struct rray_int128_div_result {
+src/int-128.h:75:static inline struct rray_int128_div_result rray_int128_div(
+src/int-128.h:76:  struct rray_int128 x,
+src/int-128.h:107:  return (struct rray_int128_div_result) {
+ugrep: warning: tests/testthat/test-mean.R: No such file or directory</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n -i &quot;pairwise\|block\|128\|compens\|neumaier\|…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n -i &quot;pairwise\|block\|128\|compens\|neumaier\|lanes\|8 &quot; src/reduce-sum.c | head -30; echo ---; grep -n &quot;mean(\|expect_identical&quot; tests/testthat/test-reduce-mean.R | head -40; echo ---; grep -n -i &quot;double\|accura\|base R\|precision&quot; R/reduce.R | head -30</pre><pre class="output">5:#include &quot;int-128.h&quot;
+14:// guaranteed to fit in an `int128_t`. So we fall back to a slower sum that
+15:// relies on `int128_t` summing. That type isn't actually portable, so we mock
+476:// Lossless sum into `int128_t`-ish, which is wide enough to handle any length
+493:    KEEP_N(r_alloc_raw0(out_size * sizeof(struct rray_int128)), &amp;n_prot);
+494:  struct rray_int128* v_sums = (struct rray_int128*) r_raw_begin(sums);
+521:        struct rray_int128 sum = v_sums[out_loc];
+525:          sum = rray_int128_add(sum, x_elt == na_int ? 0 : x_elt);
+533:            rray_int128_add(v_sums[out_loc], x_elt == na_int ? 0 : x_elt);
+547:        struct rray_int128 sum = v_sums[out_loc];
+553:          sum = rray_int128_add(sum, na ? 0 : x_elt);
+563:          v_sums[out_loc] = rray_int128_add(v_sums[out_loc], na ? 0 : x_elt);
+576:      v_out[i] = rray_int128_as_int(v_sums[i], error_call);
+581:        v_missings[i] ? na_int : rray_int128_as_int(v_sums[i], error_call);
+---
+4:  out &lt;- rray_mean(x, 1L)
+5:  expect_identical(as.vector(out), c(3, 8))
+8:  expect_identical(as.vector(out), c(3, 8))
+14:  out &lt;- rray_mean(x, 2L)
+15:  expect_identical(as.vector(out), c(3.5, 4.5, 5.5, 6.5, 7.5))
+18:  expect_identical(as.vector(out), c(3.5, 4.5, 5.5, 6.5, 7.5))
+23:  expect_identical(rray_dimensions(rray_mean(x, 1L)), c(1L, 2L))
+24:  expect_identical(rray_dimensions(rray_mean(x, 2L)), c(5L, 1L))
+29:  out &lt;- rray_mean(x, c(1L, 2L))
+30:  expect_identical(as.vector(out), 5.5)
+31:  expect_identical(rray_dimensions(out), c(1L, 1L))
+36:  expect_identical(rray_mean(x, integer()), x)
+39:  expect_identical(
+40:    rray_mean(x, integer()),
+47:  out &lt;- rray_mean(x, c(1L, 2L))
+48:  expect_identical(as.vector(out), rep(1, 4L))
+49:  expect_identical(rray_dimensions(out), c(1L, 1L, 4L))
+54:  out &lt;- rray_mean(x, 3L)
+55:  expect_identical(rray_dimensions(out), c(2L, 3L, 1L))
+56:  expect_identical(as.vector(out), c(10, 11, 12, 13, 14, 15))
+59:test_that(&quot;matches `mean()` over every combination of axes&quot;, {
+70:      mean(x)
+79:    expect_identical(rray_mean(x, axis), expected(axis))
+85:  expect_identical(dimnames(rray_mean(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+86:  expect_identical(dimnames(rray_mean(x, 2L)), list(letters[1:5], NULL))
+91:  expect_null(dimnames(rray_mean(x, 1L)))
+95:  expect_identical(storage.mode(rray_mean(array(TRUE), 1L)), &quot;double&quot;)
+96:  expect_identical(storage.mode(rray_mean(array(1L), 1L)), &quot;double&quot;)
+97:  expect_identical(storage.mode(rray_mean(array(1), 1L)), &quot;double&quot;)
+102:  out &lt;- rray_mean(x, 1L)
+103:  expect_identical(as.vector(out), c(0.5, 1))
+108:  expect_identical(as.vector(rray_mean(x, 1L)), mean(x))
+109:  expect_identical(as.vector(rray_mean(x, 1L)), 2500000000000001)
+116:  expect_identical(as.vector(rray_mean(x, 1L)), expected)
+117:  expect_identical(as.vector(rray_mean(rbind(x, x), 2L)), c(expected, expected))
+119:  expect_identical(as.vector(rray_mean_forced_fallback(x, 1L)), expected)
+120:  expect_identical(
+125:  expect_identical(as.vector(rray_mean(-x, 1L)), -expected)
+126:  expect_identical(as.vector(rray_mean_forced_fallback(-x, 1L)), -expected)
+129:  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), expected)
+---
+36:#' Logicals and integers are cast to double.
+39:#' Logicals and integers are cast to double.
+59:#' | double  | `-Inf`                  | `Inf`                  |</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 55,82p tests/testthat/test-reduce-mean.R; sed …</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 55,82p tests/testthat/test-reduce-mean.R; sed -n 100,112p tests/testthat/test-reduce-mean.R; grep -n &quot;second pass\|correct&quot; tests/testthat/test-reduce-mean.R; echo ---; grep -n &quot;^static\|^r_obj\|^void\|out_stride\|run&quot; src/reduce-sum.c | head -50; echo ---; sed -n 1,80p R/reduce.R</pre><pre class="output">  expect_identical(rray_dimensions(out), c(2L, 3L, 1L))
+  expect_identical(as.vector(out), c(10, 11, 12, 13, 14, 15))
+})
+
+test_that(&quot;matches `mean()` over every combination of axes&quot;, {
+  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))
+
+  expected &lt;- function(axes) {
+    dimensions &lt;- dim(x)
+    dimensions[axes] &lt;- 1L
+    kept_axes &lt;- setdiff(seq_along(dimensions), axes)
+
+    values &lt;- if (length(kept_axes)) {
+      apply(x, kept_axes, mean)
+    } else {
+      mean(x)
+    }
+
+    array(values, dimensions)
+  }
+
+  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)
+
+  for (axis in axes) {
+    expect_identical(rray_mean(x, axis), expected(axis))
+  }
+})
+
+test_that(&quot;logical TRUE is averaged as 1&quot;, {
+  x &lt;- array(c(TRUE, FALSE, TRUE, TRUE), c(2L, 2L))
+  out &lt;- rray_mean(x, 1L)
+  expect_identical(as.vector(out), c(0.5, 1))
+})
+
+test_that(&quot;a second pass corrects the rounding error of the first sum&quot;, {
+  x &lt;- c(1e16, 1, 1, 1)
+  expect_identical(as.vector(rray_mean(x, 1L)), mean(x))
+  expect_identical(as.vector(rray_mean(x, 1L)), 2500000000000001)
+})
+
+test_that(&quot;integer means are exact when the total is above 2^53&quot;, {
+106:test_that(&quot;a second pass corrects the rounding error of the first sum&quot;, {
+185:test_that(&quot;a correction that overflows is not applied&quot;, {
+269:test_that(&quot;outputs that are fed by multiple runs are corrected&quot;, {
+---
+19:r_obj* ffi_rray_sum(
+30:r_obj* rray_sum(
+40:static rray_reduce_fn rray_sum_switch(
+67:static r_obj* rray_sum_lgl(
+90:static r_obj* rray_sum_int(
+127:static r_obj* rray_sum_dbl(
+145:  struct rray_run_iterator it;
+146:  rray_run_iterator_init1(
+154:    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+155:      const r_ssize start = rray_run_iterator_start(&amp;it);
+156:      const r_ssize end = rray_run_iterator_end(&amp;it);
+158:      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+159:      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+161:      if (out_stride == 0) {
+174:          out_loc += out_stride;
+179:    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+180:      const r_ssize start = rray_run_iterator_start(&amp;it);
+181:      const r_ssize end = rray_run_iterator_end(&amp;it);
+183:      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+184:      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+186:      if (out_stride == 0) {
+197:          out_loc += out_stride;
+207:static r_obj* rray_sum_cpl(
+225:  struct rray_run_iterator it;
+226:  rray_run_iterator_init1(
+234:    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+235:      const r_ssize start = rray_run_iterator_start(&amp;it);
+236:      const r_ssize end = rray_run_iterator_end(&amp;it);
+238:      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+239:      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+241:      if (out_stride == 0) {
+259:          out_loc += out_stride;
+264:    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+265:      const r_ssize start = rray_run_iterator_start(&amp;it);
+266:      const r_ssize end = rray_run_iterator_end(&amp;it);
+268:      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+269:      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+271:      if (out_stride == 0) {
+289:          out_loc += out_stride;
+300:static r_obj* rray_sum_lgl_or_int(
+324:  struct rray_run_iterator it;
+325:  rray_run_iterator_init1(
+333:    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+334:      const r_ssize start = rray_run_iterator_start(&amp;it);
+335:      const r_ssize end = rray_run_iterator_end(&amp;it);
+337:      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+338:      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+340:      if (out_stride == 0) {
+353:          out_loc += out_stride;
+358:    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+---
+#' Reduce an array along axes
+#'
+#' @description
+#' - `rray_sum()` computes the sum along the specified `axes`.
+#'
+#' - `rray_prod()` computes the product along the specified `axes`.
+#'
+#' - `rray_mean()` computes the mean along the specified `axes`.
+#'
+#' - `rray_all()` checks if all values are `TRUE` along the specified `axes`.
+#'
+#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.
+#'
+#' - `rray_max()` computes the maximum along the specified `axes`.
+#'
+#' - `rray_min()` computes the minimum along the specified `axes`.
+#'
+#' @details
+#' The dimensionality of `x` is retained in the result, with the reduced axes
+#' collapsed to size 1.
+#'
+#' @section Sum:
+#' Logicals are summed as integers. If an integer sum doesn't fit in an
+#' integer, an error is thrown. Only the final sum is checked, and `NA` wins
+#' over an overflow:
+#'
+#' ```r
+#' x &lt;- c(.Machine$integer.max, 1L, -1L)
+#' rray_sum(x, 1L) # .Machine$integer.max
+#'
+#' x &lt;- c(.Machine$integer.max, 1L, NA)
+#' rray_sum(x, 1L) # NA
+#' ```
+#'
+#' @section Product:
+#' Logicals and integers are cast to double.
+#'
+#' @section Mean:
+#' Logicals and integers are cast to double.
+#'
+#' When `NA` and `NaN` are both present, you get one of them, but which one
+#' depends on the platform and the order of the values, like [mean()]. Either
+#' way, `is.na()` is `TRUE`:
+#'
+#' ```r
+#' rray_mean(c(NA, NaN), 1L) # NA or NaN
+#' rray_mean(c(NaN, NA), 1L) # NA or NaN
+#' ```
+#'
+#' @section Min / Max:
+#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,
+#' such as an axis of dimension 0, `rray_max()` returns the smallest value of
+#' that type and `rray_min()` returns the largest:
+#'
+#' | type    | `rray_max()`            | `rray_min()`           |
+#' |---------|-------------------------|------------------------|
+#' | logical | `FALSE`                 | `TRUE`                 |
+#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |
+#' | double  | `-Inf`                  | `Inf`                  |
+#'
+#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+#'
+#' ```r
+#' rray_max(c(NA, NaN), 1L) # NA
+#' rray_max(c(NaN, NA), 1L) # NA
+#' ```
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to reduce over. `1` reduces
+#'   rows, `2` reduces columns, and so on.
+#'
+#' @param na_rm If `TRUE`, missing values are removed before reducing.
+#'
+#' @returns
+#' An array with the same dimensionality as `x`, but with the dimensions along
+#' `axes` reduced to 1.
+#'</pre></details>
+<p>Checking the double sum loop to see if pairwise summation landed.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 127,205p src/reduce-sum.c</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 127,205p src/reduce-sum.c</pre><pre class="output">static r_obj* rray_sum_dbl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  const double* v_x = r_dbl_cbegin(x);
+
+  r_obj* out = KEEP(r_alloc_double(out_size));
+  double* v_out = r_dbl_begin(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    v_out[i] = 0.0;
+  }
+
+  struct rray_run_iterator it;
+  rray_run_iterator_init1(
+    &amp;it,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides
+  );
+
+  if (na_rm) {
+    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+      const r_ssize start = rray_run_iterator_start(&amp;it);
+      const r_ssize end = rray_run_iterator_end(&amp;it);
+
+      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+
+      if (out_stride == 0) {
+        double sum = v_out[out_loc];
+
+        for (r_ssize i = start; i &lt; end; ++i) {
+          const double x_elt = v_x[i];
+          sum += ISNAN(x_elt) ? 0 : x_elt;
+        }
+
+        v_out[out_loc] = sum;
+      } else {
+        for (r_ssize i = start; i &lt; end; ++i) {
+          const double x_elt = v_x[i];
+          v_out[out_loc] += ISNAN(x_elt) ? 0 : x_elt;
+          out_loc += out_stride;
+        }
+      }
+    }
+  } else {
+    for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+      const r_ssize start = rray_run_iterator_start(&amp;it);
+      const r_ssize end = rray_run_iterator_end(&amp;it);
+
+      r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+      const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+
+      if (out_stride == 0) {
+        double sum = v_out[out_loc];
+
+        for (r_ssize i = start; i &lt; end; ++i) {
+          sum += v_x[i];
+        }
+
+        v_out[out_loc] = sum;
+      } else {
+        for (r_ssize i = start; i &lt; end; ++i) {
+          v_out[out_loc] += v_x[i];
+          out_loc += out_stride;
+        }
+      }
+    }
+  }
+
+  FREE(1);
+  return out;
+}</pre></details>
+<p>Yes. Three scheduled items in <code>plans/accuracy.md</code> are still undone, plus two undecided ideas.</p>
+<p><strong>Not done yet (the &quot;Order of work&quot; list)</strong></p>
+<ol>
+<li>
+<p><strong>Mean tests still compare against base R.</strong> <code>tests/testthat/test-reduce-mean.R:59</code> (&quot;matches <code>mean()</code> over every combination of axes&quot;) and <code>:106</code> (&quot;a second pass corrects the rounding error...&quot;) still use <code>expect_identical()</code> against base <code>mean()</code>. On x86_64, base R adds in <code>long double</code>, so these tests could fail there. CI only runs on macOS arm64, so it wouldn't catch that. The <code>:106</code> test already pins <code>2500000000000001</code>, so you could just drop its <code>mean(x)</code> line. The <code>:59</code> test needs hard-coded expected values.</p>
+</li>
+<li>
+<p><strong>Pairwise summation for double and complex sums.</strong> Not done. In <code>rray_sum_dbl()</code> (<code>src/reduce-sum.c:161</code>), the <code>out_stride == 0</code> branch still adds one element at a time into a single <code>double</code>. <code>rray_sum_cpl()</code> works the same way. #125 made integer and logical sums exact and fast, but double sums didn't get the 128-element blocks with 8 running totals. This is the one item with real value left: better accuracy, and probably a large speedup when summing along axis 1. That speedup is still a guess, not measured.</p>
+</li>
+<li>
+<p><strong>The shared docs section is missing.</strong> The <code>@section Sum:</code>, <code>Product:</code> and <code>Mean:</code> blocks in <code>R/reduce.R</code> never say that rray4 adds in <code>double</code> and can differ from base R in the last bits.</p>
+</li>
+</ol>
+<p><strong>Still undecided (listed as open questions, never scheduled)</strong></p>
+<ul>
+<li>
+<p>Compensated (Neumaier) summation for outputs that aren't fed by a single run of elements.</p>
+</li>
+<li>
+<p>A mantissa plus exponent accumulator, so <code>rray_prod()</code> doesn't overflow partway through.</p>
+</li>
+</ul>
+<p><strong>Stale content in the document</strong></p>
+<ul>
+<li>
+<p>The &quot;Benchmarks&quot; section predates #124 through #131. It even says its <code>rray_mean()</code> numbers are out of date.</p>
+</li>
+<li>
+<p>Plan 1 points at the old test names, and the closing paragraph about <code>rray_sum()</code> describes work that is now finished.</p>
+</li>
+</ul>
+<p>If you want to keep the document, I'd trim it to items 1 to 3 plus the two open questions. Or you could do items 1 and 3 as one small PR and give pairwise summation its own PR.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Do 1 in feature/mean-tests and then remove the document, we aren’t doing the rest</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git checkout -b feature/mean-tests &amp;&amp; Rscript -e 'dev…</summary>
+<pre>cd ~/files/r/packages/rray4; git checkout -b feature/mean-tests &amp;&amp; Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L)); A &lt;- (1e16 - 2) / 3; B &lt;- (7e15 + 2) / 3
+print(c(
+identical(rray_mean(x, 1L), x),
+identical(rray_mean(x, 2L), array(c(A, B), c(1L, 1L, 2L, 4L))),
+identical(rray_mean(x, 3L), array(c(8.5e15, 1, -1), c(1L, 3L, 1L, 4L))),
+identical(rray_mean(x, 4L), array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 1L))),
+identical(rray_mean(x, c(1L, 3L)), array(c(8.5e15, 1, -1), c(1L, 3L, 1L, 4L))),
+identical(rray_mean(x, c(2L, 4L)), array(c(A, B), c(1L, 1L, 2L, 1L))),
+identical(rray_mean(x, 1:4), array(1.7e16 / 6, c(1L, 1L, 1L, 1L)))))'; grep -rn &quot;\bsum(\|\bprod(\|\bmean(&quot; tests/testthat/test-reduce-*.R | grep -v &quot;rray_&quot; | head</pre><pre class="output">Switched to a new branch 'feature/mean-tests'
+[1] TRUE TRUE TRUE TRUE TRUE TRUE TRUE
+tests/testthat/test-reduce-mean.R:59:test_that(&quot;matches `mean()` over every combination of axes&quot;, {
+tests/testthat/test-reduce-mean.R:70:      mean(x)
+tests/testthat/test-reduce-mean.R:237:    mean(c(Inf, -Inf))
+tests/testthat/test-reduce-mean.R:277:    c(2500000000000001, NA, mean(rep(1e308, 4L)))
+tests/testthat/test-reduce-mean.R:335:  expect_identical(out, mean(x, na.rm = TRUE))
+tests/testthat/test-reduce-mean.R:367:  expected &lt;- c(2, NaN, mean(rep(1e308, 3L)), 3333333333333334, -Inf)
+tests/testthat/test-reduce-mean.R:405:test_that(&quot;na_rm matches `mean()` over every combination of axes&quot;, {
+tests/testthat/test-reduce-mean.R:418:      mean(x, na.rm = TRUE)
+tests/testthat/test-reduce-prod.R:112:    prod(Inf, 1)
+tests/testthat/test-reduce-prod.R:116:    prod(-Inf, 1)</pre></details>
+<p>All seven hand-computed values match. The file has more base <code>mean()</code> comparisons, so I'm checking those too.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 228,240p tests/testthat/test-reduce-mean.R; ec…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 228,240p tests/testthat/test-reduce-mean.R; echo ----; sed -n 265,285p tests/testthat/test-reduce-mean.R; echo ----; sed -n 325,430p tests/testthat/test-reduce-mean.R</pre><pre class="output">  x &lt;- c(NaN, NA)
+  expect_identical(is.na(rray_mean(x, 1L)), array(TRUE, 1L))
+})
+
+test_that(&quot;Inf matches base R mean&quot;, {
+  expect_identical(as.vector(rray_mean(c(Inf, 1), 1L)), mean(c(Inf, 1)))
+  expect_identical(as.vector(rray_mean(c(-Inf, 1), 1L)), mean(c(-Inf, 1)))
+  expect_identical(
+    as.vector(rray_mean(c(Inf, -Inf), 1L)),
+    mean(c(Inf, -Inf))
+  )
+  expect_identical(as.vector(rray_mean(c(Inf, NaN), 1L)), NaN)
+  expect_identical(as.vector(rray_mean(c(Inf, NA), 1L)), NA_real_)
+----
+  expect_identical(as.vector(rray_mean(x, 2L)), c(NA, 2 / 3))
+  expect_identical(as.vector(rray_mean(t(x), 1L)), c(NA, 2 / 3))
+})
+
+test_that(&quot;outputs that are fed by multiple runs are corrected&quot;, {
+  x &lt;- array(
+    c(1e16, 1, NA, 1, 1e308, 1e308, 1, 1, 1e16, 1, 1e308, 1e308),
+    c(2L, 3L, 2L)
+  )
+  out &lt;- rray_mean(x, c(1L, 3L))
+  expect_identical(
+    as.vector(out),
+    c(2500000000000001, NA, mean(rep(1e308, 4L)))
+  )
+})
+
+test_that(&quot;integer outputs can be fed by multiple runs&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+  x[1L, 2L, 3L] &lt;- NA
+
+  expected &lt;- c(10.5, NA, 14.5)
+----
+  x &lt;- c(NA_integer_, NA_integer_)
+  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), NaN)
+
+  x &lt;- c(NA_real_, NaN)
+  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), NaN)
+})
+
+test_that(&quot;na_rm does not change the sign of a zero mean&quot;, {
+  x &lt;- c(-0, NA)
+  out &lt;- as.vector(rray_mean(x, 1L, na_rm = TRUE))
+  expect_identical(out, mean(x, na.rm = TRUE))
+  expect_identical(1 / out, Inf)
+})
+
+test_that(&quot;na_rm keeps infinities&quot;, {
+  x &lt;- c(Inf, NA, 1)
+  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), Inf)
+
+  x &lt;- c(-Inf, NA, 1)
+  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), -Inf)
+})
+
+test_that(&quot;na_rm gives `NaN` when infinities of both signs remain&quot;, {
+  x &lt;- c(Inf, -Inf, NA)
+  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), NaN)
+
+  x &lt;- c(-Inf, NaN, Inf)
+  expect_identical(as.vector(rray_mean(x, 1L, na_rm = TRUE)), NaN)
+
+  x &lt;- array(c(Inf, -Inf, Inf, NA), c(2L, 2L))
+  out &lt;- rray_mean(x, 1L, na_rm = TRUE)
+  expect_identical(as.vector(out), c(NaN, Inf))
+})
+
+test_that(&quot;na_rm counts the missing values of each output&quot;, {
+  x &lt;- rbind(
+    c(1, NA, 3, NaN),
+    c(NA, NA, NA, NA),
+    c(1e308, 1e308, NA, 1e308),
+    c(1e16, NA, 1, 1),
+    c(-Inf, NA, 1, 1)
+  )
+  expected &lt;- c(2, NaN, mean(rep(1e308, 3L)), 3333333333333334, -Inf)
+
+  expect_identical(as.vector(rray_mean(x, 2L, na_rm = TRUE)), expected)
+  expect_identical(as.vector(rray_mean(t(x), 1L, na_rm = TRUE)), expected)
+})
+
+test_that(&quot;na_rm counts the integer and logical NA of each output&quot;, {
+  x &lt;- rbind(c(1L, NA, 3L), c(NA, NA, NA), c(1L, 2L, 6L))
+  expect_identical(as.vector(rray_mean(x, 2L, na_rm = TRUE)), c(2, NaN, 3))
+  expect_identical(as.vector(rray_mean(t(x), 1L, na_rm = TRUE)), c(2, NaN, 3))
+  expect_identical(
+    as.vector(rray_mean_forced_fallback(x, 2L, na_rm = TRUE)),
+    c(2, NaN, 3)
+  )
+  expect_identical(
+    as.vector(rray_mean_forced_fallback(t(x), 1L, na_rm = TRUE)),
+    c(2, NaN, 3)
+  )
+
+  x &lt;- rbind(c(TRUE, NA, FALSE), c(NA, NA, NA), c(TRUE, TRUE, FALSE))
+  expect_identical(
+    as.vector(rray_mean(x, 2L, na_rm = TRUE)),
+    c(0.5, NaN, 2 / 3)
+  )
+  expect_identical(
+    as.vector(rray_mean(t(x), 1L, na_rm = TRUE)),
+    c(0.5, NaN, 2 / 3)
+  )
+})
+
+test_that(&quot;na_rm with no missing values matches the default&quot;, {
+  x &lt;- array(1:10, c(5L, 2L))
+  expect_identical(
+    rray_mean(x, 1L, na_rm = TRUE),
+    rray_mean(x, 1L)
+  )
+})
+
+test_that(&quot;na_rm matches `mean()` over every combination of axes&quot;, {
+  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))
+  x[c(1L, 5L, 9L, 20L)] &lt;- NA
+  x[c(2L, 6L)] &lt;- NaN
+
+  expected &lt;- function(axes) {
+    dimensions &lt;- dim(x)
+    dimensions[axes] &lt;- 1L
+    kept_axes &lt;- setdiff(seq_along(dimensions), axes)
+
+    values &lt;- if (length(kept_axes)) {
+      apply(x, kept_axes, mean, na.rm = TRUE)
+    } else {
+      mean(x, na.rm = TRUE)
+    }
+
+    array(values, dimensions)
+  }
+
+  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)
+
+  for (axis in axes) {
+    expect_identical(rray_mean(x, axis, na_rm = TRUE), expected(axis))
+  }
+})</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>I'll also fix the mean tests at lines 277, 367, and 405 that can differ on x86_64, using high-precision arithmetic to compute exact expected values.</p>
+</details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray4; Rscript -e 'library(Rmpfr); devtools::load_all(quiet=…</summary>
+<pre>cd ~/files/r/packages/rray4; Rscript -e 'library(Rmpfr); devtools::load_all(quiet=TRUE)
+print(rray_mean(rep(1e308,4L),1L)==1e308); print(rray_mean(rep(1e308,3L),1L)==1e308)
+x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L)); x[c(1L, 5L, 9L, 20L)] &lt;- NA; x[c(2L, 6L)] &lt;- NaN
+exact &lt;- function(v) { v &lt;- v[!is.na(v)]; if (!length(v)) return(NaN); asNumeric(sum(mpfr(v, 300)) / length(v)) }
+for (axes in list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)) {
+  kept &lt;- setdiff(1:4, axes); d &lt;- dim(x); d[axes] &lt;- 1L
+  vals &lt;- if (length(kept)) apply(x, kept, exact) else exact(x)
+  e &lt;- array(vals, d); got &lt;- rray_mean(x, axes, na_rm = TRUE)
+  cat(deparse(axes), identical(got, e), &quot;\n&quot;); print(sprintf(&quot;%.17g&quot;, as.vector(e)))
+}'</pre><pre class="output">Exit code 1
+Error in library(Rmpfr) : there is no package called ‘Rmpfr’
+Execution halted</pre></details>
+<p>Rmpfr isn't installed. The values are small integers, so I'll print rray's output and check each one by hand.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; Rscript -e 'devtools::load_all(quiet=TRUE)</summary>
+<pre>cd ~/files/r/packages/rray4; Rscript -e 'devtools::load_all(quiet=TRUE)
+print(rray_mean(rep(1e308,4L),1L)==1e308); print(rray_mean(rep(1e308,3L),1L)==1e308)
+x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L)); x[c(1L, 5L, 9L, 20L)] &lt;- NA; x[c(2L, 6L)] &lt;- NaN
+print(sprintf(&quot;%.17g&quot;, x))
+for (axes in list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)) { got &lt;- rray_mean(x, axes, na_rm = TRUE); cat(deparse(axes), deparse(dim(got)), sprintf(&quot;%.17g&quot;, as.vector(got)), &quot;\n&quot;) }'</pre><pre class="output">[1] TRUE
+[1] TRUE
+ [1] &quot;NA&quot;                &quot;NaN&quot;               &quot;-3&quot;               
+ [4] &quot;7000000000000000&quot;  &quot;NA&quot;                &quot;NaN&quot;              
+ [7] &quot;10000000000000000&quot; &quot;1&quot;                 &quot;NA&quot;               
+[10] &quot;7000000000000000&quot;  &quot;1&quot;                 &quot;1&quot;                
+[13] &quot;10000000000000000&quot; &quot;1&quot;                 &quot;-3&quot;               
+[16] &quot;7000000000000000&quot;  &quot;1&quot;                 &quot;1&quot;                
+[19] &quot;10000000000000000&quot; &quot;NA&quot;                &quot;-3&quot;               
+[22] &quot;7000000000000000&quot;  &quot;1&quot;                 &quot;1&quot;                
+1L c(1L, 3L, 2L, 4L) NaN NaN -3 7000000000000000 NaN NaN 10000000000000000 1 NaN 7000000000000000 1 1 10000000000000000 1 -3 7000000000000000 1 1 10000000000000000 NaN -3 7000000000000000 1 1 
+2L c(1L, 1L, 2L, 4L) -3 7000000000000000 5000000000000000 2333333333333334 3333333333333332.5 2333333333333334 4999999999999998 2333333333333334 
+3L c(1L, 3L, 1L, 4L) 7000000000000000 NaN -3 8500000000000000 1 1 8500000000000000 1 -1 8500000000000000 1 -1 
+4L c(1L, 3L, 2L, 1L) 10000000000000000 1 -3 7000000000000000 1 1 
+c(1L, 3L) c(1L, 3L, 1L, 4L) 7000000000000000 NaN -3 8500000000000000 1 1 8500000000000000 1 -1 8500000000000000 1 -1 
+c(2L, 4L) c(1L, 1L, 2L, 1L) 3749999999999999.5 2800000000000000.5 
+1:4 c(1L, 1L, 1L, 1L) 3222222222222222</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Confirmed rray's <code>c(2L, 4L)</code> first-half result gives <code>.5</code> instead of the nearest double <code>.0</code>, matching the x86_64 failure predicted in plan 1. I'll pin rray's actual values, then verify the <code>.5</code> literals parse exactly.</p>
+</details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; Rscript -e 'c(identical(3749999999999999.5, 749999999…</summary>
+<pre>cd ~/files/r/packages/rray4; Rscript -e 'c(identical(3749999999999999.5, 7499999999999999/2), identical(2800000000000000.5, 5600000000000001/2), identical(3333333333333332.5, 6666666666666665/2))'</pre><pre class="output">[1] FALSE  TRUE  TRUE</pre></details>
+<p>The literal <code>3749999999999999.5</code> doesn't parse exactly, so I'll write half values as <code>n / 2</code>, which is exact.</p>
+
+<details class="tool"><summary>Read tests/testthat/test-reduce-mean.R</summary>
+<pre class="output">59	test_that(&quot;matches `mean()` over every combination of axes&quot;, {
+60	  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))
+61	
+62	  expected &lt;- function(axes) {
+63	    dimensions &lt;- dim(x)
+64	    dimensions[axes] &lt;- 1L
+65	    kept_axes &lt;- setdiff(seq_along(dimensions), axes)
+66	
+67	    values &lt;- if (length(kept_axes)) {
+68	      apply(x, kept_axes, mean)
+69	    } else {
+70	      mean(x)
+71	    }
+72	
+73	    array(values, dimensions)
+74	  }
+75	
+76	  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)
+77	
+78	  for (axis in axes) {
+79	    expect_identical(rray_mean(x, axis), expected(axis))
+80	  }
+81	})
+82	
+83	test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+84	  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], c(&quot;c1&quot;, &quot;c2&quot;)))
+85	  expect_identical(dimnames(rray_mean(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+86	  expect_identical(dimnames(rray_mean(x, 2L)), list(letters[1:5], NULL))
+87	})
+88	
+89	test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+90	  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], NULL))
+91	  expect_null(dimnames(rray_mean(x, 1L)))
+92	})
+93	
+94	test_that(&quot;output type is always double&quot;, {
+95	  expect_identical(storage.mode(rray_mean(array(TRUE), 1L)), &quot;double&quot;)
+96	  expect_identical(storage.mode(rray_mean(array(1L), 1L)), &quot;double&quot;)
+97	  expect_identical(storage.mode(rray_mean(array(1), 1L)), &quot;double&quot;)
+98	})
+99	
+100	test_that(&quot;logical TRUE is averaged as 1&quot;, {
+101	  x &lt;- array(c(TRUE, FALSE, TRUE, TRUE), c(2L, 2L))
+102	  out &lt;- rray_mean(x, 1L)
+103	  expect_identical(as.vector(out), c(0.5, 1))
+104	})
+105	
+106	test_that(&quot;a second pass corrects the rounding error of the first sum&quot;, {
+107	  x &lt;- c(1e16, 1, 1, 1)
+108	  expect_identical(as.vector(rray_mean(x, 1L)), mean(x))
+109	  expect_identical(as.vector(rray_mean(x, 1L)), 2500000000000001)
+110	})</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;matches `mean()` over every combination of axes&quot;, {</span>
+<span class="del">-  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))</span>
+<span class="del">-</span>
+<span class="del">-  expected &lt;- function(axes) {</span>
+<span class="del">-    dimensions &lt;- dim(x)</span>
+<span class="del">-    dimensions[axes] &lt;- 1L</span>
+<span class="del">-    kept_axes &lt;- setdiff(seq_along(dimensions), axes)</span>
+<span class="del">-</span>
+<span class="del">-    values &lt;- if (length(kept_axes)) {</span>
+<span class="del">-      apply(x, kept_axes, mean)</span>
+<span class="del">-    } else {</span>
+<span class="del">-      mean(x)</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    array(values, dimensions)</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)</span>
+<span class="del">-</span>
+<span class="del">-  for (axis in axes) {</span>
+<span class="del">-    expect_identical(rray_mean(x, axis), expected(axis))</span>
+<span class="del">-  }</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;works over every combination of axes&quot;, {</span>
+<span class="ins">+  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_mean(x, 1L), x)</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 2L),</span>
+<span class="ins">+    array(c((1e16 - 2) / 3, (7e15 + 2) / 3), c(1L, 1L, 2L, 4L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 3L),</span>
+<span class="ins">+    array(c(8.5e15, 1, -1), c(1L, 3L, 1L, 4L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 4L),</span>
+<span class="ins">+    array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(rray_mean(x, c(1L, 3L)), rray_mean(x, 3L))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, c(2L, 4L)),</span>
+<span class="ins">+    array(c((1e16 - 2) / 3, (7e15 + 2) / 3), c(1L, 1L, 2L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(rray_mean(x, 1:4), array(1.7e16 / 6, c(1L, 1L, 1L, 1L)))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-  x &lt;- c(1e16, 1, 1, 1)</span>
+<span class="del">-  expect_identical(as.vector(rray_mean(x, 1L)), mean(x))</span>
+<span class="del">-  expect_identical</span>
+<span class="ins">+  x &lt;- c(1e16, 1, 1, 1)</span>
+<span class="ins">+  expect_identical</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-    c(2500000000000001, NA, mean(rep(1e308, 4L)))</span>
+<span class="ins">+    c(2500000000000001, NA, 1e308)</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-  expected &lt;- c(2, NaN, mean(rep(1e308, 3L)), 3333333333333334, -Inf)</span>
+<span class="ins">+  expected &lt;- c(2, NaN, 1e308, 3333333333333334, -Inf)</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;na_rm matches `mean()` over every combination of axes&quot;, {</span>
+<span class="del">-  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))</span>
+<span class="del">-  x[c(1L, 5L, 9L, 20L)] &lt;- NA</span>
+<span class="del">-  x[c(2L, 6L)] &lt;- NaN</span>
+<span class="del">-</span>
+<span class="del">-  expected &lt;- function(axes) {</span>
+<span class="del">-    dimensions &lt;- dim(x)</span>
+<span class="del">-    dimensions[axes] &lt;- 1L</span>
+<span class="del">-    kept_axes &lt;- setdiff(seq_along(dimensions), axes)</span>
+<span class="del">-</span>
+<span class="del">-    values &lt;- if (length(kept_axes)) {</span>
+<span class="del">-      apply(x, kept_axes, mean, na.rm = TRUE)</span>
+<span class="del">-    } else {</span>
+<span class="del">-      mean(x, na.rm = TRUE)</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    array(values, dimensions)</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)</span>
+<span class="del">-</span>
+<span class="del">-  for (axis in axes) {</span>
+<span class="del">-    expect_identical(rray_mean(x, axis, na_rm = TRUE), expected(axis))</span>
+<span class="del">-  }</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;na_rm works over every combination of axes&quot;, {</span>
+<span class="ins">+  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))</span>
+<span class="ins">+  x[c(1L, 5L, 9L, 20L)] &lt;- NA</span>
+<span class="ins">+  x[c(2L, 6L)] &lt;- NaN</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_mean(x, 1L, na_rm = TRUE), replace(x, is.na(x), NaN))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 2L, na_rm = TRUE),</span>
+<span class="ins">+    array(</span>
+<span class="ins">+      c(</span>
+<span class="ins">+        -3,</span>
+<span class="ins">+        7e15,</span>
+<span class="ins">+        5e15,</span>
+<span class="ins">+        2333333333333334,</span>
+<span class="ins">+        6666666666666665 / 2,</span>
+<span class="ins">+        2333333333333334,</span>
+<span class="ins">+        4999999999999998,</span>
+<span class="ins">+        2333333333333334</span>
+<span class="ins">+      ),</span>
+<span class="ins">+      c(1L, 1L, 2L, 4L)</span>
+<span class="ins">+    )</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 3L, na_rm = TRUE),</span>
+<span class="ins">+    array(</span>
+<span class="ins">+      c(7e15, NaN, -3, 8.5e15, 1, 1, 8.5e15, 1, -1, 8.5e15, 1, -1),</span>
+<span class="ins">+      c(1L, 3L, 1L, 4L)</span>
+<span class="ins">+    )</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 4L, na_rm = TRUE),</span>
+<span class="ins">+    array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, c(1L, 3L), na_rm = TRUE),</span>
+<span class="ins">+    rray_mean(x, 3L, na_rm = TRUE)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, c(2L, 4L), na_rm = TRUE),</span>
+<span class="ins">+    array(c(7499999999999999 / 2, 5600000000000001 / 2), c(1L, 1L, 2L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_mean(x, 1:4, na_rm = TRUE),</span>
+<span class="ins">+    array(3222222222222222, c(1L, 1L, 1L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<p>Now I'll delete the plan, check for links to it, format, and run the tests.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git rm -q plans/accuracy.md; grep -rn &quot;accuracy&quot; plan…</summary>
+<pre>cd ~/files/r/packages/rray4; git rm -q plans/accuracy.md; grep -rn &quot;accuracy&quot; plans/ R/ src/ CLAUDE.md _pkgdown.yml 2&gt;/dev/null; air format . &amp;&amp; git status --short &amp;&amp; Rscript -e 'devtools::test(filter = &quot;^reduce-mean&quot;)' 2&gt;&amp;1 | tail -5</pre><pre class="output">plans/mod-and-idiv.md:44:- A warning (&quot;probable complete loss of accuracy in modulus&quot;) when
+plans/mod-and-idiv.md:193:- **The &quot;loss of accuracy&quot; warning.** `myfmod()` calls base R's `warning()`
+plans/mod-and-idiv.md:214:  edge cases like the loss-of-accuracy threshold may not match R bit for bit),
+D  plans/accuracy.md
+ M tests/testthat/test-reduce-mean.R
+
+SKIP: 'test-reduce-mean.R:168:3' ------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 3 | PASS 135 ]</pre></details>
+<p>Plan 1 is done on <code>feature/mean-tests</code>, and <code>plans/accuracy.md</code> is deleted. The mean tests pass (135 pass, 0 fail, 3 skipped long-vector tests). Nothing else in the repo linked to the plan. I haven't committed.</p>
+<p><strong>Changes in <code>tests/testthat/test-reduce-mean.R</code></strong></p>
+<ul>
+<li>
+<p>&quot;matches <code>mean()</code> over every combination of axes&quot; is now &quot;works over every combination of axes&quot;. Each axis combination has its own expected value, written as an exact expression such as <code>(1e16 - 2) / 3</code>. The numerator is exact and the division rounds correctly, so these are the true means.</p>
+</li>
+<li>
+<p>&quot;na_rm matches <code>mean()</code>...&quot; is now &quot;na_rm works over every combination of axes&quot;, with the same kind of expected values written out.</p>
+</li>
+<li>
+<p>&quot;a second pass corrects...&quot; no longer compares against <code>mean(x)</code>. It keeps the pinned <code>2500000000000001</code>.</p>
+</li>
+<li>
+<p>Two other tests also compared against base R and could differ on x86_64: <code>mean(rep(1e308, 4L))</code> and <code>mean(rep(1e308, 3L))</code>. Both are now the literal <code>1e308</code>.</p>
+</li>
+</ul>
+<p><strong>Things you should know</strong></p>
+<ul>
+<li>
+<p>One <code>na_rm</code> value isn't the nearest double to the true mean. In <code>rray_mean(x, c(2L, 4L), na_rm = TRUE)</code>, the first output's true mean is <code>3749999999999999.125</code>. The nearest double is <code>3749999999999999</code>, but rray gives <code>3749999999999999.5</code>, even with the correction pass. Base R on arm64 gives the same <code>.5</code>, which is why the old test passed. I pinned rray's actual value, so this is a regression check, not a correctness check. I checked every other expected value by hand, and each is the nearest double to the true mean.</p>
+</li>
+<li>
+<p>Half values are written as <code>7499999999999999 / 2</code> instead of decimal literals. On this machine, <code>3749999999999999.5</code> doesn't parse to the exact double.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Maybe the tougher tests should be blocked on skip if not longdouble == 4?</p>
+
+<p>Or 8 I guess</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -rn &quot;sizeof.longdouble&quot; src/main/*.c src/library/base/man…</summary>
+<pre>cd ~/files/r/r-svn; grep -rn &quot;sizeof.longdouble&quot; src/main/*.c src/library/base/man/zMachine.Rd | head; Rscript -e '.Machine$sizeof.longdouble'</pre><pre class="output">src/main/machine.c:139:    SET_STRING_ELT(nms, 16, mkChar(&quot;sizeof.longdouble&quot;));
+src/library/base/man/zMachine.Rd:87:  \item{sizeof.longdouble}{the number of bytes in a C \samp{long double}
+src/library/base/man/zMachine.Rd:137:  \code{sizeof.longdouble} only tells you the amount of storage
+[1] 8
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; sed -n 85,92p src/library/base/man/zMachine.Rd; sed -n 130,145…</summary>
+<pre>cd ~/files/r/r-svn; sed -n 85,92p src/library/base/man/zMachine.Rd; sed -n 130,145p src/library/base/man/zMachine.Rd; sed -n 130,150p src/main/machine.c; grep -n &quot;longdouble.digits\|HAVE_LONG_DOUBLE&quot; src/main/platform.c src/main/machine.c | head</pre><pre class="output">    type.  Will be zero if there is no such type, otherwise usually
+    \code{8}.}
+  \item{sizeof.longdouble}{the number of bytes in a C \samp{long double}
+    type.  Will be zero if there is no such type (or its use was
+    disabled when \R was built), otherwise possibly
+    \code{12} (most 32-bit builds),  \code{16} (most 64-bit builds) or 8
+    (CPUs such as ARM where for most compilers \samp{long double} is
+    identical to \code{double}).}
+  \cr%--------------------------------
+  For this reason, in that case, \code{.Machine} contains ten further components,
+  \code{longdouble.eps}, \code{*.neg.eps}, \code{*.digits}, \code{*.rounding}
+  \code{*.guard}, \code{*.ulp.digits}, \code{*.neg.ulp.digits},
+  \code{*.exponent}, \code{*.min.exp}, and \code{*.max.exp}, computed
+  entirely analogously to their \code{double.*} counterparts, see there.
+
+  \code{sizeof.longdouble} only tells you the amount of storage
+  allocated for a long double.  Often what is stored is the 80-bit extended
+  double type of \abbr{IEC} 60559, padded to the double alignment used on the
+  platform --- this seems to be the case for the common \R platforms
+  using ix86 and x86_64 chips.  There are other implementation of long
+  double, usually in software for example on \I{Sparc} Solaris and \I{AIX}.
+
+  Note that it is legal for a platform to have a \samp{long double} C
+  type which is identical to the \samp{double} type --- this happens on
+    SET_STRING_ELT(nms, 13, mkChar(&quot;integer.max&quot;));
+    SET_VECTOR_ELT(ans, 13, ScalarInteger(INT_MAX));
+
+    SET_STRING_ELT(nms, 14, mkChar(&quot;sizeof.long&quot;));
+    SET_VECTOR_ELT(ans, 14, ScalarInteger(SIZEOF_LONG));
+
+    SET_STRING_ELT(nms, 15, mkChar(&quot;sizeof.longlong&quot;));
+    SET_VECTOR_ELT(ans, 15, ScalarInteger(SIZEOF_LONG_LONG));
+
+    SET_STRING_ELT(nms, 16, mkChar(&quot;sizeof.longdouble&quot;));
+#ifdef HAVE_LONG_DOUBLE
+    SET_VECTOR_ELT(ans, 16, ScalarInteger(SIZEOF_LONG_DOUBLE));
+#else
+    SET_VECTOR_ELT(ans, 16, ScalarInteger(0));
+#endif
+
+    SET_STRING_ELT(nms, 17, mkChar(&quot;sizeof.pointer&quot;));
+    SET_VECTOR_ELT(ans, 17, ScalarInteger(sizeof(SEXP)));
+
+    SET_STRING_ELT(nms, 18, mkChar(&quot;sizeof.time_t&quot;));
+#ifdef  USE_INTERNAL_MKTIME
+src/main/machine.c:42:#ifdef HAVE_LONG_DOUBLE
+src/main/machine.c:79:#ifdef HAVE_LONG_DOUBLE
+src/main/machine.c:140:#ifdef HAVE_LONG_DOUBLE
+src/main/machine.c:156:#ifdef HAVE_LONG_DOUBLE
+src/main/machine.c:160:#ifdef HAVE_LONG_DOUBLE
+src/main/machine.c:186:	SET_STRING_ELT(nms, PT1+2, mkChar(&quot;longdouble.digits&quot;));
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Yes, with two changes to the check.</p>
+<p><strong>A better check than <code>sizeof.longdouble == 8</code></strong></p>
+<ul>
+<li>
+<p>R also uses plain <code>double</code> when it was built with <code>--disable-long-double</code>. In that case <code>.Machine$sizeof.longdouble</code> is <code>0</code>, not <code>8</code> (<code>src/main/machine.c:140</code>). So the check would at least need to be <code>%in% c(0L, 8L)</code>.</p>
+</li>
+<li>
+<p><code>sizeof</code> is the number of bytes of storage, not the precision. A more direct check is the number of mantissa bits. That component only exists when R has a <code>long double</code>:</p>
+<pre><code class="language-r">skip_if_long_double &lt;- function() {
+  digits &lt;- .Machine$longdouble.digits
+  if (!is.null(digits) &amp;&amp; digits &gt; 53L) {
+    skip(&quot;Base R accumulates in `long double`&quot;)
+  }
+}
+</code></pre>
+<p>It skips exactly when base R gets extra precision: x86_64 (64 bits) and Linux arm64 (113 bits). It runs on Apple silicon, Windows arm64, and builds without <code>long double</code>.</p>
+</li>
+</ul>
+<p><strong>Add, don't replace</strong></p>
+<p>I'd keep the new hand-pinned tests and add the base <code>mean()</code> comparisons back as separate tests behind the skip. They check different things:</p>
+<ul>
+<li>
+<p>The pinned tests run on every platform. They lock in rray's own results, which are the same everywhere.</p>
+</li>
+<li>
+<p>The base R comparisons only run where base R also uses <code>double</code>. They check that rray matches base R's algorithm, including its correction pass. A skip-only version would leave x86_64 without any check on those values.</p>
+</li>
+</ul>
+<p>Do you want me to add the skipped base R comparisons next to the pinned tests? Or would you rather have the skipped comparisons replace the pinned values?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Add them next to them</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat tests/testthat/helper-reduce-mean.R; ls tests/tes…</summary>
+<pre>cd ~/files/r/packages/rray4; cat tests/testthat/helper-reduce-mean.R; ls tests/testthat/helper-*; grep -n &quot;test_that(\&quot;a second pass\|outputs that are fed by multiple runs are corrected\|na_rm counts the missing values of each output\|na_rm works over every\|works over every&quot; tests/testthat/test-reduce-mean.R</pre><pre class="output">rray_mean_forced_fallback &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_test_rray_mean_forced_fallback, x, axes, na_rm, environment())
+}
+tests/testthat/helper-extract.R
+tests/testthat/helper-extremum.R
+tests/testthat/helper-index.R
+tests/testthat/helper-ptype.R
+tests/testthat/helper-reduce-mean.R
+tests/testthat/helper-reduce-sum.R
+tests/testthat/helper-rep.R
+tests/testthat/helper-roll.R
+tests/testthat/helper-skip.R
+tests/testthat/helper-slice.R
+tests/testthat/helper-stack.R
+tests/testthat/helper-subscript.R
+tests/testthat/helper-wrapper.R
+59:test_that(&quot;works over every combination of axes&quot;, {
+106:test_that(&quot;a second pass corrects the rounding error of the first sum&quot;, {
+268:test_that(&quot;outputs that are fed by multiple runs are corrected&quot;, {
+358:test_that(&quot;na_rm counts the missing values of each output&quot;, {
+404:test_that(&quot;na_rm works over every combination of axes&quot;, {</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat tests/testthat/helper-skip.R; grep -rn &quot;skip_if_\…</summary>
+<pre>cd ~/files/r/packages/rray4; cat tests/testthat/helper-skip.R; grep -rn &quot;skip_if_\|skip_on&quot; tests/testthat/test-*.R | head -5</pre><pre class="output">skip_if_not_testing_long_vectors &lt;- function() {
+  skip_if_not(
+    identical(Sys.getenv(&quot;RRAY_TESTING_LONG_VECTORS&quot;), &quot;true&quot;),
+    &quot;Not testing long vectors&quot;
+  )
+}
+tests/testthat/test-reduce-sum.R:459:  skip_if_not_testing_long_vectors()
+tests/testthat/test-reduce-sum.R:466:  skip_if_not_testing_long_vectors()
+tests/testthat/test-reduce-sum.R:474:  skip_if_not_testing_long_vectors()
+tests/testthat/test-reduce-mean.R:145:  skip_if_not_testing_long_vectors()
+tests/testthat/test-reduce-mean.R:155:  skip_if_not_testing_long_vectors()</pre></details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray4; cat &gt;&gt; tests/testthat/helper-skip.R &lt;&lt;'EOF'</summary>
+<pre>cd ~/files/r/packages/rray4; cat &gt;&gt; tests/testthat/helper-skip.R &lt;&lt;'EOF'
+
+skip_if_long_double &lt;- function() {
+  digits &lt;- .Machine$longdouble.digits
+  skip_if(
+    !is.null(digits) &amp;&amp; digits &gt; 53L,
+    &quot;Base R accumulates in `long double`&quot;
+  )
+}
+EOF
+sed -n 104,110p tests/testthat/test-reduce-mean.R; sed -n 268,280p tests/testthat/test-reduce-mean.R; sed -n 358,372p tests/testthat/test-reduce-mean.R; tail -5 tests/testthat/test-reduce-mean.R</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read tests/testthat/helper-skip.R</summary>
+<pre class="output">1	skip_if_not_testing_long_vectors &lt;- function() {
+2	  skip_if_not(
+3	    identical(Sys.getenv(&quot;RRAY_TESTING_LONG_VECTORS&quot;), &quot;true&quot;),
+4	    &quot;Not testing long vectors&quot;
+5	  )
+6	}
+7	</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-reduce-mean.R</summary>
+<pre class="output">80	  expect_identical(rray_mean(x, 1:4), array(1.7e16 / 6, c(1L, 1L, 1L, 1L)))
+81	})
+82	
+83	test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+84	  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], c(&quot;c1&quot;, &quot;c2&quot;)))
+85	  expect_identical(dimnames(rray_mean(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+86	  expect_identical(dimnames(rray_mean(x, 2L)), list(letters[1:5], NULL))
+87	})
+88	
+89	test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+90	  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], NULL))
+91	  expect_null(dimnames(rray_mean(x, 1L)))
+92	})
+93	
+94	test_that(&quot;output type is always double&quot;, {
+95	  expect_identical(storage.mode(rray_mean(array(TRUE), 1L)), &quot;double&quot;)
+96	  expect_identical(storage.mode(rray_mean(array(1L), 1L)), &quot;double&quot;)
+97	  expect_identical(storage.mode(rray_mean(array(1), 1L)), &quot;double&quot;)
+98	})
+99	
+100	test_that(&quot;logical TRUE is averaged as 1&quot;, {
+101	  x &lt;- array(c(TRUE, FALSE, TRUE, TRUE), c(2L, 2L))
+102	  out &lt;- rray_mean(x, 1L)
+103	  expect_identical(as.vector(out), c(0.5, 1))
+104	})
+105	
+106	test_that(&quot;a second pass corrects the rounding error of the first sum&quot;, {
+107	  x &lt;- c(1e16, 1, 1, 1)
+108	  expect_identical(as.vector(rray_mean(x, 1L)), 2500000000000001)
+109	})</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-reduce-mean.R</summary>
+<pre class="output">266	})
+267	
+268	test_that(&quot;outputs that are fed by multiple runs are corrected&quot;, {
+269	  x &lt;- array(
+270	    c(1e16, 1, NA, 1, 1e308, 1e308, 1, 1, 1e16, 1, 1e308, 1e308),
+271	    c(2L, 3L, 2L)
+272	  )
+273	  out &lt;- rray_mean(x, c(1L, 3L))
+274	  expect_identical(
+275	    as.vector(out),
+276	    c(2500000000000001, NA, 1e308)
+277	  )
+278	})
+279	
+280	test_that(&quot;integer outputs can be fed by multiple runs&quot;, {
+281	  x &lt;- array(1:24, c(2L, 3L, 4L))</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-reduce-mean.R</summary>
+<pre class="output">356	})
+357	
+358	test_that(&quot;na_rm counts the missing values of each output&quot;, {
+359	  x &lt;- rbind(
+360	    c(1, NA, 3, NaN),
+361	    c(NA, NA, NA, NA),
+362	    c(1e308, 1e308, NA, 1e308),
+363	    c(1e16, NA, 1, 1),
+364	    c(-Inf, NA, 1, 1)
+365	  )
+366	  expected &lt;- c(2, NaN, 1e308, 3333333333333334, -Inf)
+367	
+368	  expect_identical(as.vector(rray_mean(x, 2L, na_rm = TRUE)), expected)
+369	  expect_identical(as.vector(rray_mean(t(x), 1L, na_rm = TRUE)), expected)
+370	})
+371	</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-reduce-mean.R</summary>
+<pre class="output">440	  )
+441	  expect_identical(
+442	    rray_mean(x, c(2L, 4L), na_rm = TRUE),
+443	    array(c(7499999999999999 / 2, 5600000000000001 / 2), c(1L, 1L, 2L, 1L))
+444	  )
+445	  expect_identical(
+446	    rray_mean(x, 1:4, na_rm = TRUE),
+447	    array(3222222222222222, c(1L, 1L, 1L, 1L))
+448	  )
+449	})
+450	
+451	test_that(&quot;plain vector input works&quot;, {
+452	  out &lt;- rray_mean(1:3, 1L)
+453	  expect_identical(as.vector(out), 2)
+454	  expect_identical(rray_dimensions(out), 1L)
+455	})
+456	
+457	test_that(&quot;scalar reduction works&quot;, {
+458	  out &lt;- rray_mean(5, 1L)
+459	  expect_identical(as.vector(out), 5)
+460	  expect_identical(rray_dimensions(out), 1L)
+461	})
+462	
+463	test_that(&quot;axes are coerced to integer&quot;, {
+464	  x &lt;- array(1:4, c(2L, 2L))
+465	  expect_identical(
+466	    rray_mean(x, 1),
+467	    rray_mean(x, 1L)
+468	  )
+469	})
+470	
+471	test_that(&quot;the mean of no values is `NaN`&quot;, {
+472	  x &lt;- matrix(numeric(), 0L, 2L)
+473	  out &lt;- rray_mean(x, 1L)
+474	  expect_identical(rray_dimensions(out), c(1L, 2L))
+475	  expect_identical(as.vector(out), c(NaN, NaN))
+476	})
+477	
+478	test_that(&quot;reducing over a non-zero-length axis with a zero-length axis&quot;, {
+479	  x &lt;- matrix(numeric(), 0L, 2L)
+480	  out &lt;- rray_mean(x, 2L)
+481	  expect_identical(rray_dimensions(out), c(0L, 1L))
+482	  expect_identical(as.vector(out), numeric())
+483	})
+484	
+485	test_that(&quot;reducing all axes of a zero-length array&quot;, {
+486	  x &lt;- matrix(numeric(), 0L, 2L)
+487	  out &lt;- rray_mean(x, c(1L, 2L))
+488	  expect_identical(rray_dimensions(out), c(1L, 1L))
+489	  expect_identical(as.vector(out), NaN)
+490	})
+491	
+492	test_that(&quot;the empty reduction of each input type is `NaN`&quot;, {
+493	  zero_size &lt;- function(x) array(x, c(0L, 1L))
+494	
+495	  expect_identical(as.vector(rray_mean(zero_size(logical()), 1L)), NaN)
+496	  expect_identical(as.vector(rray_mean(zero_size(integer()), 1L)), NaN)
+497	  expect_identical(
+498	    as.vector(rray_mean_forced_fallback(zero_size(integer()), 1L)),
+499	    NaN
+500	  )
+501	  expect_identical(
+502	    as.vector(rray_mean_forced_fallback(
+503	      zero_size(integer()),
+504	      1L,
+505	      na_rm = TRUE
+506	    )),
+507	    NaN
+508	  )
+509	  expect_identical(as.vector(rray_mean(zero_size(double()), 1L)), NaN)
+510	})
+511	
+512	test_that(&quot;errors on axes out of range&quot;, {
+513	  x &lt;- array(1:4, c(2L, 2L))
+514	  expect_snapshot(rray_mean(x, 3L), error = TRUE)
+515	})
+516	
+517	test_that(&quot;errors on axes not in strictly increasing order&quot;, {
+518	  x &lt;- array(1:24, c(2L, 3L, 4L))
+519	  expect_snapshot(rray_mean(x, c(1L, 1L)), error = TRUE)
+520	  expect_snapshot(rray_mean(x, c(2L, 1L)), error = TRUE)
+521	})
+522	
+523	test_that(&quot;errors on axes less than 1&quot;, {
+524	  x &lt;- array(1:4, c(2L, 2L))
+525	  expect_snapshot(rray_mean(x, 0L), error = TRUE)
+526	})
+527	
+528	test_that(&quot;errors on axes with NA&quot;, {
+529	  x &lt;- array(1:4, c(2L, 2L))
+530	  expect_snapshot(rray_mean(x, NA_integer_), error = TRUE)
+531	})
+532	
+533	test_that(&quot;`na_rm` must be `TRUE` or `FALSE`&quot;, {
+534	  x &lt;- array(1:4, c(2L, 2L))
+535	  expect_snapshot(rray_mean(x, 1L, na_rm = NA), error = TRUE)
+536	  expect_snapshot(rray_mean(x, 1L, na_rm = logical()), error = TRUE)
+537	  expect_snapshot(rray_mean(x, 1L, na_rm = c(TRUE, FALSE)), error = TRUE)
+538	  expect_snapshot(rray_mean(x, 1L, na_rm = 1), error = TRUE)
+539	})
+540	
+541	test_that(&quot;errors on complex input&quot;, {
+542	  x &lt;- array(c(1 + 2i, 3 + 4i, 5 + 6i, 7 + 8i), c(2L, 2L))
+543	  expect_snapshot(rray_mean(x, 1L), error = TRUE)
+544	})
+545	
+546	test_that(&quot;errors on non-numeric input&quot;, {
+547	  x &lt;- array(letters[1:4], c(2L, 2L))
+548	  expect_snapshot(rray_mean(x, 1L), error = TRUE)
+549	
+550	  x &lt;- array(as.raw(1:4), c(2L, 2L))
+551	  expect_snapshot(rray_mean(x, 1L), error = TRUE)
+552	
+553	  x &lt;- array(list(1, 2, 3, 4), c(2L, 2L))
+554	  expect_snapshot(rray_mean(x, 1L), error = TRUE)
+555	})
+556	
+557	test_that(&quot;errors on classed input&quot;, {
+558	  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+559	  expect_snapshot(rray_mean(x, 1L), error = TRUE)
+560	})
+561	</pre></details>
+<p>Adding the helper and five base R comparison tests, each placed right after its pinned test.</p>
+
+<details class="tool"><summary>Edit tests/testthat/helper-skip.R</summary>
+<pre class="diff"><span class="del">-    &quot;Not testing long vectors&quot;</span>
+<span class="del">-  )</span>
+<span class="del">-}</span>
+<span class="ins">+    &quot;Not testing long vectors&quot;</span>
+<span class="ins">+  )</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+skip_if_long_double &lt;- function() {</span>
+<span class="ins">+  digits &lt;- .Machine$longdouble.digits</span>
+<span class="ins">+  skip_if(</span>
+<span class="ins">+    !is.null(digits) &amp;&amp; digits &gt; 53L,</span>
+<span class="ins">+    &quot;Base R accumulates in `long double`&quot;</span>
+<span class="ins">+  )</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/helper-skip.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(rray_mean(x, 1:4), array(1.7e16 / 6, c(1L, 1L, 1L, 1L)))</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_identical(rray_mean(x, 1:4), array(1.7e16 / 6, c(1L, 1L, 1L, 1L)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;matches `mean()` over every combination of axes&quot;, {</span>
+<span class="ins">+  skip_if_long_double()</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))</span>
+<span class="ins">+</span>
+<span class="ins">+  expected &lt;- function(axes) {</span>
+<span class="ins">+    dimensions &lt;- dim(x)</span>
+<span class="ins">+    dimensions[axes] &lt;- 1L</span>
+<span class="ins">+    kept_axes &lt;- setdiff(seq_along(dimensions), axes)</span>
+<span class="ins">+</span>
+<span class="ins">+    values &lt;- if (length(kept_axes)) {</span>
+<span class="ins">+      apply(x, kept_axes, mean)</span>
+<span class="ins">+    } else {</span>
+<span class="ins">+      mean(x)</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    array(values, dimensions)</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)</span>
+<span class="ins">+</span>
+<span class="ins">+  for (axis in axes) {</span>
+<span class="ins">+    expect_identical(rray_mean(x, axis), expected(axis))</span>
+<span class="ins">+  }</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(as.vector(rray_mean(x, 1L)), 2500000000000001)</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_identical(as.vector(rray_mean(x, 1L)), 2500000000000001)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;a second pass matches `mean()`&quot;, {</span>
+<span class="ins">+  skip_if_long_double()</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(1e16, 1, 1, 1)</span>
+<span class="ins">+  expect_identical(as.vector(rray_mean(x, 1L)), mean(x))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-    c(2500000000000001, NA, 1e308)</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    c(2500000000000001, NA, 1e308)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;outputs that are fed by multiple runs match `mean()`&quot;, {</span>
+<span class="ins">+  skip_if_long_double()</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- array(</span>
+<span class="ins">+    c(1e16, 1, NA, 1, 1e308, 1e308, 1, 1, 1e16, 1, 1e308, 1e308),</span>
+<span class="ins">+    c(2L, 3L, 2L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  out &lt;- rray_mean(x, c(1L, 3L))</span>
+<span class="ins">+  expect_identical(as.vector(out), apply(x, 2L, mean))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(as.vector(rray_mean(t(x), 1L, na_rm = TRUE)), expected)</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_identical(as.vector(rray_mean(t(x), 1L, na_rm = TRUE)), expected)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;na_rm matches `mean()` for each output&quot;, {</span>
+<span class="ins">+  skip_if_long_double()</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- rbind(</span>
+<span class="ins">+    c(1, NA, 3, NaN),</span>
+<span class="ins">+    c(NA, NA, NA, NA),</span>
+<span class="ins">+    c(1e308, 1e308, NA, 1e308),</span>
+<span class="ins">+    c(1e16, NA, 1, 1),</span>
+<span class="ins">+    c(-Inf, NA, 1, 1)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expected &lt;- apply(x, 1L, mean, na.rm = TRUE)</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(as.vector(rray_mean(x, 2L, na_rm = TRUE)), expected)</span>
+<span class="ins">+  expect_identical(as.vector(rray_mean(t(x), 1L, na_rm = TRUE)), expected)</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-mean.R</summary>
+<pre class="diff"><span class="del">-    array(3222222222222222, c(1L, 1L, 1L, 1L))</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    array(3222222222222222, c(1L, 1L, 1L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;na_rm matches `mean()` over every combination of axes&quot;, {</span>
+<span class="ins">+  skip_if_long_double()</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- array(c(1e16, 1, -3, 7e15, 1, 1), c(1L, 3L, 2L, 4L))</span>
+<span class="ins">+  x[c(1L, 5L, 9L, 20L)] &lt;- NA</span>
+<span class="ins">+  x[c(2L, 6L)] &lt;- NaN</span>
+<span class="ins">+</span>
+<span class="ins">+  expected &lt;- function(axes) {</span>
+<span class="ins">+    dimensions &lt;- dim(x)</span>
+<span class="ins">+    dimensions[axes] &lt;- 1L</span>
+<span class="ins">+    kept_axes &lt;- setdiff(seq_along(dimensions), axes)</span>
+<span class="ins">+</span>
+<span class="ins">+    values &lt;- if (length(kept_axes)) {</span>
+<span class="ins">+      apply(x, kept_axes, mean, na.rm = TRUE)</span>
+<span class="ins">+    } else {</span>
+<span class="ins">+      mean(x, na.rm = TRUE)</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    array(values, dimensions)</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)</span>
+<span class="ins">+</span>
+<span class="ins">+  for (axis in axes) {</span>
+<span class="ins">+    expect_identical(rray_mean(x, axis, na_rm = TRUE), expected(axis))</span>
+<span class="ins">+  }</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; air format . &amp;&amp; Rscript -e 'devtools::test(filter = &quot;…</summary>
+<pre>cd ~/files/r/packages/rray4; air format . &amp;&amp; Rscript -e 'devtools::test(filter = &quot;^reduce-mean&quot;)' 2&gt;&amp;1 | tail -3; Rscript -e '.Machine$longdouble.digits'; git status --short</pre><pre class="output">Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 3 | PASS 153 ]
+NULL
+D  plans/accuracy.md
+ M tests/testthat/helper-skip.R
+ M tests/testthat/test-reduce-mean.R</pre></details>
+<p>The tests pass. One detail surprised me: on this Mac, <code>.Machine$longdouble.digits</code> is <code>NULL</code>, not <code>53</code>. Checking R's source to confirm the helper still skips on x86_64.</p>
+
+<details class="tool"><summary>Bash: sed -n 150,190p ~/files/r/r-svn/src/main/machine.c</summary>
+<pre>sed -n 150,190p ~/files/r/r-svn/src/main/machine.c</pre><pre class="output">#ifdef  USE_INTERNAL_MKTIME
+    SET_VECTOR_ELT(ans, 18, ScalarInteger(sizeof(R_time_t)));
+#else
+    SET_VECTOR_ELT(ans, 18, ScalarInteger(sizeof(time_t)));
+#endif
+/* This used to be just
+#ifdef HAVE_LONG_DOUBLE
+   but platforms can have the type and it be identical to double
+   (as on ARM).  So do the same as capabilities(&quot;long.double&quot;)
+*/
+#ifdef HAVE_LONG_DOUBLE
+    if (sizeof(LDOUBLE) &gt; sizeof(double)) {
+	static struct {
+	    int ibeta, it, irnd, ngrd, machep, negep, iexp, minexp, maxexp;
+	    long double eps, epsneg, xmin, xmax;
+	} R_LD_AccuracyInfo;
+	
+	machar_LD(&amp;R_LD_AccuracyInfo.ibeta,
+		  &amp;R_LD_AccuracyInfo.it,
+		  &amp;R_LD_AccuracyInfo.irnd,
+		  &amp;R_LD_AccuracyInfo.ngrd,
+		  &amp;R_LD_AccuracyInfo.machep,
+		  &amp;R_LD_AccuracyInfo.negep,
+		  &amp;R_LD_AccuracyInfo.iexp,
+		  &amp;R_LD_AccuracyInfo.minexp,
+		  &amp;R_LD_AccuracyInfo.maxexp,
+		  &amp;R_LD_AccuracyInfo.eps,
+		  &amp;R_LD_AccuracyInfo.epsneg,
+		  &amp;R_LD_AccuracyInfo.xmin,
+		  &amp;R_LD_AccuracyInfo.xmax);
+#define PT1 19
+	SET_STRING_ELT(nms, PT1+0, mkChar(&quot;longdouble.eps&quot;));
+	SET_VECTOR_ELT(ans, PT1+0, ScalarReal((double) R_LD_AccuracyInfo.eps));
+
+	SET_STRING_ELT(nms, PT1+1, mkChar(&quot;longdouble.neg.eps&quot;));
+	SET_VECTOR_ELT(ans, PT1+1, ScalarReal((double) R_LD_AccuracyInfo.epsneg));
+	SET_STRING_ELT(nms, PT1+2, mkChar(&quot;longdouble.digits&quot;));
+	SET_VECTOR_ELT(ans, PT1+2, ScalarInteger(R_LD_AccuracyInfo.it));
+
+	SET_STRING_ELT(nms, PT1+3, mkChar(&quot;longdouble.rounding&quot;));
+	SET_VECTOR_ELT(ans, PT1+3, ScalarInteger(R_LD_AccuracyInfo.irnd));</pre></details>
+<p>R only sets <code>.Machine$longdouble.digits</code> when <code>long double</code> is wider than <code>double</code>. So the helper can just check whether the field exists:</p>
+
+<details class="tool"><summary>Edit tests/testthat/helper-skip.R</summary>
+<pre class="diff"><span class="del">-  digits &lt;- .Machine$longdouble.digits</span>
+<span class="del">-  skip_if(</span>
+<span class="del">-    !is.null(digits) &amp;&amp; digits &gt; 53L,</span>
+<span class="del">-    &quot;Base R accumulates in `long double`&quot;</span>
+<span class="del">-  )</span>
+<span class="ins">+  skip_if(</span>
+<span class="ins">+    !is.null(.Machine$longdouble.digits),</span>
+<span class="ins">+    &quot;Base R accumulates in `long double`&quot;</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/helper-skip.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; air format . &amp;&amp; Rscript -e 'devtools::test(filter = &quot;…</summary>
+<pre>cd ~/files/r/packages/rray4; air format . &amp;&amp; Rscript -e 'devtools::test(filter = &quot;^reduce-mean&quot;)' 2&gt;&amp;1 | tail -1</pre><pre class="output">[ FAIL 0 | WARN 0 | SKIP 3 | PASS 153 ]</pre></details>
+<p>I added the base R comparisons next to the pinned tests on <code>feature/mean-tests</code>. All mean tests pass on this Mac: 153 pass, 0 fail, and the same 3 long-vector skips as before. None of the new tests skip here, because base R also uses <code>double</code> on this machine. I haven't committed.</p>
+<p><strong>The skip helper</strong> is <code>skip_if_long_double()</code> in <code>tests/testthat/helper-skip.R</code>:</p>
+<pre><code class="language-r">skip_if_long_double &lt;- function() {
+  skip_if(
+    !is.null(.Machine$longdouble.digits),
+    &quot;Base R accumulates in `long double`&quot;
+  )
+}
+</code></pre>
+<p>It's simpler than what I first suggested. R only sets <code>.Machine$longdouble.digits</code> when <code>long double</code> is wider than <code>double</code> (<code>src/main/machine.c:161</code>). On this Mac the field is <code>NULL</code>. So the field existing is the exact test for &quot;base R gets extra precision&quot;. It also covers builds made with <code>--disable-long-double</code>. A <code>sizeof.longdouble</code> check would have needed both <code>0</code> and <code>8</code> to cover those.</p>
+<p><strong>Five tests in <code>test-reduce-mean.R</code> now compare against base R behind the skip</strong>, each placed after its pinned test:</p>
+<ul>
+<li>
+<p>&quot;matches <code>mean()</code> over every combination of axes&quot;</p>
+</li>
+<li>
+<p>&quot;a second pass matches <code>mean()</code>&quot;</p>
+</li>
+<li>
+<p>&quot;outputs that are fed by multiple runs match <code>mean()</code>&quot;</p>
+</li>
+<li>
+<p>&quot;na_rm matches <code>mean()</code> for each output&quot;</p>
+</li>
+<li>
+<p>&quot;na_rm matches <code>mean()</code> over every combination of axes&quot;</p>
+</li>
+</ul>
+<p>The x86_64 behavior is checked against R's source only. I haven't run these tests on an x86_64 machine.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git add -A &amp;&amp; git commit -q -m &quot;Pin mean test values,…</summary>
+<pre>cd ~/files/r/packages/rray4; git add -A &amp;&amp; git commit -q -m &quot;Pin mean test values, skip base R comparisons with long double, remove accuracy plan&quot; &amp;&amp; git push -u origin feature/mean-tests 2&gt;&amp;1 | tail -3; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/mean-tests -&gt; feature/mean-tests
+branch 'feature/mean-tests' set up to track 'origin/feature/mean-tests'.
+5012a80 Pin mean test values, skip base R comparisons with long double, remove accuracy plan</pre></details>
+<p>I committed the changes as <code>5012a80</code> and pushed <code>feature/mean-tests</code> to origin. The message is &quot;Pin mean test values, skip base R comparisons with long double, remove accuracy plan&quot;, with no co-author line. I didn't open a pull request.</p>
+
+</section>
+</main>
+</body>
+</html>

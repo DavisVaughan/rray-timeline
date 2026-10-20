@@ -1,0 +1,3459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Implementing rray_cumulative_sum() and planning a logical NA audit</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-146">rray timeline</a>
+<h1>Implementing <code>rray_cumulative_sum()</code> and planning a logical <code>NA</code> audit</h1>
+<p class="facts">Claude · Oct 12, 2026 · 4 prompts · 17 replies · <a href="https://github.com/r-lib/rray/pull/146">#146</a></p>
+</header>
+<main>
+<p class="divider">Oct 12, 2026, 00:36 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create feature/cumulative-sum</p>
+<p>Read the plan/cumulative and the last few PRs</p>
+<p>Implement the cumulative sum function from the plan with benchmarking. Pay close attention to performance</p>
+<p>Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Remove the plan when finished<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status &amp;&amp; git branch -a &amp;&amp; ls &amp;&amp; ls plan* 2&gt;/dev/null; git log --oneline -8</summary>
+<pre>git status &amp;&amp; git branch -a &amp;&amp; ls &amp;&amp; ls plan* 2&gt;/dev/null; git log --oneline -8</pre><pre class="output">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+* main
+  remotes/origin/HEAD -&gt; origin/main
+  remotes/origin/gh-pages
+  remotes/origin/main
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+codecov.yml
+compile_commands.json
+DESCRIPTION
+docs
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+panache.toml
+pkgdown
+plans
+R
+README.md
+README.Rmd
+rray.Rproj
+src
+tests
+vignettes
+cumulative.md
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+5b91e39 Implement the prod performance plan!
+91dbe6d Remove titles plan (#144)
+53d97b5 Add `rray_cumulative_prod()` (#143)
+0dd7ce1 Add `rray_cumulative_max/min()` (#142)
+15edd77 Add `rray_cumulative_any/all()` (#141)
+153250e Update cumulative plan for current reducers (#140)
+6694814 Add titles API (#139)
+7ff7f6b Remove key plan</pre></details>
+<details class="tool"><summary>Bash: cat plans/cumulative.md &amp;&amp; ls bench R src src/decl tests/testthat</summary>
+<pre>cat plans/cumulative.md &amp;&amp; ls bench R src src/decl tests/testthat</pre><pre class="output"># Cumulative functions
+
+## Scope and decisions
+
+Add `rray_cumulative_sum()`, `rray_cumulative_prod()`,
+`rray_cumulative_min()`, `rray_cumulative_max()`,
+`rray_cumulative_any()`, and `rray_cumulative_all()`. Each takes one
+required, one-based `axis`. There is no `na_rm` argument. Do not add a
+cumulative mean. The current mean reducer uses a corrected second pass for
+doubles and exact wide integer sums. A cumulative mean would need a separate
+numerical rule for every prefix.
+
+For an array `x`, the value at position `i` on the selected axis summarizes
+positions `1:i` on that axis. All other coordinates stay fixed. Each such
+line starts with fresh state. The output has the same dimensions and axis
+names as `x`; only the element type may change. A vector is treated as a
+one-dimensional array, following the rest of rray.
+
+```r
+x &lt;- matrix(1:6, nrow = 2)
+rray_cumulative_sum(x, axis = 1L)
+rray_cumulative_sum(x, axis = 2L)
+```
+
+The first call gives rows `(1, 3, 5)` and `(3, 7, 11)`. The second gives
+rows `(1, 4, 9)` and `(2, 6, 12)`.
+
+One axis keeps prefix order clear. NumPy also accepts one axis for
+[`cumsum()`](https://numpy.org/doc/stable/reference/generated/numpy.cumsum.html);
+its `axis = None` scans a flattened array. rray will require an axis and
+retain the input dimensions. A scan over several axes would need a separate
+rule for their order and for which intermediate prefixes become output.
+
+These are array scans: the selected axis does not collapse. Use the current
+reducer type rules and the existing one-element operations where they fit.
+Each section below states any difference from a reducer or base R.
+
+## Public API and file layout
+
+- Put all six documented and exported R functions in `R/cumulative.R`.
+  Use one `rray-cumulative` documentation topic, a required `axis`, and
+  `.Call(ffi_rray_cumulative_..., x, axis, environment())`. Do not add
+  `na_rm` or an unused `...` argument.
+- Add `src/cumulative.c`, `src/cumulative.h`, and
+  `src/decl/cumulative-decl.h` for input validation, shape handling,
+  dispatch, and `RRAY_CUMULATIVE()`. Add operation files
+  `src/cumulative-sum.c/.h`, `src/cumulative-prod.c/.h`,
+  `src/cumulative-extremum.c/.h`, and `src/cumulative-logical.c/.h`,
+  each with its own `src/decl/*-decl.h`.
+  Extremum holds min and max; logical holds any and all, as the reducers do.
+- Add the six `extern` FFI declarations and registrations to `src/init.c`.
+  Keep FFI declarations out of feature headers. Put thin FFI wrappers first
+  in each operation `.c`, then the internal entry points, type switches,
+  typed loops, and helpers in use order. Include the decl header last.
+- Add `test-cumulative-sum.R`, `test-cumulative-prod.R`,
+  `test-cumulative-extremum.R`, and `test-cumulative-logical.R`.
+  Add the topic to `_pkgdown.yml` under a Cumulative section, then
+  document and run `pkgdown::check_pkgdown()`.
+
+The common C entry point should accept the validated integer axis and a
+typed function switch, for example
+`rray_cumulative(x, axis, fn_switch, arg, error_call)`. A typed function
+receives `x`, `stride`, `axis_dimension`, `outer`, and `error_call`, and
+returns a freshly allocated output vector. Each public internal function
+passes its switch to the common entry point. Convert the R axis in the
+FFI wrapper with `arg_as_int(ffi_axis, rray_args.axis, error_call)` and call
+`check_axis()` after finding dimensionality. Use `check_unclassed()` and
+`arg_as_array()` as `rray_reduce()` does. Switch on `rray_typeof(x)` and
+reject unsupported types through a cumulative-specific error naming the
+operation. For any and all, use `check_logical()` as their reducers do.
+
+The common entry point protects the converted `x` and the typed output. It
+attaches `r_dim(x)` and, when present, `r_dim_names(x)`. Both are borrowed
+from the protected input. The typed function or macro allocates and fills
+the output. Do not copy class or other attributes. Preserve all axis names,
+including the scanned axis, since every output position still belongs to
+the same input position. A named vector becomes a one-dimensional array
+with its names on that axis through `arg_as_array()`.
+
+## Traversal and `RRAY_CUMULATIVE()`
+
+For a one-based axis, define `stride` as the product of dimensions before
+that axis, `axis_dimension` as its dimension, and `outer` as the product of
+dimensions after it. These use `r_ssize`. For each outer block, the source
+index for axis position `k` and inner lane `j` is
+`block * axis_dimension * stride + k * stride + j`.
+
+```text
+dimensions c(2, 3, 4), axis 2:
+stride = 2, axis_dimension = 3, outer = 4
+one line uses offsets 0, 2, 4; another uses 1, 3, 5
+the next block begins at offset 6
+```
+
+Make `RRAY_CUMULATIVE()` analogous to `RRAY_REDUCE()`: typed input and output
+accessors, output type, initial state, and one-element operation. The macro
+allocates one output vector, obtains input and output pointers once, and
+writes every prefix.
+
+Process each block in axis order and each `k` across adjacent `j` lanes.
+At `k = 0`, apply the operation to its identity and the first input. At
+later positions, read the preceding result at `index - stride` and combine
+it with `x[index]`. This avoids a scratch array for sum, product, extrema,
+and logical scans. The output never aliases the input. The `k` loop must
+remain sequential; the lane loop may vectorize. Axis 1 is a single
+contiguous line per outer block. Do not pass this scan through the reduction
+iterator, whose zero strides intentionally merge all positions of a reduced
+axis into one result.
+
+For zero-sized arrays, allocate a zero-sized output of the right type and
+attach the input shape and names. Do not divide by an axis dimension or
+read a first element. An axis of dimension 1 still applies type conversion.
+Use `r_ssize` for size, stride, and outer counts. Base their products on the
+validated dimensions of `x`, and check multiplication if a product can be
+formed before encountering a zero dimension. An error in any line aborts
+the whole call. Line state does not leak into the next line.
+
+## `rray_cumulative_sum()`
+
+Accepted types: logical, integer, double, and complex. Logical input yields
+integer; every other accepted input keeps its type, like `rray_sum()` and
+base [`cumsum()`](https://stat.ethz.ch/R-manual/R-devel/library/base/html/cumsum.html).
+Use zero as the starting value, separately for each line.
+
+Reuse `rray_add_int_one()` from `src/one-add.h` for both integer and logical
+input. Logical values already use `0`, `1`, and the same missing sentinel as
+integers. This checks each returned prefix against `[-INT_MAX, INT_MAX]`.
+The current `rray_sum()` instead sums in `int64_t`, or its `int128_t`
+fallback for very long reductions, and checks only the final result. A
+cumulative sum must error as soon as a returned prefix overflows, even if
+a later value or `NA` would make the final reduction valid. Once a line is
+missing, `rray_add_int_one()` keeps it missing and does not report a later
+overflow. Base `cumsum()` warns and fills the suffix with `NA` on overflow.
+
+```r
+x &lt;- c(.Machine$integer.max, 1L, -1L)
+rray_sum(x, 1L)
+rray_cumulative_sum(x, 1L)
+```
+
+The reducer returns `.Machine$integer.max`; the scan errors at its second
+prefix.
+
+For double input, reuse `rray_add_dbl_one()`. For complex input, reuse
+`rray_add_cpl_one()`, which adds real and imaginary parts separately. These
+are ordinary double additions in prefix order, like the current double and
+complex sum reducers. Do not add a separate missing-value rule. When `NA`
+and `NaN` meet, the result can be either one, depending on the platform and
+operand order. Test `is.na()` for those mixed cases. A single `NA` or `NaN`
+persists in its line, and opposing infinities produce `NaN`. Base `cumsum()`
+revisits missing prefixes to prefer `NA`; it also uses `long double` when
+available for real doubles. Compare with base only for cases whose semantics
+agree.
+
+Test both scan axes and a third axis, types, resets between lines, upper
+and lower integer overflow, cancellation after overflow, a missing value
+before overflow, both `NA` and `NaN` orders, opposing infinities, and
+complex values with a missing real or imaginary part.
+
+## `rray_cumulative_prod()`
+
+Accepted types: logical, integer, double, and complex. Logical and integer
+input yield double, matching `rray_prod()` and base `cumprod()`. Double and
+complex input keep their type. Start every line at one, with a zero
+imaginary part for complex numbers.
+
+Reuse `rray_prod_lgl_one()`, `rray_prod_int_one()`, `rray_prod_dbl_one()`,
+and `rray_prod_cpl_one()` from `src/one-multiply.h`. Integer multiplication
+is done in double, so it has no integer overflow error. A double product may
+become `Inf` or underflow to zero; `0 * Inf` is `NaN`. As with the current
+product reducer, do not promise whether `NA` or `NaN` wins when both occur.
+For complex multiplication, keep rray's C99 operation and its infinity
+recovery behavior. Its special values can differ from base R's complex
+`cumprod()`. Base real `cumprod()` also uses `long double` when available
+and revisits missing prefixes to prefer `NA`. State these differences in
+documentation.
+
+Test type promotion, line resets, signed and zero products, `0 * Inf`,
+both `NA` and `NaN` orders, overflow to infinity, underflow, and finite
+complex products. Compare simple lines to base `cumprod()`.
+
+## `rray_cumulative_min()`
+
+Accepted types: logical, integer, and double. Keep the input type, as
+`rray_min()` does. Base `cummin()` returns integer for logical input, so
+that is an intentional type difference. Complex is unsupported.
+
+Start each line at `TRUE`, `INT_MAX`, or `Inf`, respectively. Reuse the
+missing-aware operations in `src/one-extremum.h` where their behavior
+matches prefix semantics. A logical or integer `NA` persists through the
+rest of its line. A double `NaN` persists until a later `NA`, which then
+persists. Later finite values cannot clear either missing state. Compare
+ordinary values by taking the smaller one. Check ties and signed zero
+explicitly: the existing one-element helper keeps the earlier operand on
+a tie, while base R's double `cummin()` may keep the later one. Keep the
+rray helper rule and avoid a bit-level promise for signed zero.
+
+Test logical, integer, and double types; rising and falling values;
+repeated extrema; both missing orders; infinity; signed zero; empty
+lines; and independent lines on each axis.</pre><p class="cut">466 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show --stat HEAD 53d97b5 0dd7ce1 &amp;&amp; git show HEAD | head -800</summary>
+<pre>git show --stat HEAD 53d97b5 0dd7ce1 &amp;&amp; git show HEAD | head -800</pre><pre class="output">commit 5b91e391d1b3ebf9675524457df2b4b2d7ae11a8
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:33:09 2026 -0400
+
+    Implement the prod performance plan!
+
+ R/reduce.R                            |  12 +++
+ bench/binary.R                        |   1 +
+ bench/reduce.R                        |  13 ++-
+ man/rray-reduce.Rd                    |  11 ++
+ plans/prod-performance.md             | 182 ----------------------------------
+ src/one-multiply.h                    |  30 +-----
+ tests/testthat/test-cumulative-prod.R |   6 ++
+ tests/testthat/test-reduce-prod.R     |  25 +++++
+ 8 files changed, 71 insertions(+), 209 deletions(-)
+
+commit 53d97b51c914da2253f02e5558b974369973ef75
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:02:39 2026 -0400
+
+    Add `rray_cumulative_prod()` (#143)
+
+ NAMESPACE                                |   1 +
+ R/cumulative.R                           |  23 +++
+ bench/cumulative.R                       |   7 +-
+ man/rray-cumulative.Rd                   |  20 +++
+ plans/prod-performance.md                | 182 ++++++++++++++++++++++
+ src/cumulative-prod.c                    | 130 ++++++++++++++++
+ src/cumulative-prod.h                    |  15 ++
+ src/decl/cumulative-prod-decl.h          |  38 +++++
+ src/init.c                               |   6 +
+ tests/testthat/_snaps/cumulative-prod.md | 104 +++++++++++++
+ tests/testthat/test-cumulative-prod.R    | 252 +++++++++++++++++++++++++++++++
+ 11 files changed, 777 insertions(+), 1 deletion(-)
+
+commit 0dd7ce1f61f54bc9c5bff0dac3ac3825378c8adc
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 16:43:28 2026 -0400
+
+    Add `rray_cumulative_max/min()` (#142)
+
+ NAMESPACE                                    |   2 +
+ R/cumulative.R                               |  40 +++++
+ bench/cumulative.R                           |  10 +-
+ man/rray-cumulative.Rd                       |  32 ++++
+ src/cumulative-extremum.c                    | 215 +++++++++++++++++++++++
+ src/cumulative-extremum.h                    |  22 +++
+ src/cumulative.c                             |  15 ++
+ src/cumulative.h                             |   7 +
+ src/decl/cumulative-extremum-decl.h          |  60 +++++++
+ src/init.c                                   |  12 ++
+ tests/testthat/_snaps/cumulative-extremum.md | 128 ++++++++++++++
+ tests/testthat/test-cumulative-extremum.R    | 250 +++++++++++++++++++++++++++
+ 12 files changed, 792 insertions(+), 1 deletion(-)
+commit 5b91e391d1b3ebf9675524457df2b4b2d7ae11a8
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:33:09 2026 -0400
+
+    Implement the prod performance plan!
+
+diff --git a/R/reduce.R b/R/reduce.R
+index 5b2dabf..f7915c7 100644
+--- a/R/reduce.R
++++ b/R/reduce.R
+@@ -35,6 +35,18 @@
+ #' @section Product:
+ #' Logicals and integers are cast to double.
+ #'
++#' When `NA` and `NaN` are both present, you get one of them, but which one
++#' depends on the platform and the order of the values. Either way, `is.na()`
++#' is `TRUE`. Integers can hit this too, since a product that overflows to
++#' `Inf` becomes `NaN` when multiplied by `0`:
++#'
++#' ```r
++#' rray_prod(c(NA, NaN), 1L) # NA or NaN
++#'
++#' x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++#' rray_prod(x, 1L) # NA or NaN
++#' ```
++#'
+ #' @section Mean:
+ #' Logicals and integers are cast to double.
+ #'
+diff --git a/bench/binary.R b/bench/binary.R
+index b98ccc8..c6b62da 100644
+--- a/bench/binary.R
++++ b/bench/binary.R
+@@ -4,6 +4,7 @@ iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
++  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+diff --git a/bench/reduce.R b/bench/reduce.R
+index 7b2861c..f58e73a 100644
+--- a/bench/reduce.R
++++ b/bench/reduce.R
+@@ -5,7 +5,14 @@ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
+   sum = list(fn = rray_sum, types = c(&quot;integer&quot;, &quot;double&quot;)),
+-  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),
++  prod = list(
++    fn = rray_prod,
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++  ),
++  prod_na_rm = list(
++    fn = \(x, axes) rray_prod(x, axes, na_rm = TRUE),
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++  ),
+   max = list(fn = rray_max, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   max_na_rm = list(
+     fn = \(x, axes) rray_max(x, axes, na_rm = TRUE),
+@@ -22,6 +29,7 @@ operations &lt;- list(
+ )
+ 
+ shapes &lt;- list(
++  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+   &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+   &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+   &quot;[4000, 4000] over 1, 2&quot; = list(c(4000L, 4000L), 1:2),
+@@ -40,7 +48,8 @@ make_array &lt;- function(dimensions, type) {
+     type,
+     logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+     integer = sample(100L, n, replace = TRUE),
+-    double = runif(n)
++    double = runif(n),
++    complex = complex(real = runif(n), imaginary = runif(n))
+   )
+ 
+   array(values, dimensions)
+diff --git a/man/rray-reduce.Rd b/man/rray-reduce.Rd
+index 315322d..145e8ca 100644
+--- a/man/rray-reduce.Rd
++++ b/man/rray-reduce.Rd
+@@ -71,6 +71,17 @@ rray_sum(x, 1L) # NA
+ \section{Product}{
+ 
+ Logicals and integers are cast to double.
++
++When \code{NA} and \code{NaN} are both present, you get one of them, but which one
++depends on the platform and the order of the values. Either way, \code{is.na()}
++is \code{TRUE}. Integers can hit this too, since a product that overflows to
++\code{Inf} becomes \code{NaN} when multiplied by \code{0}:
++
++\if{html}{\out{&lt;div class=&quot;sourceCode r&quot;&gt;}}\preformatted{rray_prod(c(NA, NaN), 1L) # NA or NaN
++
++x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++rray_prod(x, 1L) # NA or NaN
++}\if{html}{\out{&lt;/div&gt;}}
+ }
+ 
+ \section{Mean}{
+diff --git a/plans/prod-performance.md b/plans/prod-performance.md
+deleted file mode 100644
+index 0cac275..0000000
+--- a/plans/prod-performance.md
++++ /dev/null
+@@ -1,182 +0,0 @@
+-# Product helper performance
+-
+-## Summary
+-
+-While adding `rray_cumulative_prod()`, a one-line rewrite of
+-`rray_prod_lgl_one()` and `rray_prod_int_one()` in `src/one-multiply.h` made
+-logical and integer products 25% to 35% faster along a contiguous axis. This
+-helped both `rray_cumulative_prod()` and `rray_prod()`. That change was made
+-and then undone on the `feature/cumulative-prod` branch (commit `32aabcc`,
+-reverted after it). It belongs in its own PR. That PR should check every
+-helper in `src/one-multiply.h` at once.
+-
+-## The change
+-
+-Before:
+-
+-```c
+-static inline double rray_prod_int_one(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
+-}
+-```
+-
+-After:
+-
+-```c
+-static inline double rray_prod_int_one(double out, int x) {
+-  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : (double) x);
+-}
+-```
+-
+-`rray_prod_lgl_one()` got the same rewrite.
+-
+-## Why it is faster
+-
+-Along axis 1, both `RRAY_REDUCE()` and `RRAY_CUMULATIVE()` take the fixed zero</pre><p class="cut">269 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show 53d97b5 -- R src bench NAMESPACE &amp;&amp; cat src/cumulative.c src/cumulative.h</summary>
+<pre>git show 53d97b5 -- R src bench NAMESPACE &amp;&amp; cat src/cumulative.c src/cumulative.h</pre><pre class="output">commit 53d97b51c914da2253f02e5558b974369973ef75
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:02:39 2026 -0400
+
+    Add `rray_cumulative_prod()` (#143)
+
+diff --git a/NAMESPACE b/NAMESPACE
+index dfd6b56..6014c1f 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -14,6 +14,7 @@ export(rray_cumulative_all)
+ export(rray_cumulative_any)
+ export(rray_cumulative_max)
+ export(rray_cumulative_min)
++export(rray_cumulative_prod)
+ export(rray_dimensionality)
+ export(rray_dimensions)
+ export(rray_dimensions_common)
+diff --git a/R/cumulative.R b/R/cumulative.R
+index c21bf59..4417691 100644
+--- a/R/cumulative.R
++++ b/R/cumulative.R
+@@ -11,6 +11,8 @@
+ #'
+ #' - `rray_cumulative_min()` computes the minimum so far along `axis`.
+ #'
++#' - `rray_cumulative_prod()` computes the product so far along `axis`.
++#'
+ #' @details
+ #' Each position along `axis` summarizes every position up to and including
+ #' it.
+@@ -41,6 +43,18 @@
+ #' rray_cumulative_any(c(NA, TRUE), 1L) # NA, TRUE
+ #' ```
+ #'
++#' @section Product:
++#' `x` must be logical, integer, double, or complex. Logicals and integers are
++#' cast to double.
++#'
++#' When `NA` and `NaN` are both present, you get one of them, but which one
++#' depends on the platform and the order of the values. Either way, `is.na()`
++#' is `TRUE` from that point on:
++#'
++#' ```r
++#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN
++#' ```
++#'
+ #' @param x An array.
+ #'
+ #' @param axis A single integer. The axis to accumulate along. `1`
+@@ -68,6 +82,9 @@
+ #' # Running maximum and minimum across columns
+ #' rray_cumulative_max(x, 2L)
+ #' rray_cumulative_min(x, 2L)
++#'
++#' # Running product down rows
++#' rray_cumulative_prod(x, 1L)
+ NULL
+ 
+ #' @rdname rray-cumulative
+@@ -93,3 +110,9 @@ rray_cumulative_max &lt;- function(x, axis) {
+ rray_cumulative_min &lt;- function(x, axis) {
+   .Call(ffi_rray_cumulative_min, x, axis, environment())
+ }
++
++#' @rdname rray-cumulative
++#' @export
++rray_cumulative_prod &lt;- function(x, axis) {
++  .Call(ffi_rray_cumulative_prod, x, axis, environment())
++}
+diff --git a/bench/cumulative.R b/bench/cumulative.R
+index 4c17388..60cf4ce 100644
+--- a/bench/cumulative.R
++++ b/bench/cumulative.R
+@@ -13,6 +13,10 @@ operations &lt;- list(
+   min = list(
+     fn = rray_cumulative_min,
+     types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
++  ),
++  prod = list(
++    fn = rray_cumulative_prod,
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+   )
+ )
+ 
+@@ -34,7 +38,8 @@ make_array &lt;- function(dimensions, type) {
+     type,
+     logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+     integer = sample(100L, n, replace = TRUE),
+-    double = runif(n)
++    double = runif(n),
++    complex = complex(real = runif(n), imaginary = runif(n))
+   )
+ 
+   array(values, dimensions)
+diff --git a/src/cumulative-prod.c b/src/cumulative-prod.c
+new file mode 100644
+index 0000000..d5b5154
+--- /dev/null
++++ b/src/cumulative-prod.c
+@@ -0,0 +1,130 @@
++#include &quot;cumulative-prod.h&quot;
++
++#include &quot;cumulative.h&quot;
++#include &quot;one-multiply.h&quot;
++#include &quot;type.h&quot;
++#include &quot;utils.h&quot;
++
++#include &quot;decl/cumulative-prod-decl.h&quot;
++
++r_obj* ffi_rray_cumulative_prod(
++  r_obj* ffi_x,
++  r_obj* ffi_axis,
++  r_obj* ffi_frame
++) {
++  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
++  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
++  return rray_cumulative_prod(ffi_x, axis, rray_args.x, error_call);
++}
++
++r_obj* rray_cumulative_prod(
++  r_obj* x,
++  int axis,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++) {
++  return rray_cumulative(x, axis, rray_cumulative_prod_switch, arg, error_call);
++}
++
++static rray_cumulative_fn rray_cumulative_prod_switch(
++  r_obj* x,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++) {
++  switch (rray_typeof(x)) {
++  case RRAY_TYPE_logical:
++    return rray_cumulative_prod_lgl;
++  case RRAY_TYPE_integer:
++    return rray_cumulative_prod_int;
++  case RRAY_TYPE_double:
++    return rray_cumulative_prod_dbl;
++  case RRAY_TYPE_complex:
++    return rray_cumulative_prod_cpl;
++
++  case RRAY_TYPE_character:
++  case RRAY_TYPE_raw:
++  case RRAY_TYPE_list:
++    stop_unsupported_cumulative(&quot;product&quot;, x, arg, error_call);
++
++  case RRAY_TYPE_scalar:
++    stop_scalar_input(x, arg, error_call);
++  }
++
++  r_stop_unreachable();
++}
++
++static r_obj* rray_cumulative_prod_lgl(
++  r_obj* x,
++  r_ssize state_size,
++  const int* v_dimensions,
++  int dimensionality,
++  const r_ssize* v_state_broadcast_strides,
++  struct r_lazy error_call
++) {
++  RRAY_CUMULATIVE(
++    int,
++    r_lgl_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    1.0,
++    rray_prod_lgl_one
++  );
++}
++
++static r_obj* rray_cumulative_prod_int(
++  r_obj* x,
++  r_ssize state_size,
++  const int* v_dimensions,
++  int dimensionality,
++  const r_ssize* v_state_broadcast_strides,
++  struct r_lazy error_call
++) {
++  RRAY_CUMULATIVE(
++    int,
++    r_int_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    1.0,
++    rray_prod_int_one
++  );
++}
++
++static r_obj* rray_cumulative_prod_dbl(
++  r_obj* x,
++  r_ssize state_size,
++  const int* v_dimensions,
++  int dimensionality,
++  const r_ssize* v_state_broadcast_strides,</pre><p class="cut">293 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/one-add.h R/cumulative.R bench/cumulative.R tests/testthat/helper-cumulative.R &amp;&amp; cat…</summary>
+<pre>cat src/one-add.h R/cumulative.R bench/cumulative.R tests/testthat/helper-cumulative.R &amp;&amp; cat src/cumulative-extremum.c | head -80</pre><pre class="output">#ifndef RRAY_ONE_ADD_H
+#define RRAY_ONE_ADD_H
+
+#include &lt;limits.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// - `x = 1`, `y = 1`: returns `2`.
+// - `x = 1`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = INT_MAX`: returns `NA`.
+// - `x = 1`, `y = INT_MAX`: errors.
+static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+    stop_int_overflow(error_call);
+  }
+
+  return x + y;
+}
+
+// For `c(NA, NaN)` behavior, match `+` and let the order be &quot;implementation
+// defined&quot; which is very fast. We consistently do this for both `rray_add()`
+// and `rray_sum()`, while R itself only does this for `+`. `sum()` prefers
+// `NA` when both are present.
+static inline double rray_add_dbl_one(double x, double y) {
+  return x + y;
+}
+
+static inline r_complex rray_add_cpl_one(r_complex x, r_complex y) {
+  return (r_complex) {.r = x.r + y.r, .i = x.i + y.i};
+}
+
+#endif
+#' Accumulate along an axis
+#'
+#' @description
+#' - `rray_cumulative_all()` checks if all values are `TRUE` so far along
+#'   `axis`.
+#'
+#' - `rray_cumulative_any()` checks if any value is `TRUE` so far along
+#'   `axis`.
+#'
+#' - `rray_cumulative_max()` computes the maximum so far along `axis`.
+#'
+#' - `rray_cumulative_min()` computes the minimum so far along `axis`.
+#'
+#' - `rray_cumulative_prod()` computes the product so far along `axis`.
+#'
+#' @details
+#' Each position along `axis` summarizes every position up to and including
+#' it.
+#'
+#' @section All / Any:
+#' `x` must be logical. Missing values follow [all()] and [any()], so a later
+#' `FALSE` or `TRUE` can settle an earlier `NA`:
+#'
+#' ```r
+#' rray_cumulative_all(c(TRUE, NA, FALSE), 1L) # TRUE, NA, FALSE
+#' rray_cumulative_any(c(FALSE, NA, TRUE), 1L) # FALSE, NA, TRUE
+#' ```
+#'
+#' @section Min / Max:
+#' `x` must be logical, integer, or double, and the result keeps the type of
+#' `x`. Once a line hits `NA` or `NaN`, the rest of it stays missing. A later
+#' `NA` replaces an earlier `NaN`, like [max()] and [min()]:
+#'
+#' ```r
+#' rray_cumulative_max(c(1, NaN, 2, NA, 3), 1L) # 1, NaN, NaN, NA, NA
+#' ```
+#'
+#' For logical `x`, a later `TRUE` or `FALSE` does not settle an earlier `NA`,
+#' unlike `rray_cumulative_any()` and `rray_cumulative_all()`:
+#'
+#' ```r
+#' rray_cumulative_max(c(NA, TRUE), 1L) # NA, NA
+#' rray_cumulative_any(c(NA, TRUE), 1L) # NA, TRUE
+#' ```
+#'
+#' @section Product:
+#' `x` must be logical, integer, double, or complex. Logicals and integers are
+#' cast to double.
+#'
+#' When `NA` and `NaN` are both present, you get one of them, but which one
+#' depends on the platform and the order of the values. Either way, `is.na()`
+#' is `TRUE` from that point on:
+#'
+#' ```r
+#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN
+#' ```
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer. The axis to accumulate along. `1`
+#'   accumulates down rows, `2` accumulates across columns, and so on.
+#'
+#' @returns
+#' An array with the same dimensions and names as `x`.
+#'
+#' @name rray-cumulative
+#' @examples
+#' x &lt;- array(c(TRUE, TRUE, FALSE, TRUE, NA, TRUE), c(2L, 3L))
+#' x
+#'
+#' # Down rows
+#' rray_cumulative_all(x, 1L)
+#' rray_cumulative_any(x, 1L)
+#'
+#' # Across columns
+#' rray_cumulative_all(x, 2L)
+#' rray_cumulative_any(x, 2L)
+#'
+#' x &lt;- array(c(3L, 1L, 2L, 5L, 4L, 0L), c(2L, 3L))
+#' x
+#'
+#' # Running maximum and minimum across columns
+#' rray_cumulative_max(x, 2L)
+#' rray_cumulative_min(x, 2L)
+#'
+#' # Running product down rows
+#' rray_cumulative_prod(x, 1L)
+NULL
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_all &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_all, x, axis, environment())
+}
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_any &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_any, x, axis, environment())
+}
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_max &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_max, x, axis, environment())
+}
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_min &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_min, x, axis, environment())
+}
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_prod &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_prod, x, axis, environment())
+}
+devtools::load_all(quiet = TRUE)
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+operations &lt;- list(
+  all = list(fn = rray_cumulative_all, types = &quot;logical&quot;),
+  any = list(fn = rray_cumulative_any, types = &quot;logical&quot;),
+  max = list(
+    fn = rray_cumulative_max,
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
+  ),
+  min = list(
+    fn = rray_cumulative_min,
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
+  ),
+  prod = list(
+    fn = rray_cumulative_prod,
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+  )
+)
+
+shapes &lt;- list(
+  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+  &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+  &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+  &quot;[200, 200, 200] over 1&quot; = list(c(200L, 200L, 200L), 1L),
+  &quot;[200, 200, 200] over 2&quot; = list(c(200L, 200L, 200L), 2L),
+  &quot;[200, 200, 200] over 3&quot; = list(c(200L, 200L, 200L), 3L),
+  &quot;[10, 1e6] over 1&quot; = list(c(10L, 1000000L), 1L),
+  &quot;[10, 1e6] over 2&quot; = list(c(10L, 1000000L), 2L)
+)
+
+make_array &lt;- function(dimensions, type) {
+  n &lt;- prod(dimensions)
+
+  values &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),</pre><p class="cut">142 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/reduce-sum.c | head -150 &amp;&amp; grep -rn &quot;error_call)&quot; src/one-*.h src/reduce.h | head; g…</summary>
+<pre>cat src/reduce-sum.c | head -150 &amp;&amp; grep -rn &quot;error_call)&quot; src/one-*.h src/reduce.h | head; grep -n &quot;ONE(&quot; src/reduce.h src/*.h | head -20</pre><pre class="output">#include &quot;reduce-sum.h&quot;
+
+#include &lt;stdint.h&gt;
+
+#include &quot;int-128.h&quot;
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-sum-decl.h&quot;
+
+// Above an input length of 2^32 for a single output location, we can't
+// guarantee that an `int` sum will fit in an `int64_t`. However, it is
+// guaranteed to fit in an `int128_t`. So we fall back to a slower sum that
+// relies on `int128_t` summing. That type isn't actually portable, so we mock
+// our own minimal version.
+#define RRAY_SUM_INT64_MAX_COUNT ((r_ssize) 1 &lt;&lt; 32)
+
+r_obj* ffi_rray_sum(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_sum(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_sum(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_sum_switch, arg, error_call);
+}
+
+static rray_reduce_fn rray_sum_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return rray_sum_lgl;
+  case RRAY_TYPE_integer:
+    return rray_sum_int;
+  case RRAY_TYPE_double:
+    return rray_sum_dbl;
+  case RRAY_TYPE_complex:
+    return rray_sum_cpl;
+
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;sum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_sum_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  const int* v_x = r_lgl_cbegin(x);
+
+  return rray_sum_lgl_or_int(
+    v_x,
+    r_globals.na_lgl,
+    na_rm,
+    out_size,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides,
+    error_call
+  );
+}
+
+static r_obj* rray_sum_int(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  const int* v_x = r_int_cbegin(x);
+  const r_ssize x_size = r_length(x);
+  const r_ssize count = rray_reduce_count(x_size, out_size);
+
+  if (count &gt; RRAY_SUM_INT64_MAX_COUNT) {
+    return rray_sum_int_fallback(
+      v_x,
+      na_rm,
+      out_size,
+      v_dimensions,
+      dimensionality,
+      v_out_broadcast_strides,
+      error_call
+    );
+  }
+
+  return rray_sum_lgl_or_int(
+    v_x,
+    r_globals.na_int,
+    na_rm,
+    out_size,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides,
+    error_call
+  );
+}
+
+static r_obj* rray_sum_dbl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  const double* v_x = r_dbl_cbegin(x);
+
+  r_obj* out = KEEP(r_alloc_double(out_size));
+  double* v_out = r_dbl_begin(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    v_out[i] = 0.0;
+  }
+
+  struct rray_run_iterator it;
+  rray_run_iterator_init1(
+    &amp;it,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides
+src/one-multiply.h:31:    stop_int_overflow(error_call);
+src/one-add.h:18:static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+src/one-add.h:24:    stop_int_overflow(error_call);
+src/reduce.h:82:        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+src/reduce.h:86:        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+src/binary.h:53:        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+src/binary.h:59:        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+src/binary.h:66:        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+src/binary.h:73:        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+src/cumulative.h:72:        elt = ONE(elt, v_x[i]);                                                \
+src/cumulative.h:79:        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i]);                 \
+src/reduce.h:82:        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+src/reduce.h:86:        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \</pre></details>
+<details class="tool"><summary>Bash: cat tests/testthat/test-cumulative-prod.R &amp;&amp; cat tests/testthat/_snaps/cumulative-prod.md | h…</summary>
+<pre>cat tests/testthat/test-cumulative-prod.R &amp;&amp; cat tests/testthat/_snaps/cumulative-prod.md | head -60 &amp;&amp; grep -n &quot;Cumulative&quot; -A10 _pkgdown.yml</pre><pre class="output">test_that(&quot;can accumulate along axis 1&quot;, {
+  x &lt;- array(c(2, 3, -1, 4, 0, 5), c(3L, 2L))
+
+  expect_identical(
+    rray_cumulative_prod(x, 1L),
+    array(c(2, 6, -6, 4, 0, 0), c(3L, 2L))
+  )
+})
+
+test_that(&quot;can accumulate along axis 2&quot;, {
+  x &lt;- array(c(2, 4, 3, 0, -1, 5), c(2L, 3L))
+
+  expect_identical(
+    rray_cumulative_prod(x, 2L),
+    array(c(2, 4, 6, 0, -6, 0), c(2L, 3L))
+  )
+})
+
+test_that(&quot;can accumulate along every axis of a 3D array&quot;, {
+  x &lt;- array(rep_len(c(2L, -1L, 3L, 1L, -2L), 24L), c(2L, 3L, 4L))
+  expected &lt;- array(as.double(x), dim(x))
+
+  for (axis in 1:3) {
+    expect_identical(
+      rray_cumulative_prod(x, axis),
+      cumulative_reference(expected, axis, `*`)
+    )
+  }
+})
+
+test_that(&quot;each line starts fresh&quot;, {
+  x &lt;- array(c(0, 2, 3, 4), c(2L, 2L))
+  expect_identical(
+    rray_cumulative_prod(x, 1L),
+    array(c(0, 0, 3, 12), c(2L, 2L))
+  )
+  expect_identical(
+    rray_cumulative_prod(x, 2L),
+    array(c(0, 2, 0, 8), c(2L, 2L))
+  )
+})
+
+test_that(&quot;logicals and integers become doubles&quot;, {
+  expect_identical(
+    rray_cumulative_prod(c(TRUE, TRUE, FALSE), 1L),
+    array(c(1, 1, 0), 3L)
+  )
+  expect_identical(
+    rray_cumulative_prod(c(2L, -3L, 4L), 1L),
+    array(c(2, -6, -24), 3L)
+  )
+  expect_identical(
+    rray_cumulative_prod(c(2, 0.5), 1L),
+    array(c(2, 1), 2L)
+  )
+  expect_identical(
+    rray_cumulative_prod(c(1i, 1i), 1L),
+    array(c(1i, -1 + 0i), 2L)
+  )
+})
+
+test_that(&quot;integers do not overflow&quot;, {
+  x &lt;- c(.Machine$integer.max, .Machine$integer.max)
+  expect_identical(
+    rray_cumulative_prod(x, 1L),
+    array(c(.Machine$integer.max, .Machine$integer.max^2), 2L)
+  )
+})
+
+test_that(&quot;matches base R for simple lines&quot;, {
+  lines &lt;- list(
+    c(TRUE, TRUE, FALSE, TRUE),
+    c(2L, -1L, 3L, 0L, 5L),
+    c(0.5, -4, 2, -0.25),
+    c(1 + 1i, 2 - 1i, 0 + 1i, -3 + 0i)
+  )
+
+  for (x in lines) {
+    expect_identical(as.vector(rray_cumulative_prod(x, 1L)), cumprod(x))
+  }
+})
+
+test_that(&quot;products can overflow to infinity and underflow to zero&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(1e200, -1e200, 2), 1L)),
+    c(1e200, -Inf, -Inf)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(1e-200, 1e-200, 2), 1L)),
+    c(1e-200, 0, 0)
+  )
+})
+
+test_that(&quot;zero times infinity is `NaN`&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(0, Inf, 1), 1L)),
+    c(0, NaN, NaN)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(Inf, 0, 1), 1L)),
+    c(Inf, NaN, NaN)
+  )
+})
+
+test_that(&quot;zero keeps its sign&quot;, {
+  out &lt;- as.vector(rray_cumulative_prod(c(-1, 0, 2, -3), 1L))
+  expect_identical(1 / out, c(-1, -Inf, -Inf, Inf))
+})
+
+test_that(&quot;missing values persist through the rest of a line&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(TRUE, NA, FALSE), 1L)),
+    c(1, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(2L, NA, 0L), 1L)),
+    c(2, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(2, NA, 0), 1L)),
+    c(2, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(2, NaN, 0), 1L)),
+    c(2, NaN, NaN)
+  )
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(c(1i, NA, 0i), 1L))),
+    c(FALSE, TRUE, TRUE)
+  )
+})
+
+test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(c(2, NA, NaN, 3), 1L))),
+    c(FALSE, TRUE, TRUE, TRUE)
+  )
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),
+    c(FALSE, TRUE, TRUE, TRUE)
+  )
+
+  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(x, 1L))),
+    c(rep(FALSE, 40L), TRUE, TRUE)
+  )
+})
+
+test_that(&quot;last position matches the reducer&quot;, {
+  x &lt;- array(c(2, -1, 0.5, 4, -3, 0.25), c(2L, 3L))
+  expect_identical(
+    rray_cumulative_prod(x, 2L)[, 3L, drop = FALSE],
+    rray_prod(x, 2L)
+  )
+
+  x &lt;- array(c(1 + 1i, 2i, -1 + 0i, 3 - 1i), c(2L, 2L))
+  expect_identical(
+    rray_cumulative_prod(x, 1L)[2L, , drop = FALSE],
+    rray_prod(x, 1L)
+  )
+})
+
+test_that(&quot;an axis of dimension 1 still casts to double&quot;, {
+  x &lt;- array(c(TRUE, FALSE, NA), c(1L, 3L))
+  expect_identical(rray_cumulative_prod(x, 1L), array(c(1, 0, NA), c(1L, 3L)))
+
+  x &lt;- array(c(-2L, 3L, NA), c(1L, 3L))
+  expect_identical(rray_cumulative_prod(x, 1L), array(c(-2, 3, NA), c(1L, 3L)))
+
+  x &lt;- array(c(-Inf, 2, NA, NaN), c(1L, 4L))
+  expect_identical(rray_cumulative_prod(x, 1L), x)
+})
+
+test_that(&quot;zero-size arrays keep their shape&quot;, {
+  for (x in list(logical(), integer(), double())) {
+    x &lt;- array(x, c(2L, 0L, 3L))
+
+    for (axis in 1:3) {
+      expect_identical(
+        rray_cumulative_prod(x, axis),
+        array(double(), c(2L, 0L, 3L))
+      )
+    }
+  }
+
+  x &lt;- array(complex(), c(2L, 0L, 3L))
+  expect_identical(rray_cumulative_prod(x, 2L), x)
+})
+
+test_that(&quot;names are kept on every axis&quot;, {
+  x &lt;- array(
+    c(1, 2, 3, 4),
+    c(2L, 2L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;))
+  )
+  expect_identical(dimnames(rray_cumulative_prod(x, 1L)), dimnames(x))
+  expect_identical(dimnames(rray_cumulative_prod(x, 2L)), dimnames(x))
+
+  x &lt;- array(1L, c(2L, 2L), dimnames = list(NULL, c(&quot;c&quot;, &quot;d&quot;)))</pre><p class="cut">129 more lines cut</p></details>
+<p>Explored the plan, the cumulative framework, and the last few PRs. Now checking how the binary macro passes <code>error_call</code> to a one-element op, since integer sum needs it.</p>
+
+<details class="tool"><summary>Bash: sed -n 1,90p src/binary.h &amp;&amp; grep -rn &quot;RRAY_BINARY\b\|RRAY_BINARY(&quot; src/arithmetic-add.c | he…</summary>
+<pre>sed -n 1,90p src/binary.h &amp;&amp; grep -rn &quot;RRAY_BINARY\b\|RRAY_BINARY(&quot; src/arithmetic-add.c | head; grep -n &quot;ONE_ARGS\|error_call&quot; src/arithmetic-add.c | head -30; grep -rn &quot;RRAY_CUMULATIVE(&quot; src/*.c | wc -l</pre><pre class="output">#ifndef RRAY_BINARY_H
+#define RRAY_BINARY_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;strided-iterator.h&quot;
+
+#define RRAY_BINARY_ARGS(...) , __VA_ARGS__
+#define RRAY_BINARY_NO_ARGS
+
+#define RRAY_BINARY(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  X_CAST,                                                                      \
+  Y_CTYPE,                                                                     \
+  Y_CONST_DEREF,                                                               \
+  Y_CAST,                                                                      \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  ONE,                                                                         \
+  ONE_ARGS                                                                     \
+)                                                                              \
+  struct rray_run_iterator it;                                                 \
+  rray_run_iterator_init2(                                                     \
+    &amp;it,                                                                       \
+    v_dimensions,                                                              \
+    dimensionality,                                                            \
+    v_x_broadcast_strides,                                                     \
+    v_y_broadcast_strides                                                      \
+  );                                                                           \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, rray_run_iterator_size(&amp;it)));   \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+  const Y_CTYPE* v_y = Y_CONST_DEREF(y);                                       \
+                                                                               \
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next2(&amp;it)) {         \
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+                                                                               \
+    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+                                                                               \
+    r_ssize y_loc = rray_run_iterator_loc(&amp;it, 1);                             \
+    const r_ssize y_stride = rray_run_iterator_stride(&amp;it, 1);                 \
+                                                                               \
+    if (x_stride == 0 &amp;&amp; y_stride == 0) {                                      \
+      const X_CTYPE x_elt = v_x[x_loc];                                        \
+      const Y_CTYPE y_elt = v_y[y_loc];                                        \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+      }                                                                        \
+    } else if (x_stride == 0) {                                                \
+      const X_CTYPE x_elt = v_x[x_loc];                                        \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const Y_CTYPE y_elt = v_y[y_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        y_loc += y_stride;                                                     \
+      }                                                                        \
+    } else if (y_stride == 0) {                                                \
+      const Y_CTYPE y_elt = v_y[y_loc];                                        \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        x_loc += x_stride;                                                     \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        const Y_CTYPE y_elt = v_y[y_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        x_loc += x_stride;                                                     \
+        y_loc += y_stride;                                                     \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#endif
+src/arithmetic-add.c:116:  RRAY_BINARY(
+src/arithmetic-add.c:140:  RRAY_BINARY(
+src/arithmetic-add.c:164:  RRAY_BINARY(
+src/arithmetic-add.c:188:  RRAY_BINARY(
+src/arithmetic-add.c:212:  RRAY_BINARY(
+src/arithmetic-add.c:236:  RRAY_BINARY(
+src/arithmetic-add.c:260:  RRAY_BINARY(
+src/arithmetic-add.c:284:  RRAY_BINARY(
+src/arithmetic-add.c:308:  RRAY_BINARY(
+src/arithmetic-add.c:332:  RRAY_BINARY(
+14:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+15:  return rray_add(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+23:  struct r_lazy error_call
+31:    error_call
+40:  struct r_lazy error_call
+87:    stop_unsupported_arithmetic(&quot;+&quot;, x, y, x_arg, y_arg, error_call);
+98:      stop_scalar_input(x, x_arg, error_call);
+100:      stop_scalar_input(y, y_arg, error_call);
+114:  struct r_lazy error_call
+127:    RRAY_BINARY_ARGS(error_call)
+138:  struct r_lazy error_call
+151:    RRAY_BINARY_ARGS(error_call)
+162:  struct r_lazy error_call
+175:    RRAY_BINARY_ARGS(error_call)
+186:  struct r_lazy error_call
+210:  struct r_lazy error_call
+234:  struct r_lazy error_call
+258:  struct r_lazy error_call
+282:  struct r_lazy error_call
+295:    RRAY_BINARY_ARGS(error_call)
+306:  struct r_lazy error_call
+330:  struct r_lazy error_call
+354:  struct r_lazy error_call
+378:  struct r_lazy error_call
+402:  struct r_lazy error_call
+426:  struct r_lazy error_call
+450:  struct r_lazy error_call
+474:  struct r_lazy error_call
+      12</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;stop_int_overflow&quot; -A12 src/utils.c | head -20; grep -rn &quot;overflow&quot; tests/testthat/_…</summary>
+<pre>grep -n &quot;stop_int_overflow&quot; -A12 src/utils.c | head -20; grep -rn &quot;overflow&quot; tests/testthat/_snaps/*.md | head</pre><pre class="output">76:r_no_return void stop_int_overflow(struct r_lazy error_call) {
+77-  r_abort_lazy_call(error_call, &quot;Integer overflow.&quot;);
+78-}
+79-
+80-r_obj* arg_as_bare_integer(
+81-  r_obj* x,
+82-  struct rray_arg* arg,
+83-  struct r_lazy error_call
+84-) {
+85-  if (r_attrib_has_any(x)) {
+86-    r_abort_lazy_call(
+87-      error_call,
+88-      &quot;%s can't have attributes.&quot;,
+tests/testthat/_snaps/arithmetic-multiply.md:80:# errors on integer overflow
+tests/testthat/_snaps/arithmetic-multiply.md:86:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-multiply.md:94:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-multiply.md:102:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-add.md:80:# errors on integer overflow
+tests/testthat/_snaps/arithmetic-add.md:86:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-add.md:94:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-subtract.md:80:# errors on integer overflow
+tests/testthat/_snaps/arithmetic-subtract.md:86:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-subtract.md:94:      ! Integer overflow.</pre></details>
+<details class="tool"><summary>Question: Integer sum needs `error_call` inside the one-element op (`rray_add_int_one(x, y, error_c…</summary>
+<p>Integer sum needs <code>error_call</code> inside the one-element op (<code>rray_add_int_one(x, y, error_call)</code>), but <code>RRAY_CUMULATIVE()</code> calls <code>ONE(elt, v_x[i])</code>. How should I pass it?</p>
+<ul>
+<li>Add ONE_ARGS (Recommended)</li>
+<li>Hand-written int loop</li>
+</ul>
+<p>If benchmarking shows a faster form of <code>rray_add_int_one()</code> (it is shared with <code>rray_add()</code>), what should I do with it?</p>
+<ul>
+<li>Write a plan (Recommended)</li>
+<li>Change it here</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;Integer sum needs `error_call` inside the one-element op (`rray_add_int_one(x, y, error_call)`), but `RRAY_CUMULATIVE()` calls `ONE(elt, v_x[i])`. How should I pass it?&quot;=&quot;Add ONE_ARGS (Recommended)&quot;, &quot;If benchmarking shows a faster form of `rray_add_int_one()` (it is shared with `rray_add()`), what should I do with it?&quot;=&quot;Write a plan (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/cumulative-sum &amp;&amp; cat src/cumulative-logical.c | sed -n 60,200p &amp;&amp; gr…</summary>
+<pre>git checkout -b feature/cumulative-sum &amp;&amp; cat src/cumulative-logical.c | sed -n 60,200p &amp;&amp; grep -n &quot;cumulative&quot; src/init.c</pre><pre class="output">Switched to a new branch 'feature/cumulative-sum'
+  struct r_lazy error_call
+) {
+  check_logical(x, arg, error_call);
+  return rray_cumulative_any_lgl;
+}
+
+static r_obj* rray_cumulative_all_lgl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_logical,
+    int,
+    r_lgl_begin,
+    1,
+    rray_all_lgl_one
+  );
+}
+
+static r_obj* rray_cumulative_any_lgl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_logical,
+    int,
+    r_lgl_begin,
+    0,
+    rray_any_lgl_one
+  );
+}
+277:extern r_obj* ffi_rray_cumulative_all(
+282:extern r_obj* ffi_rray_cumulative_any(
+287:extern r_obj* ffi_rray_cumulative_max(
+292:extern r_obj* ffi_rray_cumulative_min(
+297:extern r_obj* ffi_rray_cumulative_prod(
+447:  {&quot;ffi_rray_cumulative_all&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_all, 3},
+448:  {&quot;ffi_rray_cumulative_any&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_any, 3},
+449:  {&quot;ffi_rray_cumulative_max&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_max, 3},
+450:  {&quot;ffi_rray_cumulative_min&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_min, 3},
+451:  {&quot;ffi_rray_cumulative_prod&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_prod, 3},</pre></details>
+<details class="tool tool-error"><summary>Bash: perl -0pi -e 's/^(    rray_\w+_one)\n  \);/$1,\n    RRAY_CUMULATIVE_NO_ARGS\n  );/mg' src/cum…</summary>
+<pre>perl -0pi -e 's/^(    rray_\w+_one)\n  \);/$1,\n    RRAY_CUMULATIVE_NO_ARGS\n  );/mg' src/cumulative-*.c &amp;&amp; grep -c &quot;RRAY_CUMULATIVE_NO_ARGS&quot; src/cumulative-*.c &amp;&amp; python3 - &lt;&lt;'EOF'
+p='src/cumulative.h'
+s=open(p).read()
+s=s.replace('''#define RRAY_CUMULATIVE(  ''','''#define RRAY_CUMULATIVE_ARGS(...) , __VA_ARGS__
+#define RRAY_CUMULATIVE_NO_ARGS
+
+#define RRAY_CUMULATIVE(  ''',1)
+s=s.replace('''  ONE                                                                          \\
+)''','''  ONE,                                                                         \\
+  ONE_ARGS                                                                     \\
+)''',1)
+s=s.replace('elt = ONE(elt, v_x[i]);','elt = ONE(elt, v_x[i] ONE_ARGS);')
+s=s.replace('ONE(v_state[state_loc], v_x[i]);','ONE(v_state[state_loc], v_x[i] ONE_ARGS);')
+open(p,'w').write(s)
+EOF
+grep -n &quot;ONE&quot; src/cumulative.h</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a perl in-place edit. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>Hook requires the Edit tool, so I'll do the macro change and call sites by hand.</p>
+
+<details class="tool"><summary>Read src/cumulative.h</summary>
+<pre class="output">30	);
+31	
+32	#define RRAY_CUMULATIVE(                                                       \
+33	  X_CTYPE,                                                                     \
+34	  X_CONST_DEREF,                                                               \
+35	  OUT_RTYPE,                                                                   \
+36	  OUT_CTYPE,                                                                   \
+37	  OUT_DEREF,                                                                   \
+38	  OUT_INIT,                                                                    \
+39	  ONE                                                                          \
+40	)                                                                              \
+41	  struct rray_run_iterator it;                                                 \
+42	  rray_run_iterator_init1(                                                     \
+43	    &amp;it,                                                                       \
+44	    v_dimensions,                                                              \
+45	    dimensionality,                                                            \
+46	    v_state_broadcast_strides                                                  \
+47	  );                                                                           \
+48	                                                                               \
+49	  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, r_length(x)));                   \
+50	  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+51	                                                                               \
+52	  r_obj* state = KEEP(r_alloc_vector(OUT_RTYPE, state_size));                  \
+53	  OUT_CTYPE* v_state = OUT_DEREF(state);                                       \
+54	                                                                               \
+55	  for (r_ssize i = 0; i &lt; state_size; ++i) {                                   \
+56	    v_state[i] = OUT_INIT;                                                     \
+57	  }                                                                            \
+58	                                                                               \
+59	  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+60	                                                                               \
+61	  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+62	    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+63	    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+64	                                                                               \
+65	    r_ssize state_loc = rray_run_iterator_loc(&amp;it, 0);                         \
+66	    const r_ssize state_stride = rray_run_iterator_stride(&amp;it, 0);             \
+67	                                                                               \
+68	    if (state_stride == 0) {                                                   \
+69	      OUT_CTYPE elt = v_state[state_loc];                                      \
+70	                                                                               \
+71	      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+72	        elt = ONE(elt, v_x[i]);                                                \
+73	        v_out[i] = elt;                                                        \
+74	      }                                                                        \
+75	                                                                               \
+76	      v_state[state_loc] = elt;                                                \
+77	    } else {                                                                   \
+78	      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+79	        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i]);                 \</pre></details>
+<details class="tool"><summary>Edit src/cumulative.h</summary>
+<pre class="diff"><span class="del">-#define RRAY_CUMULATIVE(                                                       \</span>
+<span class="del">-  X_CTYPE,                                                                     \</span>
+<span class="del">-  X_CONST_DEREF,                                                               \</span>
+<span class="del">-  OUT_RTYPE,                                                                   \</span>
+<span class="del">-  OUT_CTYPE,                                                                   \</span>
+<span class="del">-  OUT_DEREF,                                                                   \</span>
+<span class="del">-  OUT_INIT,                                                                    \</span>
+<span class="del">-  ONE                                                                          \</span>
+<span class="del">-)</span>
+<span class="ins">+#define RRAY_CUMULATIVE_ARGS(...) , __VA_ARGS__</span>
+<span class="ins">+#define RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+</span>
+<span class="ins">+#define RRAY_CUMULATIVE(                                                       \</span>
+<span class="ins">+  X_CTYPE,                                                                     \</span>
+<span class="ins">+  X_CONST_DEREF,                                                               \</span>
+<span class="ins">+  OUT_RTYPE,                                                                   \</span>
+<span class="ins">+  OUT_CTYPE,                                                                   \</span>
+<span class="ins">+  OUT_DEREF,                                                                   \</span>
+<span class="ins">+  OUT_INIT,                                                                    \</span>
+<span class="ins">+  ONE,                                                                         \</span>
+<span class="ins">+  ONE_ARGS                                                                     \</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative.h</summary>
+<pre class="diff"><span class="del">-        elt = ONE(elt, v_x[i]);                                                \</span>
+<span class="ins">+        elt = ONE(elt, v_x[i] ONE_ARGS);                                       \</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative.h</summary>
+<pre class="diff"><span class="del">-        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i]);                 \</span>
+<span class="ins">+        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i] ONE_ARGS);        \</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n -A1 &quot;    rray_.*_one$&quot; src/cumulative-*.c</summary>
+<pre>grep -n -A1 &quot;    rray_.*_one$&quot; src/cumulative-*.c</pre><pre class="output">src/cumulative-logical.c:81:    rray_all_lgl_one
+src/cumulative-logical.c-82-  );
+--
+src/cumulative-logical.c:100:    rray_any_lgl_one
+src/cumulative-logical.c-101-  );
+src/cumulative-extremum.c:118:    rray_max_lgl_one
+src/cumulative-extremum.c-119-  );
+--
+src/cumulative-extremum.c:137:    rray_max_int_one
+src/cumulative-extremum.c-138-  );
+--
+src/cumulative-extremum.c:156:    rray_max_dbl_one
+src/cumulative-extremum.c-157-  );
+--
+src/cumulative-extremum.c:175:    rray_min_lgl_one
+src/cumulative-extremum.c-176-  );
+--
+src/cumulative-extremum.c:194:    rray_min_int_one
+src/cumulative-extremum.c-195-  );
+--
+src/cumulative-extremum.c:213:    rray_min_dbl_one
+src/cumulative-extremum.c-214-  );
+src/cumulative-prod.c:71:    rray_prod_lgl_one
+src/cumulative-prod.c-72-  );
+--
+src/cumulative-prod.c:90:    rray_prod_int_one
+src/cumulative-prod.c-91-  );
+--
+src/cumulative-prod.c:109:    rray_prod_dbl_one
+src/cumulative-prod.c-110-  );
+--
+src/cumulative-prod.c:128:    rray_prod_cpl_one
+src/cumulative-prod.c-129-  );</pre></details>
+<p>Expected; updating the 12 call sites now.</p>
+
+<details class="tool"><summary>Read src/cumulative-logical.c</summary>
+<pre class="output">80	    1,
+81	    rray_all_lgl_one</pre></details>
+<details class="tool"><summary>Read src/cumulative-extremum.c</summary>
+<pre class="output">117	    0,
+118	    rray_max_lgl_one</pre></details>
+<details class="tool"><summary>Read src/cumulative-prod.c</summary>
+<pre class="output">70	    1.0,
+71	    rray_prod_lgl_one</pre></details>
+<details class="tool"><summary>Edit src/cumulative-logical.c</summary>
+<pre class="diff"><span class="del">-    rray_all_lgl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_all_lgl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-logical.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-logical.c</summary>
+<pre class="diff"><span class="del">-    rray_any_lgl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_any_lgl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-logical.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-extremum.c</summary>
+<pre class="diff"><span class="del">-    rray_max_lgl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_max_lgl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-extremum.c</summary>
+<pre class="diff"><span class="del">-    rray_max_int_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_max_int_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-extremum.c</summary>
+<pre class="diff"><span class="del">-    rray_max_dbl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_max_dbl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-extremum.c</summary>
+<pre class="diff"><span class="del">-    rray_min_lgl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_min_lgl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-extremum.c</summary>
+<pre class="diff"><span class="del">-    rray_min_int_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_min_int_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-extremum.c</summary>
+<pre class="diff"><span class="del">-    rray_min_dbl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_min_dbl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-prod.c</summary>
+<pre class="diff"><span class="del">-    rray_prod_lgl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_prod_lgl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-prod.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-prod.c</summary>
+<pre class="diff"><span class="del">-    rray_prod_int_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_prod_int_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-prod.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-prod.c</summary>
+<pre class="diff"><span class="del">-    rray_prod_dbl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_prod_dbl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-prod.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/cumulative-prod.c</summary>
+<pre class="diff"><span class="del">-    rray_prod_cpl_one</span>
+<span class="del">-  );</span>
+<span class="ins">+    rray_prod_cpl_one,</span>
+<span class="ins">+    RRAY_CUMULATIVE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-prod.c has been updated successfully.</pre></details>
+<p>Now the new sum files.</p>
+
+<details class="tool"><summary>Write src/cumulative-sum.c</summary>
+<pre>#include &quot;cumulative-sum.h&quot;
+
+#include &quot;cumulative.h&quot;
+#include &quot;one-add.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/cumulative-sum-decl.h&quot;
+
+r_obj* ffi_rray_cumulative_sum(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_cumulative_sum(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_cumulative_sum(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_cumulative(x, axis, rray_cumulative_sum_switch, arg, error_call);
+}
+
+static rray_cumulative_fn rray_cumulative_sum_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return rray_cumulative_sum_lgl;
+  case RRAY_TYPE_integer:
+    return rray_cumulative_sum_int;
+  case RRAY_TYPE_double:
+    return rray_cumulative_sum_dbl;
+  case RRAY_TYPE_complex:
+    return rray_cumulative_sum_cpl;
+
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_cumulative(&quot;sum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_cumulative_sum_lgl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_add_int_one,
+    RRAY_CUMULATIVE_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_cumulative_sum_int(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_int_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_add_int_one,
+    RRAY_CUMULATIVE_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_cumulative_sum_dbl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    double,
+    r_dbl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    0.0,
+    rray_add_dbl_one,
+    RRAY_CUMULATIVE_NO_ARGS
+  );
+}
+
+static r_obj* rray_cumulative_sum_cpl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    r_complex,
+    r_cpl_cbegin,
+    R_TYPE_complex,
+    r_complex,
+    r_cpl_begin,
+    ((r_complex){.r = 0, .i = 0}),
+    rray_add_cpl_one,
+    RRAY_CUMULATIVE_NO_ARGS
+  );
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/cumulative-sum.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/cumulative-sum.h</summary>
+<pre>#ifndef RRAY_CUMULATIVE_SUM_H
+#define RRAY_CUMULATIVE_SUM_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_cumulative_sum(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/cumulative-sum.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/decl/cumulative-sum-decl.h</summary>
+<pre>static rray_cumulative_fn rray_cumulative_sum_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_cumulative_sum_lgl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+);
+static r_obj* rray_cumulative_sum_int(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+);
+static r_obj* rray_cumulative_sum_dbl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+);
+static r_obj* rray_cumulative_sum_cpl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+);</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/decl/cumulative-sum-decl.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Read src/init.c</summary>
+<pre class="output">295	  r_obj* ffi_frame
+296	);
+297	extern r_obj* ffi_rray_cumulative_prod(
+298	  r_obj* ffi_x,
+299	  r_obj* ffi_axis,
+300	  r_obj* ffi_frame
+301	);</pre></details>
+<p>Decl-header diagnostics are expected (no includes by convention). Registering in <code>init.c</code>.</p>
+
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-extern r_obj* ffi_rray_cumulative_prod(</span>
+<span class="del">-  r_obj* ffi_x,</span>
+<span class="del">-  r_obj* ffi_axis,</span>
+<span class="del">-  r_obj* ffi_frame</span>
+<span class="del">-);</span>
+<span class="ins">+extern r_obj* ffi_rray_cumulative_prod(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axis,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span>
+<span class="ins">+extern r_obj* ffi_rray_cumulative_sum(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axis,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/init.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-  {&quot;ffi_rray_cumulative_prod&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_prod, 3},</span>
+<span class="ins">+  {&quot;ffi_rray_cumulative_prod&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_prod, 3},</span>
+<span class="ins">+  {&quot;ffi_rray_cumulative_sum&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_sum, 3},</span></pre><pre class="output">The file ~/files/r/packages/rray/src/init.c has been updated successfully.</pre></details>
+<p>Now the R function and docs.</p>
+
+<details class="tool"><summary>Edit R/cumulative.R</summary>
+<pre class="diff"><span class="del">-#' - `rray_cumulative_prod()` computes the product so far along `axis`.</span>
+<span class="del">-#'</span>
+<span class="ins">+#' - `rray_cumulative_prod()` computes the product so far along `axis`.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' - `rray_cumulative_sum()` computes the sum so far along `axis`.</span>
+<span class="ins">+#'</span></pre><pre class="output">The file ~/files/r/packages/rray/R/cumulative.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/cumulative.R</summary>
+<pre class="diff"><span class="del">-#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN</span>
+<span class="del">-#' ```</span>
+<span class="del">-#'</span>
+<span class="del">-#' @param x</span>
+<span class="ins">+#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN</span>
+<span class="ins">+#' ```</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Sum:</span>
+<span class="ins">+#' `x` must be logical, integer, double, or complex. Logicals are cast to</span>
+<span class="ins">+#' integer.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' An integer sum errors as soon as a running total overflows, even if a</span>
+<span class="ins">+#' later value would bring it back in range. This differs from [rray_sum()],</span>
+<span class="ins">+#' which only checks the final total:</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' ```r</span>
+<span class="ins">+#' x &lt;- c(.Machine$integer.max, 1L, -1L)</span>
+<span class="ins">+#' rray_sum(x, 1L) # .Machine$integer.max</span>
+<span class="ins">+#' rray_cumulative_sum(x, 1L) # Error</span>
+<span class="ins">+#' ```</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' Once a line is `NA`, it stays `NA`, and a later overflow does not error.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' When `NA` and `NaN` are both present, you get one of them, but which one</span>
+<span class="ins">+#' depends on the platform and the order of the values. Either way, `is.na()`</span>
+<span class="ins">+#' is `TRUE` from that point on:</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' ```r</span>
+<span class="ins">+#' rray_cumulative_sum(c(2, NA, NaN), 1L) # 2, NA, NA or NaN</span>
+<span class="ins">+#' ```</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @param x</span></pre><pre class="output">The file ~/files/r/packages/rray/R/cumulative.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/cumulative.R</summary>
+<pre class="diff"><span class="del">-#' # Running product down rows</span>
+<span class="del">-#' rray_cumulative_prod(x, 1L)</span>
+<span class="del">-NULL</span>
+<span class="ins">+#' # Running product down rows</span>
+<span class="ins">+#' rray_cumulative_prod(x, 1L)</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' # Running sum across columns</span>
+<span class="ins">+#' rray_cumulative_sum(x, 2L)</span>
+<span class="ins">+NULL</span></pre><pre class="output">The file ~/files/r/packages/rray/R/cumulative.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/cumulative.R</summary>
+<pre class="diff"><span class="del">-rray_cumulative_prod &lt;- function(x, axis) {</span>
+<span class="del">-  .Call(ffi_rray_cumulative_prod, x, axis, environment())</span>
+<span class="del">-}</span>
+<span class="ins">+rray_cumulative_prod &lt;- function(x, axis) {</span>
+<span class="ins">+  .Call(ffi_rray_cumulative_prod, x, axis, environment())</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+#' @rdname rray-cumulative</span>
+<span class="ins">+#' @export</span>
+<span class="ins">+rray_cumulative_sum &lt;- function(x, axis) {</span>
+<span class="ins">+  .Call(ffi_rray_cumulative_sum, x, axis, environment())</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray/R/cumulative.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -5 &amp;&amp; Rscript -e &quot;devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, nrow = 2); print(rray_cumulative_sum(x, 1L)); print(rray_cumulative_sum(x, 2L)); print(try(rray_cumulative_sum(c(.Machine\$integer.max, 1L, -1L), 1L))); print(rray_cumulative_sum(c(TRUE,NA,TRUE),1L))&quot;</pre><pre class="output"> M R/cumulative.R
+ M src/cumulative-extremum.c
+ M src/cumulative-logical.c
+ M src/cumulative-prod.c
+ M src/cumulative.h
+ M src/init.c
+?? src/cumulative-sum.c
+?? src/cumulative-sum.h
+?? src/decl/cumulative-sum-decl.h
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpReXAcf/devtools_install_eabc7b9f2125/00LOCK-rray/00new/rray/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray)
+Writing 'NAMESPACE'
+Writing 'rray-cumulative.Rd'
+     [,1] [,2] [,3]
+[1,]    1    3    5
+[2,]    3    7   11
+     [,1] [,2] [,3]
+[1,]    1    4    9
+[2,]    2    6   12
+Error in rray_cumulative_sum(c(.Machine$integer.max, 1L, -1L), 1L) : 
+  Integer overflow.
+[1] &quot;Error in rray_cumulative_sum(c(.Machine$integer.max, 1L, -1L), 1L) : \n  Integer overflow.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_sum()`:
+! Integer overflow.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(...)
+ 2. ├─base::try(...)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_sum(c(.Machine$integer.max, 1L, -1L), 1L)
+[1]  1 NA NA</pre></details>
+<p>Works. Adding sum to <code>bench/cumulative.R</code>, then benchmarking against base <code>cumsum()</code>.</p>
+
+<details class="tool"><summary>Edit bench/cumulative.R</summary>
+<pre class="diff"><span class="del">-  prod = list(</span>
+<span class="del">-    fn = rray_cumulative_prod,</span>
+<span class="del">-    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)</span>
+<span class="del">-  )</span>
+<span class="del">-)</span>
+<span class="ins">+  prod = list(</span>
+<span class="ins">+    fn = rray_cumulative_prod,</span>
+<span class="ins">+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)</span>
+<span class="ins">+  ),</span>
+<span class="ins">+  sum = list(</span>
+<span class="ins">+    fn = rray_cumulative_sum,</span>
+<span class="ins">+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)</span>
+<span class="ins">+  )</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/cumulative.R has been updated successfully.</pre></details>
+<details class="tool tool-error"><summary>Bash: mkdir -p /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9…</summary>
+<pre>mkdir -p /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad &amp;&amp; cd ~/files/r/packages/rray &amp;&amp; cat &gt; /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b1.R &lt;&lt;'EOF'
+devtools::load_all(quiet = TRUE)
+set.seed(1)
+n &lt;- 16e6
+xi &lt;- sample(100L, n, TRUE)
+xl &lt;- sample(c(TRUE, FALSE, NA), n, TRUE)
+xl2 &lt;- sample(c(TRUE, FALSE), n, TRUE)
+xd &lt;- runif(n)
+xc &lt;- complex(real = runif(n), imaginary = runif(n))
+xs &lt;- sample(-1:1, n, TRUE)
+m &lt;- function(e) round(as.numeric(bench::mark(e, iterations = 15, check = FALSE, memory = FALSE, filter_gc = FALSE)$median) * 1000, 1)
+res &lt;- rbind(
+  data.frame(what = &quot;cumsum int (sample 100)&quot;, rray = m(rray_cumulative_sum(xs * 0L + xi %% 3L - 1L, 1L)), base = NA),
+  data.frame(what = &quot;int -1:1&quot;, rray = m(rray_cumulative_sum(xs, 1L)), base = m(cumsum(xs))),
+  data.frame(what = &quot;lgl no NA&quot;, rray = m(rray_cumulative_sum(xl2, 1L)), base = m(cumsum(xl2))),
+  data.frame(what = &quot;lgl with NA&quot;, rray = m(rray_cumulative_sum(xl, 1L)), base = m(cumsum(xl))),
+  data.frame(what = &quot;dbl&quot;, rray = m(rray_cumulative_sum(xd, 1L)), base = m(cumsum(xd))),
+  data.frame(what = &quot;cpl&quot;, rray = m(rray_cumulative_sum(xc, 1L)), base = m(cumsum(xc))),
+  data.frame(what = &quot;max int (ref)&quot;, rray = m(rray_cumulative_max(xs, 1L)), base = m(cummax(xs))),
+  data.frame(what = &quot;add int + 1L (ref)&quot;, rray = m(rray_add(xs, 1L)), base = m(xs + 1L))
+)
+print(res)
+mi &lt;- matrix(xs, 4000)
+md &lt;- matrix(xd, 4000)
+print(c(
+  int_ax1 = m(rray_cumulative_sum(mi, 1L)), int_ax2 = m(rray_cumulative_sum(mi, 2L)),
+  dbl_ax1 = m(rray_cumulative_sum(md, 1L)), dbl_ax2 = m(rray_cumulative_sum(md, 2L)),
+  dbl_mult_ref = m(rray_multiply(md, 1))
+))
+EOF
+Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b1.R</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f8…</summary>
+<pre>devtools::load_all(quiet = TRUE)
+set.seed(1)
+n &lt;- 16e6
+xs &lt;- sample(-1:1, n, TRUE)
+xl &lt;- sample(c(TRUE, FALSE, NA), n, TRUE)
+xl2 &lt;- sample(c(TRUE, FALSE), n, TRUE)
+xd &lt;- runif(n)
+xc &lt;- complex(real = runif(n), imaginary = runif(n))
+m &lt;- function(e) {
+  round(
+    as.numeric(
+      bench::mark(
+        e,
+        iterations = 15,
+        check = FALSE,
+        memory = FALSE,
+        filter_gc = FALSE
+      )$median
+    ) *
+      1000,
+    1
+  )
+}
+res &lt;- rbind(
+  data.frame(what = &quot;int -1:1&quot;, rray = m(rray_cumulative_sum(xs, 1L)), base = m(cumsum(xs))),
+  data.frame(what = &quot;lgl no NA&quot;, rray = m(rray_cumulative_sum(xl2, 1L)), base = m(cumsum(xl2))),
+  data.frame(what = &quot;lgl with NA&quot;, rray = m(rray_cumulative_sum(xl, 1L)), base = m(cumsum(xl))),
+  data.frame(what = &quot;dbl&quot;, rray = m(rray_cumulative_sum(xd, 1L)), base = m(cumsum(xd))),
+  data.frame(what = &quot;cpl&quot;, rray = m(rray_cumulative_sum(xc, 1L)), base = m(cumsum(xc))),
+  data.frame(what = &quot;max int (ref)&quot;, rray = m(rray_cumulative_max(xs, 1L)), base = m(cummax(xs))),
+  data.frame(what = &quot;prod dbl (ref)&quot;, rray = m(rray_cumulative_prod(xd, 1L)), base = m(cumprod(xd))),
+  data.frame(what = &quot;add int (ref)&quot;, rray = m(rray_add(xs, 1L)), base = m(xs + 1L))
+)
+print(res)
+mi &lt;- matrix(xs, 4000)
+md &lt;- matrix(xd, 4000)
+print(c(
+  int_ax1 = m(rray_cumulative_sum(mi, 1L)),
+  int_ax2 = m(rray_cumulative_sum(mi, 2L)),
+  dbl_ax1 = m(rray_cumulative_sum(md, 1L)),
+  dbl_ax2 = m(rray_cumulative_sum(md, 2L)),
+  dbl_mult_ref = m(rray_multiply(md, 1)),
+  int_add_ref = m(rray_add(mi, 1L))
+))</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b1.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9c…</summary>
+<pre>Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b1.R</pre><pre class="output">            what rray base
+1       int -1:1    0    0
+2      lgl no NA    0    0
+3    lgl with NA    0    0
+4            dbl    0    0
+5            cpl    0    0
+6  max int (ref)    0    0
+7 prod dbl (ref)    0    0
+8  add int (ref)    0    0
+     int_ax1      int_ax2      dbl_ax1      dbl_ax2 dbl_mult_ref  int_add_ref 
+           0            0            0            0            0            0</pre></details>
+<p>Promise was forced once before timing. Switching to quoted expressions.</p>
+
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f87…</summary>
+<pre class="diff"><span class="del">-m &lt;- function(e) {</span>
+<span class="del">-  round(</span>
+<span class="del">-    as.numeric(</span>
+<span class="del">-      bench::mark(</span>
+<span class="del">-        e,</span>
+<span class="ins">+m &lt;- function(e) {</span>
+<span class="ins">+  e &lt;- substitute(e)</span>
+<span class="ins">+  env &lt;- parent.frame()</span>
+<span class="ins">+  round(</span>
+<span class="ins">+    as.numeric(</span>
+<span class="ins">+      bench::mark(</span>
+<span class="ins">+        eval(e, env),</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b1.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9c…</summary>
+<pre>Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b1.R</pre><pre class="output">            what rray base
+1       int -1:1 49.8 33.5
+2      lgl no NA 26.1 51.7
+3    lgl with NA 19.3 35.7
+4            dbl 38.0 37.9
+5            cpl 64.3 67.6
+6  max int (ref) 22.4 26.8
+7 prod dbl (ref) 43.1 39.8
+8  add int (ref) 29.1 44.6
+     int_ax1      int_ax2      dbl_ax1      dbl_ax2 dbl_mult_ref  int_add_ref 
+        52.1         56.4         38.2         32.3         15.9         29.3</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The integer sum runs at 50ms on <code>-1:1</code> data vs 26ms for the logical path, likely due to branch mispredictions on the sign test in <code>rray_add_int_one()</code>. I'll test a temporary <code>int64_t</code> variant to confirm this theory.</p>
+</details>
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {</span>
+<span class="del">-    stop_int_overflow(error_call);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return x + y;</span>
+<span class="ins">+  const int64_t out = (int64_t) x + y;</span>
+<span class="ins">+</span>
+<span class="ins">+  if (out &gt; INT_MAX || out &lt; -INT_MAX) {</span>
+<span class="ins">+    stop_int_overflow(error_call);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return (int) out;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f8…</summary>
+<pre>devtools::load_all(quiet = TRUE)
+set.seed(1)
+n &lt;- 16e6
+xs &lt;- sample(-1:1, n, TRUE)
+xp &lt;- sample(0:1, n, TRUE)
+xs2 &lt;- sample(-1:1, n, TRUE)
+xl2 &lt;- sample(c(TRUE, FALSE), n, TRUE)
+m &lt;- function(e) {
+  e &lt;- substitute(e)
+  env &lt;- parent.frame()
+  round(
+    as.numeric(
+      bench::mark(
+        eval(e, env),
+        iterations = 15,
+        check = FALSE,
+        memory = FALSE,
+        filter_gc = FALSE
+      )$median
+    ) *
+      1000,
+    1
+  )
+}
+mi &lt;- matrix(xs, 4000)
+print(c(
+  cumsum_int_mixed = m(rray_cumulative_sum(xs, 1L)),
+  cumsum_int_pos = m(rray_cumulative_sum(xp, 1L)),
+  cumsum_lgl = m(rray_cumulative_sum(xl2, 1L)),
+  base_int_mixed = m(cumsum(xs)),
+  cumsum_int_ax2 = m(rray_cumulative_sum(mi, 2L)),
+  add_mixed = m(rray_add(xs, xs2)),
+  base_add_mixed = m(xs + xs2)
+))</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b2.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;stdint&quot; src/one-add.h src/utils.h src/missing.h; Rscript /private/tmp/claude-502/-Us…</summary>
+<pre>grep -n &quot;stdint&quot; src/one-add.h src/utils.h src/missing.h; Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b2.R; git stash push src/one-add.h -q &amp;&amp; Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/416aec11-356d-4cd1-a92f-9cb47578f870/scratchpad/b2.R; git stash pop -q; git diff --stat src/one-add.h</pre><pre class="output">cumsum_int_mixed   cumsum_int_pos       cumsum_lgl   base_int_mixed 
+            23.9             23.8             23.1             33.5 
+  cumsum_int_ax2        add_mixed   base_add_mixed 
+            22.7             23.0             48.3 
+cumsum_int_mixed   cumsum_int_pos       cumsum_lgl   base_int_mixed 
+            52.1             25.8             26.7             33.4 
+  cumsum_int_ax2        add_mixed   base_add_mixed 
+            57.4             62.2             49.2 
+ src/one-add.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The int64_t version confirms big speedups: cumsum drops from 52ms to 24ms (vs 33ms base) and array_add from 62ms to 23ms. I'll revert the change per your choice, write it up as a plan, and check what else uses the same helper or pattern.</p>
+</details>
+<details class="tool"><summary>Bash: git checkout src/one-add.h &amp;&amp; grep -rn &quot;rray_add_int_one\|INT_MAX - \|-INT_MAX -\|INT_MAX +&quot; …</summary>
+<pre>git checkout src/one-add.h &amp;&amp; grep -rn &quot;rray_add_int_one\|INT_MAX - \|-INT_MAX -\|INT_MAX +&quot; src --include=*.c --include=*.h | grep -v &quot;src/rlang&quot; ; sed -n 1,45p src/one-multiply.h; ls src/one-*.h; grep -rln &quot;subtract_int_one&quot; src | head</pre><pre class="output">Updated 1 path from the index
+(eval):1: no matches found: --include=*.c
+#ifndef RRAY_ONE_MULTIPLY_H
+#define RRAY_ONE_MULTIPLY_H
+
+#include &lt;limits.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// - `x = 2`, `y = 3`: returns `6`.
+// - `x = 2`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = 0`: returns `NA`.
+// - `x = 2`, `y = INT_MAX`: errors.
+static inline int rray_multiply_int_one(
+  int x,
+  int y,
+  struct r_lazy error_call
+) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  // Benchmarked and this is just as fast as R's `GOODIPROD()`
+  const double out = (double) x * (double) y;
+
+  if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+    stop_int_overflow(error_call);
+  }
+
+  return (int) out;
+}
+
+static inline double rray_multiply_dbl_one(double x, double y) {
+  return x * y;
+}
+
+// Matching R with `_Complex` `*`, which &quot;recovers&quot; infinities
+static inline r_complex rray_multiply_cpl_one(r_complex x, r_complex y) {
+  return rray_c99_to_cpl(rray_cpl_to_c99(x) * rray_cpl_to_c99(y));
+}
+
+src/one-add.h
+src/one-extremum.h
+src/one-logical.h
+src/one-multiply.h
+src/arithmetic-subtract.c
+src/decl/arithmetic-subtract-decl.h</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_add_int_one\|INT_MAX - y\|INT_MAX + y&quot; src/*.c src/*.h; grep -n &quot;subtract_int_…</summary>
+<pre>grep -rn &quot;rray_add_int_one\|INT_MAX - y\|INT_MAX + y&quot; src/*.c src/*.h; grep -n &quot;subtract_int_one&quot; -A16 src/arithmetic-subtract.c | head -40</pre><pre class="output">src/arithmetic-add.c:126:    rray_add_int_one,
+src/arithmetic-add.c:150:    rray_add_int_one,
+src/arithmetic-add.c:174:    rray_add_int_one,
+src/arithmetic-add.c:294:    rray_add_int_one,
+src/arithmetic-subtract.c:507:  if ((y &lt; 0 &amp;&amp; x &gt; INT_MAX + y) || (y &gt; 0 &amp;&amp; x &lt; -INT_MAX + y)) {
+src/cumulative-sum.c:71:    rray_add_int_one,
+src/cumulative-sum.c:91:    rray_add_int_one,
+src/utils.c:228:  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; INT_MIN - y)) {
+src/one-add.h:18:static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+src/one-add.h:23:  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+133:    rray_subtract_int_one,
+134-    RRAY_BINARY_ARGS(error_call)
+135-  );
+136-}
+137-
+138-static r_obj* rray_subtract_lgl_int(
+139-  r_obj* x,
+140-  r_obj* y,
+141-  const int* v_dimensions,
+142-  int dimensionality,
+143-  const r_ssize* v_x_broadcast_strides,
+144-  const r_ssize* v_y_broadcast_strides,
+145-  struct r_lazy error_call
+146-) {
+147-  RRAY_BINARY(
+148-    int,
+149-    r_lgl_cbegin,
+--
+157:    rray_subtract_int_one,
+158-    RRAY_BINARY_ARGS(error_call)
+159-  );
+160-}
+161-
+162-static r_obj* rray_subtract_int_lgl(
+163-  r_obj* x,
+164-  r_obj* y,
+165-  const int* v_dimensions,
+166-  int dimensionality,
+167-  const r_ssize* v_x_broadcast_strides,
+168-  const r_ssize* v_y_broadcast_strides,
+169-  struct r_lazy error_call
+170-) {
+171-  RRAY_BINARY(
+172-    int,
+173-    r_int_cbegin,
+--
+181:    rray_subtract_int_one,
+182-    RRAY_BINARY_ARGS(error_call)
+183-  );
+184-}</pre></details>
+<details class="tool"><summary>Bash: sed -n 215,240p src/utils.c; grep -rn &quot;r_ssize_add\|rray_.*checked\|int_add&quot; src/utils.h | he…</summary>
+<pre>sed -n 215,240p src/utils.c; grep -rn &quot;r_ssize_add\|rray_.*checked\|int_add&quot; src/utils.h | head</pre><pre class="output">  if (i &gt;= n) {
+    r_stop_internal(
+      &quot;`i` of %&quot; R_PRI_SSIZE &quot; can't be past the end of %&quot; R_PRI_SSIZE &quot;.&quot;,
+      i,
+      n
+    );
+  }
+
+  return r_str_is_name(r_chr_get(names, i));
+}
+
+int int_add_checked(int x, int y) {
+  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; INT_MIN - y)) {
+    r_abort(&quot;Can't add %d and %d, the result doesn't fit in an integer.&quot;, x, y);
+  }
+
+  return x + y;
+}
+src/utils.h:71:int int_add_checked(int x, int y);</pre></details>
+<p>Reverted. Now the tests, mirroring <code>test-cumulative-prod.R</code>.</p>
+
+<details class="tool"><summary>Write tests/testthat/test-cumulative-sum.R</summary>
+<pre>test_that(&quot;can accumulate along axis 1&quot;, {
+  x &lt;- array(c(1L, 2L, 3L, 4L, 5L, 6L), c(3L, 2L))
+
+  expect_identical(
+    rray_cumulative_sum(x, 1L),
+    array(c(1L, 3L, 6L, 4L, 9L, 15L), c(3L, 2L))
+  )
+})
+
+test_that(&quot;can accumulate along axis 2&quot;, {
+  x &lt;- array(c(1L, 2L, 3L, 4L, 5L, 6L), c(2L, 3L))
+
+  expect_identical(
+    rray_cumulative_sum(x, 2L),
+    array(c(1L, 2L, 4L, 6L, 9L, 12L), c(2L, 3L))
+  )
+})
+
+test_that(&quot;can accumulate along every axis of a 3D array&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  for (axis in 1:3) {
+    expect_identical(
+      rray_cumulative_sum(x, axis),
+      cumulative_reference(x, axis, `+`)
+    )
+  }
+})
+
+test_that(&quot;each line starts fresh&quot;, {
+  x &lt;- array(c(1, 2, 3, 4), c(2L, 2L))
+  expect_identical(
+    rray_cumulative_sum(x, 1L),
+    array(c(1, 3, 3, 7), c(2L, 2L))
+  )
+  expect_identical(
+    rray_cumulative_sum(x, 2L),
+    array(c(1, 2, 4, 6), c(2L, 2L))
+  )
+})
+
+test_that(&quot;logicals become integers, other types are kept&quot;, {
+  expect_identical(
+    rray_cumulative_sum(c(TRUE, FALSE, TRUE), 1L),
+    array(c(1L, 1L, 2L), 3L)
+  )
+  expect_identical(
+    rray_cumulative_sum(c(2L, -3L, 4L), 1L),
+    array(c(2L, -1L, 3L), 3L)
+  )
+  expect_identical(
+    rray_cumulative_sum(c(2, 0.5), 1L),
+    array(c(2, 2.5), 2L)
+  )
+  expect_identical(
+    rray_cumulative_sum(c(1i, 1 + 1i), 1L),
+    array(c(1i, 1 + 2i), 2L)
+  )
+})
+
+test_that(&quot;matches base R for simple lines&quot;, {
+  lines &lt;- list(
+    c(TRUE, TRUE, FALSE, TRUE),
+    c(2L, -1L, 3L, 0L, 5L),
+    c(0.5, -4, 2, -0.25),
+    c(1 + 1i, 2 - 1i, 0 + 1i, -3 + 0i)
+  )
+
+  for (x in lines) {
+    expect_identical(as.vector(rray_cumulative_sum(x, 1L)), cumsum(x))
+  }
+})
+
+test_that(&quot;errors on integer overflow&quot;, {
+  x &lt;- c(.Machine$integer.max, 1L)
+  expect_snapshot(rray_cumulative_sum(x, 1L), error = TRUE)
+
+  x &lt;- c(-.Machine$integer.max, -1L)
+  expect_snapshot(rray_cumulative_sum(x, 1L), error = TRUE)
+
+  x &lt;- array(c(1L, 2L, .Machine$integer.max, 1L), c(2L, 2L))
+  expect_snapshot(rray_cumulative_sum(x, 2L), error = TRUE)
+})
+
+test_that(&quot;errors on integer overflow even if a later value cancels it&quot;, {
+  x &lt;- c(.Machine$integer.max, 1L, -1L)
+  expect_snapshot(rray_cumulative_sum(x, 1L), error = TRUE)
+})
+
+test_that(&quot;can reach the integer limits without overflowing&quot;, {
+  x &lt;- c(.Machine$integer.max - 1L, 1L, -1L)
+  expect_identical(
+    rray_cumulative_sum(x, 1L),
+    array(c(.Machine$integer.max - 1L, .Machine$integer.max, .Machine$integer.max - 1L), 3L)
+  )
+
+  x &lt;- c(-.Machine$integer.max + 1L, -1L)
+  expect_identical(
+    rray_cumulative_sum(x, 1L),
+    array(c(-.Machine$integer.max + 1L, -.Machine$integer.max), 2L)
+  )
+})
+
+test_that(&quot;missing values persist through the rest of a line&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(TRUE, NA, FALSE), 1L)),
+    c(1L, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(2L, NA, 0L), 1L)),
+    c(2L, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(2, NA, 0), 1L)),
+    c(2, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(2, NaN, 0), 1L)),
+    c(2, NaN, NaN)
+  )
+})
+
+test_that(&quot;a missing value before an overflow does not error&quot;, {
+  x &lt;- c(1L, NA, .Machine$integer.max, .Machine$integer.max)
+  expect_identical(
+    as.vector(rray_cumulative_sum(x, 1L)),
+    c(1L, NA, NA, NA)
+  )
+})
+
+test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+  expect_identical(
+    is.na(as.vector(rray_cumulative_sum(c(2, NA, NaN, 3), 1L))),
+    c(FALSE, TRUE, TRUE, TRUE)
+  )
+  expect_identical(
+    is.na(as.vector(rray_cumulative_sum(c(2, NaN, NA, 3), 1L))),
+    c(FALSE, TRUE, TRUE, TRUE)
+  )
+})
+
+test_that(&quot;opposing infinities give `NaN`&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(Inf, 1, -Inf, 1), 1L)),
+    c(Inf, Inf, NaN, NaN)
+  )
+})
+
+test_that(&quot;complex parts are summed separately&quot;, {
+  x &lt;- c(1 + 1i, complex(real = NA, imaginary = 2), 3 + 3i)
+  out &lt;- as.vector(rray_cumulative_sum(x, 1L))
+  expect_identical(is.na(Re(out)), c(FALSE, TRUE, TRUE))
+  expect_identical(Im(out), c(1, 3, 6))
+
+  x &lt;- c(1 + 1i, complex(real = 2, imaginary = NA), 3 + 3i)
+  out &lt;- as.vector(rray_cumulative_sum(x, 1L))
+  expect_identical(Re(out), c(1, 3, 6))
+  expect_identical(is.na(Im(out)), c(FALSE, TRUE, TRUE))
+})
+
+test_that(&quot;last position matches the reducer&quot;, {
+  x &lt;- array(c(2L, -1L, 5L, 4L, -3L, 7L), c(2L, 3L))
+  expect_identical(
+    rray_cumulative_sum(x, 2L)[, 3L, drop = FALSE],
+    rray_sum(x, 2L)
+  )
+
+  x &lt;- array(c(2, -1, 0.5, 4, -3, 0.25), c(3L, 2L))
+  expect_identical(
+    rray_cumulative_sum(x, 1L)[3L, , drop = FALSE],
+    rray_sum(x, 1L)
+  )
+
+  x &lt;- array(c(1 + 1i, 2i, -1 + 0i, 3 - 1i), c(2L, 2L))
+  expect_identical(
+    rray_cumulative_sum(x, 1L)[2L, , drop = FALSE],
+    rray_sum(x, 1L)
+  )
+})
+
+test_that(&quot;an axis of dimension 1 still casts logicals to integer&quot;, {
+  x &lt;- array(c(TRUE, FALSE, NA), c(1L, 3L))
+  expect_identical(rray_cumulative_sum(x, 1L), array(c(1L, 0L, NA), c(1L, 3L)))
+
+  x &lt;- array(c(-Inf, 2, NA, NaN), c(1L, 4L))
+  expect_identical(rray_cumulative_sum(x, 1L), x)
+})
+
+test_that(&quot;zero-size arrays keep their shape&quot;, {
+  x &lt;- array(logical(), c(2L, 0L, 3L))
+  for (axis in 1:3) {
+    expect_identical(
+      rray_cumulative_sum(x, axis),
+      array(integer(), c(2L, 0L, 3L))
+    )
+  }
+
+  for (x in list(integer(), double(), complex())) {
+    x &lt;- array(x, c(2L, 0L, 3L))
+</pre><p class="cut">74 more lines cut</p><pre class="output">File created successfully at: ~/files/r/packages/rray/tests/testthat/test-cumulative-sum.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | tail -25</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | tail -25</pre><pre class="output">WARNING: 'test-cumulative-sum.R:274:3' ------------
+Adding new snapshot:
+Code
+  rray_cumulative_sum(as.raw(1L), 1L)
+Condition
+  Error in `rray_cumulative_sum()`:
+  ! Can't compute the cumulative sum of `x` &lt;raw&gt;.
+
+WARNING: 'test-cumulative-sum.R:275:3' ------------
+Adding new snapshot:
+Code
+  rray_cumulative_sum(list(1), 1L)
+Condition
+  Error in `rray_cumulative_sum()`:
+  ! Can't compute the cumulative sum of `x` &lt;list&gt;.
+
+WARNING: 'test-cumulative-sum.R:280:3' ------------
+Adding new snapshot:
+Code
+  rray_cumulative_sum(x, 1L)
+Condition
+  Error in `rray_cumulative_sum()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+[ FAIL 0 | WARN 17 | SKIP 0 | PASS 1533 ]</pre></details>
+<p>All pass. Checking the new overflow snapshots.</p>
+
+<details class="tool"><summary>Bash: sed -n 1,45p tests/testthat/_snaps/cumulative-sum.md</summary>
+<pre>sed -n 1,45p tests/testthat/_snaps/cumulative-sum.md</pre><pre class="output"># errors on integer overflow
+
+    Code
+      rray_cumulative_sum(x, 1L)
+    Condition
+      Error in `rray_cumulative_sum()`:
+      ! Integer overflow.
+
+---
+
+    Code
+      rray_cumulative_sum(x, 1L)
+    Condition
+      Error in `rray_cumulative_sum()`:
+      ! Integer overflow.
+
+---
+
+    Code
+      rray_cumulative_sum(x, 2L)
+    Condition
+      Error in `rray_cumulative_sum()`:
+      ! Integer overflow.
+
+# errors on integer overflow even if a later value cancels it
+
+    Code
+      rray_cumulative_sum(x, 1L)
+    Condition
+      Error in `rray_cumulative_sum()`:
+      ! Integer overflow.
+
+# `axis` is validated
+
+    Code
+      rray_cumulative_sum(x, integer())
+    Condition
+      Error in `rray_cumulative_sum()`:
+      ! `axis` must be a single integer, not length 0.
+
+---
+
+    Code
+      rray_cumulative_sum(x, 1:2)
+    Condition</pre></details>
+<p>Snapshots look right. Running the full cumulative benchmark in the background while I write the add-performance plan.</p>
+
+<details class="tool"><summary>Bash: RRAY_BENCH_ITERATIONS=10 Rscript bench/cumulative.R 2&gt;&amp;1 | tail -170</summary>
+<pre>RRAY_BENCH_ITERATIONS=10 Rscript bench/cumulative.R 2&gt;&amp;1 | tail -170</pre><pre class="output">Command running in background with ID: b9986ash0. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b9986ash0.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<details class="tool"><summary>Write plans/add-performance.md</summary>
+<pre># Integer add helper performance
+
+## Summary
+
+While adding `rray_cumulative_sum()`, rewriting the overflow check in
+`rray_add_int_one()` (`src/one-add.h`) made integer sums about 2x faster when
+the values have mixed signs. This helps both `rray_cumulative_sum()` and
+`rray_add()`. The change was tried and undone on the `feature/cumulative-sum`
+branch. It belongs in its own PR, which should also check
+`rray_subtract_int_one()`.
+
+## The change
+
+Before:
+
+```c
+if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+  stop_int_overflow(error_call);
+}
+
+return x + y;
+```
+
+After:
+
+```c
+const int64_t out = (int64_t) x + y;
+
+if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+  stop_int_overflow(error_call);
+}
+
+return (int) out;
+```
+
+Add `#include &lt;stdint.h&gt;` to `src/one-add.h`. The missing value check at the
+top of the helper stays as is.
+
+## Why it is faster
+
+The old check branches on the sign of `y`. When `y` is a random mix of
+negative, zero, and positive values, the CPU can't predict that branch, and
+every wrong guess costs a pipeline flush.
+
+The new check does not depend on the sign of `y`. Its only branch is &quot;did it
+overflow&quot;, which is almost never taken and so is always predicted right.
+
+The old form is fine when every value has the same sign, which is why
+logical input (only `0` and `1`) was already fast.
+
+## Measurements
+
+Apple Silicon (arm64), R's default compiler flags through
+`devtools::load_all()`, median of 15 iterations, 1.6e7 elements.
+
+| Call | Data | Before | After |
+|---|---|---|---|
+| `rray_cumulative_sum(x, 1L)` | `sample(-1:1)` | 52ms | 24ms |
+| `rray_cumulative_sum(x, 1L)` | `sample(0:1)` | 26ms | 24ms |
+| `rray_cumulative_sum(x, 1L)` | `sample(c(TRUE, FALSE))` | 27ms | 23ms |
+| `rray_cumulative_sum(m, 2L)`, 4000 x 4000 | `sample(-1:1)` | 57ms | 23ms |
+| `rray_add(x, y)` | both `sample(-1:1)` | 62ms | 23ms |
+
+For reference, base `cumsum()` took 33ms and base `x + y` took 48ms on the
+same mixed sign data.
+
+The inputs were:
+
+```r
+set.seed(1)
+n &lt;- 16e6
+xs &lt;- sample(-1:1, n, TRUE)
+xp &lt;- sample(0:1, n, TRUE)
+xs2 &lt;- sample(-1:1, n, TRUE)
+xl2 &lt;- sample(c(TRUE, FALSE), n, TRUE)
+m &lt;- matrix(xs, 4000)
+```
+
+## Behavior
+
+None. Both forms error on exactly the same inputs: a result above `INT_MAX`
+or below `-INT_MAX`. `INT_MIN` is the integer `NA`, so it stays out of range
+in both.
+
+## Helpers to investigate
+
+- `rray_add_int_one()`: the change above.
+
+- `rray_subtract_int_one()` in `src/arithmetic-subtract.c`: it has the same
+  sign branch, `(y &lt; 0 &amp;&amp; x &gt; INT_MAX + y) || (y &gt; 0 &amp;&amp; x &lt; -INT_MAX + y)`.
+  Try `(int64_t) x - y` with the same range check. Expect the same win on
+  mixed sign data.
+
+- `int_add_checked()` in `src/utils.c`: same pattern, but it is not on a hot
+  path. Leave it unless it shows up in a benchmark.
+
+- `rray_multiply_int_one()` already uses a range check on a wider type, so
+  there is nothing to change.
+
+## Benchmarks for the new PR
+
+Measure before and after, on mixed sign and same sign integer data:
+
+- `rray_cumulative_sum()` for logical and integer.
+
+- `rray_add()` and `rray_subtract()` for integer, with both inputs full size
+  and with one input broadcast.
+
+- Axis 1 of a long vector, axis 1 and axis 2 of a 4000 x 4000 matrix.
+
+`bench/cumulative.R` and `bench/binary.R` cover most of these, but their
+integer data is `sample(100L)`, which is all positive. Add mixed sign data,
+otherwise the benchmarks will not show the change. Results on x86 would also
+help.
+
+## Tests for the new PR
+
+- Existing overflow tests for `rray_add()`, `rray_subtract()`, and
+  `rray_cumulative_sum()` already cover both bounds. Check that sums that
+  land exactly on `INT_MAX` and `-INT_MAX` still succeed.
+
+- The full suite.</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/plans/add-performance.md (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cat plans/index.md | head -60; grep -rn &quot;cumulative.md\|prod-performance&quot; plans/ | head</summary>
+<pre>cat plans/index.md | head -60; grep -rn &quot;cumulative.md\|prod-performance&quot; plans/ | head</pre><pre class="output"># Integer coordinate indexing plan
+
+## Recommendation
+
+Add one fully specified coordinate function and one directional one-axis
+specialization:
+
+```r
+rray_index(x, ...)
+rray_index_assign(x, ..., value)
+
+rray_index_axis(x, i, ..., axis)
+rray_index_assign_axis(x, i, ..., axis, value)
+```
+
+`rray_index()` requires exactly one integer coordinate array for every source
+axis. The arrays broadcast to common dimensions and are read pointwise. The
+common dimensions are the result dimensions.
+
+`rray_index_axis()` accepts one integer array for the selected source axis and
+supplies identity coordinates for every other axis. `i` must broadcast to the
+dimensions of `x` outside `axis`. The result has the same dimensionality as
+`x`, every unselected axis keeps its source dimension, and only the selected
+axis can change.
+
+Every source coordinate is explicit. Different partial indexing behaviors are
+represented by shaping full coordinate arrays in different ways.
+
+The complete family is:
+
+| Operation | Read | Assign |
+|---|---|---|
+| Orthogonal subscripts | `rray_slice()` | `rray_slice_assign()` |
+| One-axis subscript | `rray_slice_axis()` | `rray_slice_assign_axis()` |
+| First axis subscript | `rray_slice_rows()` | `rray_slice_assign_rows()` |
+| Second axis subscript | `rray_slice_columns()` | `rray_slice_assign_columns()` |
+| One-axis coordinate array | `rray_index_axis()` | `rray_index_assign_axis()` |
+| Full coordinate arrays | `rray_index()` | `rray_index_assign()` |
+| Flat subscript or point matrix | `rray_extract()` | `rray_extract_assign()` |
+
+Do not add replacement functions. Every `_assign()` function returns a
+modified copy of `x`.
+
+## Subscripts and coordinates
+
+A subscript describes a set of positions. It can be negative, logical,
+character, missing, or `NULL`. Subscript normalization produces a
+one-dimensional sequence of positive or missing locations. Subscripts on
+different axes form a Cartesian product.
+
+A coordinate array has a narrower meaning. Each non-missing element is one
+positive, one-based position on one source axis. Its dimensions connect that
+coordinate to an output point. Coordinates on different source axes broadcast
+and pair pointwise.
+
+```r
+rray_slice_axis(x, -1L, axis = 2L)
+# Complement selection
+
+rray_index_axis(x, array(-1L, rray_dimensions(x)), axis = 2L)</pre></details>
+<p>Fine, no index to update. Removing the cumulative plan, then running the full suite and pkgdown check.</p>
+
+<details class="tool"><summary>Bash: git rm -q plans/cumulative.md &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4 &amp;&amp; Rscript -e &quot;…</summary>
+<pre>git rm -q plans/cumulative.md &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4 &amp;&amp; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -3</pre><pre class="output">SKIP: 'test-reduce-sum.R:476:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 5389 ]
+✔ No problems found.</pre></details>
+<details class="tool"><summary>Bash: grep -E &quot;^ +(sum|prod) &quot; /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-…</summary>
+<pre>grep -E &quot;^ +(sum|prod) &quot; /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b9986ash0.output | grep -v &quot;^ *prod&quot; ; grep -E &quot;^ +prod +double&quot; /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b9986ash0.output</pre><pre class="output">       sum logical         [1.6e7] over 1 10.239032
+       sum logical    [4000, 4000] over 1 13.854064
+       sum logical    [4000, 4000] over 2 21.193474
+       sum logical [200, 200, 200] over 1  6.940173
+       sum logical [200, 200, 200] over 2  7.167927
+       sum logical [200, 200, 200] over 3 10.749687
+       sum logical       [10, 1e6] over 1 20.828164
+       sum logical       [10, 1e6] over 2  9.406507
+       sum integer         [1.6e7] over 1 20.430853
+       sum integer    [4000, 4000] over 1 26.696084
+       sum integer    [4000, 4000] over 2 24.833618
+       sum integer [200, 200, 200] over 1 12.282575
+       sum integer [200, 200, 200] over 2 12.577447
+       sum integer [200, 200, 200] over 3 13.134534
+       sum integer       [10, 1e6] over 1 18.047319
+       sum integer       [10, 1e6] over 2 17.673706
+       sum  double         [1.6e7] over 1 34.474071
+       sum  double    [4000, 4000] over 1 34.402608
+       sum  double    [4000, 4000] over 2 21.033430
+       sum  double [200, 200, 200] over 1 18.877876
+       sum  double [200, 200, 200] over 2 16.719329
+       sum  double [200, 200, 200] over 3 17.343820
+       sum  double       [10, 1e6] over 1 22.005377
+       sum  double       [10, 1e6] over 2 18.590015
+       sum complex         [1.6e7] over 1 66.419139
+       sum complex    [4000, 4000] over 1 66.140605
+       sum complex    [4000, 4000] over 2 65.848337
+       sum complex [200, 200, 200] over 1 32.794260
+       sum complex [200, 200, 200] over 2 34.019422
+       sum complex [200, 200, 200] over 3 24.475668
+       sum complex       [10, 1e6] over 1 35.196491
+       sum complex       [10, 1e6] over 2 47.405245
+      prod  double         [1.6e7] over 1 43.078823
+      prod  double    [4000, 4000] over 1 44.021946
+      prod  double    [4000, 4000] over 2 35.591055
+      prod  double [200, 200, 200] over 1 10.980538
+      prod  double [200, 200, 200] over 2 17.727477
+      prod  double [200, 200, 200] over 3  9.000361
+      prod  double       [10, 1e6] over 1 22.358735
+      prod  double       [10, 1e6] over 2 12.130342</pre></details>
+<p>Full suite passes (5389, 0 fail) and pkgdown is clean. Benchmarks are in. Last, a review pass over the diff and the protection check.</p>
+
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git status --short &amp;&amp; git diff --cached -- src/cumulative.h src/cumulative-logi…</summary>
+<pre>git add -A &amp;&amp; git status --short &amp;&amp; git diff --cached -- src/cumulative.h src/cumulative-logical.c NAMESPACE _pkgdown.yml | head -80 &amp;&amp; git diff --cached --stat</pre><pre class="output">M  NAMESPACE
+M  R/cumulative.R
+M  bench/cumulative.R
+M  man/rray-cumulative.Rd
+A  plans/add-performance.md
+D  plans/cumulative.md
+M  src/cumulative-extremum.c
+M  src/cumulative-logical.c
+M  src/cumulative-prod.c
+A  src/cumulative-sum.c
+A  src/cumulative-sum.h
+M  src/cumulative.h
+A  src/decl/cumulative-sum-decl.h
+M  src/init.c
+A  tests/testthat/_snaps/cumulative-sum.md
+A  tests/testthat/test-cumulative-sum.R
+diff --git a/NAMESPACE b/NAMESPACE
+index 6014c1f..60ce2fb 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -15,6 +15,7 @@ export(rray_cumulative_any)
+ export(rray_cumulative_max)
+ export(rray_cumulative_min)
+ export(rray_cumulative_prod)
++export(rray_cumulative_sum)
+ export(rray_dimensionality)
+ export(rray_dimensions)
+ export(rray_dimensions_common)
+diff --git a/src/cumulative-logical.c b/src/cumulative-logical.c
+index 4253a32..e69a6d9 100644
+--- a/src/cumulative-logical.c
++++ b/src/cumulative-logical.c
+@@ -78,7 +78,8 @@ static r_obj* rray_cumulative_all_lgl(
+     int,
+     r_lgl_begin,
+     1,
+-    rray_all_lgl_one
++    rray_all_lgl_one,
++    RRAY_CUMULATIVE_NO_ARGS
+   );
+ }
+ 
+@@ -97,6 +98,7 @@ static r_obj* rray_cumulative_any_lgl(
+     int,
+     r_lgl_begin,
+     0,
+-    rray_any_lgl_one
++    rray_any_lgl_one,
++    RRAY_CUMULATIVE_NO_ARGS
+   );
+ }
+diff --git a/src/cumulative.h b/src/cumulative.h
+index dba6477..2a4523e 100644
+--- a/src/cumulative.h
++++ b/src/cumulative.h
+@@ -29,6 +29,9 @@ r_obj* rray_cumulative(
+   struct r_lazy error_call
+ );
+ 
++#define RRAY_CUMULATIVE_ARGS(...) , __VA_ARGS__
++#define RRAY_CUMULATIVE_NO_ARGS
++
+ #define RRAY_CUMULATIVE(                                                       \
+   X_CTYPE,                                                                     \
+   X_CONST_DEREF,                                                               \
+@@ -36,7 +39,8 @@ r_obj* rray_cumulative(
+   OUT_CTYPE,                                                                   \
+   OUT_DEREF,                                                                   \
+   OUT_INIT,                                                                    \
+-  ONE                                                                          \
++  ONE,                                                                         \
++  ONE_ARGS                                                                     \
+ )                                                                              \
+   struct rray_run_iterator it;                                                 \
+   rray_run_iterator_init1(                                                     \
+@@ -69,14 +73,14 @@ r_obj* rray_cumulative(
+       OUT_CTYPE elt = v_state[state_loc];                                      \
+                                                                                \
+       for (r_ssize i = start; i &lt; end; ++i) {                                  \
+-        elt = ONE(elt, v_x[i]);                                                \
++        elt = ONE(elt, v_x[i] ONE_ARGS);                                       \
+         v_out[i] = elt;                                                        \
+       }                                                                        \
+                                                                                \
+       v_state[state_loc] = elt;                                                \
+     } else {                                                                   \
+       for (r_ssize i = start; i &lt; end; ++i) {                                  \
+-        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i]);                 \
++        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i] ONE_ARGS);        \
+         v_state[state_loc] = elt;                                              \
+         v_out[i] = elt;                                                        \
+         state_loc += state_stride;                                             \
+ NAMESPACE                               |   1 +
+ R/cumulative.R                          |  35 ++++
+ bench/cumulative.R                      |   4 +
+ man/rray-cumulative.Rd                  |  31 ++++
+ plans/add-performance.md                | 122 ++++++++++++++
+ plans/cumulative.md                     | 276 -------------------------------
+ src/cumulative-extremum.c               |  18 +-
+ src/cumulative-logical.c                |   6 +-
+ src/cumulative-prod.c                   |  12 +-
+ src/cumulative-sum.c                    | 134 +++++++++++++++
+ src/cumulative-sum.h                    |  15 ++
+ src/cumulative.h                        |  10 +-
+ src/decl/cumulative-sum-decl.h          |  38 +++++
+ src/init.c                              |   6 +
+ tests/testthat/_snaps/cumulative-sum.md | 136 ++++++++++++++++
+ tests/testthat/test-cumulative-sum.R    | 281 ++++++++++++++++++++++++++++++++
+ 16 files changed, 834 insertions(+), 291 deletions(-)</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Protection pass checks out: all objects are protected via <code>RRAY_CUMULATIVE()</code> and <code>rray_cumulative()</code>, and R's protect stack unwinding handles mid-loop overflow errors safely. Committing and pushing now.</p>
+</details>
+<details class="tool"><summary>Bash: git commit -q -m 'Add `rray_cumulative_sum()`' &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin …</summary>
+<pre>git commit -q -m 'Add `rray_cumulative_sum()`' &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/cumulative-sum 2&gt;&amp;1 | tail -3</pre><pre class="output">29931ac Add `rray_cumulative_sum()`
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/cumulative-sum -&gt; feature/cumulative-sum
+branch 'feature/cumulative-sum' set up to track 'origin/feature/cumulative-sum'.</pre></details>
+<p>I added <code>rray_cumulative_sum()</code>, committed it as <code>29931ac</code> (&quot;Add <code>rray_cumulative_sum()</code>&quot;), and pushed it to <code>feature/cumulative-sum</code>. All tests pass (5389, no failures) and <code>pkgdown::check_pkgdown()</code> is clean. I also removed <code>plans/cumulative.md</code>, since sum was the last of its six functions.</p>
+<p>Your session config named a different branch (<code>feature/titles</code>), but I used the one you asked for.</p>
+<h2>What changed</h2>
+<ul>
+<li>
+<p><strong>New files:</strong> <code>src/cumulative-sum.c</code>, <code>src/cumulative-sum.h</code> and <code>src/decl/cumulative-sum-decl.h</code>. They follow the same layout as the prod PR and reuse the existing add helpers. Logical input returns integer; every other type keeps its type.</p>
+</li>
+<li>
+<p><strong>Macro change:</strong> <code>RRAY_CUMULATIVE()</code> now takes a trailing <code>ONE_ARGS</code>, with <code>RRAY_CUMULATIVE_ARGS()</code> and <code>RRAY_CUMULATIVE_NO_ARGS</code>, the same way <code>RRAY_BINARY()</code> does it. Integer sum uses it to pass <code>error_call</code>. I updated the 12 existing call sites to pass <code>RRAY_CUMULATIVE_NO_ARGS</code>, which leaves their compiled code unchanged.</p>
+</li>
+<li>
+<p><strong>Integer overflow:</strong> it errors as soon as a running total overflows, even if a later value would bring it back in range. Once a line is <code>NA</code>, a later overflow does not error. Both rules are in the new Sum section of the docs and covered by tests.</p>
+</li>
+<li>
+<p><strong>Benchmark and tests:</strong> sum is added to <code>bench/cumulative.R</code>. <code>test-cumulative-sum.R</code> covers everything the plan listed.</p>
+</li>
+</ul>
+<h2>Performance</h2>
+<p>Medians over 1.6e7 elements along axis 1, compared with base R:</p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th><code>rray_cumulative_sum()</code></th>
+<th><code>cumsum()</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>logical</td>
+<td>26ms</td>
+<td>52ms</td>
+</tr>
+<tr>
+<td>double</td>
+<td>38ms</td>
+<td>38ms</td>
+</tr>
+<tr>
+<td>complex</td>
+<td>64ms</td>
+<td>68ms</td>
+</tr>
+<tr>
+<td>integer, mixed signs (<code>-1:1</code>)</td>
+<td>52ms</td>
+<td>33ms</td>
+</tr>
+<tr>
+<td>integer, all positive</td>
+<td>about 24ms</td>
+<td>n/a</td>
+</tr>
+</tbody>
+</table>
+<p>Double and complex can't get much faster without changing the order of the additions, which would change the results.</p>
+<p>Integer with mixed signs is the one slow case. <code>rray_add_int_one()</code> branches on the sign of <code>y</code>, and with random signs the CPU keeps guessing that branch wrong. Changing the check to an <code>int64_t</code> add plus a range check gave:</p>
+<ul>
+<li>
+<p><strong><code>rray_cumulative_sum()</code>:</strong> 52ms down to 24ms.</p>
+</li>
+<li>
+<p><strong>Axis 2 of a 4000 x 4000 matrix:</strong> 57ms down to 23ms.</p>
+</li>
+<li>
+<p><strong><code>rray_add()</code>:</strong> 62ms down to 23ms.</p>
+</li>
+</ul>
+<p>It errors on exactly the same inputs as before. As you chose, I put the helper back and wrote this up in <code>plans/add-performance.md</code>. It also points out that <code>rray_subtract_int_one()</code> has the same pattern, and that the benchmark integer data (<code>sample(100L)</code>) is all positive, so it won't show the slowdown.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Hmm for logical with add int one are you comparing to na int?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;is_missing&quot; -A3 src/missing.h | head -30; grep -rn &quot;na_lgl\|na_int&quot; src/rlang/global…</summary>
+<pre>grep -n &quot;is_missing&quot; -A3 src/missing.h | head -30; grep -rn &quot;na_lgl\|na_int&quot; src/rlang/globals.c | head</pre><pre class="output">8:static inline bool rray_lgl_is_missing(int x) {
+9-  return x == r_globals.na_lgl;
+10-}
+11-
+12:static inline bool rray_int_is_missing(int x) {
+13-  return x == r_globals.na_int;
+14-}
+15-
+16:static inline bool rray_dbl_is_missing(double x) {
+17-  return ISNAN(x);
+18-}
+19-
+20:static inline bool rray_cpl_is_missing(r_complex x) {
+21-  // Purposefully bitwise, can help compiler perform vectorization
+22-  return bool_bitwise_or(ISNAN(x.r), ISNAN(x.i));
+23-}
+src/rlang/globals.c:26:    r_globals.na_lgl = NA_LOGICAL;
+src/rlang/globals.c:27:    r_globals.na_int = NA_INTEGER;</pre></details>
+<details class="tool"><summary>Bash: sed -n 105,180p src/arithmetic-add.c | grep -n &quot;RRAY_BINARY\|begin\|_one\|static&quot;</summary>
+<pre>sed -n 105,180p src/arithmetic-add.c | grep -n &quot;RRAY_BINARY\|begin\|_one\|static&quot; </pre><pre class="output">3:static r_obj* rray_add_lgl_lgl(
+12:  RRAY_BINARY(
+14:    r_lgl_cbegin,
+15:    rray_cast_lgl_to_int_one,
+17:    r_lgl_cbegin,
+18:    rray_cast_lgl_to_int_one,
+21:    r_int_begin,
+22:    rray_add_int_one,
+23:    RRAY_BINARY_ARGS(error_call)
+27:static r_obj* rray_add_lgl_int(
+36:  RRAY_BINARY(
+38:    r_lgl_cbegin,
+39:    rray_cast_lgl_to_int_one,
+41:    r_int_cbegin,
+42:    rray_cast_int_to_int_one,
+45:    r_int_begin,
+46:    rray_add_int_one,
+47:    RRAY_BINARY_ARGS(error_call)
+51:static r_obj* rray_add_int_lgl(
+60:  RRAY_BINARY(
+62:    r_int_cbegin,
+63:    rray_cast_int_to_int_one,
+65:    r_lgl_cbegin,
+66:    rray_cast_lgl_to_int_one,
+69:    r_int_begin,
+70:    rray_add_int_one,
+71:    RRAY_BINARY_ARGS(error_call)
+75:static r_obj* rray_add_lgl_dbl(</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_cast_lgl_to_int_one&quot; -A8 src/cast*.h | head -14; grep -n &quot;na_lgl\|na_int\|NA_L…</summary>
+<pre>grep -rn &quot;rray_cast_lgl_to_int_one&quot; -A8 src/cast*.h | head -14; grep -n &quot;na_lgl\|na_int\|NA_LOGICAL&quot; src/reduce-sum.c | head</pre><pre class="output">src/cast.h:46:static inline int rray_cast_lgl_to_int_one(int x) {
+src/cast.h-47-  return x;
+src/cast.h-48-}
+src/cast.h-49-
+src/cast.h-50-static inline double rray_cast_lgl_to_dbl_one(int x) {
+src/cast.h-51-  if (x == r_globals.na_lgl) {
+src/cast.h-52-    return r_globals.na_dbl;
+src/cast.h-53-  }
+src/cast.h-54-
+80:    r_globals.na_lgl,
+117:    r_globals.na_int,
+406:        v_out[i] = r_globals.na_int;
+487:  const int na_int = r_globals.na_int;
+525:          sum = rray_int128_add(sum, x_elt == na_int ? 0 : x_elt);
+533:            rray_int128_add(v_sums[out_loc], x_elt == na_int ? 0 : x_elt);
+552:          const bool na = x_elt == na_int;
+562:          const bool na = x_elt == na_int;
+581:        v_missings[i] ? na_int : rray_int128_as_int(v_sums[i], error_call);</pre></details>
+<p>Yes. For logical input, <code>rray_add_int_one()</code> checks both values against <code>r_globals.na_int</code>, not <code>r_globals.na_lgl</code>.</p>
+<p>The result is still correct, because R stores <code>NA_LOGICAL</code> and <code>NA_INTEGER</code> as the same value (<code>INT_MIN</code>). A logical <code>NA</code> matches the integer check and comes out as an integer <code>NA</code>, which is the right output for logical input. The test <code>rray_cumulative_sum(c(TRUE, NA, FALSE), 1L)</code> gives <code>c(1L, NA, NA)</code>.</p>
+<p><code>rray_add()</code> already does the same thing. For logical inputs, <code>src/arithmetic-add.c</code> casts with <code>rray_cast_lgl_to_int_one()</code>, which returns <code>x</code> unchanged (<code>src/cast.h:46</code>), and then calls <code>rray_add_int_one()</code>. The plan also asked for this reuse.</p>
+<p>The one place that's more explicit is <code>rray_sum_lgl()</code> in <code>src/reduce-sum.c</code>, which passes <code>r_globals.na_lgl</code> as the missing value.</p>
+<p>If you'd rather the cumulative code say so explicitly too, I can do one of these:</p>
+<ul>
+<li>
+<p><strong>Add a helper:</strong> <code>rray_add_lgl_one(int out, int x, error_call)</code> in <code>src/one-add.h</code>, checking <code>out</code> against <code>na_int</code> and <code>x</code> against <code>na_lgl</code>.</p>
+</li>
+<li>
+<p><strong>Add a cast to the macro:</strong> give <code>RRAY_CUMULATIVE()</code> an <code>X_CAST</code> step like <code>RRAY_BINARY()</code> has, and pass <code>rray_cast_lgl_to_int_one()</code>.</p>
+</li>
+</ul>
+<p>I'd leave it as is, to match <code>rray_add()</code>, but I'm happy to make either change.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Hmm add another plans/fix-int-lgl-na.md plan that states that we should avoid comparing a logical int against the integer NA value because it’s bad practice. We should do a full review of this across the package. I like option 1 I think</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -rln &quot;rray_cast_lgl_to_int_one&quot; src/*.c; grep -rn &quot;rray_cast_lgl_to_int_one&quot; src/*.c | w…</summary>
+<pre>grep -rln &quot;rray_cast_lgl_to_int_one&quot; src/*.c; grep -rn &quot;rray_cast_lgl_to_int_one&quot; src/*.c | wc -l; grep -rn -B1 -A9 &quot;r_lgl_cbegin&quot; src/*.c | grep -E &quot;_int_one|na_int&quot; | grep -v cast_lgl</pre><pre class="output">src/arithmetic-add.c
+src/arithmetic-subtract.c
+src/arithmetic-multiply.c
+src/cast.c
+src/compare.c
+src/equal.c
+src/extremum.c
+      27
+src/arithmetic-add.c-126-    rray_add_int_one,
+src/arithmetic-add.c-146-    rray_cast_int_to_int_one,
+src/arithmetic-add.c-150-    rray_add_int_one,
+src/arithmetic-add.c-174-    rray_add_int_one,
+src/arithmetic-multiply.c-132-    rray_multiply_int_one,
+src/arithmetic-multiply.c-152-    rray_cast_int_to_int_one,
+src/arithmetic-multiply.c-156-    rray_multiply_int_one,
+src/arithmetic-multiply.c-180-    rray_multiply_int_one,
+src/arithmetic-subtract.c-133-    rray_subtract_int_one,
+src/arithmetic-subtract.c-153-    rray_cast_int_to_int_one,
+src/arithmetic-subtract.c-157-    rray_subtract_int_one,
+src/arithmetic-subtract.c-181-    rray_subtract_int_one,
+src/compare.c-417-    rray_greater_than_int_int_one,
+src/compare.c-418-    rray_greater_than_or_equal_int_int_one,
+src/compare.c-419-    rray_less_than_int_int_one,
+src/compare.c-420-    rray_less_than_or_equal_int_int_one
+src/compare.c-439-    rray_cast_int_to_int_one,
+src/compare.c-440-    rray_greater_than_int_int_one,
+src/compare.c-441-    rray_greater_than_or_equal_int_int_one,
+src/compare.c-442-    rray_less_than_int_int_one,
+src/compare.c-443-    rray_less_than_or_equal_int_int_one
+src/compare.c-463-    rray_greater_than_int_int_one,
+src/compare.c-464-    rray_greater_than_or_equal_int_int_one,
+src/compare.c-465-    rray_less_than_int_int_one,
+src/compare.c-466-    rray_less_than_or_equal_int_int_one
+src/compare.c-509-    rray_greater_than_dbl_int_one,
+src/compare.c-510-    rray_greater_than_or_equal_dbl_int_one,
+src/compare.c-511-    rray_less_than_dbl_int_one,
+src/compare.c-512-    rray_less_than_or_equal_dbl_int_one
+src/cumulative-sum.c-71-    rray_add_int_one,
+src/equal.c-310-    rray_equal_int_one,
+src/equal.c-311-    rray_not_equal_int_one
+src/equal.c-330-    rray_cast_int_to_int_one,
+src/equal.c-331-    rray_equal_int_one,
+src/equal.c-332-    rray_not_equal_int_one
+src/equal.c-352-    rray_equal_int_one,
+src/equal.c-353-    rray_not_equal_int_one
+src/extremum.c-376-    rray_cast_int_to_int_one,
+src/extremum.c-380-    rray_pmax_int_one,
+src/extremum.c-381-    rray_pmax_int_one_na_rm
+src/extremum.c-404-    rray_pmax_int_one,
+src/extremum.c-405-    rray_pmax_int_one_na_rm
+src/extremum.c-592-    rray_cast_int_to_int_one,
+src/extremum.c-596-    rray_pmin_int_one,
+src/extremum.c-597-    rray_pmin_int_one_na_rm
+src/extremum.c-620-    rray_pmin_int_one,
+src/extremum.c-621-    rray_pmin_int_one_na_rm</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;na_int\|NA_INTEGER\|rray_int_is_missing&quot; src/*.c src/*.h | grep -v &quot;^src/rlang&quot; | w…</summary>
+<pre>grep -rn &quot;na_int\|NA_INTEGER\|rray_int_is_missing&quot; src/*.c src/*.h | grep -v &quot;^src/rlang&quot; | wc -l; grep -rn &quot;na_int\|rray_int_is_missing&quot; src/*.c src/*.h | grep -iE &quot;lgl|logical&quot;; grep -n &quot;lgl&quot; src/one-extremum.h | head; grep -rn &quot;case R_TYPE_logical:\|case RRAY_TYPE_logical:&quot; -A2 src/*.c | grep -E &quot;int&quot; | head -20</pre><pre class="output">      87
+src/slice-subscript.c:206:          elt == r_globals.na_lgl ? r_globals.na_int : (int) location + 1;
+20:static inline int rray_pmax_lgl_one(int x, int y) {
+23:    bool_bitwise_or(rray_lgl_is_missing(x), rray_lgl_is_missing(y));
+24:  return has_na ? r_globals.na_lgl : out;
+28:static inline int rray_pmax_lgl_one_na_rm(int x, int y) {
+119:static inline int rray_pmin_lgl_one(int x, int y) {
+124:static inline int rray_pmin_lgl_one_na_rm(int x, int y) {
+126:  out = rray_lgl_is_missing(y) ? x : out;
+127:  out = rray_lgl_is_missing(x) ? y : out;
+221:static inline int rray_max_lgl_one(int out, int x) {
+222:  return rray_pmax_lgl_one(out, x);
+src/cumulative-sum.c-37-  case RRAY_TYPE_integer:
+src/cast.c-39-    case RRAY_TYPE_integer:
+src/cast.c-53-      return rray_cast_int_to_lgl(x, x_arg, error_call);
+src/cast.c-54-    case RRAY_TYPE_integer:
+src/cast.c-69-    case RRAY_TYPE_integer:
+src/cumulative-prod.c-37-  case RRAY_TYPE_integer:
+src/clone.c-7-    const int* v_x = r_lgl_cbegin(x);
+src/cumulative-extremum.c-59-  case RRAY_TYPE_integer:
+src/cumulative-extremum.c-85-  case RRAY_TYPE_integer:
+src/ptype.c-24-  case RRAY_TYPE_integer:
+src/reduce-extremum.c-63-  case RRAY_TYPE_integer:
+src/reduce-extremum.c-89-  case RRAY_TYPE_integer:
+src/reduce-prod.c-39-  case RRAY_TYPE_integer:
+src/reduce-sum.c-48-  case RRAY_TYPE_integer:
+src/reduce-mean.c-56-  case RRAY_TYPE_integer:
+src/slice-subscript.c-70-  case R_TYPE_integer:
+src/type.c-10-  case R_TYPE_integer:
+src/type.c-31-  case RRAY_TYPE_integer:
+src/typeof2.c-41-      return RRAY_TYPE2_logical_integer;
+src/wrapper.c-63-  case R_TYPE_integer:</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;rray_cast_lgl_to_int\b\|rray_cast_lgl_to_int(&quot; -A14 src/cast.c | head -30; grep -n &quot;…</summary>
+<pre>grep -n &quot;rray_cast_lgl_to_int\b\|rray_cast_lgl_to_int(&quot; -A14 src/cast.c | head -30; grep -n &quot;lgl&quot; src/reduce-mean.c | head; grep -n &quot;lgl_or_int\|na_lgl\|rray_int_is_missing&quot; src/reduce-extremum.c src/reduce-mean.c src/one-*.h src/clone.c | head -20</pre><pre class="output">40:      return rray_cast_lgl_to_int(x, x_arg, error_call);
+41-    case RRAY_TYPE_double:
+42-      return rray_cast_lgl_to_dbl(x, x_arg, error_call);
+43-    case RRAY_TYPE_complex:
+44-      return rray_cast_lgl_to_cpl(x, x_arg, error_call);
+45-    case RRAY_TYPE_scalar:
+46-      stop_scalar_input(to, to_arg, error_call);
+47-    default:
+48-      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+49-    }
+50-  case RRAY_TYPE_integer:
+51-    switch (to_type) {
+52-    case RRAY_TYPE_logical:
+53-      return rray_cast_int_to_lgl(x, x_arg, error_call);
+54-    case RRAY_TYPE_integer:
+--
+178:static r_obj* rray_cast_lgl_to_int(
+179-  r_obj* x,
+180-  struct rray_arg* x_arg,
+181-  struct r_lazy error_call
+182-) {
+183-  RRAY_CAST(
+184-    int,
+185-    r_lgl_cbegin,
+186-    R_TYPE_integer,
+187-    int,
+188-    r_int_begin,
+189-    rray_cast_lgl_to_int_one
+190-  );
+191-}
+55:    return rray_mean_lgl;
+74:static r_obj* rray_mean_lgl(
+83:  const int* v_x = r_lgl_cbegin(x);
+87:  return rray_mean_lgl_or_int(
+89:    r_globals.na_lgl,
+124:  return rray_mean_lgl_or_int(
+326:static r_obj* rray_mean_lgl_or_int(
+src/one-extremum.h:24:  return has_na ? r_globals.na_lgl : out;
+src/one-extremum.h:40:    bool_bitwise_or(rray_int_is_missing(x), rray_int_is_missing(y));
+src/one-extremum.h:148:  out = rray_int_is_missing(y) ? x : out;
+src/one-extremum.h:149:  out = rray_int_is_missing(x) ? y : out;
+src/one-extremum.h:272:  const bool is_less = bool_bitwise_and(x &lt; out, !rray_int_is_missing(x));
+src/reduce-mean.c:87:  return rray_mean_lgl_or_int(
+src/reduce-mean.c:89:    r_globals.na_lgl,
+src/reduce-mean.c:124:  return rray_mean_lgl_or_int(
+src/reduce-mean.c:326:static r_obj* rray_mean_lgl_or_int(
+src/one-add.h:19:  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+src/one-logical.h:21:  return !any_false * (equal * x + !equal * r_globals.na_lgl);
+src/one-logical.h:33:  return any_true + !any_true * (equal * x + !equal * r_globals.na_lgl);
+src/one-logical.h:45:  return missing ? r_globals.na_lgl : elt;
+src/one-multiply.h:23:  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+src/one-multiply.h:67:  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : x);
+src/one-multiply.h:74:  return out * (rray_int_is_missing(x) ? 1.0 : x);</pre></details>
+<details class="tool"><summary>Bash: sed -n 40,50p src/cast.h; grep -rn &quot;rray_cast_lgl_to_int_one&quot; src/*.c | awk -F: '{print $1}' …</summary>
+<pre>sed -n 40,50p src/cast.h; grep -rn &quot;rray_cast_lgl_to_int_one&quot; src/*.c | awk -F: '{print $1}' | sort | uniq -c; grep -n &quot;na_lgl\|na_int&quot; src/slice-subscript.c | head -5</pre><pre class="output">}
+
+static inline r_complex rray_cast_cpl_to_cpl_one(r_complex x) {
+  return x;
+}
+
+static inline int rray_cast_lgl_to_int_one(int x) {
+  return x;
+}
+
+static inline double rray_cast_lgl_to_dbl_one(int x) {
+   4 src/arithmetic-add.c
+   4 src/arithmetic-multiply.c
+   4 src/arithmetic-subtract.c
+   1 src/cast.c
+   6 src/compare.c
+   4 src/equal.c
+   4 src/extremum.c
+109:      v_out[i] = r_globals.na_int;
+173:        rray_dbl_is_missing(location) ? r_globals.na_int : (int) location;
+192:      } else if (elt == r_globals.na_lgl) {
+194:          v_out[i] = r_globals.na_int;
+206:          elt == r_globals.na_lgl ? r_globals.na_int : (int) location + 1;</pre></details>
+<details class="tool"><summary>Write plans/fix-int-lgl-na.md</summary>
+<pre># Logical `NA` checked against integer `NA`
+
+## Summary
+
+Several places pass logical data to a helper that checks for missing values
+with `r_globals.na_int`. The answer is right only because R happens to store
+`NA_LOGICAL` and `NA_INTEGER` as the same value (`INT_MIN`). Code that relies
+on this is hard to read and easy to break. A logical value should always be
+checked against `r_globals.na_lgl`, and turned into `r_globals.na_int`
+explicitly when it becomes an integer.
+
+Do a full review of the package for this pattern and fix every case in one PR.
+
+## Known cases
+
+- `rray_cumulative_sum()` on logical input (`src/cumulative-sum.c`) passes
+  logical data straight to `rray_add_int_one()`, which checks both operands
+  with `rray_int_is_missing()`.
+
+  Fix: add `rray_add_lgl_one(int out, int x, struct r_lazy error_call)` to
+  `src/one-add.h`. It checks the running total `out` with
+  `rray_int_is_missing()` and the new value `x` with `rray_lgl_is_missing()`,
+  then returns `r_globals.na_int` for a missing result. Use it in
+  `rray_cumulative_sum_lgl()`.
+
+- `rray_cast_lgl_to_int_one()` in `src/cast.h` returns `x` unchanged, so a
+  logical `NA` passes through as is and is later read as an integer `NA`.
+  Every logical input to an integer helper in a binary operation goes
+  through this cast. It is used 27 times:
+
+  - `src/arithmetic-add.c`, `src/arithmetic-subtract.c`, and
+    `src/arithmetic-multiply.c` (4 each)
+
+  - `src/compare.c` (6)
+
+  - `src/equal.c` and `src/extremum.c` (4 each)
+
+  - `src/cast.c` (1), through `rray_cast_lgl_to_int()`, which backs
+    `rray_cast()`
+
+  Fix: map the missing value explicitly, the way
+  `rray_cast_lgl_to_dbl_one()` already does:
+
+  ```c
+  static inline int rray_cast_lgl_to_int_one(int x) {
+    return rray_lgl_is_missing(x) ? r_globals.na_int : x;
+  }
+  ```
+
+  This one change fixes every binary operation at once.
+
+## Already correct
+
+These show the pattern to follow:
+
+- `rray_sum_lgl()` and `rray_mean_lgl()` pass `r_globals.na_lgl` as the
+  missing value to their shared logical and integer loops.
+
+- `rray_cast_lgl_to_dbl_one()` checks `r_globals.na_lgl`.
+
+- `rray_prod_lgl_one()` and the logical helpers in `src/one-extremum.h` and
+  `src/one-logical.h` use `rray_lgl_is_missing()` and `r_globals.na_lgl`.
+
+- `src/slice-subscript.c` checks a logical subscript against
+  `r_globals.na_lgl` and writes `r_globals.na_int`.
+
+## Full review
+
+The list above came from a quick search, so it is a starting point, not the
+whole set. For the review:
+
+- Find every read of logical data (`r_lgl_cbegin()`, `r_lgl_begin()`,
+  `r_lgl_get()`) and follow each value to the point where it is checked for
+  missingness. Flag any check that uses `r_globals.na_int`, `NA_INTEGER`, or
+  `rray_int_is_missing()`.
+
+- Look at every helper with `int` in its name that is ever handed logical
+  data, including through a macro such as `RRAY_BINARY()`,
+  `RRAY_CUMULATIVE()`, `RRAY_REDUCE()`, or `RRAY_CAST()`.
+
+- Check the reverse too: integer data checked with `r_globals.na_lgl` or
+  `rray_lgl_is_missing()`.
+
+- Check places that write a missing value into a logical output, and make
+  sure they write `r_globals.na_lgl`.
+
+## Performance
+
+`r_globals.na_lgl` and `r_globals.na_int` are set at run time, so the
+compiler can't tell they are equal and won't remove the new select. Each fix
+adds a compare and a select per element. This should be cheap, since it does
+not depend on the running result, but measure it:
+
+- `rray_cumulative_sum()` on logical input, from `bench/cumulative.R`.
+
+- `rray_add()`, `rray_greater_than()`, `rray_equal()`, and `rray_pmax()` with
+  a logical input, from `bench/binary.R`. Its operations only use integer and
+  double data today, so add logical.
+
+- `rray_cast()` from logical to integer.
+
+If a hot path gets slower, say so in the PR before keeping the change.
+
+## Tests
+
+Results should not change. Existing tests for logical `NA` in arithmetic,
+comparison, equality, extrema, casting, and cumulative sum cover the
+behavior. Add a test wherever the review finds a logical path with no `NA`
+test. Run the full suite.</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/plans/fix-int-lgl-na.md (file state is current in your context — no need to Read it back)</pre></details>
+<p>I wrote <code>plans/fix-int-lgl-na.md</code>. It isn't committed yet. Do you want me to commit and push it to <code>feature/cumulative-sum</code>?</p>
+<p>The quick search found that the problem goes beyond cumulative sum:</p>
+<ul>
+<li>
+<p><strong><code>rray_cumulative_sum()</code>:</strong> your option 1 is in the plan. Add <code>rray_add_lgl_one()</code> to <code>src/one-add.h</code>. It checks the running total against <code>na_int</code> and the new logical value against <code>na_lgl</code>.</p>
+</li>
+<li>
+<p><strong><code>rray_cast_lgl_to_int_one()</code>:</strong> this is the bigger case. It returns <code>x</code> unchanged (<code>src/cast.h:46</code>), and its 27 uses cover:</p>
+<ul>
+<li>arithmetic (add, subtract, multiply)</li>
+<li>comparison and equality</li>
+<li><code>rray_pmax()</code> and <code>rray_pmin()</code></li>
+<li><code>rray_cast()</code></li>
+</ul>
+<p>Every logical input to an integer helper in those operations goes through it. Making it map <code>na_lgl</code> to <code>na_int</code> explicitly, the way <code>rray_cast_lgl_to_dbl_one()</code> already does, fixes all of them at once.</p>
+</li>
+</ul>
+<p>The plan also covers:</p>
+<ul>
+<li>
+<p><strong>Already correct:</strong> the code that does it right, as a model to follow, such as <code>rray_sum_lgl()</code> and <code>rray_mean_lgl()</code>, which pass <code>na_lgl</code>.</p>
+</li>
+<li>
+<p><strong>Full review:</strong> steps for finding the rest, since a quick search may have missed cases. That means following every logical read to its missing check, checking the reverse (integer data checked against <code>na_lgl</code>), and checking logical outputs.</p>
+</li>
+<li>
+<p><strong>Performance:</strong> <code>r_globals.na_lgl</code> and <code>r_globals.na_int</code> are set when R starts, not at compile time. So the compiler can't remove the new check, and each element gets one extra comparison. The plan says what to benchmark. It also notes that <code>bench/binary.R</code> has no logical data yet.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add plans/fix-int-lgl-na.md &amp;&amp; git status --short &amp;&amp; git commit -q -m &quot;Add plan for check…</summary>
+<pre>git add plans/fix-int-lgl-na.md &amp;&amp; git status --short &amp;&amp; git commit -q -m &quot;Add plan for checking logical values against the logical NA&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/cumulative-sum 2&gt;&amp;1 | tail -2</pre><pre class="output">A  plans/fix-int-lgl-na.md
+b073ac0 Add plan for checking logical values against the logical NA
+   29931ac..b073ac0  feature/cumulative-sum -&gt; feature/cumulative-sum
+branch 'feature/cumulative-sum' set up to track 'origin/feature/cumulative-sum'.</pre></details>
+<p>I committed the plan as <code>b073ac0</code> (&quot;Add plan for checking logical values against the logical NA&quot;) and pushed it to <code>feature/cumulative-sum</code>. The branch now has two commits on top of <code>main</code>: the cumulative sum work and this plan.</p>
+
+</section>
+</main>
+</body>
+</html>

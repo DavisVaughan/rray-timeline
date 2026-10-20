@@ -1,0 +1,1142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whether the run iterator makes custom per-type reducer loops cheap</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-113">rray timeline</a>
+<h1>Whether the run iterator makes custom per-type reducer loops cheap</h1>
+<p class="facts">Claude · Oct 2, 2026 · 1 prompt · 1 reply · <a href="https://github.com/r-lib/rray/pull/113">#113</a></p>
+</header>
+<main>
+<p class="divider">Oct 2, 2026, 23:59 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I’m hoping that the newly merged strided iterator2 will make it a bit easier to implement plans/accuracy.md where sum/prod reducers will need more customized loops per type. They probably won’t share the RRAY REDUCE macro anymore, but that seems ok if the overhead of writing a reducer loop is much smaller. Does that seem right?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls src plans &amp;&amp; git log --oneline -3 &amp;&amp; cat plans/accuracy.md</summary>
+<pre>ls src plans &amp;&amp; git log --oneline -3 &amp;&amp; cat plans/accuracy.md</pre><pre class="output">plans:
+accuracy.md
+cumulative.md
+extensions.md
+implementation.md
+index.md
+iterators.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+sum.md
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+one-add.h
+one-extremum.h
+one-logical.h
+one-multiply.h
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-extremum.c
+reduce-extremum.h
+reduce-extremum.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-prod.c
+reduce-prod.h
+reduce-prod.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rep-each.c
+rep-each.h
+rep-each.o
+rep.c
+rep.h
+rep.o
+reverse.c
+reverse.h
+reverse.o
+rlang
+rlang.c
+rlang.o
+roll-each.c
+roll-each.h
+roll-each.o
+roll.c
+roll.h
+roll.o
+rray4.so
+size.c
+size.h
+size.o
+slice-assign.c
+slice-assign.h
+slice-assign.o
+slice-axis.c
+slice-axis.h
+slice-axis.o
+slice-iterator.h
+slice-subscript.c
+slice-subscript.h
+slice-subscript.o
+slice.c
+slice.h
+slice.o
+split.c
+split.h
+split.o
+stack.c
+stack.h
+stack.o
+strided-iterator.h
+strided-iterator2.h
+strides.c
+strides.h
+strides.o
+subscript.c
+subscript.h
+subscript.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+unstack.c
+unstack.h
+unstack.o</pre><p class="cut">342 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/strided-iterator2.h &amp;&amp; cat src/reduce.h &amp;&amp; git show --stat HEAD &amp;&amp; grep -rn &quot;strided_…</summary>
+<pre>cat src/strided-iterator2.h &amp;&amp; cat src/reduce.h &amp;&amp; git show --stat HEAD &amp;&amp; grep -rn &quot;strided_iterator2\|rray_strided2\|iterator2&quot; src/*.c | head -30</pre><pre class="output">#ifndef RRAY_STRIDED_ITERATOR2_H
+#define RRAY_STRIDED_ITERATOR2_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator2-decl.h&quot;
+
+// Strided iterator
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates the current `loc`ations in one or
+// more alternate subspaces defined by `v_v_strides`.
+//
+// We've carefully tuned this iterator for both performance and flexibility. The
+// caller MUST create the iterator INSIDE the function that utilizes it. If a
+// pointer to the iterator is passed around, it can destroy performance due to
+// the way the result is compiled.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+// This loop is typically what the caller writes.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// Note that all sets of strides must be coalescible, as coalescing changes the
+// output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+//
+// --------------------------------------------------------------------------
+// Optimization - Next specialization
+//
+// The loops that callers write seem to be particularly sensitive to whether or
+// not the &quot;next&quot; loop is unrolled on `n`. For the generic &quot;next&quot; function with
+// a runtime `n`, it usually isn't unrolled. But most of the time you have
+// either one or two inputs, so we manually unroll in next1() and next2(), and
+// those should be used where possible.
+struct rray_run_iterator {
+  r_ssize size;
+
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize start;
+  r_ssize end;
+  r_ssize v_loc[RRAY_MAX_INPUTS];
+
+  // Strides for all `n` arrays, laid out axis-major in a flat array as
+  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+  r_ssize n;
+};
+
+static inline struct rray_run_iterator rray_run_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* const* v_v_strides,
+  r_ssize n
+) {
+  check_dimensionality(dimensionality);
+
+  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+    r_stop_internal(
+      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+      n,
+      RRAY_MAX_INPUTS
+    );
+  }
+
+  struct rray_run_iterator it;
+
+  it.size = rray_size_from_dimensions_checked(
+    v_dimensions,
+    dimensionality,
+    r_lazy_null
+  );
+
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+  }
+
+  // Reorder strides to be contiguous during next() calls
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    r_ssize* v_strides = it.v_strides + axis * n;
+    for (r_ssize i = 0; i &lt; n; ++i) {
+      v_strides[i] = v_v_strides[i][axis];
+    }</pre><p class="cut">554 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/reduce-sum.c | head -150 &amp;&amp; sed -n '/Reduce/,$p' src/one-add.h | head -80 &amp;&amp; cat benc…</summary>
+<pre>cat src/reduce-sum.c | head -150 &amp;&amp; sed -n '/Reduce/,$p' src/one-add.h | head -80 &amp;&amp; cat bench/index.R</pre><pre class="output">#include &quot;reduce-sum.h&quot;
+
+#include &quot;one-add.h&quot;
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-sum-decl.h&quot;
+
+r_obj* ffi_rray_sum(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_sum(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_sum(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce_run(x, axes, na_rm, rray_sum_switch, arg, error_call);
+}
+
+static rray_reduce_run_fn rray_sum_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return na_rm ? rray_sum_lgl_na_rm : rray_sum_lgl;
+  case RRAY_TYPE_integer:
+    return na_rm ? rray_sum_int_na_rm : rray_sum_int;
+  case RRAY_TYPE_double:
+    return na_rm ? rray_sum_dbl_na_rm : rray_sum_dbl;
+  case RRAY_TYPE_complex:
+    return na_rm ? rray_sum_cpl_na_rm : rray_sum_cpl;
+
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;sum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_sum_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_REDUCE_RUN(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_sum_lgl_one,
+    RRAY_REDUCE_NO_ARGS
+  );
+}
+
+static r_obj* rray_sum_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_REDUCE_RUN(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_sum_lgl_one_na_rm,
+    RRAY_REDUCE_NO_ARGS
+  );
+}
+
+static r_obj* rray_sum_int(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_REDUCE_RUN(
+    int,
+    r_int_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_sum_int_one,
+    RRAY_REDUCE_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_sum_int_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_REDUCE_RUN(
+    int,
+    r_int_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_sum_int_one_na_rm,
+    RRAY_REDUCE_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_sum_dbl(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_REDUCE_RUN(
+    double,
+    r_dbl_cbegin,
+    R_TYPE_double,
+// Reduce
+
+// `out` is an integer, `x` is a logical
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `NA`.
+// - `out = NA`, `x = 1`: returns `NA`.
+static inline int rray_sum_lgl_one(int out, int x) {
+  if (rray_int_is_missing(out)) {
+    return r_globals.na_int;
+  }
+
+  if (rray_lgl_is_missing(x)) {
+    return r_globals.na_int;
+  }
+
+  // Since long vectors aren't supported in arrays,
+  // we can't ever integer overflow in a logical array
+
+  return out + x;
+}
+
+// `out` is an integer that is never `NA`, `x` is a logical
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `1`.
+static inline int rray_sum_lgl_one_na_rm(int out, int x) {
+  if (rray_lgl_is_missing(x)) {
+    return out;
+  }
+
+  return out + x;
+}
+
+static inline int rray_sum_int_one(int out, int x, struct r_lazy error_call) {
+  return rray_add_int_one(out, x, error_call);
+}
+
+// `out` is never `NA`
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `1`.
+// - `out = 1`, `x = INT_MAX`: errors.
+static inline int rray_sum_int_one_na_rm(
+  int out,
+  int x,
+  struct r_lazy error_call
+) {
+  if (rray_int_is_missing(x)) {
+    return out;
+  }
+
+  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {</pre><p class="cut">394 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 40,400p src/strided-iterator2.h</summary>
+<pre>sed -n 40,400p src/strided-iterator2.h</pre><pre class="output">// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+// This loop is typically what the caller writes.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// Note that all sets of strides must be coalescible, as coalescing changes the
+// output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+//
+// --------------------------------------------------------------------------
+// Optimization - Next specialization
+//
+// The loops that callers write seem to be particularly sensitive to whether or
+// not the &quot;next&quot; loop is unrolled on `n`. For the generic &quot;next&quot; function with
+// a runtime `n`, it usually isn't unrolled. But most of the time you have
+// either one or two inputs, so we manually unroll in next1() and next2(), and
+// those should be used where possible.
+struct rray_run_iterator {
+  r_ssize size;
+
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize start;
+  r_ssize end;
+  r_ssize v_loc[RRAY_MAX_INPUTS];
+
+  // Strides for all `n` arrays, laid out axis-major in a flat array as
+  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+  r_ssize n;
+};
+
+static inline struct rray_run_iterator rray_run_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* const* v_v_strides,
+  r_ssize n
+) {
+  check_dimensionality(dimensionality);
+
+  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+    r_stop_internal(
+      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+      n,
+      RRAY_MAX_INPUTS
+    );
+  }
+
+  struct rray_run_iterator it;
+
+  it.size = rray_size_from_dimensions_checked(
+    v_dimensions,
+    dimensionality,
+    r_lazy_null
+  );
+
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+  }
+
+  // Reorder strides to be contiguous during next() calls
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    r_ssize* v_strides = it.v_strides + axis * n;
+    for (r_ssize i = 0; i &lt; n; ++i) {
+      v_strides[i] = v_v_strides[i][axis];
+    }
+  }
+
+  it.dimensionality = rray__run_iterator_axes_coalesce(
+    it.v_dimensions,
+    it.v_strides,
+    n,
+    dimensionality
+  );
+
+  it.start = 0;
+  it.end = it.v_dimensions[0];
+
+  it.n = n;
+
+  for (r_ssize i = 0; i &lt; n; ++i) {
+    it.v_loc[i] = 0;
+  }
+
+  for (int axis = 0; axis &lt; it.dimensionality; ++axis) {
+    it.v_point[axis] = 0;
+  }
+
+  return it;
+}
+
+static inline struct rray_run_iterator rray_run_iterator1(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  const r_ssize* v_v_strides[] = {v_strides};
+  return rray_run_iterator(v_dimensions, dimensionality, v_v_strides, 1);
+}
+
+static inline struct rray_run_iterator rray_run_iterator2(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides1,
+  const r_ssize* v_strides2</pre><p class="cut">161 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rln &quot;rray_run_iterator\|RRAY_REDUCE_RUN&quot; src/*.c src/*.h; grep -n &quot;define RRAY_REDUCE&quot; …</summary>
+<pre>grep -rln &quot;rray_run_iterator\|RRAY_REDUCE_RUN&quot; src/*.c src/*.h; grep -n &quot;define RRAY_REDUCE&quot; src/reduce.h; sed -n '/define RRAY_REDUCE_RUN/,/^$/p' src/reduce.h; grep -n &quot;rray_reduce_run\b\|rray_reduce_run(&quot; src/reduce.c | head</pre><pre class="output">src/broadcast.c
+src/reduce-sum.c
+src/binary.h
+src/reduce.h
+src/strided-iterator2.h
+2:#define RRAY_REDUCE_H
+10:#define RRAY_REDUCE_ARGS(...) , __VA_ARGS__
+11:#define RRAY_REDUCE_NO_ARGS
+70:#define RRAY_REDUCE(                                                           \
+122:#define RRAY_REDUCE_RUN(                                                       \
+199:#define RRAY_REDUCE_OUTER(                                                     \
+242:#define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+#define RRAY_REDUCE_RUN(                                                       \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE,                                                                         \
+  ONE_ARGS                                                                     \
+)                                                                              \
+  struct rray_run_iterator it =                                                \
+    rray_run_iterator1(v_dimensions, dimensionality, v_out_broadcast_strides); \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+                                                                               \
+    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);                           \
+    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \
+                                                                               \
+    if (out_stride == 0) {                                                     \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i] ONE_ARGS);                 \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i] ONE_ARGS);                 \
+        out_loc += out_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+66:r_obj* rray_reduce_run(</pre></details>
+<details class="tool"><summary>Bash: sed -n 60,121p src/reduce.h; sed -n 55,130p src/reduce.c; grep -n &quot;rray_run_iterator&quot; -A30 sr…</summary>
+<pre>sed -n 60,121p src/reduce.h; sed -n 55,130p src/reduce.c; grep -n &quot;rray_run_iterator&quot; -A30 src/broadcast.c | head -60</pre><pre class="output">r_obj* rray_reduce_run(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_run_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE,                                                                         \
+  ONE_ARGS                                                                     \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize out_start = 0;                                                       \
+  const r_ssize out_run_stride = rray_strided_iterator_plan_run_stride(plan);  \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize out_loc = out_start;                                               \
+                                                                               \
+    if (out_run_stride == 0) {                                                 \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i] ONE_ARGS);                 \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i] ONE_ARGS);                 \
+        out_loc += out_run_stride;                                             \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(out_start, v_point, plan);                      \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_run(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_run_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_dimensions, sizeof(int) * dimensionality);
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out_dimensions[v_axes[i] - 1] = 1;
+  }
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  r_ssize v_out_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_out_dimensions,
+    dimensionality,
+    dimensionality,
+    v_out_broadcast_strides
+  );
+
+  const rray_reduce_run_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(
+    x,
+    out_size,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides,
+    error_call
+  ));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+149:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+150:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+151:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+152-                                                                               \
+153:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+154:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+155-                                                                               \
+156-    if (x_stride == 0) {                                                       \
+157-      CTYPE const x_elt = v_x[x_loc];                                          \
+158-      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+159-        POKE(out, i, x_elt);                                                   \
+160-      }                                                                        \
+161-    } else {                                                                   \
+162-      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+163-        POKE(out, i, v_x[x_loc]);                                              \
+164-        x_loc += x_stride;                                                     \
+165-      }                                                                        \
+166-    }                                                                          \
+167-  }
+168-
+169-#define RRAY_BROADCAST_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+170-
+171-#define RRAY_BROADCAST_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)                \
+172:  struct rray_run_iterator it =                                                \
+173:    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+174-                                                                               \
+175:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+176-  CTYPE* v_out = DEREF(out);                                                   \
+177-                                                                               \
+178-  const CTYPE* v_x = CONST_DEREF(x);                                           \
+179-                                                                               \
+180-  RRAY_BROADCAST_LOOP(CTYPE, RRAY_BROADCAST_ATOMIC_POKE);                      \
+181-                                                                               \
+182-  FREE(1);                                                                     \
+183-  return out;
+184-
+185-#define RRAY_BROADCAST_BARRIER(RTYPE, CONST_DEREF, POKE)                       \
+186:  struct rray_run_iterator it =                                                \
+187:    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+188-                                                                               \
+189:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+190-                                                                               \
+191-  r_obj* const* v_x = CONST_DEREF(x);                                          \
+192-                                                                               \
+193-  RRAY_BROADCAST_LOOP(r_obj*, POKE);                                           \
+194-                                                                               \
+195-  FREE(1);                                                                     \
+196-  return out;
+197-
+198-static r_obj* rray_broadcast_lgl(
+199-  r_obj* x,
+200-  const int* v_dimensions,
+201-  int dimensionality,
+202-  const r_ssize* v_x_broadcast_strides
+203-) {
+204-  RRAY_BROADCAST_ATOMIC(R_TYPE_logical, int, r_lgl_cbegin, r_lgl_begin);
+205-}
+206-
+207-static r_obj* rray_broadcast_int(
+208-  r_obj* x,</pre></details>
+<p>I've read the new iterator, <code>RRAY_REDUCE_RUN()</code>, and the accuracy plan. Short answer: yes, it seems right, with two caveats.</p>
+<h2>Why it holds</h2>
+<p>The hard part of a reducer loop used to be the walk itself: the plan struct, <code>v_point</code> setup, <code>run_start</code> / <code>out_start</code> bookkeeping, and <code>RRAY_STRIDED_ITERATOR_NEXT()</code>. That is a lot to copy, which is why the plan wanted <code>RRAY_REDUCE_ACC()</code>. With <code>rray_run_iterator</code>, the walk shrinks to:</p>
+<pre><code class="language-c">struct rray_run_iterator it =
+  rray_run_iterator1(v_dimensions, dimensionality, v_out_broadcast_strides);
+
+for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+  const r_ssize start = rray_run_iterator_start(&amp;it);
+  const r_ssize end = rray_run_iterator_end(&amp;it);
+  r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+  const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+  ...
+}
+</code></pre>
+<p>That costs less than a macro with 11 parameters like <code>ONE</code>, <code>RUN</code>, <code>FINISH</code> and <code>ONE_ARGS</code>. The <code>out_stride == 0</code> branch hands you <code>start</code> and <code>end</code> of a contiguous run, which is exactly what the pairwise sum needs.</p>
+<p>It also helps that the reducers in the plan don't all need the same thing:</p>
+<ul>
+<li>
+<p><strong>Double and complex sum</strong> can add straight into <code>v_out</code>. Only the <code>out_stride == 0</code> branch changes, to <code>v_out[out_loc] += pairwise(v_x + start, end - start)</code>. No buffer and no finish step, unless you later choose compensated summation.</p>
+</li>
+<li>
+<p><strong>Integer and logical sum</strong> need an <code>int64_t</code> buffer and a finish pass that checks overflow and <code>NA</code>.</p>
+</li>
+<li>
+<p><strong>Product with mantissa and exponent</strong> (if you do it) needs a struct buffer and a finish step.</p>
+</li>
+<li>
+<p><strong>Mean on the flat walk</strong> is two walks in a row.</p>
+</li>
+</ul>
+<p>A shared <code>RRAY_REDUCE_ACC()</code> would make the double sum use a buffer it doesn't need. Writing each loop by hand avoids that.</p>
+<h2>Caveats</h2>
+<ol>
+<li>
+<p><strong>The iterator must be built inside the function that loops over it.</strong> The header comment says passing <code>&amp;it</code> to a helper can hurt performance. So the walk can't become a shared function. <code>RUN</code> and <code>FINISH</code> can still be <code>static inline</code> helpers that take a pointer and a length. The loop itself stays in each reducer.</p>
+</li>
+<li>
+<p><strong>The <code>na_rm</code> variants double the copies.</strong> <code>rray_sum()</code> alone has 8 functions (4 types, each with and without <code>na_rm</code>). Within one type, the two versions have identical loops and differ only in the element function. A small macro local to <code>src/reduce-sum.c</code>, covering one family (for example the <code>int64_t</code> buffer loop shared by <code>lgl</code> / <code>int</code>, with and without <code>na_rm</code>), keeps that in check without a general macro in <code>src/reduce.h</code>. I'd use one macro per loop shape, not one for every reducer.</p>
+</li>
+</ol>
+<h2>What I'd change in <code>plans/accuracy.md</code></h2>
+<ul>
+<li>
+<p>Drop plan 2 (<code>RRAY_REDUCE_ACC()</code>). Each sum family writes its own loop on <code>rray_run_iterator</code>, with file-local macros only to merge the <code>na_rm</code> pairs.</p>
+</li>
+<li>
+<p>Remove the open question about merging <code>RRAY_REDUCE_ACC()</code> back into <code>RRAY_REDUCE()</code>, since it would no longer exist. Extremum and logical keep <code>RRAY_REDUCE_RUN()</code> as they are.</p>
+</li>
+<li>
+<p>Note that the double sum doesn't need a buffer.</p>
+</li>
+</ul>
+<p>I haven't edited the plan. Want me to make these changes?</p>
+
+</section>
+</main>
+</body>
+</html>

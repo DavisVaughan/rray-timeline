@@ -1,0 +1,4032 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adding rray_cumulative_all() and any() on top of the run iterator</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-141">rray timeline</a>
+<h1>Adding <code>rray_cumulative_all()</code> and <code>any()</code> on top of the run iterator</h1>
+<p class="facts">Claude · Oct 11, 2026 · 5 prompts · 26 replies · <a href="https://github.com/r-lib/rray/pull/141">#141</a></p>
+</header>
+<main>
+<p class="divider">Oct 11, 2026, 12:44 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create feature/cumulative-any-all</p>
+<p>Read the plan/cumulative and implement the any and all logical ones</p>
+<p>Plan the infrastructure so we can add more cumulative functions easily</p>
+<p>Add bench/cumulative.R to start to track performance, we will add to this as we go</p>
+<p>Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status &amp;&amp; git log --oneline -5 &amp;&amp; ls &amp;&amp; ls plan* R src tests/testthat bench 2&gt;&amp;1 | head -…</summary>
+<pre>git status &amp;&amp; git log --oneline -5 &amp;&amp; ls &amp;&amp; ls plan* R src tests/testthat bench 2&gt;&amp;1 | head -100</pre><pre class="output">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+153250e Update cumulative plan for current reducers (#140)
+6694814 Add titles API (#139)
+7ff7f6b Remove key plan
+b9295fd Require R &gt;= 4.3.0 for ALTLIST support
+e3bc7d8 Only do the complex missing tests on new enough R
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+codecov.yml
+compile_commands.json
+DESCRIPTION
+docs
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+panache.toml
+pkgdown
+plan
+plans
+R
+README.md
+README.Rmd
+rray.Rproj
+src
+tests
+vignettes
+bench:
+binary.R
+broadcast.R
+combine.R
+extremum.R
+index.R
+iterator.R
+matrix-stats.R
+mean.R
+permute-axes.R
+reduce-logical.R
+reduce.R
+slice.R
+split.R
+stride-zero.R
+
+plan:
+titles.md
+
+plans:
+cumulative.md
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+
+R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extract-subscript.R
+extract.R
+extremum.R
+if-else.R
+index.R
+insert-axes.R
+locate.R
+logical.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+reverse.R
+roll.R
+rray-package.R
+size.R
+slice-subscript.R
+slice.R
+split.R
+stack.R
+titles.R
+unstack.R
+zzz.R
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h</pre></details>
+<details class="tool"><summary>Bash: cat plans/cumulative.md &amp;&amp; ls src | grep -v '\.o$' &amp;&amp; ls tests/testthat</summary>
+<pre>cat plans/cumulative.md &amp;&amp; ls src | grep -v '\.o$' &amp;&amp; ls tests/testthat</pre><pre class="output"># Cumulative functions
+
+## Scope and decisions
+
+Add `rray_cumulative_sum()`, `rray_cumulative_prod()`,
+`rray_cumulative_min()`, `rray_cumulative_max()`,
+`rray_cumulative_any()`, and `rray_cumulative_all()`. Each takes one
+required, one-based `axis`. There is no `na_rm` argument. Do not add a
+cumulative mean. The current mean reducer uses a corrected second pass for
+doubles and exact wide integer sums. A cumulative mean would need a separate
+numerical rule for every prefix.
+
+For an array `x`, the value at position `i` on the selected axis summarizes
+positions `1:i` on that axis. All other coordinates stay fixed. Each such
+line starts with fresh state. The output has the same dimensions and axis
+names as `x`; only the element type may change. A vector is treated as a
+one-dimensional array, following the rest of rray.
+
+```r
+x &lt;- matrix(1:6, nrow = 2)
+rray_cumulative_sum(x, axis = 1L)
+rray_cumulative_sum(x, axis = 2L)
+```
+
+The first call gives rows `(1, 3, 5)` and `(3, 7, 11)`. The second gives
+rows `(1, 4, 9)` and `(2, 6, 12)`.
+
+One axis keeps prefix order clear. NumPy also accepts one axis for
+[`cumsum()`](https://numpy.org/doc/stable/reference/generated/numpy.cumsum.html);
+its `axis = None` scans a flattened array. rray will require an axis and
+retain the input dimensions. A scan over several axes would need a separate
+rule for their order and for which intermediate prefixes become output.
+
+These are array scans: the selected axis does not collapse. Use the current
+reducer type rules and the existing one-element operations where they fit.
+Each section below states any difference from a reducer or base R.
+
+## Public API and file layout
+
+- Put all six documented and exported R functions in `R/cumulative.R`.
+  Use one `rray-cumulative` documentation topic, a required `axis`, and
+  `.Call(ffi_rray_cumulative_..., x, axis, environment())`. Do not add
+  `na_rm` or an unused `...` argument.
+- Add `src/cumulative.c`, `src/cumulative.h`, and
+  `src/decl/cumulative-decl.h` for input validation, shape handling,
+  dispatch, and `RRAY_CUMULATIVE()`. Add operation files
+  `src/cumulative-sum.c/.h`, `src/cumulative-prod.c/.h`,
+  `src/cumulative-extremum.c/.h`, and `src/cumulative-logical.c/.h`,
+  each with its own `src/decl/*-decl.h`.
+  Extremum holds min and max; logical holds any and all, as the reducers do.
+- Add the six `extern` FFI declarations and registrations to `src/init.c`.
+  Keep FFI declarations out of feature headers. Put thin FFI wrappers first
+  in each operation `.c`, then the internal entry points, type switches,
+  typed loops, and helpers in use order. Include the decl header last.
+- Add `test-cumulative-sum.R`, `test-cumulative-prod.R`,
+  `test-cumulative-extremum.R`, and `test-cumulative-logical.R`.
+  Add the topic to `_pkgdown.yml` under a Cumulative section, then
+  document and run `pkgdown::check_pkgdown()`.
+
+The common C entry point should accept the validated integer axis and a
+typed function switch, for example
+`rray_cumulative(x, axis, fn_switch, arg, error_call)`. A typed function
+receives `x`, `stride`, `axis_dimension`, `outer`, and `error_call`, and
+returns a freshly allocated output vector. Each public internal function
+passes its switch to the common entry point. Convert the R axis in the
+FFI wrapper with `arg_as_int(ffi_axis, rray_args.axis, error_call)` and call
+`check_axis()` after finding dimensionality. Use `check_unclassed()` and
+`arg_as_array()` as `rray_reduce()` does. Switch on `rray_typeof(x)` and
+reject unsupported types through a cumulative-specific error naming the
+operation. For any and all, use `check_logical()` as their reducers do.
+
+The common entry point protects the converted `x` and the typed output. It
+attaches `r_dim(x)` and, when present, `r_dim_names(x)`. Both are borrowed
+from the protected input. The typed function or macro allocates and fills
+the output. Do not copy class or other attributes. Preserve all axis names,
+including the scanned axis, since every output position still belongs to
+the same input position. A named vector becomes a one-dimensional array
+with its names on that axis through `arg_as_array()`.
+
+## Traversal and `RRAY_CUMULATIVE()`
+
+For a one-based axis, define `stride` as the product of dimensions before
+that axis, `axis_dimension` as its dimension, and `outer` as the product of
+dimensions after it. These use `r_ssize`. For each outer block, the source
+index for axis position `k` and inner lane `j` is
+`block * axis_dimension * stride + k * stride + j`.
+
+```text
+dimensions c(2, 3, 4), axis 2:
+stride = 2, axis_dimension = 3, outer = 4
+one line uses offsets 0, 2, 4; another uses 1, 3, 5
+the next block begins at offset 6
+```
+
+Make `RRAY_CUMULATIVE()` analogous to `RRAY_REDUCE()`: typed input and output
+accessors, output type, initial state, and one-element operation. The macro
+allocates one output vector, obtains input and output pointers once, and
+writes every prefix.
+
+Process each block in axis order and each `k` across adjacent `j` lanes.
+At `k = 0`, apply the operation to its identity and the first input. At
+later positions, read the preceding result at `index - stride` and combine
+it with `x[index]`. This avoids a scratch array for sum, product, extrema,
+and logical scans. The output never aliases the input. The `k` loop must
+remain sequential; the lane loop may vectorize. Axis 1 is a single
+contiguous line per outer block. Do not pass this scan through the reduction
+iterator, whose zero strides intentionally merge all positions of a reduced
+axis into one result.
+
+For zero-sized arrays, allocate a zero-sized output of the right type and
+attach the input shape and names. Do not divide by an axis dimension or
+read a first element. An axis of dimension 1 still applies type conversion.
+Use `r_ssize` for size, stride, and outer counts. Base their products on the
+validated dimensions of `x`, and check multiplication if a product can be
+formed before encountering a zero dimension. An error in any line aborts
+the whole call. Line state does not leak into the next line.
+
+## `rray_cumulative_sum()`
+
+Accepted types: logical, integer, double, and complex. Logical input yields
+integer; every other accepted input keeps its type, like `rray_sum()` and
+base [`cumsum()`](https://stat.ethz.ch/R-manual/R-devel/library/base/html/cumsum.html).
+Use zero as the starting value, separately for each line.
+
+Reuse `rray_add_int_one()` from `src/one-add.h` for both integer and logical
+input. Logical values already use `0`, `1`, and the same missing sentinel as
+integers. This checks each returned prefix against `[-INT_MAX, INT_MAX]`.
+The current `rray_sum()` instead sums in `int64_t`, or its `int128_t`
+fallback for very long reductions, and checks only the final result. A
+cumulative sum must error as soon as a returned prefix overflows, even if
+a later value or `NA` would make the final reduction valid. Once a line is
+missing, `rray_add_int_one()` keeps it missing and does not report a later
+overflow. Base `cumsum()` warns and fills the suffix with `NA` on overflow.
+
+```r
+x &lt;- c(.Machine$integer.max, 1L, -1L)
+rray_sum(x, 1L)
+rray_cumulative_sum(x, 1L)
+```
+
+The reducer returns `.Machine$integer.max`; the scan errors at its second
+prefix.
+
+For double input, reuse `rray_add_dbl_one()`. For complex input, reuse
+`rray_add_cpl_one()`, which adds real and imaginary parts separately. These
+are ordinary double additions in prefix order, like the current double and
+complex sum reducers. Do not add a separate missing-value rule. When `NA`
+and `NaN` meet, the result can be either one, depending on the platform and
+operand order. Test `is.na()` for those mixed cases. A single `NA` or `NaN`
+persists in its line, and opposing infinities produce `NaN`. Base `cumsum()`
+revisits missing prefixes to prefer `NA`; it also uses `long double` when
+available for real doubles. Compare with base only for cases whose semantics
+agree.
+
+Test both scan axes and a third axis, types, resets between lines, upper
+and lower integer overflow, cancellation after overflow, a missing value
+before overflow, both `NA` and `NaN` orders, opposing infinities, and
+complex values with a missing real or imaginary part.
+
+## `rray_cumulative_prod()`
+
+Accepted types: logical, integer, double, and complex. Logical and integer
+input yield double, matching `rray_prod()` and base `cumprod()`. Double and
+complex input keep their type. Start every line at one, with a zero
+imaginary part for complex numbers.
+
+Reuse `rray_prod_lgl_one()`, `rray_prod_int_one()`, `rray_prod_dbl_one()`,
+and `rray_prod_cpl_one()` from `src/one-multiply.h`. Integer multiplication
+is done in double, so it has no integer overflow error. A double product may
+become `Inf` or underflow to zero; `0 * Inf` is `NaN`. As with the current
+product reducer, do not promise whether `NA` or `NaN` wins when both occur.
+For complex multiplication, keep rray's C99 operation and its infinity
+recovery behavior. Its special values can differ from base R's complex
+`cumprod()`. Base real `cumprod()` also uses `long double` when available
+and revisits missing prefixes to prefer `NA`. State these differences in
+documentation.
+
+Test type promotion, line resets, signed and zero products, `0 * Inf`,
+both `NA` and `NaN` orders, overflow to infinity, underflow, and finite
+complex products. Compare simple lines to base `cumprod()`.
+
+## `rray_cumulative_min()`
+
+Accepted types: logical, integer, and double. Keep the input type, as
+`rray_min()` does. Base `cummin()` returns integer for logical input, so
+that is an intentional type difference. Complex is unsupported.
+
+Start each line at `TRUE`, `INT_MAX`, or `Inf`, respectively. Reuse the
+missing-aware operations in `src/one-extremum.h` where their behavior
+matches prefix semantics. A logical or integer `NA` persists through the
+rest of its line. A double `NaN` persists until a later `NA`, which then
+persists. Later finite values cannot clear either missing state. Compare
+ordinary values by taking the smaller one. Check ties and signed zero
+explicitly: the existing one-element helper keeps the earlier operand on
+a tie, while base R's double `cummin()` may keep the later one. Keep the
+rray helper rule and avoid a bit-level promise for signed zero.
+
+Test logical, integer, and double types; rising and falling values;
+repeated extrema; both missing orders; infinity; signed zero; empty
+lines; and independent lines on each axis.</pre><p class="cut">274 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray/src &amp;&amp; cat reduce.h reduce.c decl/reduce-decl.h</summary>
+<pre>cd ~/files/r/packages/rray/src &amp;&amp; cat reduce.h reduce.c decl/reduce-decl.h</pre><pre class="output">Exit code 1
+#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+// --------------------------------------------------------------------------
+// rray_reduce
+
+// Flat reduction is useful when the output element is the only state carried
+// between input elements. It walks `x` once in storage order, updating the
+// output element that each input contributes to. This is faster than nested
+// reduction because it reads `x` linearly and avoids a separate inner traversal
+// for each output element.
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+);
+
+typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static inline r_ssize rray_reduce_count(r_ssize x_size, r_ssize out_size) {
+  return out_size == 0 ? 0 : x_size / out_size;
+}
+
+#define RRAY_REDUCE(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  struct rray_run_iterator it;                                                 \
+  rray_run_iterator_init1(                                                     \
+    &amp;it,                                                                       \
+    v_dimensions,                                                              \
+    dimensionality,                                                            \
+    v_out_broadcast_strides                                                    \
+  );                                                                           \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+                                                                               \
+    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);                           \
+    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \
+                                                                               \
+    if (out_stride == 0) {                                                     \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+        out_loc += out_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+// --------------------------------------------------------------------------
+// stop_unsupported_reduce
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+#include &quot;reduce.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * dimensionality);
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out_dimensions[v_axes[i] - 1] = 1;
+  }
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  r_ssize v_out_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_out_dimensions,
+    dimensionality,
+    dimensionality,
+    v_out_broadcast_strides
+  );
+
+  const rray_reduce_fn fn = fn_switch(x, arg, error_call);
+
+  r_obj* out = KEEP(fn(
+    x,
+    na_rm,
+    out_size,
+    v_x_dimensions,
+    dimensionality,
+    v_out_broadcast_strides,
+    error_call
+  ));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't compute the %s of %s.&quot;,
+    op,
+    rray_arg_type_format(arg, rray_typeof(x))
+  );
+}
+cat: decl/reduce-decl.h: No such file or directory</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray/src &amp;&amp; cat reduce-logical.h reduce-logical.c decl/reduc…</summary>
+<pre>cd ~/files/r/packages/rray/src &amp;&amp; cat reduce-logical.h reduce-logical.c decl/reduce-logical-decl.h one-logical.h; grep -n &quot;reduce\|any\|all&quot; init.c | head -60</pre><pre class="output">#ifndef RRAY_REDUCE_LOGICAL_H
+#define RRAY_REDUCE_LOGICAL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_all(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_any(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+#include &quot;reduce-logical.h&quot;
+
+#include &quot;logical.h&quot;
+#include &quot;one-logical.h&quot;
+#include &quot;reduce.h&quot;
+
+#include &quot;decl/reduce-logical-decl.h&quot;
+
+r_obj* ffi_rray_all(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_all(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_any(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_any(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_all(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_all_switch, arg, error_call);
+}
+
+r_obj* rray_any(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_any_switch, arg, error_call);
+}
+
+static rray_reduce_fn rray_all_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_logical(x, arg, error_call);
+  return rray_all_lgl;
+}
+
+static rray_reduce_fn rray_any_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_logical(x, arg, error_call);
+  return rray_any_lgl;
+}
+
+static r_obj* rray_all_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  if (na_rm) {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      1,
+      rray_all_lgl_one_na_rm
+    );
+  } else {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      1,
+      rray_all_lgl_one
+    );
+  }
+}
+
+static r_obj* rray_any_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  if (na_rm) {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      0,
+      rray_any_lgl_one_na_rm
+    );
+  } else {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      0,
+      rray_any_lgl_one
+    );
+  }
+}
+static rray_reduce_fn rray_all_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+static rray_reduce_fn rray_any_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_all_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+);
+static r_obj* rray_any_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+);
+#ifndef RRAY_ONE_LOGICAL_H
+#define RRAY_ONE_LOGICAL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// Logical `NA` is `INT_MIN`, so it is never false
+// - `x = 1`, `y = 1`: returns `1` (`any_false = false`, `equal = true`).
+// - `x = 1`, `y = 0`: returns `0` (`any_false = true`).
+// - `x = 1`, `y = NA`: returns `NA` (`any_false = false`, `equal = false`).
+// - `x = 0`, `y = NA`: returns `0` (`any_false = true`).</pre><p class="cut">75 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat R/reduce.R | head -150; cat bench/reduce-logical.R bench/reduce.R; cat tests/testthat/tes…</summary>
+<pre>cat R/reduce.R | head -150; cat bench/reduce-logical.R bench/reduce.R; cat tests/testthat/test-reduce-logical.R | head -120</pre><pre class="output">#' Reduce an array along axes
+#'
+#' @description
+#' - `rray_sum()` computes the sum along the specified `axes`.
+#'
+#' - `rray_prod()` computes the product along the specified `axes`.
+#'
+#' - `rray_mean()` computes the mean along the specified `axes`.
+#'
+#' - `rray_all()` checks if all values are `TRUE` along the specified `axes`.
+#'
+#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.
+#'
+#' - `rray_max()` computes the maximum along the specified `axes`.
+#'
+#' - `rray_min()` computes the minimum along the specified `axes`.
+#'
+#' @details
+#' The dimensionality of `x` is retained in the result, with the reduced axes
+#' collapsed to size 1.
+#'
+#' @section Sum:
+#' Logicals are summed as integers. If an integer sum doesn't fit in an
+#' integer, an error is thrown. Only the final sum is checked, and `NA` wins
+#' over an overflow:
+#'
+#' ```r
+#' x &lt;- c(.Machine$integer.max, 1L, -1L)
+#' rray_sum(x, 1L) # .Machine$integer.max
+#'
+#' x &lt;- c(.Machine$integer.max, 1L, NA)
+#' rray_sum(x, 1L) # NA
+#' ```
+#'
+#' @section Product:
+#' Logicals and integers are cast to double.
+#'
+#' @section Mean:
+#' Logicals and integers are cast to double.
+#'
+#' When `NA` and `NaN` are both present, you get one of them, but which one
+#' depends on the platform and the order of the values, like [mean()]. Either
+#' way, `is.na()` is `TRUE`:
+#'
+#' ```r
+#' rray_mean(c(NA, NaN), 1L) # NA or NaN
+#' rray_mean(c(NaN, NA), 1L) # NA or NaN
+#' ```
+#'
+#' @section Min / Max:
+#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,
+#' such as an axis of dimension 0, `rray_max()` returns the smallest value of
+#' that type and `rray_min()` returns the largest:
+#'
+#' | type    | `rray_max()`            | `rray_min()`           |
+#' |---------|-------------------------|------------------------|
+#' | logical | `FALSE`                 | `TRUE`                 |
+#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |
+#' | double  | `-Inf`                  | `Inf`                  |
+#'
+#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+#'
+#' ```r
+#' rray_max(c(NA, NaN), 1L) # NA
+#' rray_max(c(NaN, NA), 1L) # NA
+#' ```
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to reduce over. `1` reduces
+#'   rows, `2` reduces columns, and so on.
+#'
+#' @param na_rm If `TRUE`, missing values are removed before reducing.
+#'
+#' @returns
+#' An array with the same dimensionality as `x`, but with the dimensions along
+#' `axes` reduced to 1.
+#'
+#' @name rray-reduce
+#' @examples
+#' x &lt;- array(1:10, c(5L, 2L))
+#'
+#' # Sum along rows
+#' rray_sum(x, 1L)
+#'
+#' # Sum along columns
+#' rray_sum(x, 2L)
+#'
+#' # Sum along both axes
+#' rray_sum(x, c(1L, 2L))
+#'
+#' # Product along rows
+#' rray_prod(x, 1L)
+#'
+#' # Mean along rows
+#' rray_mean(x, 1L)
+#'
+#' y &lt;- array(c(TRUE, TRUE, FALSE, TRUE), c(2L, 2L))
+#'
+#' rray_all(y, 1L)
+#' rray_any(y, 1L)
+#'
+#' # Maximum and minimum along columns
+#' rray_max(x, 2L)
+#' rray_min(x, 2L)
+NULL
+
+#' @rdname rray-reduce
+#' @export
+rray_sum &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_sum, x, axes, na_rm, environment())
+}
+
+#' @rdname rray-reduce
+#' @export
+rray_prod &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_prod, x, axes, na_rm, environment())
+}
+
+#' @rdname rray-reduce
+#' @export
+rray_mean &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_mean, x, axes, na_rm, environment())
+}
+
+#' @rdname rray-reduce
+#' @export
+rray_all &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_all, x, axes, na_rm, environment())
+}
+
+#' @rdname rray-reduce
+#' @export
+rray_any &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_any, x, axes, na_rm, environment())
+}
+
+#' @rdname rray-reduce
+#' @export
+rray_max &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_max, x, axes, na_rm, environment())
+}
+devtools::load_all(quiet = TRUE)
+
+size &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_SIZE&quot;, &quot;1000000&quot;))
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;15&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+side &lt;- as.integer(sqrt(size))
+if (side * side != size) {
+  stop(&quot;`RRAY_BENCH_SIZE` must be a perfect square.&quot;, call. = FALSE)
+}
+
+dimensions &lt;- c(side, side)
+
+cases &lt;- expand.grid(
+  operation = c(&quot;all&quot;, &quot;any&quot;),
+  na_rm = c(FALSE, TRUE),
+  missing = c(&quot;none&quot;, &quot;sparse&quot;, &quot;dense&quot;),
+  values = c(&quot;true&quot;, &quot;false&quot;, &quot;mixed&quot;),
+  axes = c(&quot;axis1&quot;, &quot;axis2&quot;, &quot;both&quot;),
+  stringsAsFactors = FALSE
+)
+
+make_values &lt;- function(n, values) {
+  switch(
+    values,
+    true = rep(TRUE, n),
+    false = rep(FALSE, n),
+    mixed = (seq_len(n) * 7L) %% 3L != 0L
+  )
+}
+
+add_missing &lt;- function(x, missing) {
+  if (missing == &quot;none&quot;) {
+    return(x)
+  }
+
+  step &lt;- if (missing == &quot;sparse&quot;) 101L else 3L
+  x[seq.int(1L, length(x), by = step)] &lt;- NA
+  x
+}
+
+make_input &lt;- function(values, missing) {
+  x &lt;- make_values(size, values)
+  x &lt;- add_missing(x, missing)
+  array(x, dimensions)
+}
+
+results &lt;- vector(&quot;list&quot;, nrow(cases))
+
+for (i in seq_len(nrow(cases))) {</pre><p class="cut">248 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;check_axis\|arg_as_int\b\|arg_as_int(&quot; *.c *.h | head -30; cat reverse.c | head -80;…</summary>
+<pre>grep -n &quot;check_axis\|arg_as_int\b\|arg_as_int(&quot; *.c *.h | head -30; cat reverse.c | head -80; cat logical.h | head; grep -n &quot;axis&quot; arg.h axes.h</pre><pre class="output">axes.c:206:void check_axis(
+combine.c:20:  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+combine.c:53:  check_axis(axis, out_dimensionality, rray_args.dot_axis, error_call);
+locate.c:40:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+locate.c:62:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+locate.c:94:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+names.c:26:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+names.c:50:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+names.c:102:      check_axis_names(v_names[i], i + 1, v_dimensions[i], error_call);
+names.c:122:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+names.c:155:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+names.c:158:  check_axis_names(names, axis, dimension, error_call);
+names.c:178:static inline void check_axis_names(
+index.c:238:    arg_as_int(ffi_dimension, rray_args.dimension, error_call);
+rep-each.c:20:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+rep-each.c:39:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+slice-axis.c:18:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+slice-axis.c:51:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+slice-axis.c:70:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+slice-axis.c:135:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+roll-each.c:21:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+roll-each.c:40:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+slice-subscript.c:18:    arg_as_int(ffi_dimension, rray_args.dimension, error_call);
+stack.c:15:  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+stack.c:48:  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+titles.c:25:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+titles.c:36:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+titles.c:115:  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+titles.c:130:  check_axis(axis, dimensionality, rray_args.axis, error_call);
+utils.c:157:int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+#include &quot;reverse.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;slice.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reverse-decl.h&quot;
+
+r_obj* ffi_rray_reverse(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_reverse(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_reverse(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+
+  r_obj* x_dimensions = r_dim(x);
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* indices = KEEP(r_alloc_list(dimensionality));
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    r_list_poke(indices, i, r_true);
+  }
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+    const int dimension = v_x_dimensions[axis - 1];
+    r_list_poke(indices, axis - 1, rray_reverse_locations(dimension));
+  }
+
+  r_obj* out = rray_slice(x, indices, x_arg, rray_args.empty, error_call);
+
+  FREE(3);
+  return out;
+}
+
+static r_obj* rray_reverse_locations(int dimension) {
+  r_obj* out = KEEP(r_alloc_integer(dimension));
+  int* v_out = r_int_begin(out);
+
+  for (int i = 0; i &lt; dimension; ++i) {
+    v_out[i] = dimension - i;
+  }
+
+  FREE(1);
+  return out;
+}
+#ifndef RRAY_LOGICAL_H
+#define RRAY_LOGICAL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;type.h&quot;
+
+r_obj* rray_and(
+  r_obj* x,
+arg.h:21:  struct rray_arg* axis;
+arg.h:22:  struct rray_arg* dot_axis;
+axes.h:36:void check_axis(
+axes.h:37:  int axis,</pre></details>
+<details class="tool"><summary>Bash: cat rep-each.c | head -80; sed -n 195,240p axes.c; cat size.h; grep -n &quot;size_from\|r_ssize_mu…</summary>
+<pre>cat rep-each.c | head -80; sed -n 195,240p axes.c; cat size.h; grep -n &quot;size_from\|r_ssize_mult\|mult&quot; size.c utils.h | head</pre><pre class="output">#include &quot;rep-each.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;rep.h&quot;
+#include &quot;slice.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/rep-each-decl.h&quot;
+
+r_obj* ffi_rray_rep_each(
+  r_obj* ffi_x,
+  r_obj* ffi_times,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_rep_each(ffi_x, ffi_times, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_rep_each(
+  r_obj* x,
+  r_obj* times,
+  int axis,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+
+  r_obj* x_dimensions = r_dim(x);
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_x_dimensions[axis - 1];
+
+  times = KEEP(
+    arg_as_rep_each_times(times, axis_dimension, rray_args.times, error_call)
+  );
+  const int* v_times = r_int_cbegin(times);
+  const r_ssize times_size = r_length(times);
+
+  const int out_dimension =
+    rray_rep_each_dimension(axis_dimension, v_times, times_size, error_call);
+
+  r_obj* indices = KEEP(r_alloc_list(dimensionality));
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    r_list_poke(indices, i, r_true);
+  }
+
+  r_list_poke(
+    indices,
+    axis - 1,
+    rray_rep_each_locations(axis_dimension, out_dimension, v_times, times_size)
+  );
+
+  r_obj* out = rray_slice(x, indices, x_arg, rray_args.empty, error_call);
+
+  FREE(3);
+  return out;
+}
+
+static r_obj* arg_as_rep_each_times(
+  r_obj* times,
+  int axis_dimension,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  times = KEEP(arg_as_non_negative_bare_integer(times, arg, error_call));
+
+  const r_ssize times_size = r_length(times);
+
+  if (times_size != 1 &amp;&amp; times_size != axis_dimension) {
+    stop_rep_each_times_size(times_size, axis_dimension, arg, error_call);
+        axis
+      );
+    }
+
+    v_seen[axis - 1] = true;
+  }
+
+  FREE(1);
+  return axes;
+}
+
+void check_axis(
+  int axis,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  if (axis == r_globals.na_int) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must not be missing.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  if (axis &lt; 1) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be greater than or equal to 1, not %d.&quot;,
+      rray_arg_format(arg),
+      axis
+    );
+  }
+
+  if (axis &gt; dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be less than or equal to the dimensionality of %d, &quot;
+      &quot;not %d.&quot;,
+      rray_arg_format(arg),
+      dimensionality,
+      axis
+    );
+  }
+}
+#ifndef RRAY_SIZE_H
+#define RRAY_SIZE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_ssize rray_size(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_ssize rray_size_from_dimensions(const int* v_dimensions, int dimensionality);
+
+r_ssize rray_size_from_dimensions_checked(
+  const int* v_dimensions,
+  int dimensionality,
+  struct r_lazy error_call
+);
+
+#endif
+size.c:20:r_ssize rray_size_from_dimensions(const int* v_dimensions, int dimensionality) {
+size.c:32:r_ssize rray_size_from_dimensions_checked(</pre></details>
+<p>Reading the reducer infrastructure (reduce.c, one-logical.h, axis checks) before planning the cumulative design.</p>
+
+<details class="tool"><summary>Bash: sed -n 1,60p size.c; grep -n &quot;check_logical&quot; -A12 logical.c type.c | head -30; grep -n &quot;arg_a…</summary>
+<pre>sed -n 1,60p size.c; grep -n &quot;check_logical&quot; -A12 logical.c type.c | head -30; grep -n &quot;arg_as_array\|check_unclassed&quot; utils.h dimensions.h *.h | head; sed -n 1,60p arg.h</pre><pre class="output">#include &quot;size.h&quot;
+
+#include &lt;stdio.h&gt;
+
+#include &quot;utils.h&quot;
+
+#include &quot;decl/size-decl.h&quot;
+
+r_obj* ffi_rray_size(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_dbl((double) rray_size(ffi_x, rray_args.x, error_call));
+}
+
+r_ssize rray_size(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  check_unclassed(x, arg, error_call);
+  x = arg_as_array(x, arg, error_call);
+  return r_length(x);
+}
+
+r_ssize rray_size_from_dimensions(const int* v_dimensions, int dimensionality) {
+  r_ssize out = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    out *= v_dimensions[i];
+  }
+
+  return out;
+}
+
+// Sometimes dimensions are built from pieces rather than being pulled from an
+// existing array, and must be checked for overflow
+r_ssize rray_size_from_dimensions_checked(
+  const int* v_dimensions,
+  int dimensionality,
+  struct r_lazy error_call
+) {
+  r_ssize out = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int dimension = v_dimensions[i];
+
+    if (dimension != 0 &amp;&amp; out &gt; R_SSIZE_MAX / dimension) {
+      stop_size_too_large(v_dimensions, dimensionality, error_call);
+    }
+
+    out *= dimension;
+  }
+
+  return out;
+}
+
+static r_no_return void stop_size_too_large(
+  const int* v_dimensions,
+  int dimensionality,
+  struct r_lazy error_call
+) {
+  double size = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    size *= v_dimensions[i];
+logical.c:75:  check_logical(x, x_arg, error_call);
+logical.c:76:  check_logical(y, y_arg, error_call);
+logical.c-77-
+logical.c-78-  x = KEEP(arg_as_array(x, x_arg, error_call));
+logical.c-79-  y = KEEP(arg_as_array(y, y_arg, error_call));
+logical.c-80-
+logical.c-81-  r_obj* x_dimensions = r_dim(x);
+logical.c-82-  r_obj* y_dimensions = r_dim(y);
+logical.c-83-
+logical.c-84-  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+logical.c-85-  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+logical.c-86-
+logical.c-87-  const int x_dimensionality =
+logical.c-88-    rray_dimensionality_from_dimensions(x_dimensions);
+utils.h:41:void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+utils.h:53:r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+utils.h:41:void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+utils.h:53:r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+#ifndef RRAY_ARG_H
+#define RRAY_ARG_H
+
+#include &quot;rlang.h&quot;
+
+struct rray_arg {
+  r_obj* shelter;
+  struct rray_arg* parent;
+  r_ssize (*fill)(void* data, char* buf, r_ssize remaining);
+  void* data;
+};
+
+struct rray_args {
+  struct rray_arg* empty;
+  struct rray_arg* x;
+  struct rray_arg* y;
+  struct rray_arg* i;
+  struct rray_arg* names;
+  struct rray_arg* titles;
+  struct rray_arg* title;
+  struct rray_arg* axis;
+  struct rray_arg* dot_axis;
+  struct rray_arg* axes;
+  struct rray_arg* from;
+  struct rray_arg* to;
+  struct rray_arg* dimensions;
+  struct rray_arg* dot_dimensions;
+  struct rray_arg* dimension;
+  struct rray_arg* times;
+  struct rray_arg* n;
+  struct rray_arg* value;
+};
+
+extern struct rray_args rray_args;
+
+r_obj* rray_arg(struct rray_arg* arg);
+
+const char* rray_arg_format(struct rray_arg* arg);
+
+const char* rray_arg_format_input(struct rray_arg* arg);
+
+bool rray_arg_is_empty(struct rray_arg* arg);
+
+struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+
+struct rray_arg new_lazy_arg(struct r_lazy* arg);
+
+struct rray_arg* new_subscript_arg(
+  struct rray_arg* parent,
+  r_obj* names,
+  r_ssize n,
+  r_ssize* p_i
+);
+
+#endif</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;void check_logical&quot; -A20 *.c | head -30; grep -n &quot;titles\|dimnames\|dim_names&quot; util…</summary>
+<pre>grep -rn &quot;void check_logical&quot; -A20 *.c | head -30; grep -n &quot;titles\|dimnames\|dim_names&quot; utils.h dimensions.h names.h | head; cat ../R/titles.R | head -40; grep -n &quot;r_dim_names\|poke_dim_names&quot; *.c | head</pre><pre class="output">#' Array titles
+#'
+#' @description
+#' Titles are the names on an array's list of names. They appear in
+#' array print output.
+#'
+#' - `rray_titles()` returns the titles for every axis.
+#'
+#' - `rray_axis_title()` returns the title for one axis.
+#'
+#' - `rray_set_titles()` sets the titles for every axis.
+#'
+#' - `rray_set_axis_title()` sets the title for one axis.
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer. The axis to get or set the title for.
+#'
+#' @param titles A character vector with one title per axis, or `NULL` to
+#'   remove all titles.
+#'
+#' @param title A single character string, or `NULL` to remove the title for
+#'   `axis`.
+#'
+#' @returns
+#' - `rray_titles()` returns a character vector, or `NULL` if there are no
+#'   titles.
+#' - `rray_axis_title()` returns one character string, or `NULL` if there are
+#'   no titles. It returns `&quot;&quot;` when the titles vector exists but that axis
+#'   has no title.
+#' - The setters return `x` with new titles. Plain vectors become
+#'   one-dimensional arrays.
+#'
+#' @name rray-titles
+#' @examples
+#' x &lt;- matrix(1:6, 2, 3)
+#' x &lt;- rray_set_titles(x, c(&quot;Row&quot;, &quot;Column&quot;))
+#' rray_titles(x)
+#' rray_axis_title(x, 2)
+#' rray_set_axis_title(x, 1, NULL)
+arithmetic.c:81:    r_attrib_poke_dim_names(out, out_names);
+broadcast.c:141:    r_attrib_poke_dim_names(out, out_names);
+combine.c:146:    r_attrib_poke_dim_names(out, out_names);
+combine.c:194:    r_obj* names = r_dim_names(x);
+cast.c:138:  r_obj* names = r_dim_names(x);                                               \
+cast.c:141:    r_attrib_poke_dim_names(out, names);                                       \
+cast.c:169:  r_obj* names = r_dim_names(x);                                               \
+cast.c:172:    r_attrib_poke_dim_names(out, names);                                       \
+compare.c:206:    r_attrib_poke_dim_names(out, out_names);
+dimensions.c:96:  r_attrib_poke_dim_names(out, r_null);</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;check_logical&quot; *.h; grep -rn &quot;^void check_logical\|^static.*check_logical&quot; -A18 *.c…</summary>
+<pre>grep -rn &quot;check_logical&quot; *.h; grep -rn &quot;^void check_logical\|^static.*check_logical&quot; -A18 *.c | head -30; sed -n 125,180p cast.c</pre><pre class="output">logical.h:33:static inline void check_logical(
+                                                                               \
+  const r_ssize size = r_length(x);                                            \
+  const FROM_CTYPE* v_x = FROM_CBEGIN(x);                                      \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(TO_RTYPE, size));                           \
+  TO_CTYPE* v_out = TO_BEGIN(out);                                             \
+                                                                               \
+  for (r_ssize i = 0; i &lt; size; ++i) {                                         \
+    v_out[i] = ONE(v_x[i]);                                                    \
+  }                                                                            \
+                                                                               \
+  r_attrib_poke_dim(out, r_dim(x));                                            \
+                                                                               \
+  r_obj* names = r_dim_names(x);                                               \
+                                                                               \
+  if (names != r_null) {                                                       \
+    r_attrib_poke_dim_names(out, names);                                       \
+  }                                                                            \
+                                                                               \
+  FREE(2);                                                                     \
+  return out;
+
+#define RRAY_CAST_LOSSY(                                                       \
+  FROM_CTYPE,                                                                  \
+  FROM_CBEGIN,                                                                 \
+  TO_RTYPE,                                                                    \
+  TO_CTYPE,                                                                    \
+  TO_BEGIN,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  x = KEEP(vec_as_array(x));                                                   \
+                                                                               \
+  const r_ssize size = r_length(x);                                            \
+  const FROM_CTYPE* v_x = FROM_CBEGIN(x);                                      \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(TO_RTYPE, size));                           \
+  TO_CTYPE* v_out = TO_BEGIN(out);                                             \
+                                                                               \
+  for (r_ssize i = 0; i &lt; size; ++i) {                                         \
+    v_out[i] = ONE(v_x[i], i, x_arg, error_call);                              \
+  }                                                                            \
+                                                                               \
+  r_attrib_poke_dim(out, r_dim(x));                                            \
+                                                                               \
+  r_obj* names = r_dim_names(x);                                               \
+                                                                               \
+  if (names != r_null) {                                                       \
+    r_attrib_poke_dim_names(out, names);                                       \
+  }                                                                            \
+                                                                               \
+  FREE(2);                                                                     \
+  return out;
+
+static r_obj* rray_cast_lgl_to_int(
+  r_obj* x,
+  struct rray_arg* x_arg,</pre></details>
+<details class="tool"><summary>Bash: sed -n 25,60p logical.h; cat ../tests/testthat/_snaps/reduce-logical.md | head -40; grep -n &quot;…</summary>
+<pre>sed -n 25,60p logical.h; cat ../tests/testthat/_snaps/reduce-logical.md | head -40; grep -n &quot;Reduc\|rray-reduce\|title&quot; -B2 -A6 ../_pkgdown.yml | head -40</pre><pre class="output">r_obj* rray_xor(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+static inline void check_logical(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return;
+
+  case RRAY_TYPE_integer:
+  case RRAY_TYPE_double:
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+  case RRAY_TYPE_scalar:
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be a logical array, not %s.&quot;,
+      rray_arg_format_input(arg),
+      r_obj_type_friendly(x)
+    );
+  }
+
+  r_stop_unreachable();
+}
+
+#endif
+# errors on axes out of range
+
+    Code
+      rray_all(x, 3L)
+    Condition
+      Error in `rray_all()`:
+      ! `axes` must contain values less than or equal to the dimensionality of 2, not 3.
+
+---
+
+    Code
+      rray_any(x, 3L)
+    Condition
+      Error in `rray_any()`:
+      ! `axes` must contain values less than or equal to the dimensionality of 2, not 3.
+
+# `na_rm` must be `TRUE` or `FALSE`
+
+    Code
+      rray_all(x, 1L, na_rm = NA)
+    Condition
+      Error in `rray_all()`:
+      ! `na_rm` must be `TRUE` or `FALSE`.
+
+---
+
+    Code
+      rray_any(x, 1L, na_rm = 1)
+    Condition
+      Error in `rray_any()`:
+      ! `na_rm` must be `TRUE` or `FALSE`.
+
+# errors on non-logical input
+
+    Code
+      rray_all(array(1L, c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_all()`:
+      ! `x` must be a logical array, not an integer matrix.
+
+9-
+10-reference:
+11:- title: Elementwise
+12-  contents:
+13-  - rray-arithmetic
+14-  - rray-extremum
+15-  - rray-equal
+16-  - rray-compare
+17-  - rray-logical
+18-  - rray_if_else
+19-
+20:- title: Reducers
+21-  contents:
+22:  - rray-reduce
+23-  - rray-locate
+24-
+25:- title: Combining and Splitting
+26-  contents:
+27-  - rray_combine
+28-  - rray_split
+29-  - rray_stack
+30-  - rray_unstack
+31-
+32:- title: Indexing
+33-  contents:
+34-  - rray_slice
+35-  - rray_index
+36-  - rray_extract
+37-  - rray-rep
+38-  - rray-roll
+39-  - rray_reverse
+40-
+41:- title: Broadcasting
+42-  contents:
+43-  - rray_broadcast
+44-  - rray_broadcast_common
+45-
+46:- title: Dimensions
+47-  contents:
+48-  - rray_dimensions</pre></details>
+<p>I have what I need; no blocking questions. Creating the branch and writing the C infrastructure.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; git checkout -b feature/cumulative-any-all &amp;&amp; sed -n…</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; git checkout -b feature/cumulative-any-all &amp;&amp; sed -n 225,260p src/init.c &amp;&amp; sed -n 405,425p src/init.c &amp;&amp; grep -n &quot;check_dimensionality&quot; -A3 src/dimensionality.h &amp;&amp; sed -n 150,200p R/reduce.R &amp;&amp; cat src/decl/reverse-decl.h</pre><pre class="output">Switched to a new branch 'feature/cumulative-any-all'
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_prod(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_mean(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_all(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_any(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_max(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_min(
+  r_obj* ffi_x,
+  {&quot;ffi_rray_rep_each&quot;, (DL_FUNC) &amp;ffi_rray_rep_each, 4},
+  {&quot;ffi_rray_roll&quot;, (DL_FUNC) &amp;ffi_rray_roll, 4},
+  {&quot;ffi_rray_roll_each&quot;, (DL_FUNC) &amp;ffi_rray_roll_each, 4},
+  {&quot;ffi_rray_reverse&quot;, (DL_FUNC) &amp;ffi_rray_reverse, 3},
+  {&quot;ffi_rray_remove_axes&quot;, (DL_FUNC) &amp;ffi_rray_remove_axes, 3},
+  {&quot;ffi_rray_insert_axes&quot;, (DL_FUNC) &amp;ffi_rray_insert_axes, 3},
+  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+  {&quot;ffi_rray_move_axes&quot;, (DL_FUNC) &amp;ffi_rray_move_axes, 4},
+  {&quot;ffi_rray_sum&quot;, (DL_FUNC) &amp;ffi_rray_sum, 4},
+  {&quot;ffi_rray_prod&quot;, (DL_FUNC) &amp;ffi_rray_prod, 4},
+  {&quot;ffi_rray_mean&quot;, (DL_FUNC) &amp;ffi_rray_mean, 4},
+  {&quot;ffi_rray_all&quot;, (DL_FUNC) &amp;ffi_rray_all, 4},
+  {&quot;ffi_rray_any&quot;, (DL_FUNC) &amp;ffi_rray_any, 4},
+  {&quot;ffi_rray_max&quot;, (DL_FUNC) &amp;ffi_rray_max, 4},
+  {&quot;ffi_rray_min&quot;, (DL_FUNC) &amp;ffi_rray_min, 4},
+  {&quot;ffi_rray_locate_max&quot;, (DL_FUNC) &amp;ffi_rray_locate_max, 4},
+  {&quot;ffi_rray_locate_min&quot;, (DL_FUNC) &amp;ffi_rray_locate_min, 4},
+  {&quot;ffi_rray_ptype&quot;, (DL_FUNC) &amp;ffi_rray_ptype, 2},
+  {&quot;ffi_rray_ptype2&quot;, (DL_FUNC) &amp;ffi_rray_ptype2, 3},
+  {&quot;ffi_rray_ptype_common&quot;, (DL_FUNC) &amp;ffi_rray_ptype_common, 3},
+  {&quot;ffi_rray_cast&quot;, (DL_FUNC) &amp;ffi_rray_cast, 3},
+31:void check_dimensionality(int dimensionality);
+32-
+33-#endif
+}
+
+#' @rdname rray-reduce
+#' @export
+rray_min &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_min, x, axes, na_rm, environment())
+}
+static r_obj* rray_reverse_locations(int dimension);</pre></details>
+<details class="tool"><summary>Bash: sed -n 255,275p src/init.c &amp;&amp; grep -n &quot;locate_max\|locate_min&quot; src/init.c</summary>
+<pre>sed -n 255,275p src/init.c &amp;&amp; grep -n &quot;locate_max\|locate_min&quot; src/init.c</pre><pre class="output">  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_min(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_locate_max(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_locate_min(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+265:extern r_obj* ffi_rray_locate_max(
+271:extern r_obj* ffi_rray_locate_min(
+420:  {&quot;ffi_rray_locate_max&quot;, (DL_FUNC) &amp;ffi_rray_locate_max, 4},
+421:  {&quot;ffi_rray_locate_min&quot;, (DL_FUNC) &amp;ffi_rray_locate_min, 4},</pre></details>
+<p>Now the C files.</p>
+
+<details class="tool"><summary>Write src/cumulative.h</summary>
+<pre>#ifndef RRAY_CUMULATIVE_H
+#define RRAY_CUMULATIVE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+typedef r_obj* (*rray_cumulative_fn)(
+  r_obj* x,
+  r_ssize stride,
+  r_ssize axis_dimension,
+  struct r_lazy error_call
+);
+
+typedef rray_cumulative_fn (*rray_cumulative_fn_switch)(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_cumulative(
+  r_obj* x,
+  int axis,
+  rray_cumulative_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_CUMULATIVE(                                                       \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  const r_ssize size = r_length(x);                                            \
+  const r_ssize block_size = stride * axis_dimension;                          \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  for (r_ssize start = 0; start &lt; size; start += block_size) {                 \
+    const r_ssize first_end = start + stride;                                  \
+    const r_ssize end = start + block_size;                                    \
+                                                                               \
+    for (r_ssize i = start; i &lt; first_end; ++i) {                              \
+      v_out[i] = ONE(OUT_INIT, v_x[i]);                                        \
+    }                                                                          \
+                                                                               \
+    for (r_ssize i = first_end; i &lt; end; ++i) {                                \
+      v_out[i] = ONE(v_out[i - stride], v_x[i]);                               \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/cumulative.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/cumulative.c</summary>
+<pre>#include &quot;cumulative.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_cumulative(
+  r_obj* x,
+  int axis,
+  rray_cumulative_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* dimensions = r_dim(x);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  const rray_cumulative_fn fn = fn_switch(x, arg, error_call);
+
+  const r_ssize axis_dimension = v_dimensions[axis - 1];
+  const r_ssize stride = r_length(x) == 0
+    ? 0
+    : rray_size_from_dimensions(v_dimensions, axis - 1);
+
+  r_obj* out = KEEP(fn(x, stride, axis_dimension, error_call));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* names = r_dim_names(x);
+
+  if (names != r_null) {
+    r_attrib_poke_dim_names(out, names);
+  }
+
+  FREE(2);
+  return out;
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/cumulative.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/cumulative-logical.h</summary>
+<pre>#ifndef RRAY_CUMULATIVE_LOGICAL_H
+#define RRAY_CUMULATIVE_LOGICAL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_cumulative_any(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_cumulative_all(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/cumulative-logical.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/cumulative-logical.c</summary>
+<pre>#include &quot;cumulative-logical.h&quot;
+
+#include &quot;cumulative.h&quot;
+#include &quot;logical.h&quot;
+#include &quot;one-logical.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/cumulative-logical-decl.h&quot;
+
+r_obj* ffi_rray_cumulative_any(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_cumulative_any(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_cumulative_all(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_cumulative_all(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_cumulative_any(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_cumulative(x, axis, rray_cumulative_any_switch, arg, error_call);
+}
+
+r_obj* rray_cumulative_all(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_cumulative(x, axis, rray_cumulative_all_switch, arg, error_call);
+}
+
+static rray_cumulative_fn rray_cumulative_any_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_logical(x, arg, error_call);
+  return rray_cumulative_any_lgl;
+}
+
+static rray_cumulative_fn rray_cumulative_all_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_logical(x, arg, error_call);
+  return rray_cumulative_all_lgl;
+}
+
+static r_obj* rray_cumulative_any_lgl(
+  r_obj* x,
+  r_ssize stride,
+  r_ssize axis_dimension,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_logical,
+    int,
+    r_lgl_begin,
+    0,
+    rray_any_lgl_one
+  );
+}
+
+static r_obj* rray_cumulative_all_lgl(
+  r_obj* x,
+  r_ssize stride,
+  r_ssize axis_dimension,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_logical,
+    int,
+    r_lgl_begin,
+    1,
+    rray_all_lgl_one
+  );
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/cumulative-logical.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/decl/cumulative-logical-decl.h</summary>
+<pre>static rray_cumulative_fn rray_cumulative_any_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+static rray_cumulative_fn rray_cumulative_all_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_cumulative_any_lgl(
+  r_obj* x,
+  r_ssize stride,
+  r_ssize axis_dimension,
+  struct r_lazy error_call
+);
+static r_obj* rray_cumulative_all_lgl(
+  r_obj* x,
+  r_ssize stride,
+  r_ssize axis_dimension,
+  struct r_lazy error_call
+);</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/src/decl/cumulative-logical-decl.h (file state is current in your context — no need to Read it back)</pre></details>
+<p>Matching the reducer ordering (all before any) for consistency.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray/src &amp;&amp; grep -n &quot;int arg_as_int&quot; utils.h &amp;&amp; python3 - &lt;&lt;…</summary>
+<pre>cd ~/files/r/packages/rray/src &amp;&amp; grep -n &quot;int arg_as_int&quot; utils.h &amp;&amp; python3 - &lt;&lt;'EOF'
+import re
+def swap(path, a, b):
+    s = open(path).read()
+    i = s.index(a); j = s.index(b)
+    assert i &lt; j
+    blk_a = s[i:j]
+    # b block ends at next blank-line-separated block of same kind; caller gives exact strings
+    return s
+EOF
+echo</pre><pre class="output">61:int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);</pre></details>
+<p>The file-not-found diagnostic is stale (the decl header was written after). Rewriting the logical files with all-first ordering.</p>
+
+<details class="tool"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+for path in [&quot;cumulative-logical.c&quot;, &quot;cumulative-logical.h&quot;, &quot;decl/cumulative-logical-decl.h&quot;]:
+    s = open(path).read()
+    s = s.replace(&quot;any&quot;, &quot;@@TMP@@&quot;).replace(&quot;all&quot;, &quot;any&quot;).replace(&quot;@@TMP@@&quot;, &quot;all&quot;)
+    open(path, &quot;w&quot;).write(s)
+EOF
+grep -n &quot;0,\|1,\|one&quot; cumulative-logical.c</pre><pre class="output">5:#include &quot;one-logical.h&quot;
+78:    0,
+79:    rray_all_lgl_one
+95:    1,
+96:    rray_any_lgl_one</pre></details>
+<p>My swap mangled <code>error_call</code> and the init values. Fixing.</p>
+
+<details class="tool"><summary>Bash: sed -i '' 's/error_cany/error_call/g' cumulative-logical.c cumulative-logical.h decl/cumulati…</summary>
+<pre>sed -i '' 's/error_cany/error_call/g' cumulative-logical.c cumulative-logical.h decl/cumulative-logical-decl.h &amp;&amp; python3 - &lt;&lt;'EOF'
+p=&quot;cumulative-logical.c&quot;
+s=open(p).read()
+s=s.replace(&quot;    0,\n    rray_all_lgl_one&quot;,&quot;    1,\n    rray_all_lgl_one&quot;).replace(&quot;    1,\n    rray_any_lgl_one&quot;,&quot;    0,\n    rray_any_lgl_one&quot;)
+open(p,&quot;w&quot;).write(s)
+EOF
+grep -n &quot;cany\|  [01],$&quot; -A1 cumulative-logical.c cumulative-logical.h decl/cumulative-logical-decl.h</pre><pre class="output">cumulative-logical.c:78:    1,
+cumulative-logical.c-79-    rray_all_lgl_one
+--
+cumulative-logical.c:95:    0,
+cumulative-logical.c-96-    rray_any_lgl_one</pre></details>
+<p>Now init.c registration and the R wrapper.</p>
+
+<details class="tool"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+p=&quot;init.c&quot;
+s=open(p).read()
+anchor=&quot;&quot;&quot;extern r_obj* ffi_rray_locate_min(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+&quot;&quot;&quot;
+assert anchor in s
+s=s.replace(anchor, anchor+&quot;&quot;&quot;extern r_obj* ffi_rray_cumulative_all(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_cumulative_any(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+);
+&quot;&quot;&quot;)
+a2='  {&quot;ffi_rray_locate_min&quot;, (DL_FUNC) &amp;ffi_rray_locate_min, 4},\n'
+assert a2 in s
+s=s.replace(a2, a2+'  {&quot;ffi_rray_cumulative_all&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_all, 3},\n  {&quot;ffi_rray_cumulative_any&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_any, 3},\n')
+open(p,&quot;w&quot;).write(s)
+EOF
+git diff --stat</pre><pre class="output"> src/init.c | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)</pre></details>
+<details class="tool"><summary>Write R/cumulative.R</summary>
+<pre>#' Cumulative functions along an axis
+#'
+#' @description
+#' - `rray_cumulative_all()` checks if all values are `TRUE` so far along
+#'   `axis`.
+#'
+#' - `rray_cumulative_any()` checks if any value is `TRUE` so far along
+#'   `axis`.
+#'
+#' @details
+#' Each position along `axis` summarizes every position up to and including
+#' it. Every other axis is held fixed, so each line along `axis` starts
+#' fresh.
+#'
+#' The result has the same dimensions and names as `x`.
+#'
+#' @section All / Any:
+#' `x` must be logical. Missing values follow [all()] and [any()], so a later
+#' `FALSE` or `TRUE` can settle an earlier `NA`:
+#'
+#' ```r
+#' rray_cumulative_all(c(TRUE, NA, FALSE), 1L) # TRUE, NA, FALSE
+#' rray_cumulative_any(c(FALSE, NA, TRUE), 1L) # FALSE, NA, TRUE
+#' ```
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer. The axis to accumulate along. `1`
+#'   accumulates down rows, `2` accumulates across columns, and so on.
+#'
+#' @returns
+#' An array with the same dimensions and names as `x`.
+#'
+#' @name rray-cumulative
+#' @examples
+#' x &lt;- array(c(TRUE, TRUE, FALSE, TRUE, NA, TRUE), c(2L, 3L))
+#' x
+#'
+#' # Along rows
+#' rray_cumulative_all(x, 1L)
+#' rray_cumulative_any(x, 1L)
+#'
+#' # Along columns
+#' rray_cumulative_all(x, 2L)
+#' rray_cumulative_any(x, 2L)
+NULL
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_all &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_all, x, axis, environment())
+}
+
+#' @rdname rray-cumulative
+#' @export
+rray_cumulative_any &lt;- function(x, axis) {
+  .Call(ffi_rray_cumulative_any, x, axis, environment())
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/R/cumulative.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; python3 - &lt;&lt;'EOF'</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; python3 - &lt;&lt;'EOF'
+p=&quot;_pkgdown.yml&quot;
+s=open(p).read()
+a=&quot;&quot;&quot;  - rray-reduce
+  - rray-locate
+&quot;&quot;&quot;
+assert a in s
+s=s.replace(a, a+&quot;&quot;&quot;
+- title: Cumulative
+  contents:
+  - rray-cumulative
+&quot;&quot;&quot;)
+open(p,&quot;w&quot;).write(s)
+EOF
+clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -8</pre><pre class="output"> M _pkgdown.yml
+ M src/init.c
+?? R/cumulative.R
+?? src/cumulative-logical.c
+?? src/cumulative-logical.h
+?? src/cumulative.c
+?? src/cumulative.h
+?? src/decl/cumulative-logical-decl.h
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c utils.c -o utils.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c wrapper.c -o wrapper.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o clone.o combine.o compare.o cumulative-logical.o cumulative.o dimensionality.o dimensions.o equal.o extract-assign.o extract-subscript.o extract.o extremum.o if-else.o index.o init.o insert-axes.o locate.o logical.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-extremum.o reduce-logical.o reduce-mean.o reduce-names.o reduce-prod.o reduce-sum.o reduce.o remove-axes.o rep-each.o rep.o reverse.o rlang.o roll-each.o roll.o size.o slice-assign.o slice-axis.o slice-subscript.o slice.o split.o stack.o strides.o subscript.o syms.o titles.o type.o typeof2.o unstack.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpimtbKJ/devtools_install_4de9a0852e/00LOCK-rray/00new/rray/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray)
+Writing 'NAMESPACE'
+Writing 'rray-cumulative.Rd'</pre></details>
+<p>Compiled cleanly. Quick sanity check against a reference built from base R.</p>
+
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+ref &lt;- function(x, axis, f) { d &lt;- dim(x); out &lt;- apply(x, setdiff(seq_along(d), axis), function(l) Reduce(f, l, accumulate = TRUE)); if (length(d) &gt; 1) aperm(array(out, d[c(axis, setdiff(seq_along(d), axis))]), order(c(axis, setdiff(seq_along(d), axis)))) else out }
+set.seed(1)
+x &lt;- array(sample(c(TRUE, FALSE, NA), 60, TRUE, prob = c(.6,.3,.1)), c(3, 4, 5))
+for (axis in 1:3) {
+  stopifnot(identical(as.vector(rray_cumulative_all(x, axis)), as.vector(ref(x, axis, `&amp;`))))
+  stopifnot(identical(as.vector(rray_cumulative_any(x, axis)), as.vector(ref(x, axis, `|`))))
+}
+print(rray_cumulative_any(c(a = FALSE, b = NA, c = TRUE), 1))
+print(rray_cumulative_all(array(logical(), c(0, 3)), 2))
+' 2&gt;&amp;1 | grep -v &quot;^clang\|^\*\*\|^installing&quot;</pre><pre class="output">    a     b     c 
+FALSE    NA  TRUE 
+     [,1] [,2] [,3]</pre></details>
+<p>Works. Checking edge-case behaviour I want to pin in tests (huge zero-size dims, axis validation messages).</p>
+
+<details class="tool"><summary>Bash: sed -n 150,200p src/utils.c; Rscript -e '</summary>
+<pre>sed -n 150,200p src/utils.c; Rscript -e '
+devtools::load_all(quiet = TRUE)
+m &lt;- .Machine$integer.max
+x &lt;- array(logical(), c(m, m, m, 0L))
+str(rray_cumulative_any(x, 4L))
+for (a in list(integer(), 1:2, NA_integer_, 0L, -1L, 1.5, 3L, structure(1L, foo = 1), &quot;a&quot;, 1)) print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+print(try(rray_cumulative_any(structure(TRUE, class = &quot;foo&quot;), 1)))
+print(try(rray_cumulative_all(1:2, 1)))
+' 2&gt;&amp;1 | grep -v &quot;^clang\|^\*\*\|^installing&quot;</pre><pre class="output">    r_attrib_poke_names(out, names);
+  }
+
+  FREE(1);
+  return out;
+}
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+
+  if (r_length(x) != 1) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be a single integer, not length %&quot; R_PRI_SSIZE &quot;.&quot;,
+      rray_arg_format(arg),
+      r_length(x)
+    );
+  }
+
+  const int out = r_int_get(x, 0);
+
+  FREE(1);
+  return out;
+}
+
+r_obj* arg_as_non_negative_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+
+  const r_ssize size = r_length(x);
+  const int* v_x = r_int_cbegin(x);
+
+  for (r_ssize i = 0; i &lt; size; ++i) {
+    const int elt = v_x[i];
+
+    if (elt == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (elt &lt; 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain negative values.&quot;,
+        rray_arg_format(arg)
+ logi[1:2147483647, 1:2147483647, 1:2147483647, 0 ] 
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must be a single integer, not length 0.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must be a single integer, not length 0.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must be a single integer, not length 2.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must be a single integer, not length 2.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must not be missing.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must not be missing.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must be greater than or equal to 1, not 0.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must be greater than or equal to 1, not 0.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must be greater than or equal to 1, not -1.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must be greater than or equal to 1, not -1.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must contain whole numbers that fit in an integer. Problem at location 1.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must contain whole numbers that fit in an integer. Problem at location 1.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must be less than or equal to the dimensionality of 2, not 3.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must be less than or equal to the dimensionality of 2, not 3.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` can't have attributes.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` can't have attributes.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. └─rray::rray_cumulative_any(matrix(TRUE, 2, 2), a)
+[1] &quot;Error in rray_cumulative_any(matrix(TRUE, 2, 2), a) : \n  `axis` must be an integer or double vector, not the string \&quot;a\&quot;.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error in `rray_cumulative_any()`:
+! `axis` must be an integer or double vector, not the string &quot;a&quot;.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE))
+ 2. ├─base::try(rray_cumulative_any(matrix(TRUE, 2, 2), a), silent = TRUE)</pre><p class="cut">46 more lines cut</p></details>
+<p>All behaves as intended. Writing tests now.</p>
+
+<details class="tool"><summary>Bash: grep -n &quot;axis&quot; -A12 tests/testthat/test-titles.R | grep -n &quot;snapshot&quot; -A3 | head -40; cat tes…</summary>
+<pre>grep -n &quot;axis&quot; -A12 tests/testthat/test-titles.R | grep -n &quot;snapshot&quot; -A3 | head -40; cat tests/testthat/helper-reduce-sum.R | head -30</pre><pre class="output">120:141-  expect_snapshot(rray_titles(NULL), error = TRUE)
+121:142-  expect_snapshot(rray_titles(classed), error = TRUE)
+122:143:  expect_snapshot(rray_axis_title(x, 0), error = TRUE)
+123:144:  expect_snapshot(rray_axis_title(x, 3), error = TRUE)
+124:145:  expect_snapshot(rray_axis_title(x, NA_integer_), error = TRUE)
+125:146:  expect_snapshot(rray_axis_title(x, c(1, 2)), error = TRUE)
+126-147-})
+127-148-
+128-149-test_that(&quot;title setters reject invalid input and values&quot;, {
+--
+132:153-  expect_snapshot(rray_set_titles(classed, NULL), error = TRUE)
+133:154-  expect_snapshot(rray_set_titles(x, 1:2), error = TRUE)
+134:155-  expect_snapshot(rray_set_titles(x, &quot;Row&quot;), error = TRUE)
+135:156:  expect_snapshot(rray_set_axis_title(x, 0, &quot;Row&quot;), error = TRUE)
+136:157:  expect_snapshot(rray_set_axis_title(x, 1, 1L), error = TRUE)
+137:158:  expect_snapshot(rray_set_axis_title(x, 1, character()), error = TRUE)
+138:159:  expect_snapshot(rray_set_axis_title(x, 1, c(&quot;Row&quot;, &quot;Column&quot;)), error = TRUE)
+139-160-})
+rray_sum_forced_fallback &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_test_rray_sum_forced_fallback, x, axes, na_rm, environment())
+}</pre></details>
+<details class="tool"><summary>Write tests/testthat/helper-cumulative.R</summary>
+<pre>cumulative_reference &lt;- function(x, axis, f) {
+  dimensions &lt;- dim(x)
+  axes &lt;- c(axis, setdiff(seq_along(dimensions), axis))
+
+  out &lt;- apply(x, axes[-1L], \(line) Reduce(f, line, accumulate = TRUE))
+  out &lt;- array(out, dimensions[axes])
+  out &lt;- aperm(out, order(axes))
+
+  dimnames(out) &lt;- dimnames(x)
+  out
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/tests/testthat/helper-cumulative.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write tests/testthat/test-cumulative-logical.R</summary>
+<pre>test_that(&quot;can accumulate along axis 1&quot;, {
+  x &lt;- array(c(TRUE, FALSE, TRUE, FALSE, TRUE, TRUE), c(3L, 2L))
+
+  expect_identical(
+    rray_cumulative_all(x, 1L),
+    array(c(TRUE, FALSE, FALSE, FALSE, FALSE, FALSE), c(3L, 2L))
+  )
+  expect_identical(
+    rray_cumulative_any(x, 1L),
+    array(c(TRUE, TRUE, TRUE, FALSE, TRUE, TRUE), c(3L, 2L))
+  )
+})
+
+test_that(&quot;can accumulate along axis 2&quot;, {
+  x &lt;- array(c(TRUE, FALSE, TRUE, FALSE, TRUE, TRUE), c(2L, 3L))
+
+  expect_identical(
+    rray_cumulative_all(x, 2L),
+    array(c(TRUE, FALSE, TRUE, FALSE, TRUE, FALSE), c(2L, 3L))
+  )
+  expect_identical(
+    rray_cumulative_any(x, 2L),
+    array(c(TRUE, FALSE, TRUE, FALSE, TRUE, TRUE), c(2L, 3L))
+  )
+})
+
+test_that(&quot;can accumulate along every axis of a 3D array&quot;, {
+  x &lt;- array(
+    c(TRUE, FALSE, NA)[c(1, 1, 3, 2, 1, 3, 1, 2, 2, 1, 3, 1)][1:24 %% 12 + 1],
+    c(2L, 3L, 4L)
+  )
+  x[c(5L, 17L, 22L)] &lt;- c(FALSE, NA, TRUE)
+
+  for (axis in 1:3) {
+    expect_identical(
+      rray_cumulative_all(x, axis),
+      cumulative_reference(x, axis, `&amp;`)
+    )
+    expect_identical(
+      rray_cumulative_any(x, axis),
+      cumulative_reference(x, axis, `|`)
+    )
+  }
+})
+
+test_that(&quot;each line starts fresh&quot;, {
+  x &lt;- array(c(FALSE, TRUE, TRUE, TRUE), c(2L, 2L))
+  expect_identical(
+    rray_cumulative_all(x, 1L),
+    array(c(FALSE, FALSE, TRUE, TRUE), c(2L, 2L))
+  )
+
+  x &lt;- array(c(TRUE, FALSE, FALSE, FALSE), c(2L, 2L))
+  expect_identical(
+    rray_cumulative_any(x, 1L),
+    array(c(TRUE, TRUE, FALSE, FALSE), c(2L, 2L))
+  )
+})
+
+test_that(&quot;missing values follow `&amp;` and `|`&quot;, {
+  values &lt;- c(TRUE, FALSE, NA)
+  lines &lt;- expand.grid(values, values, values)
+
+  for (i in seq_len(nrow(lines))) {
+    x &lt;- unlist(lines[i, ], use.names = FALSE)
+
+    expect_identical(
+      as.vector(rray_cumulative_all(x, 1L)),
+      Reduce(`&amp;`, x, accumulate = TRUE)
+    )
+    expect_identical(
+      as.vector(rray_cumulative_any(x, 1L)),
+      Reduce(`|`, x, accumulate = TRUE)
+    )
+  }
+})
+
+test_that(&quot;a later decisive value settles an earlier `NA`&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_all(c(TRUE, NA, FALSE), 1L)),
+    c(TRUE, NA, FALSE)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_all(c(FALSE, NA), 1L)),
+    c(FALSE, FALSE)
+  )
+
+  expect_identical(
+    as.vector(rray_cumulative_any(c(FALSE, NA, TRUE), 1L)),
+    c(FALSE, NA, TRUE)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_any(c(TRUE, NA), 1L)),
+    c(TRUE, TRUE)
+  )
+})
+
+test_that(&quot;last position matches the reducer&quot;, {
+  x &lt;- array(c(TRUE, FALSE, NA, TRUE, TRUE, FALSE), c(2L, 3L))
+
+  expect_identical(
+    rray_cumulative_all(x, 2L)[, 3L, drop = FALSE],
+    rray_all(x, 2L)
+  )
+  expect_identical(
+    rray_cumulative_any(x, 2L)[, 3L, drop = FALSE],
+    rray_any(x, 2L)
+  )
+})
+
+test_that(&quot;an axis of dimension 1 returns `x`&quot;, {
+  x &lt;- array(c(TRUE, FALSE, NA), c(1L, 3L))
+  expect_identical(rray_cumulative_all(x, 1L), x)
+  expect_identical(rray_cumulative_any(x, 1L), x)
+})
+
+test_that(&quot;zero-size arrays keep their shape&quot;, {
+  x &lt;- array(logical(), c(2L, 0L, 3L))
+
+  for (axis in 1:3) {
+    expect_identical(rray_cumulative_all(x, axis), x)
+    expect_identical(rray_cumulative_any(x, axis), x)
+  }
+})
+
+test_that(&quot;zero-size arrays with large dimensions don't overflow&quot;, {
+  max &lt;- .Machine$integer.max
+  x &lt;- array(logical(), c(max, max, max, 0L))
+
+  expect_identical(rray_cumulative_all(x, 4L), x)
+  expect_identical(rray_cumulative_any(x, 4L), x)
+})
+
+test_that(&quot;names are kept on every axis&quot;, {
+  x &lt;- array(
+    c(TRUE, FALSE, NA, TRUE),
+    c(2L, 2L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;))
+  )
+  expect_identical(dimnames(rray_cumulative_all(x, 1L)), dimnames(x))
+  expect_identical(dimnames(rray_cumulative_any(x, 2L)), dimnames(x))
+
+  x &lt;- array(TRUE, c(2L, 2L), dimnames = list(NULL, c(&quot;c&quot;, &quot;d&quot;)))
+  expect_identical(dimnames(rray_cumulative_all(x, 2L)), dimnames(x))
+  expect_identical(dimnames(rray_cumulative_any(x, 2L)), dimnames(x))
+
+  x &lt;- array(TRUE, c(2L, 2L))
+  expect_null(dimnames(rray_cumulative_all(x, 1L)))
+  expect_null(dimnames(rray_cumulative_any(x, 1L)))
+})
+
+test_that(&quot;titles are kept&quot;, {
+  x &lt;- array(
+    TRUE,
+    c(2L, 2L),
+    dimnames = list(Row = c(&quot;a&quot;, &quot;b&quot;), Column = NULL)
+  )
+  expect_identical(rray_titles(rray_cumulative_all(x, 1L)), c(&quot;Row&quot;, &quot;Column&quot;))
+  expect_identical(rray_titles(rray_cumulative_any(x, 2L)), c(&quot;Row&quot;, &quot;Column&quot;))
+})
+
+test_that(&quot;vectors become 1D arrays&quot;, {
+  expect_identical(
+    rray_cumulative_all(c(a = TRUE, b = NA, c = FALSE), 1L),
+    array(c(TRUE, NA, FALSE), 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+  )
+  expect_identical(
+    rray_cumulative_any(c(FALSE, NA, TRUE), 1L),
+    array(c(FALSE, NA, TRUE), 3L)
+  )
+})
+
+test_that(&quot;`axis` can be a whole double&quot;, {
+  x &lt;- array(c(TRUE, FALSE), c(2L, 2L))
+  expect_identical(rray_cumulative_all(x, 2), rray_cumulative_all(x, 2L))
+  expect_identical(rray_cumulative_any(x, 2), rray_cumulative_any(x, 2L))
+})
+
+test_that(&quot;`axis` is validated&quot;, {
+  x &lt;- array(TRUE, c(2L, 2L))
+
+  expect_snapshot(rray_cumulative_all(x, integer()), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, 1:2), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, NA_integer_), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, 0L), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, -1L), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, 1.5), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, 3L), error = TRUE)
+  expect_snapshot(rray_cumulative_all(x, structure(1L, foo = 1)), error = TRUE)
+  expect_snapshot(rray_cumulative_any(x, &quot;a&quot;), error = TRUE)
+})
+
+test_that(&quot;errors on non-logical input&quot;, {
+  expect_snapshot(rray_cumulative_all(1:2, 1L), error = TRUE)
+  expect_snapshot(rray_cumulative_any(array(1, c(2L, 2L)), 1L), error = TRUE)
+})
+
+test_that(&quot;errors on classed input&quot;, {
+  x &lt;- structure(TRUE, class = &quot;foo&quot;)
+  expect_snapshot(rray_cumulative_all(x, 1L), error = TRUE)</pre><p class="cut">2 more lines cut</p><pre class="output">File created successfully at: ~/files/r/packages/rray/tests/testthat/test-cumulative-logical.R (file state is current in your context — no need to Read it back)</pre></details>
+<p>Simplifying the 3D fixture.</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-cumulative-logical.R</summary>
+<pre class="diff"><span class="del">-  x &lt;- array(</span>
+<span class="del">-    c(TRUE, FALSE, NA)[c(1, 1, 3, 2, 1, 3, 1, 2, 2, 1, 3, 1)][1:24 %% 12 + 1],</span>
+<span class="del">-    c(2L, 3L, 4L)</span>
+<span class="del">-  )</span>
+<span class="del">-  x[c(5L, 17L, 22L)] &lt;- c(FALSE, NA, TRUE)</span>
+<span class="ins">+  x &lt;- array(rep_len(c(TRUE, TRUE, NA, TRUE, FALSE), 24L), c(2L, 3L, 4L))</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-cumulative-logical.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | tail -15 &amp;&amp; cat te…</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | tail -15 &amp;&amp; cat tests/testthat/_snaps/cumulative-logical.md</pre><pre class="output">Code
+  rray_cumulative_all(x, 1L)
+Condition
+  Error in `rray_cumulative_all()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+WARNING: 'test-cumulative-logical.R:197:3' ----------
+Adding new snapshot:
+Code
+  rray_cumulative_any(x, 1L)
+Condition
+  Error in `rray_cumulative_any()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+[ FAIL 0 | WARN 13 | SKIP 0 | PASS 107 ]
+# `axis` is validated
+
+    Code
+      rray_cumulative_all(x, integer())
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must be a single integer, not length 0.
+
+---
+
+    Code
+      rray_cumulative_all(x, 1:2)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must be a single integer, not length 2.
+
+---
+
+    Code
+      rray_cumulative_all(x, NA_integer_)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must not be missing.
+
+---
+
+    Code
+      rray_cumulative_all(x, 0L)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must be greater than or equal to 1, not 0.
+
+---
+
+    Code
+      rray_cumulative_all(x, -1L)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must be greater than or equal to 1, not -1.
+
+---
+
+    Code
+      rray_cumulative_all(x, 1.5)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must contain whole numbers that fit in an integer. Problem at location 1.
+
+---
+
+    Code
+      rray_cumulative_all(x, 3L)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` must be less than or equal to the dimensionality of 2, not 3.
+
+---
+
+    Code
+      rray_cumulative_all(x, structure(1L, foo = 1))
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `axis` can't have attributes.
+
+---
+
+    Code
+      rray_cumulative_any(x, &quot;a&quot;)
+    Condition
+      Error in `rray_cumulative_any()`:
+      ! `axis` must be an integer or double vector, not the string &quot;a&quot;.
+
+# errors on non-logical input
+
+    Code
+      rray_cumulative_all(1:2, 1L)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `x` must be a logical array, not an integer 1D array.
+
+---
+
+    Code
+      rray_cumulative_any(array(1, c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_cumulative_any()`:
+      ! `x` must be a logical array, not a double matrix.
+
+# errors on classed input
+
+    Code
+      rray_cumulative_all(x, 1L)
+    Condition
+      Error in `rray_cumulative_all()`:
+      ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+---
+
+    Code
+      rray_cumulative_any(x, 1L)
+    Condition
+      Error in `rray_cumulative_any()`:
+      ! `x` must be a bare array, not a &lt;foo&gt; object.</pre></details>
+<p>All 107 pass. Now the benchmark script, modeled on <code>bench/reduce.R</code>.</p>
+
+<details class="tool"><summary>Write bench/cumulative.R</summary>
+<pre>devtools::load_all(quiet = TRUE)
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+operations &lt;- list(
+  all = list(fn = rray_cumulative_all, types = &quot;logical&quot;),
+  any = list(fn = rray_cumulative_any, types = &quot;logical&quot;)
+)
+
+shapes &lt;- list(
+  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+  &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+  &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+  &quot;[200, 200, 200] over 1&quot; = list(c(200L, 200L, 200L), 1L),
+  &quot;[200, 200, 200] over 2&quot; = list(c(200L, 200L, 200L), 2L),
+  &quot;[200, 200, 200] over 3&quot; = list(c(200L, 200L, 200L), 3L),
+  &quot;[10, 1e6] over 1&quot; = list(c(10L, 1000000L), 1L),
+  &quot;[10, 1e6] over 2&quot; = list(c(10L, 1000000L), 2L)
+)
+
+make_array &lt;- function(dimensions, type) {
+  n &lt;- prod(dimensions)
+
+  values &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),
+    double = runif(n)
+  )
+
+  array(values, dimensions)
+}
+
+set.seed(1)
+
+results &lt;- list()
+
+for (operation in names(operations)) {
+  fn &lt;- operations[[operation]]$fn
+
+  for (type in operations[[operation]]$types) {
+    for (shape in names(shapes)) {
+      x &lt;- make_array(shapes[[shape]][[1L]], type)
+      axis &lt;- shapes[[shape]][[2L]]
+
+      measurement &lt;- bench::mark(
+        fn(x, axis),
+        iterations = iterations,
+        check = FALSE,
+        memory = FALSE,
+        filter_gc = FALSE
+      )
+
+      results[[length(results) + 1L]] &lt;- data.frame(
+        operation = operation,
+        type = type,
+        shape = shape,
+        median_ms = as.numeric(measurement$median) * 1000
+      )
+    }
+  }
+}
+
+results &lt;- do.call(rbind, results)
+
+print(results, row.names = FALSE)
+
+if (nzchar(output)) {
+  saveRDS(
+    list(
+      results = results,
+      iterations = iterations,
+      revision = system2(&quot;git&quot;, c(&quot;rev-parse&quot;, &quot;HEAD&quot;), stdout = TRUE)
+    ),
+    output
+  )
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray/bench/cumulative.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; RRAY_BENCH_ITERATIONS=5 Rscript bench/cumulative.R 2&gt;&amp;1 | tail -20</summary>
+<pre>air format . &amp;&amp; RRAY_BENCH_ITERATIONS=5 Rscript bench/cumulative.R 2&gt;&amp;1 | tail -20</pre><pre class="output"> operation    type                  shape median_ms
+       all logical         [1.6e7] over 1 43.714856
+       all logical    [4000, 4000] over 1 43.509159
+       all logical    [4000, 4000] over 2 14.304285
+       all logical [200, 200, 200] over 1 21.483426
+       all logical [200, 200, 200] over 2  6.340240
+       all logical [200, 200, 200] over 3  6.509652
+       all logical       [10, 1e6] over 1 13.356857
+       all logical       [10, 1e6] over 2  8.973055
+       any logical         [1.6e7] over 1 44.060568
+       any logical    [4000, 4000] over 1 43.076814
+       any logical    [4000, 4000] over 2 13.668457
+       any logical [200, 200, 200] over 1 20.199265
+       any logical [200, 200, 200] over 2  6.328883
+       any logical [200, 200, 200] over 3  6.674021
+       any logical       [10, 1e6] over 1 12.229398
+       any logical       [10, 1e6] over 2  8.198975</pre></details>
+<p>Baseline numbers look reasonable. For context, comparing against the reducer and base R on the same data:</p>
+
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+set.seed(1)
+x &lt;- array(sample(c(TRUE, FALSE, NA), 16e6, TRUE), c(4000L, 4000L))
+v &lt;- as.vector(x)
+print(bench::mark(rray_all(x, 1L), rray_cumulative_all(x, 1L), rray_all(x, 2L), rray_cumulative_all(x, 2L), cumsum(v), check = FALSE, iterations = 10)[, 1:5])
+' 2&gt;&amp;1 | tail -8</pre><pre class="output">  &lt;bch:expr&gt;                 &lt;bch:tm&gt; &lt;bch:tm&gt;     &lt;dbl&gt; &lt;bch:byt&gt;
+1 rray_all(x, 1L)             14.14ms  14.18ms      70.4    15.7KB
+2 rray_cumulative_all(x, 1L)  41.83ms  43.16ms      23.1      61MB
+3 rray_all(x, 2L)              2.04ms   2.06ms     481.     15.7KB
+4 rray_cumulative_all(x, 2L)  12.64ms  14.37ms      69.7      61MB
+5 cumsum(v)                   17.63ms   17.9ms      55.6   122.1MB
+Warning message:
+Some expressions had a GC in every iteration; so filtering is disabled.</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Axis 1's scan is 3x slower because each step reads back from memory, creating a store-to-load bottleneck. I'll try carrying the running state in a local variable instead.</p>
+</details>
+<details class="tool"><summary>Edit src/cumulative.h</summary>
+<pre class="diff"><span class="del">-  for (r_ssize start = 0; start &lt; size; start += block_size) {                 \</span>
+<span class="del">-    const r_ssize first_end = start + stride;                                  \</span>
+<span class="ins">+  if (stride == 1) {                                                           \</span>
+<span class="ins">+    for (r_ssize start = 0; start &lt; size; start += block_size) {               \</span>
+<span class="ins">+      const r_ssize end = start + block_size;                                  \</span>
+<span class="ins">+      OUT_CTYPE elt = OUT_INIT;                                                \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = start; i &lt; end; ++i) {                                  \</span>
+<span class="ins">+        elt = ONE(elt, v_x[i]);                                                \</span>
+<span class="ins">+        v_out[i] = elt;                                                        \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    FREE(1);                                                                   \</span>
+<span class="ins">+    return out;                                                                \</span>
+<span class="ins">+  }                                                                            \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  for (r_ssize start = 0; start &lt; size; start += block_size) {                 \</span>
+<span class="ins">+    const r_ssize first_end = start + stride;                                  \</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+set.seed(1)
+x &lt;- array(sample(c(TRUE, FALSE, NA), 16e6, TRUE), c(4000L, 4000L))
+print(bench::mark(rray_all(x, 1L), rray_cumulative_all(x, 1L), rray_cumulative_any(x, 1L), rray_cumulative_all(x, 2L), check = FALSE, iterations = 10)[, 1:5])
+' 2&gt;&amp;1 | tail -6</pre><pre class="output">  expression                      min   median `itr/sec` mem_alloc
+  &lt;bch:expr&gt;                 &lt;bch:tm&gt; &lt;bch:tm&gt;     &lt;dbl&gt; &lt;bch:byt&gt;
+1 rray_all(x, 1L)              14.1ms   14.2ms      70.6    15.7KB
+2 rray_cumulative_all(x, 1L)   16.5ms   16.6ms      58.8      61MB
+3 rray_cumulative_any(x, 1L)   16.5ms   16.6ms      60.4      61MB
+4 rray_cumulative_all(x, 2L)   12.7ms   12.7ms      78.4      61MB</pre></details>
+<p>2.5x faster on axis 1, now close to the reducer. Restructuring the macro as if/else so there is one exit.</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+p=&quot;src/cumulative.h&quot;
+s=open(p).read()
+i=s.index(&quot;#define RRAY_CUMULATIVE(&quot;)
+j=s.index(&quot;#endif&quot;, i)
+body='''#define RRAY_CUMULATIVE(
+  X_CTYPE,
+  X_CONST_DEREF,
+  OUT_RTYPE,
+  OUT_CTYPE,
+  OUT_DEREF,
+  OUT_INIT,
+  ONE
+)
+  const r_ssize size = r_length(x);
+  const r_ssize block_size = stride * axis_dimension;
+
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));
+  OUT_CTYPE* v_out = OUT_DEREF(out);
+
+  const X_CTYPE* v_x = X_CONST_DEREF(x);
+
+  if (stride == 1) {
+    for (r_ssize start = 0; start &lt; size; start += block_size) {
+      const r_ssize end = start + block_size;
+      OUT_CTYPE elt = OUT_INIT;
+
+      for (r_ssize i = start; i &lt; end; ++i) {
+        elt = ONE(elt, v_x[i]);
+        v_out[i] = elt;
+      }
+    }
+  } else {
+    for (r_ssize start = 0; start &lt; size; start += block_size) {
+      const r_ssize first_end = start + stride;
+      const r_ssize end = start + block_size;
+
+      for (r_ssize i = start; i &lt; first_end; ++i) {
+        v_out[i] = ONE(OUT_INIT, v_x[i]);
+      }
+
+      for (r_ssize i = first_end; i &lt; end; ++i) {
+        v_out[i] = ONE(v_out[i - stride], v_x[i]);
+      }
+    }
+  }
+
+  FREE(1);
+  return out;
+'''
+lines=body.rstrip(&quot;\n&quot;).split(&quot;\n&quot;)
+out=&quot;\n&quot;.join(l.ljust(79)+&quot;\\&quot; for l in lines[:-1])+&quot;\n&quot;+lines[-1]+&quot;\n\n&quot;
+s=s[:i]+out+s[j:]
+open(p,&quot;w&quot;).write(s)
+EOF
+clang-format -i src/*.c src/*.h &amp;&amp; sed -n 28,80p src/cumulative.h &amp;&amp; git status --short</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/cumulative.h</summary>
+<pre class="output">38	  const r_ssize size = r_length(x);                                            \
+39	  const r_ssize block_size = stride * axis_dimension;                          \
+40	                                                                               \
+41	  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+42	  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+43	                                                                               \
+44	  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+45	                                                                               \
+46	  if (stride == 1) {                                                           \
+47	    for (r_ssize start = 0; start &lt; size; start += block_size) {               \
+48	      const r_ssize end = start + block_size;                                  \
+49	      OUT_CTYPE elt = OUT_INIT;                                                \
+50	                                                                               \
+51	      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+52	        elt = ONE(elt, v_x[i]);                                                \
+53	        v_out[i] = elt;                                                        \
+54	      }                                                                        \
+55	    }                                                                          \
+56	                                                                               \
+57	    FREE(1);                                                                   \
+58	    return out;                                                                \
+59	  }                                                                            \
+60	                                                                               \
+61	  for (r_ssize start = 0; start &lt; size; start += block_size) {                 \
+62	    const r_ssize first_end = start + stride;                                  \
+63	    const r_ssize end = start + block_size;                                    \
+64	                                                                               \
+65	    for (r_ssize i = start; i &lt; first_end; ++i) {                              \
+66	      v_out[i] = ONE(OUT_INIT, v_x[i]);                                        \
+67	    }                                                                          \
+68	                                                                               \
+69	    for (r_ssize i = first_end; i &lt; end; ++i) {                                \
+70	      v_out[i] = ONE(v_out[i - stride], v_x[i]);                               \
+71	    }                                                                          \
+72	  }                                                                            \
+73	                                                                               \
+74	  FREE(1);                                                                     \
+75	  return out;
+76	
+77	#endif
+78	</pre></details>
+<details class="tool"><summary>Edit src/cumulative.h</summary>
+<pre class="diff"><span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    FREE(1);                                                                   \</span>
+<span class="del">-    return out;                                                                \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  for (r_ssize start = 0; start &lt; size; start += block_size) {                 \</span>
+<span class="del">-    const r_ssize first_end = start + stride;                                  \</span>
+<span class="del">-    const r_ssize end = start + block_size;                                    \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    for (r_ssize i = start; i &lt; first_end; ++i) {                              \</span>
+<span class="del">-      v_out[i] = ONE(OUT_INIT, v_x[i]);                                        \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    for (r_ssize i = first_end; i &lt; end; ++i) {                                \</span>
+<span class="del">-      v_out[i] = ONE(v_out[i - stride], v_x[i]);                               \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+  } else {                                                                     \</span>
+<span class="ins">+    for (r_ssize start = 0; start &lt; size; start += block_size) {               \</span>
+<span class="ins">+      const r_ssize first_end = start + stride;                                \</span>
+<span class="ins">+      const r_ssize end = start + block_size;                                  \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = start; i &lt; first_end; ++i) {                            \</span>
+<span class="ins">+        v_out[i] = ONE(OUT_INIT, v_x[i]);                                      \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = first_end; i &lt; end; ++i) {                              \</span>
+<span class="ins">+        v_out[i] = ONE(v_out[i - stride], v_x[i]);                             \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+  }                                                                            \</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devto…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | tail -3 &amp;&amp; RRAY_BENCH_ITERATIONS=5 Rscript bench/cumulative.R 2&gt;&amp;1 | tail -17</pre><pre class="output"> M NAMESPACE
+ M _pkgdown.yml
+ M src/init.c
+?? R/cumulative.R
+?? bench/cumulative.R
+?? man/rray-cumulative.Rd
+?? src/cumulative-logical.c
+?? src/cumulative-logical.h
+?? src/cumulative.c
+?? src/cumulative.h
+?? src/decl/cumulative-logical-decl.h
+?? tests/testthat/_snaps/cumulative-logical.md
+?? tests/testthat/helper-cumulative.R
+?? tests/testthat/test-cumulative-logical.R
+ NAMESPACE    |  2 ++
+ _pkgdown.yml |  4 ++++
+ src/init.c   | 12 ++++++++++++
+ 3 files changed, 18 insertions(+)
+ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 107 ]
+ operation    type                  shape median_ms
+       all logical         [1.6e7] over 1 17.754886
+       all logical    [4000, 4000] over 1 18.495592
+       all logical    [4000, 4000] over 2 14.393378
+       all logical [200, 200, 200] over 1  8.769900
+       all logical [200, 200, 200] over 2  6.379518
+       all logical [200, 200, 200] over 3  6.515884
+       all logical       [10, 1e6] over 1  9.061820
+       all logical       [10, 1e6] over 2  8.095778
+       any logical         [1.6e7] over 1 17.452470
+       any logical    [4000, 4000] over 1 19.277052
+       any logical    [4000, 4000] over 2 13.723438
+       any logical [200, 200, 200] over 1  8.215498
+       any logical [200, 200, 200] over 2  6.204202
+       any logical [200, 200, 200] over 3  6.466643
+       any logical       [10, 1e6] over 1  8.525950
+       any logical       [10, 1e6] over 2  8.528492</pre></details>
+<p>Bench numbers improved across the board for axis 1. Running the full suite and the pkgdown check.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -2; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -…</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -2; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -3; git status --short</pre><pre class="output">ℹ Updating rray documentation
+ℹ Loading rray
+SKIP: 'test-reduce-sum.R:476:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 3956 ]
+ 5.         └─cli::cli_abort(...)
+ 6.           └─rlang::abort(...)
+Execution halted
+ M NAMESPACE
+ M _pkgdown.yml
+ M src/init.c
+ M tests/testthat/_snaps/titles.md
+?? R/cumulative.R
+?? bench/cumulative.R
+?? man/rray-cumulative.Rd
+?? src/cumulative-logical.c
+?? src/cumulative-logical.h
+?? src/cumulative.c
+?? src/cumulative.h
+?? src/decl/cumulative-logical-decl.h
+?? tests/testthat/_snaps/cumulative-logical.md
+?? tests/testthat/helper-cumulative.R
+?? tests/testthat/test-cumulative-logical.R</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | head -12; git diff tests/testthat/_snaps/titles.…</summary>
+<pre>Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | head -12; git diff tests/testthat/_snaps/titles.md</pre><pre class="output">Error in `as_pkgdown()`:
+! Template package &quot;tidytemplate&quot; is not installed.
+ℹ Please install before continuing.
+Backtrace:
+    ▆
+ 1. └─pkgdown::check_pkgdown()
+ 2.   └─pkgdown::as_pkgdown(pkg)
+ 3.     └─pkgdown:::find_template_config(template_package, bs_version_local)
+ 4.       └─pkgdown:::path_package_pkgdown(...)
+ 5.         └─cli::cli_abort(...)
+ 6.           └─rlang::abort(...)
+Execution halted
+diff --git a/tests/testthat/_snaps/titles.md b/tests/testthat/_snaps/titles.md
+index b4dd2f0..9453e08 100644
+--- a/tests/testthat/_snaps/titles.md
++++ b/tests/testthat/_snaps/titles.md
+@@ -101,3 +101,4 @@
+     Condition
+       Error in `rray_set_axis_title()`:
+       ! `title` must have length 1, not length 2.
++</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The <code>titles.md</code> change is just testthat adding a trailing newline and unrelated, so I'll revert it. Since <code>tidytemplate</code> isn't installed, I'll run the check with the template overridden instead of installing it.</p>
+</details>
+<details class="tool"><summary>Bash: git checkout tests/testthat/_snaps/titles.md &amp;&amp; Rscript -e 'pkg &lt;- pkgdown::as_pkgdown(&quot;.&quot;, o…</summary>
+<pre>git checkout tests/testthat/_snaps/titles.md &amp;&amp; Rscript -e 'pkg &lt;- pkgdown::as_pkgdown(&quot;.&quot;, override = list(template = list(package = NULL))); pkgdown::check_pkgdown(pkg)' 2&gt;&amp;1 | tail -3</pre><pre class="output">Updated 1 path from the index
+✔ No problems found.</pre></details>
+<p>No pkgdown problems. Checking for compiler warnings in the new files, then reviewing the full diff.</p>
+
+<details class="tool"><summary>Bash: touch src/cumulative*.c src/init.c &amp;&amp; Rscript -e &quot;pkgbuild::compile_dll()&quot; 2&gt;&amp;1 | grep -i &quot;wa…</summary>
+<pre>touch src/cumulative*.c src/init.c &amp;&amp; Rscript -e &quot;pkgbuild::compile_dll()&quot; 2&gt;&amp;1 | grep -i &quot;warning\|error&quot; ; echo &quot;---&quot;; git diff; cat src/cumulative.c src/cumulative-logical.c | head -60; cat man/rray-cumulative.Rd | sed -n 1,40p</pre><pre class="output">---
+diff --git a/NAMESPACE b/NAMESPACE
+index 76ce2e8..a5eea0b 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -10,6 +10,8 @@ export(rray_broadcast)
+ export(rray_broadcast_common)
+ export(rray_column_names)
+ export(rray_combine)
++export(rray_cumulative_all)
++export(rray_cumulative_any)
+ export(rray_dimensionality)
+ export(rray_dimensions)
+ export(rray_dimensions_common)
+diff --git a/_pkgdown.yml b/_pkgdown.yml
+index 065fdb8..6d07dd7 100644
+--- a/_pkgdown.yml
++++ b/_pkgdown.yml
+@@ -22,6 +22,10 @@ reference:
+   - rray-reduce
+   - rray-locate
+ 
++- title: Cumulative
++  contents:
++  - rray-cumulative
++
+ - title: Combining and Splitting
+   contents:
+   - rray_combine
+diff --git a/src/init.c b/src/init.c
+index 3c7cece..097b39e 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -274,6 +274,16 @@ extern r_obj* ffi_rray_locate_min(
+   r_obj* ffi_na_rm,
+   r_obj* ffi_frame
+ );
++extern r_obj* ffi_rray_cumulative_all(
++  r_obj* ffi_x,
++  r_obj* ffi_axis,
++  r_obj* ffi_frame
++);
++extern r_obj* ffi_rray_cumulative_any(
++  r_obj* ffi_x,
++  r_obj* ffi_axis,
++  r_obj* ffi_frame
++);
+ extern r_obj* ffi_rray_ptype(r_obj* ffi_x, r_obj* ffi_frame);
+ extern r_obj* ffi_rray_ptype2(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+ extern r_obj* ffi_rray_ptype_common(
+@@ -419,6 +429,8 @@ static const R_CallMethodDef CallEntries[] = {
+   {&quot;ffi_rray_min&quot;, (DL_FUNC) &amp;ffi_rray_min, 4},
+   {&quot;ffi_rray_locate_max&quot;, (DL_FUNC) &amp;ffi_rray_locate_max, 4},
+   {&quot;ffi_rray_locate_min&quot;, (DL_FUNC) &amp;ffi_rray_locate_min, 4},
++  {&quot;ffi_rray_cumulative_all&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_all, 3},
++  {&quot;ffi_rray_cumulative_any&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_any, 3},
+   {&quot;ffi_rray_ptype&quot;, (DL_FUNC) &amp;ffi_rray_ptype, 2},
+   {&quot;ffi_rray_ptype2&quot;, (DL_FUNC) &amp;ffi_rray_ptype2, 3},
+   {&quot;ffi_rray_ptype_common&quot;, (DL_FUNC) &amp;ffi_rray_ptype_common, 3},
+#include &quot;cumulative.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_cumulative(
+  r_obj* x,
+  int axis,
+  rray_cumulative_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* dimensions = r_dim(x);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  const rray_cumulative_fn fn = fn_switch(x, arg, error_call);
+
+  const r_ssize axis_dimension = v_dimensions[axis - 1];
+  const r_ssize stride =
+    r_length(x) == 0 ? 0 : rray_size_from_dimensions(v_dimensions, axis - 1);
+
+  r_obj* out = KEEP(fn(x, stride, axis_dimension, error_call));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* names = r_dim_names(x);
+
+  if (names != r_null) {
+    r_attrib_poke_dim_names(out, names);
+  }
+
+  FREE(2);
+  return out;
+}
+#include &quot;cumulative-logical.h&quot;
+
+#include &quot;cumulative.h&quot;
+#include &quot;logical.h&quot;
+#include &quot;one-logical.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/cumulative-logical-decl.h&quot;
+
+r_obj* ffi_rray_cumulative_all(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_cumulative_all(ffi_x, axis, rray_args.x, error_call);
+}
+% Generated by roxygen2: do not edit by hand
+% Please edit documentation in R/cumulative.R
+\name{rray-cumulative}
+\alias{rray-cumulative}
+\alias{rray_cumulative_all}
+\alias{rray_cumulative_any}
+\title{Cumulative functions along an axis}
+\usage{
+rray_cumulative_all(x, axis)
+
+rray_cumulative_any(x, axis)
+}
+\arguments{
+\item{x}{An array.}
+
+\item{axis}{A single integer. The axis to accumulate along. \code{1}
+accumulates down rows, \code{2} accumulates across columns, and so on.}
+}
+\value{
+An array with the same dimensions and names as \code{x}.
+}
+\description{
+\itemize{
+\item \code{rray_cumulative_all()} checks if all values are \code{TRUE} so far along
+\code{axis}.
+\item \code{rray_cumulative_any()} checks if any value is \code{TRUE} so far along
+\code{axis}.
+}
+}
+\details{
+Each position along \code{axis} summarizes every position up to and including
+it. Every other axis is held fixed, so each line along \code{axis} starts
+fresh.
+
+The result has the same dimensions and names as \code{x}.
+}
+\section{All / Any}{
+
+\code{x} must be logical. Missing values follow \code{\link[=all]{all()}} and \code{\link[=any]{any()}}, so a later
+\code{FALSE} or \code{TRUE} can settle an earlier \code{NA}:</pre></details>
+<p>No warnings. One cleanup: the details section repeats the <code>@returns</code> sentence, so I'm dropping it.</p>
+
+<details class="tool"><summary>Edit R/cumulative.R</summary>
+<pre class="diff"><span class="del">-#' fresh.</span>
+<span class="del">-#'</span>
+<span class="del">-#' The result has the same dimensions and names as `x`.</span>
+<span class="del">-#'</span>
+<span class="ins">+#' fresh.</span>
+<span class="ins">+#'</span></pre><pre class="output">The file ~/files/r/packages/rray/R/cumulative.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; air format . &amp;&amp; clang-format -i src/*.c s…</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; air format . &amp;&amp; clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; git status --short</pre><pre class="output">Writing 'rray-cumulative.Rd'
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 107 ]
+ M NAMESPACE
+ M _pkgdown.yml
+ M src/init.c
+?? R/cumulative.R
+?? bench/cumulative.R
+?? man/rray-cumulative.Rd
+?? src/cumulative-logical.c
+?? src/cumulative-logical.h
+?? src/cumulative.c
+?? src/cumulative.h
+?? src/decl/cumulative-logical-decl.h
+?? tests/testthat/_snaps/cumulative-logical.md
+?? tests/testthat/helper-cumulative.R
+?? tests/testthat/test-cumulative-logical.R</pre></details>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m &quot;Add rray_cumulative_all() and rray_cumulative_any()&quot; &amp;&amp; git l…</summary>
+<pre>git add -A &amp;&amp; git commit -q -m &quot;Add rray_cumulative_all() and rray_cumulative_any()&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/cumulative-any-all 2&gt;&amp;1 | tail -3</pre><pre class="output">80a0578 Add rray_cumulative_all() and rray_cumulative_any()
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/cumulative-any-all -&gt; feature/cumulative-any-all
+branch 'feature/cumulative-any-all' set up to track 'origin/feature/cumulative-any-all'.</pre></details>
+<p>I've added <code>rray_cumulative_all()</code> and <code>rray_cumulative_any()</code> on a new <code>feature/cumulative-any-all</code> branch. It's committed (80a0578) and pushed. The full test suite passes (3956 passed, 0 failed, 6 skipped), there are no compiler warnings, and <code>pkgdown::check_pkgdown()</code> finds no problems. I didn't have any blocking questions, so I went ahead without asking. My session setup named <code>feature/titles</code> as the branch, but I used the name you gave.</p>
+<p><strong>How it's set up for adding more functions</strong></p>
+<ul>
+<li><code>src/cumulative.c</code> holds the shared entry point <code>rray_cumulative(x, axis, fn_switch, arg, error_call)</code>. It checks the input and the axis, picks the typed function through the switch, and copies the dimensions and names onto the result. Copying the names also keeps axis titles.</li>
+<li><code>src/cumulative.h</code> holds the function types and the <code>RRAY_CUMULATIVE()</code> macro, which is set up like <code>RRAY_REDUCE()</code>. A new cumulative function only needs its own <code>src/cumulative-{op}.c/.h</code>, a decl header, and the macro filled in with its type and one-element operation.</li>
+<li><code>src/cumulative-logical.c</code> reuses <code>rray_all_lgl_one()</code> and <code>rray_any_lgl_one()</code>, so missing values follow <code>&amp;</code> and <code>|</code>. A later <code>FALSE</code> or <code>TRUE</code> settles an earlier <code>NA</code>.</li>
+<li><code>R/cumulative.R</code> has one <code>rray-cumulative</code> help topic, which is also listed in <code>_pkgdown.yml</code>.</li>
+<li><code>tests/testthat/helper-cumulative.R</code> has a base R reference (<code>Reduce(f, accumulate = TRUE)</code> along each line) that later tests for sum, prod, min and max can reuse.</li>
+</ul>
+<p><strong>Where I differed from <code>plans/cumulative.md</code></strong></p>
+<ul>
+<li><strong>No <code>outer</code> count:</strong> the typed function gets only <code>stride</code> and <code>axis_dimension</code>. The macro steps through the array one block at a time, and each value builds on the one at <code>i - stride</code>.</li>
+<li><strong>Faster axis 1:</strong> when the axis is 1 (or the input is a vector), the running value is kept in a local variable instead of being read back from the output each step. Before this, axis 1 was 3x slower than <code>rray_all()</code> (42ms against 14ms on a 4000 × 4000 matrix). Now it is 16.6ms.</li>
+<li><strong>Overflow guard:</strong> <code>stride</code> is set to 0 when the array is empty, so a product like <code>c(.Machine$integer.max, .Machine$integer.max, .Machine$integer.max, 0)</code> can't overflow. A test covers this.</li>
+<li><strong>Unsupported-type error deferred:</strong> I didn't add a cumulative-specific &quot;unsupported type&quot; error yet. Any and all only accept logical input and use <code>check_logical()</code>, so it would be unused code. It should come with sum.</li>
+<li><strong>No decl header for <code>cumulative.c</code>:</strong> it has no helper functions to declare.</li>
+<li><strong>All before any:</strong> functions are ordered all, then any, to match the reducers.</li>
+<li><strong>One test file:</strong> the shared checks (every axis error, empty arrays, names, titles, classed input) live in <code>test-cumulative-logical.R</code> for now.</li>
+</ul>
+<p><strong>Benchmark</strong></p>
+<p><code>bench/cumulative.R</code> follows the same pattern as <code>bench/reduce.R</code>. To add a function later, add it to the <code>operations</code> list. Timings for <code>all</code> (<code>any</code> is about the same):</p>
+<table>
+<thead>
+<tr>
+<th>Shape and axis</th>
+<th>Time</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Vector of 16 million values</td>
+<td>17.8ms</td>
+</tr>
+<tr>
+<td>[4000, 4000] along axis 1 / axis 2</td>
+<td>18.5ms / 14.4ms</td>
+</tr>
+<tr>
+<td>[200, 200, 200] along axis 1 / axis 2 / axis 3</td>
+<td>8.8ms / 6.4ms / 6.5ms</td>
+</tr>
+<tr>
+<td>[10, 1e6] along axis 1 / axis 2</td>
+<td>9.1ms / 8.1ms</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Notes</strong></p>
+<ul>
+<li><code>tidytemplate</code> isn't installed, so <code>pkgdown::check_pkgdown()</code> stopped with an error. Instead of installing anything, I ran the check with the template turned off.</li>
+<li>Running the full suite added a trailing newline to <code>_snaps/titles.md</code>. That isn't from this work, so I reverted it.</li>
+<li>Unrelated: <code>bench/reduce-logical.R</code> calls <code>rray_all_along()</code> and <code>rray_any_along()</code>, which no longer exist, so that script is broken.</li>
+<li>The commit message is one sentence with no attribution trailer, as <code>AGENTS.md</code> asks.</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Run pak::pak(“tidyverse/tidytemplate”) so that’s installed</p>
+<p>If testthat wants to add that newline then let it and keep it</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: Rscript -e 'pak::pak(&quot;tidyverse/tidytemplate&quot;)' 2&gt;&amp;1 | tail -4 &amp;&amp; Rscript -e &quot;pkgdown::check_…</summary>
+<pre>Rscript -e 'pak::pak(&quot;tidyverse/tidytemplate&quot;)' 2&gt;&amp;1 | tail -4 &amp;&amp; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; git status --short</pre><pre class="output">ℹ Building tidytemplate 1.0.0
+✔ Built tidytemplate 1.0.0 (1.4s)
+✔ Installed tidytemplate 1.0.0 (github::tidyverse/tidytemplate@f7bdedf) (42ms)
+✔ 1 pkg: added 1, dld 1 (NA B) [6.8s]
+✔ No problems found.
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 3956 ]
+ M tests/testthat/_snaps/titles.md</pre></details>
+<details class="tool"><summary>Bash: git diff &amp;&amp; git commit -qam &quot;Add trailing newline to titles snapshot&quot; &amp;&amp; git push 2&gt;&amp;1 | tail…</summary>
+<pre>git diff &amp;&amp; git commit -qam &quot;Add trailing newline to titles snapshot&quot; &amp;&amp; git push 2&gt;&amp;1 | tail -1</pre><pre class="output">diff --git a/tests/testthat/_snaps/titles.md b/tests/testthat/_snaps/titles.md
+index b4dd2f0..9453e08 100644
+--- a/tests/testthat/_snaps/titles.md
++++ b/tests/testthat/_snaps/titles.md
+@@ -101,3 +101,4 @@
+     Condition
+       Error in `rray_set_axis_title()`:
+       ! `title` must have length 1, not length 2.
++
+   80a0578..0d75e7f  feature/cumulative-any-all -&gt; feature/cumulative-any-all</pre></details>
+<p><code>tidytemplate</code> is installed, and <code>pkgdown::check_pkgdown()</code> now runs normally and finds no problems.</p>
+<p>I kept testthat's trailing newline in <code>_snaps/titles.md</code> and committed it on its own as 0d75e7f (&quot;Add trailing newline to titles snapshot&quot;). That's pushed to <code>feature/cumulative-any-all</code>. The full test suite still passes: 3956 passed, 0 failed, 6 skipped.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I realize that since we only iterate over 1 axis, this stride with axis_dimension setup seems nice</p>
+<p>Can you also try using our actual iterator instead? Is it much much slower? Make sure you follow the rray reduce setup with out stride 1 optimizations and all that. We’ve heavily optimized the iterator so I’d expect it to still be fairly fast? If so, I prefer the consistency of using the iterator everywhere over a new style of iteration</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray/src &amp;&amp; wc -l strided-iterator.h &amp;&amp; cat strided-iterator…</summary>
+<pre>cd ~/files/r/packages/rray/src &amp;&amp; wc -l strided-iterator.h &amp;&amp; cat strided-iterator.h</pre><pre class="output">     563 strided-iterator.h
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates the current `loc`ations in one or
+// more alternate subspaces defined by `v_v_strides`.
+//
+// We've carefully tuned this iterator for both performance and flexibility. The
+// caller MUST create the iterator INSIDE the function that utilizes it. If a
+// pointer to the iterator is passed around, it can destroy performance due to
+// the way the result is compiled.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+// This loop is typically what the caller writes.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// Note that all sets of strides must be coalescible, as coalescing changes the
+// output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+//
+// --------------------------------------------------------------------------
+// Optimization - Next specialization
+//
+// The loops that callers write seem to be particularly sensitive to whether or
+// not the &quot;next&quot; loop is unrolled on `n`. For the generic &quot;next&quot; function with
+// a runtime `n`, it usually isn't unrolled. But most of the time you have
+// either one or two inputs, so we manually unroll in next1() and next2(), and
+// those should be used where possible.
+struct rray_run_iterator {
+  r_ssize size;
+
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize start;
+  r_ssize end;
+  r_ssize v_loc[RRAY_MAX_INPUTS];
+
+  // Strides for all `n` arrays, laid out axis-major in a flat array as
+  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+  r_ssize n;
+};
+
+static inline void rray_run_iterator_init(
+  struct rray_run_iterator* it,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* const* v_v_strides,
+  r_ssize n
+) {
+  check_dimensionality(dimensionality);
+
+  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+    r_stop_internal(
+      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+      n,
+      RRAY_MAX_INPUTS
+    );
+  }
+
+  it-&gt;size = rray_size_from_dimensions_checked(
+    v_dimensions,
+    dimensionality,
+    r_lazy_null
+  );
+
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    it-&gt;v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+  }
+
+  // Reorder strides to be contiguous during next() calls
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    r_ssize* v_strides = it-&gt;v_strides + axis * n;
+    for (r_ssize i = 0; i &lt; n; ++i) {
+      v_strides[i] = v_v_strides[i][axis];
+    }</pre><p class="cut">364 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>I'll mirror <code>rray_reduce()</code>'s approach: iterate <code>x</code> in storage order, track the running value in a state array shaped like the reduced output, and fill <code>out[i]</code> as I go. First, I'll check how reduce handles the zero-size edge case given the iterator's checked sizes.</p>
+</details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; Rscript -e '</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; Rscript -e '
+devtools::load_all(quiet = TRUE)
+m &lt;- .Machine$integer.max
+x &lt;- array(logical(), c(m, m, m, 0L))
+print(try(rray_all(x, 4L)))
+print(try(rray_all(x, 1L)))
+' 2&gt;&amp;1 | grep -v &quot;^clang\|^\*\*\|^install&quot;; grep -n &quot;broadcast_strides_from_dimensions&quot; -A6 src/strides.h</pre><pre class="output">Error : Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.
+[1] &quot;Error : Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error:
+! Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_all(x, 4L)))
+ 2. ├─base::try(rray_all(x, 4L))
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. ├─rray::rray_all(x, 4L)
+ 8. └─rlang::abort(message = message, call = call)
+Error : Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.
+[1] &quot;Error : Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;error/rlang_error&gt;
+Error:
+! Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.
+---
+Backtrace:
+    ▆
+ 1. ├─base::print(try(rray_all(x, 1L)))
+ 2. ├─base::try(rray_all(x, 1L))
+ 3. │ └─base::tryCatch(...)
+ 4. │   └─base (local) tryCatchList(expr, classes, parentenv, handlers)
+ 5. │     └─base (local) tryCatchOne(expr, names, parentenv, handlers[[1L]])
+ 6. │       └─base (local) doTryCatch(return(expr), name, parentenv, handler)
+ 7. ├─rray::rray_all(x, 1L)
+ 8. └─rlang::abort(message = message, call = call)
+12:void rray_fill_broadcast_strides_from_dimensions(
+13-  const int* v_from_dimensions,
+14-  int from_dimensionality,
+15-  int to_dimensionality,
+16-  r_ssize* v_out
+17-);
+18-</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The reducer already fails on this input—<code>array_size_from_dimensions_checked()</code> reports an overflow before reaching the zero dimension, and since the iterator calls the same function, it'll hit the same error. I'll set that aside for now and move on to the strides helper.</p>
+</details>
+<details class="tool"><summary>Bash: sed -n 1,80p src/strides.c</summary>
+<pre>sed -n 1,80p src/strides.c</pre><pre class="output">#include &quot;strides.h&quot;
+
+void rray_fill_strides_from_dimensions(
+  const int* v_dimensions,
+  int dimensionality,
+  r_ssize* v_out
+) {
+  r_ssize stride = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    v_out[i] = stride;
+    stride *= v_dimensions[i];
+  }
+}
+
+void rray_fill_broadcast_strides_from_dimensions(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  int to_dimensionality,
+  r_ssize* v_out
+) {
+  r_ssize stride = 1;
+
+  for (int i = 0; i &lt; to_dimensionality; ++i) {
+    const int dimension = (i &lt; from_dimensionality) ? v_from_dimensions[i] : 1;
+    v_out[i] = (dimension == 1) ? 0 : stride;
+    stride *= dimension;
+  }
+}</pre></details>
+<p>Saving a fresh baseline of the current stride version before rewriting.</p>
+
+<details class="tool"><summary>Bash: RRAY_BENCH_ITERATIONS=10 RRAY_BENCH_OUTPUT=/private/tmp/claude-502/-Users-davis-files-r-packa…</summary>
+<pre>RRAY_BENCH_ITERATIONS=10 RRAY_BENCH_OUTPUT=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/94ad2743-efff-4951-b0eb-5c190ae247ed/scratchpad/stride.rds Rscript bench/cumulative.R 2&gt;&amp;1 | tail -17</pre><pre class="output"> operation    type                  shape median_ms
+       all logical         [1.6e7] over 1 18.217858
+       all logical    [4000, 4000] over 1 18.441062
+       all logical    [4000, 4000] over 2 14.690279
+       all logical [200, 200, 200] over 1  8.141309
+       all logical [200, 200, 200] over 2  6.796754
+       all logical [200, 200, 200] over 3  6.803848
+       all logical       [10, 1e6] over 1  9.003805
+       all logical       [10, 1e6] over 2  8.156376
+       any logical         [1.6e7] over 1 18.821788
+       any logical    [4000, 4000] over 1 17.575696
+       any logical    [4000, 4000] over 2 14.516952
+       any logical [200, 200, 200] over 1  8.845217
+       any logical [200, 200, 200] over 2  6.347784
+       any logical [200, 200, 200] over 3  6.660840
+       any logical       [10, 1e6] over 1  8.607663
+       any logical       [10, 1e6] over 2  8.491202</pre></details>
+<p>Now the iterator version. Header first:</p>
+
+<details class="tool"><summary>Write src/cumulative.h</summary>
+<pre>#ifndef RRAY_CUMULATIVE_H
+#define RRAY_CUMULATIVE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+typedef r_obj* (*rray_cumulative_fn)(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+);
+
+typedef rray_cumulative_fn (*rray_cumulative_fn_switch)(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_cumulative(
+  r_obj* x,
+  int axis,
+  rray_cumulative_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_CUMULATIVE(                                                       \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  struct rray_run_iterator it;                                                 \
+  rray_run_iterator_init1(                                                     \
+    &amp;it,                                                                       \
+    v_dimensions,                                                              \
+    dimensionality,                                                            \
+    v_state_broadcast_strides                                                  \
+  );                                                                           \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, r_length(x)));                   \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  r_obj* state = KEEP(r_alloc_vector(OUT_RTYPE, state_size));                  \
+  OUT_CTYPE* v_state = OUT_DEREF(state);                                       \
+                                                                               \
+  for (r_ssize i = 0; i &lt; state_size; ++i) {                                   \
+    v_state[i] = OUT_INIT;                                                     \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+                                                                               \
+    r_ssize state_loc = rray_run_iterator_loc(&amp;it, 0);                         \
+    const r_ssize state_stride = rray_run_iterator_stride(&amp;it, 0);             \
+                                                                               \
+    if (state_stride == 0) {                                                   \
+      OUT_CTYPE elt = v_state[state_loc];                                      \
+                                                                               \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        elt = ONE(elt, v_x[i]);                                                \
+        v_out[i] = elt;                                                        \
+      }                                                                        \
+                                                                               \
+      v_state[state_loc] = elt;                                                \
+    } else {                                                                   \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const OUT_CTYPE elt = ONE(v_state[state_loc], v_x[i]);                 \
+        v_state[state_loc] = elt;                                              \
+        v_out[i] = elt;                                                        \
+        state_loc += state_stride;                                             \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  FREE(2);                                                                     \
+  return out;
+
+#endif</pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/cumulative.c</summary>
+<pre>#include &quot;cumulative.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_cumulative(
+  r_obj* x,
+  int axis,
+  rray_cumulative_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* dimensions = r_dim(x);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  int v_state_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_memcpy(v_state_dimensions, v_dimensions, sizeof(int) * dimensionality);
+  v_state_dimensions[axis - 1] = 1;
+
+  const r_ssize state_size =
+    rray_size_from_dimensions(v_state_dimensions, dimensionality);
+
+  r_ssize v_state_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_state_dimensions,
+    dimensionality,
+    dimensionality,
+    v_state_broadcast_strides
+  );
+
+  const rray_cumulative_fn fn = fn_switch(x, arg, error_call);
+
+  r_obj* out = KEEP(fn(
+    x,
+    state_size,
+    v_dimensions,
+    dimensionality,
+    v_state_broadcast_strides,
+    error_call
+  ));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* names = r_dim_names(x);
+
+  if (names != r_null) {
+    r_attrib_poke_dim_names(out, names);
+  }
+
+  FREE(2);
+  return out;
+}</pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Updating the typed function signatures to match.</p>
+
+<details class="tool"><summary>Edit src/cumulative-logical.c</summary>
+<pre class="diff"><span class="del">-  r_ssize stride,</span>
+<span class="del">-  r_ssize axis_dimension,</span>
+<span class="ins">+  r_ssize state_size,</span>
+<span class="ins">+  const int* v_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_state_broadcast_strides,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/cumulative-logical.c has been updated. All occurrences were successfully replaced. (note: the file had been modified on disk since you last read it — the edit applied cleanly, but the file contains other changes not in your context. Read it before edits that depend on surrounding content.)</pre></details>
+<details class="tool"><summary>Edit src/decl/cumulative-logical-decl.h</summary>
+<pre class="diff"><span class="del">-  r_ssize stride,</span>
+<span class="del">-  r_ssize axis_dimension,</span>
+<span class="ins">+  r_ssize state_size,</span>
+<span class="ins">+  const int* v_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_state_broadcast_strides,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/decl/cumulative-logical-decl.h has been updated. All occurrences were successfully replaced. (note: the file had been modified on disk since you last read it — the edit applied cleanly, but the file contains other changes not in your context. Read it before edits that depend on surrounding content.)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; touch src/cumulative*.c &amp;&amp; Rscript -e &quot;pkgbuild::compile_d…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; touch src/cumulative*.c &amp;&amp; Rscript -e &quot;pkgbuild::compile_dll()&quot; 2&gt;&amp;1 | grep -i &quot;warning\|error&quot;; Rscript -e &quot;devtools::test(filter = '^cumulative')&quot; 2&gt;&amp;1 | grep -E &quot;FAIL|Error|large&quot; | head; RRAY_BENCH_ITERATIONS=10 RRAY_BENCH_OUTPUT=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/94ad2743-efff-4951-b0eb-5c190ae247ed/scratchpad/iterator.rds Rscript bench/cumulative.R &gt; /dev/null 2&gt;&amp;1; Rscript -e '
+d &lt;- &quot;/private/tmp/claude-502/-Users-davis-files-r-packages-rray/94ad2743-efff-4951-b0eb-5c190ae247ed/scratchpad/&quot;
+a &lt;- readRDS(paste0(d, &quot;stride.rds&quot;))$results; b &lt;- readRDS(paste0(d, &quot;iterator.rds&quot;))$results
+a$iterator_ms &lt;- b$median_ms; names(a)[4] &lt;- &quot;stride_ms&quot;; a$ratio &lt;- round(a$iterator_ms / a$stride_ms, 2); a$type &lt;- NULL
+a$stride_ms &lt;- round(a$stride_ms, 1); a$iterator_ms &lt;- round(a$iterator_ms, 1); print(a, row.names = FALSE)'</pre><pre class="output">Error: Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.
+[ FAIL 1 | WARN 0 | SKIP 0 | PASS 105 ]
+ operation                  shape stride_ms iterator_ms ratio
+       all         [1.6e7] over 1      18.2        18.7  1.03
+       all    [4000, 4000] over 1      18.4        17.5  0.95
+       all    [4000, 4000] over 2      14.7        11.3  0.77
+       all [200, 200, 200] over 1       8.1         8.3  1.02
+       all [200, 200, 200] over 2       6.8         4.7  0.69
+       all [200, 200, 200] over 3       6.8         4.6  0.67
+       all       [10, 1e6] over 1       9.0        10.1  1.12
+       all       [10, 1e6] over 2       8.2         8.0  0.98
+       any         [1.6e7] over 1      18.8        18.5  0.98
+       any    [4000, 4000] over 1      17.6        18.1  1.03
+       any    [4000, 4000] over 2      14.5        10.5  0.72
+       any [200, 200, 200] over 1       8.8         8.3  0.94
+       any [200, 200, 200] over 2       6.3         5.2  0.81
+       any [200, 200, 200] over 3       6.7         4.8  0.72
+       any       [10, 1e6] over 1       8.6        10.5  1.22
+       any       [10, 1e6] over 2       8.5         7.7  0.91</pre></details>
+<p>The iterator version compiles cleanly and is as fast or faster almost everywhere. One test fails, the huge zero-size case. Checking the rest of the suite.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | grep -E &quot;^\[ FAIL|test-.*R:[0-9]+&quot; | head</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | grep -E &quot;^\[ FAIL|test-.*R:[0-9]+&quot; | head</pre><pre class="output">ERROR: 'test-cumulative-logical.R:126:3' ----------
+ 1. ├─testthat::expect_identical(rray_cumulative_all(x, 4L), x) at test-cumulative-logical.R:126:3
+SKIP: 'test-reduce-mean.R:178:3' ------------------
+SKIP: 'test-reduce-mean.R:188:3' ------------------
+SKIP: 'test-reduce-mean.R:201:3' ------------------
+SKIP: 'test-reduce-sum.R:461:3' -------------------
+SKIP: 'test-reduce-sum.R:468:3' -------------------
+SKIP: 'test-reduce-sum.R:476:3' -------------------
+[ FAIL 1 | WARN 0 | SKIP 6 | PASS 3954 ]</pre></details>
+<p>The iterator version is not slower. On most shapes it's faster, so I've switched to it. I haven't committed yet because one test now fails, and that needs your decision (below).</p>
+<p><strong>How it works now</strong></p>
+<p>It follows <code>rray_reduce()</code> closely:</p>
+<ul>
+<li><code>rray_cumulative()</code> builds &quot;state&quot; dimensions, which are <code>x</code>'s dimensions with the scanned axis set to 1. It then fills broadcast strides for them, the same way reduce builds its output dimensions.</li>
+<li><code>RRAY_CUMULATIVE()</code> walks <code>x</code> in storage order with <code>rray_run_iterator_init1()</code> and <code>rray_run_iterator_next1()</code>. The state array holds the running value for each line. Each element updates its state slot and is written to <code>out[i]</code>.</li>
+<li>The run-stride-0 case is the same optimization reduce has. Along axis 1, each run is a whole line, so the running value stays in a local variable for the full run.</li>
+</ul>
+<p>The cost is one small scratch vector, the size of the reduced result.</p>
+<p><strong>Benchmark (median ms, 10 iterations)</strong></p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>Shape and axis</th>
+<th>Old</th>
+<th>Iterator</th>
+<th>Ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>all</td>
+<td>[1.6e7] along 1</td>
+<td>18.2</td>
+<td>18.7</td>
+<td>1.03</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[4000, 4000] along 1</td>
+<td>18.4</td>
+<td>17.5</td>
+<td>0.95</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[4000, 4000] along 2</td>
+<td>14.7</td>
+<td>11.3</td>
+<td>0.77</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[200, 200, 200] along 1</td>
+<td>8.1</td>
+<td>8.3</td>
+<td>1.02</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[200, 200, 200] along 2</td>
+<td>6.8</td>
+<td>4.7</td>
+<td>0.69</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[200, 200, 200] along 3</td>
+<td>6.8</td>
+<td>4.6</td>
+<td>0.67</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[10, 1e6] along 1</td>
+<td>9.0</td>
+<td>10.1</td>
+<td>1.12</td>
+</tr>
+<tr>
+<td>all</td>
+<td>[10, 1e6] along 2</td>
+<td>8.2</td>
+<td>8.0</td>
+<td>0.98</td>
+</tr>
+</tbody>
+</table>
+<p><code>any</code> looks the same. On the later axes the iterator is 20 to 30% faster: the old code read back <code>out[i - stride]</code> from far behind, while the state array is small and stays in cache. The only slower shape is [10, 1e6] along axis 1, by 12 to 22%. Those lines are only 10 long, so the iterator's step between runs costs more.</p>
+<p><strong>The failing test</strong></p>
+<p><code>rray_cumulative_all(array(logical(), c(m, m, m, 0L)), 4L)</code>, with <code>m &lt;- .Machine$integer.max</code>, now errors:</p>
+<pre><code>Size (0) computed from dimensions `(2147483647, 2147483647, 2147483647, 0)` is too large.
+</code></pre>
+<p>The reducers already have this bug. <code>rray_all(x, 4L)</code> gives the same error on main. <code>rray_run_iterator_init()</code> calls <code>rray_size_from_dimensions_checked()</code>, which multiplies the dimensions left to right and flags the overflow before it reaches the 0. In that same case, the state size and the broadcast strides are also computed with products that overflow, again just like reduce. The input is contrived, but every iterator user shares the problem.</p>
+<p>Which do you want?</p>
+<ol>
+<li><strong>Separate fix (my recommendation):</strong> drop that test here, so cumulative matches the reducers, commit and push the iterator switch. Then fix zero-size arrays for every iterator user in its own change. The fix would be for <code>rray_size_from_dimensions_checked()</code> to return 0 when any dimension is 0, plus guarding the state/output size and stride products in reduce and cumulative.</li>
+<li><strong>Fix it here:</strong> do the zero-size fix on this branch and keep the test.</li>
+</ol>
+
+</section>
+<p class="divider">Oct 11, 2026, 14:21 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Option 1, drop the test and commit</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read tests/testthat/test-cumulative-logical.R</summary>
+<pre class="output">120	})
+121	
+122	test_that(&quot;zero-size arrays with large dimensions don't overflow&quot;, {
+123	  max &lt;- .Machine$integer.max
+124	  x &lt;- array(logical(), c(max, max, max, 0L))
+125	
+126	  expect_identical(rray_cumulative_all(x, 4L), x)
+127	  expect_identical(rray_cumulative_any(x, 4L), x)
+128	})
+129	
+130	test_that(&quot;names are kept on every axis&quot;, {
+131	  x &lt;- array(</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-cumulative-logical.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;zero-size arrays with large dimensions don't overflow&quot;, {</span>
+<span class="del">-  max &lt;- .Machine$integer.max</span>
+<span class="del">-  x &lt;- array(logical(), c(max, max, max, 0L))</span>
+<span class="del">-</span>
+<span class="del">-  expect_identical(rray_cumulative_all(x, 4L), x)</span>
+<span class="del">-  expect_identical(rray_cumulative_any(x, 4L), x)</span>
+<span class="del">-})</span>
+<span class="del">-</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-cumulative-logical.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail …</summary>
+<pre>air format . &amp;&amp; clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; git status --short &amp;&amp; git add -A &amp;&amp; git commit -qm &quot;Use the run iterator for cumulative functions&quot; &amp;&amp; git push 2&gt;&amp;1 | tail -1</pre><pre class="output">[ FAIL 0 | WARN 0 | SKIP 6 | PASS 3954 ]
+ M src/cumulative-logical.c
+ M src/cumulative.c
+ M src/cumulative.h
+ M src/decl/cumulative-logical-decl.h
+ M tests/testthat/test-cumulative-logical.R
+   0d75e7f..fe45265  feature/cumulative-any-all -&gt; feature/cumulative-any-all</pre></details>
+<p>I dropped the huge zero-size test and committed the iterator switch as fe45265 (&quot;Use the run iterator for cumulative functions&quot;). It's pushed to <code>feature/cumulative-any-all</code>, and the full suite passes (3954 passed, 0 failed, 6 skipped).</p>
+<p>The zero-size bug is still open, and it affects the reducers too. When you want it, it goes in its own change: make <code>rray_size_from_dimensions_checked()</code> return 0 when any dimension is 0, and guard the size and stride products in reduce and cumulative.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>And that extra buffer seems necessary for performance?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Short answer: the buffer is required by the iterator design, not added for speed. But I didn't measure how much of the speedup comes from it, so I can't claim it's needed for performance.</p>
+<p><strong>Why the iterator needs it</strong></p>
+<p>The iterator gives each element a location in some other array, and that location is a fixed linear function of the element's position. Reduce uses this to point every element at its output slot. A cumulative function needs &quot;the result at the previous position on this line&quot;. That position is <code>out[i - axis_stride]</code>, except at the start of each line, where there is no previous value. That exception isn't a fixed linear function of position, and the iterator doesn't tell you when a line starts. So the running value has to live in an array the iterator can address, shaped like the reduced result. That's the state buffer. Without it, you're back to my first version's hand-written stride and block loops.</p>
+<p><strong>What it costs</strong></p>
+<p>One allocation of <code>size / axis_dimension</code> elements:</p>
+<ul>
+<li>For most shapes that's small, for example 10 elements for <code>[10, 1e6]</code> along axis 2.</li>
+<li>The worst case is an axis of dimension 2, where it's half the size of the output.</li>
+<li>Along axis 1 (and on vectors) the hot loop keeps the running value in a local variable, so the buffer is only touched once per line.</li>
+</ul>
+<p><strong>Does it explain the speedup?</strong></p>
+<p>Unclear. On later axes the iterator version was 20 to 30% faster than the old <code>v_out[i - stride]</code> loop. For [4000, 4000] along axis 2, the previous column is only 16KB back and should still be in cache. So the gain may come from how the compiler handles the loop rather than from the buffer itself. One plausible cause: a read-back with a stride only known at runtime may not vectorize. I haven't checked the generated code.</p>
+<p>If you want, I can test that properly. I'd write a buffer-free version of the old loop with the stride fixed per call, then compare it against the current code to see what the buffer is worth on its own.</p>
+
+</section>
+</main>
+</body>
+</html>

@@ -1,0 +1,1099 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How rray_add() could double dispatch on classes like vctrs</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../">rray timeline</a>
+<h1>How <code>rray_add()</code> could double dispatch on classes like vctrs</h1>
+<p class="facts">Codex · Sep 10, 2026 · 2 prompts · 4 replies · didn't ship</p>
+</header>
+<main>
+<p class="divider">Sep 10, 2026, 20:10 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Eventually we’ll want to make rray_add and other arithmetic functions generic. Ignore the plan for this for now. How might you do it? The idea is that we’d want to double dispatch on x and y so the combination “add” on x and y must be explicitly opted in to. But there should be a way to then use our fast native implementation on the underlying storage types, and then the user should have a chance to recreate their original class (if necessary) from the output.</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll trace the current arithmetic path and compare it with the closest vctrs dispatch patterns. Then I’ll sketch a protocol that keeps dispatch separate from the native storage kernel and class restoration.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;rray_add|add|arith|vec_arith|restore|proxy&quot; R src tests ~/files/r/packages/…</summary>
+<pre>$ rg -n &quot;rray_add|add|arith|vec_arith|restore|proxy&quot; R src tests ~/files/r/packages/rray/R ~/files/r/packages/rray/src ~/files/r/packages/vctrs/R ~/files/r/packages/vctrs/src | head -n 300</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+tests/testthat.R:4:# Where should you do additional test configuration?
+R/arithmetic.R:1:#' Array arithmetic
+R/arithmetic.R:4:#' - `rray_add()` adds two arrays elementwise.
+R/arithmetic.R:24:#' - `rray_add()`: logicals are cast to integer.
+R/arithmetic.R:41:#' @name arithmetic
+R/arithmetic.R:45:#' rray_add(x, 1L)
+R/arithmetic.R:52:#' rray_add(x, array(c(10L, 20L), c(1L, 2L)))
+R/arithmetic.R:60:#' rray_add(rows, cols)
+R/arithmetic.R:65:#' rray_add(x, cols)
+R/arithmetic.R:68:#' @rdname arithmetic
+R/arithmetic.R:70:rray_add &lt;- function(x, y) {
+R/arithmetic.R:71:  .Call(ffi_rray_add, x, y, environment())
+R/arithmetic.R:74:#' @rdname arithmetic
+R/arithmetic.R:80:#' @rdname arithmetic
+R/arithmetic.R:86:#' @rdname arithmetic
+R/arithmetic.R:92:#' @rdname arithmetic
+src/arithmetic-multiply.c:1:#include &quot;arithmetic-multiply.h&quot;
+src/arithmetic-multiply.c:5:#include &quot;arithmetic.h&quot;
+src/arithmetic-multiply.c:11:#include &quot;decl/arithmetic-multiply-decl.h&quot;
+src/arithmetic-multiply.c:25:  return rray_binary_arithmetic(
+src/arithmetic-multiply.c:35:static rray_binary_arithmetic_fn rray_multiply_switch(
+src/arithmetic-multiply.c:93:    stop_unsupported_arithmetic(&quot;*&quot;, x, y, x_arg, y_arg, error_call);
+src/arithmetic.h:9:typedef r_obj* (*rray_binary_arithmetic_fn)(
+src/arithmetic.h:17:typedef rray_binary_arithmetic_fn (*rray_binary_arithmetic_switch_fn)(
+src/arithmetic.h:25:r_obj* rray_binary_arithmetic(
+src/arithmetic.h:28:  rray_binary_arithmetic_switch_fn fn_switch,
+src/arithmetic.h:34:r_no_return void stop_unsupported_arithmetic(
+src/arithmetic.c:1:#include &quot;arithmetic.h&quot;
+src/arithmetic.c:10:r_obj* rray_binary_arithmetic(
+src/arithmetic.c:13:  rray_binary_arithmetic_switch_fn fn_switch,
+src/arithmetic.c:24:  const rray_binary_arithmetic_fn fn =
+src/arithmetic.c:77:r_no_return void stop_unsupported_arithmetic(
+src/arithmetic-exponentiate.c:1:#include &quot;arithmetic-exponentiate.h&quot;
+src/arithmetic-exponentiate.c:5:#include &quot;arithmetic.h&quot;
+src/arithmetic-exponentiate.c:11:#include &quot;decl/arithmetic-exponentiate-decl.h&quot;
+src/arithmetic-exponentiate.c:25:  return rray_binary_arithmetic(
+src/arithmetic-exponentiate.c:35:static rray_binary_arithmetic_fn rray_exponentiate_switch(
+src/arithmetic-exponentiate.c:86:    stop_unsupported_arithmetic(&quot;^&quot;, x, y, x_arg, y_arg, error_call);
+src/decl/arithmetic-multiply-decl.h:1:static rray_binary_arithmetic_fn rray_multiply_switch(
+tests/testthat/helper-wrapper.R:14:expect_identical_addresses &lt;- function(object, expected) {
+tests/testthat/helper-wrapper.R:15:  expect_identical(obj_address(object), obj_address(expected))
+tests/testthat/helper-wrapper.R:17:expect_different_addresses &lt;- function(object, expected) {
+tests/testthat/helper-wrapper.R:18:  expect_true(obj_address(object) != obj_address(expected))
+~/files/r/packages/vctrs/R/assert.R:201:#' If no [vec_proxy()] method has been registered, `x` is a vector if:
+~/files/r/packages/vctrs/R/assert.R:210:#' If a `vec_proxy()` method has been registered, `x` is a vector if:
+~/files/r/packages/vctrs/R/assert.R:212:#' - The proxy satisfies one of the above conditions.
+~/files/r/packages/vctrs/R/assert.R:214:#' - The base type of the proxy is `&quot;list&quot;`, regardless of its class. S3 lists
+~/files/r/packages/vctrs/R/assert.R:215:#'   are thus treated as scalars unless they implement a `vec_proxy()` method.
+~/files/r/packages/rray/src/RcppExports.cpp:9:// rray__add
+~/files/r/packages/rray/src/RcppExports.cpp:10:Rcpp::RObject rray__add(Rcpp::RObject x, Rcpp::RObject y);
+~/files/r/packages/rray/src/RcppExports.cpp:11:RcppExport SEXP _rray_rray__add(SEXP xSEXP, SEXP ySEXP) {
+~/files/r/packages/rray/src/RcppExports.cpp:16:    rcpp_result_gen = Rcpp::wrap(rray__add(x, y));
+~/files/r/packages/rray/src/RcppExports.cpp:85:Rcpp::RObject rray__bind(Rcpp::RObject proxy, Rcpp::List args, const int&amp; axis);
+~/files/r/packages/rray/src/RcppExports.cpp:86:RcppExport SEXP _rray_rray__bind(SEXP proxySEXP, SEXP argsSEXP, SEXP axisSEXP) {
+~/files/r/packages/rray/src/RcppExports.cpp:89:    Rcpp::traits::input_parameter&lt; Rcpp::RObject &gt;::type proxy(proxySEXP);
+~/files/r/packages/rray/src/RcppExports.cpp:92:    rcpp_result_gen = Rcpp::wrap(rray__bind(proxy, args, axis));
+~/files/r/packages/rray/src/RcppExports.cpp:546:// rray__multiply_add
+~/files/r/packages/rray/src/RcppExports.cpp:547:Rcpp::RObject rray__multiply_add(Rcpp::RObject x, Rcpp::RObject y, Rcpp::RObject z);
+~/files/r/packages/rray/src/RcppExports.cpp:548:RcppExport SEXP _rray_rray__multiply_add(SEXP xSEXP, SEXP ySEXP, SEXP zSEXP) {
+~/files/r/packages/rray/src/RcppExports.cpp:554:    rcpp_result_gen = Rcpp::wrap(rray__multiply_add(x, y, z));
+~/files/r/packages/rray/src/RcppExports.cpp:754:    {&quot;_rray_rray__add&quot;, (DL_FUNC) &amp;_rray_rray__add, 2},
+~/files/r/packages/rray/src/RcppExports.cpp:803:    {&quot;_rray_rray__multiply_add&quot;, (DL_FUNC) &amp;_rray_rray__multiply_add, 3},
+~/files/r/packages/rray/R/compat-base.R:3:# xtfrm.vctrs_vctr() calls vec_proxy_compare(), which (as of 2019-06-04)
+~/files/r/packages/rray/R/compat-base.R:55:determinant.vctrs_rray &lt;- function(x, logarithm = TRUE, ...) {
+~/files/r/packages/rray/R/compat-base.R:56:  determinant(as.matrix(x), logarithm = logarithm, ...)
+src/rlang/dyn-list-of.c:136:    // Resize addresses and update them to point to the new memory
+src/rlang/dyn-list-of.c:146:        // Preserve addresses of moved arrays
+~/files/r/packages/rray/R/compat-vctrs-arith.R:3:#' @method vec_arith vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:4:#' @export vec_arith.vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:5:vec_arith.vctrs_rray &lt;- function(op, x, y) {
+~/files/r/packages/rray/R/compat-vctrs-arith.R:6:  UseMethod(&quot;vec_arith.vctrs_rray&quot;, y)
+~/files/r/packages/rray/R/compat-vctrs-arith.R:9:#' @method vec_arith.vctrs_rray default
+~/files/r/packages/rray/R/compat-vctrs-arith.R:11:vec_arith.vctrs_rray.default &lt;- function(op, x, y) {
+~/files/r/packages/rray/R/compat-vctrs-arith.R:18:#' @method vec_arith.vctrs_rray vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:20:vec_arith.vctrs_rray.vctrs_rray &lt;- function(op, x, y) {
+~/files/r/packages/rray/R/compat-vctrs-arith.R:21:  f &lt;- rray_arith_binary_op_switch(op)
+~/files/r/packages/rray/R/compat-vctrs-arith.R:26:# Unary arith operations
+~/files/r/packages/rray/R/compat-vctrs-arith.R:28:#' @method vec_arith.vctrs_rray MISSING
+~/files/r/packages/rray/R/compat-vctrs-arith.R:30:vec_arith.vctrs_rray.MISSING &lt;- function(op, x, y) {
+~/files/r/packages/rray/R/compat-vctrs-arith.R:31:  f &lt;- rray_arith_unary_op_switch(op)
+~/files/r/packages/rray/R/compat-vctrs-arith.R:38:#' @method vec_arith.vctrs_rray numeric
+~/files/r/packages/rray/R/compat-vctrs-arith.R:40:vec_arith.vctrs_rray.numeric &lt;- vec_arith.vctrs_rray.vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:42:#' @method vec_arith.numeric vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:44:vec_arith.numeric.vctrs_rray &lt;- vec_arith.vctrs_rray.vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:49:#' @method vec_arith.vctrs_rray logical
+~/files/r/packages/rray/R/compat-vctrs-arith.R:51:vec_arith.vctrs_rray.logical &lt;- vec_arith.vctrs_rray.vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:53:#' @method vec_arith.logical vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:55:vec_arith.logical.vctrs_rray &lt;- vec_arith.vctrs_rray.vctrs_rray
+~/files/r/packages/rray/R/compat-vctrs-arith.R:59:rray_arith_unary_op_switch &lt;- function(op, x) {
+~/files/r/packages/rray/R/compat-vctrs-arith.R:65:    glubort(&quot;Unary arithmetic operation not known: {op}.&quot;)
+~/files/r/packages/rray/R/compat-vctrs-arith.R:69:rray_arith_binary_op_switch &lt;- function(op) {
+~/files/r/packages/rray/R/compat-vctrs-arith.R:72:    &quot;+&quot; = rray_add,
+~/files/r/packages/rray/R/compat-vctrs-arith.R:79:    &quot;%%&quot; = rray_arith_binary_generator(`%%`),
+~/files/r/packages/rray/R/compat-vctrs-arith.R:80:    &quot;%/%&quot; = rray_arith_binary_generator(`%/%`),
+~/files/r/packages/rray/R/compat-vctrs-arith.R:81:    glubort(&quot;Binary arithmetic operation not known: {op}.&quot;)
+~/files/r/packages/rray/R/compat-vctrs-arith.R:91:rray_arith_binary_generator &lt;- function(f) {
+src/init.c:98:extern r_obj* ffi_rray_add(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+src/init.c:178:  {&quot;ffi_rray_add&quot;, (DL_FUNC) &amp;ffi_rray_add, 3},
+src/arithmetic-add.h:8:r_obj* rray_add(
+src/arithmetic-divide.c:1:#include &quot;arithmetic-divide.h&quot;
+src/arithmetic-divide.c:3:#include &quot;arithmetic.h&quot;
+src/arithmetic-divide.c:9:#include &quot;decl/arithmetic-divide-decl.h&quot;
+src/arithmetic-divide.c:23:  return rray_binary_arithmetic(
+src/arithmetic-divide.c:33:static rray_binary_arithmetic_fn rray_divide_switch(
+src/arithmetic-divide.c:91:    stop_unsupported_arithmetic(&quot;/&quot;, x, y, x_arg, y_arg, error_call);
+src/arithmetic-add.c:1:#include &quot;arithmetic-add.h&quot;
+src/arithmetic-add.c:5:#include &quot;arithmetic.h&quot;
+src/arithmetic-add.c:11:#include &quot;decl/arithmetic-add-decl.h&quot;
+src/arithmetic-add.c:13:r_obj* ffi_rray_add(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+src/arithmetic-add.c:15:  return rray_add(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+src/arithmetic-add.c:18:r_obj* rray_add(
+src/arithmetic-add.c:25:  return rray_binary_arithmetic(
+src/arithmetic-add.c:28:    rray_add_switch,
+src/arithmetic-add.c:35:static rray_binary_arithmetic_fn rray_add_switch(
+src/arithmetic-add.c:49:    return rray_add_lgl_lgl;
+src/arithmetic-add.c:51:    return (side == RRAY_SIDE_right) ? rray_add_lgl_int : rray_add_int_lgl;
+src/arithmetic-add.c:53:    return (side == RRAY_SIDE_right) ? rray_add_lgl_dbl : rray_add_dbl_lgl;
+src/arithmetic-add.c:55:    return (side == RRAY_SIDE_right) ? rray_add_lgl_cpl : rray_add_cpl_lgl;
+src/arithmetic-add.c:57:    return rray_add_int_int;
+src/arithmetic-add.c:59:    return (side == RRAY_SIDE_right) ? rray_add_int_dbl : rray_add_dbl_int;
+src/arithmetic-add.c:61:    return (side == RRAY_SIDE_right) ? rray_add_int_cpl : rray_add_cpl_int;
+src/arithmetic-add.c:63:    return rray_add_dbl_dbl;
+src/arithmetic-add.c:65:    return (side == RRAY_SIDE_right) ? rray_add_dbl_cpl : rray_add_cpl_dbl;
+src/arithmetic-add.c:67:    return rray_add_cpl_cpl;
+src/arithmetic-add.c:87:    stop_unsupported_arithmetic(&quot;+&quot;, x, y, x_arg, y_arg, error_call);
+src/arithmetic-add.c:107:static r_obj* rray_add_lgl_lgl(
+src/arithmetic-add.c:124:    rray_add_int_one
+src/arithmetic-add.c:128:static r_obj* rray_add_lgl_int(
+src/arithmetic-add.c:145:    rray_add_int_one
+src/arithmetic-add.c:149:static r_obj* rray_add_int_lgl(
+src/arithmetic-add.c:166:    rray_add_int_one
+src/arithmetic-add.c:170:static r_obj* rray_add_lgl_dbl(
+src/arithmetic-add.c:187:    rray_add_dbl_one
+src/arithmetic-add.c:191:static r_obj* rray_add_dbl_lgl(
+src/arithmetic-add.c:208:    rray_add_dbl_one
+src/arithmetic-add.c:212:static r_obj* rray_add_lgl_cpl(
+src/arithmetic-add.c:229:    rray_add_cpl_one
+src/arithmetic-add.c:233:static r_obj* rray_add_cpl_lgl(
+src/arithmetic-add.c:250:    rray_add_cpl_one
+src/arithmetic-add.c:254:static r_obj* rray_add_int_int(
+src/arithmetic-add.c:271:    rray_add_int_one
+src/arithmetic-add.c:275:static r_obj* rray_add_int_dbl(
+src/arithmetic-add.c:292:    rray_add_dbl_one
+src/arithmetic-add.c:296:static r_obj* rray_add_dbl_int(
+src/arithmetic-add.c:313:    rray_add_dbl_one
+src/arithmetic-add.c:317:static r_obj* rray_add_int_cpl(
+src/arithmetic-add.c:334:    rray_add_cpl_one
+src/arithmetic-add.c:338:static r_obj* rray_add_cpl_int(
+src/arithmetic-add.c:355:    rray_add_cpl_one
+src/arithmetic-add.c:359:static r_obj* rray_add_dbl_dbl(
+src/arithmetic-add.c:376:    rray_add_dbl_one
+src/arithmetic-add.c:380:static r_obj* rray_add_dbl_cpl(
+src/arithmetic-add.c:397:    rray_add_cpl_one
+src/arithmetic-add.c:401:static r_obj* rray_add_cpl_dbl(
+src/arithmetic-add.c:418:    rray_add_cpl_one
+src/arithmetic-add.c:422:static r_obj* rray_add_cpl_cpl(
+src/arithmetic-add.c:439:    rray_add_cpl_one
+src/arithmetic-add.c:443:static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+src/arithmetic-add.c:455:static inline double rray_add_dbl_one(
+src/arithmetic-add.c:463:static inline r_complex rray_add_cpl_one(
+src/rlang/obj.c:105:const char* obj_address_formatter = &quot;%p&quot;;
+src/rlang/obj.c:107:r_obj* r_obj_address(r_obj* x) {
+src/rlang/obj.c:109:    snprintf(buf, 1000, obj_address_formatter, (void*) x);
+src/rlang/obj.c:131:    const char* null_addr = r_str_c_string(r_obj_address(r_null));
+src/rlang/obj.c:132:    if (null_addr[0] != '0' || null_addr[1] != 'x') {
+src/rlang/obj.c:133:        obj_address_formatter = &quot;0x%p&quot;;
+src/arithmetic-subtract.c:1:#include &quot;arithmetic-subtract.h&quot;
+src/arithmetic-subtract.c:5:#include &quot;arithmetic.h&quot;
+src/arithmetic-subtract.c:11:#include &quot;decl/arithmetic-subtract-decl.h&quot;
+src/arithmetic-subtract.c:25:  return rray_binary_arithmetic(
+src/arithmetic-subtract.c:35:static rray_binary_arithmetic_fn rray_subtract_switch(
+src/arithmetic-subtract.c:93:    stop_unsupported_arithmetic(&quot;-&quot;, x, y, x_arg, y_arg, error_call);
+~/files/r/packages/vctrs/R/type-factor.R:43:vec_proxy.factor &lt;- function(x, ...) {
+~/files/r/packages/vctrs/R/type-factor.R:48:vec_proxy.ordered &lt;- function(x, ...) {
+~/files/r/packages/vctrs/R/type-factor.R:53:vec_restore.factor &lt;- function(x, to, ...) {
+~/files/r/packages/vctrs/R/type-factor.R:58:vec_restore.ordered &lt;- function(x, to, ...) {
+~/files/r/packages/vctrs/R/type-factor.R:233:# Math and arithmetic -----------------------------------------------------
+~/files/r/packages/vctrs/R/type-factor.R:241:vec_arith.factor &lt;- function(op, x, y, ...) {
+src/decl/arithmetic-exponentiate-decl.h:1:static rray_binary_arithmetic_fn rray_exponentiate_switch(
+~/files/r/packages/vctrs/src/rank.c:24:                  r_obj* chr_proxy_collate) {
+~/files/r/packages/vctrs/src/rank.c:36:    chr_proxy_collate
+~/files/r/packages/vctrs/src/rank.c:47:                r_obj* chr_proxy_collate) {
+~/files/r/packages/vctrs/src/rank.c:86:  r_obj* info = KEEP(vec_order_info(x, direction, na_value, nan_distinct, chr_proxy_collate));
+tests/testthat/test-wrapper.R:130:  expect_identical_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:137:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:144:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:151:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:158:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:165:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:174:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:181:  expect_different_addresses(wrapper_readonly(w), x)
+tests/testthat/test-wrapper.R:191:  x_clone_address &lt;- obj_address(wrapper_readonly(w))
+tests/testthat/test-wrapper.R:192:  expect_false(x_clone_address == obj_address(x))
+tests/testthat/test-wrapper.R:195:  x_clone_address2 &lt;- obj_address(wrapper_readonly(w))
+tests/testthat/test-wrapper.R:196:  expect_true(x_clone_address == x_clone_address2)
+tests/testthat/test-wrapper.R:204:  x_clone_address &lt;- obj_address(wrapper_readonly(w))</pre><p class="cut">104 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,130p' R/arithmetic.R; sed -n '1,130p' src/arithmetic.c; sed -n '1,115p' src/arithme…</summary>
+<pre>$ sed -n '1,130p' R/arithmetic.R; sed -n '1,130p' src/arithmetic.c; sed -n '1,115p' src/arithmetic-add.c; sed -n '1,130p' ~/files/r/packages/rray/R/compat-vctrs-arith.R; rg -n &quot;vec_arith\.vctrs_vctr|vec_arith_base|vec_math_base|vec_restore\(&quot; ~/files/r/packages/vctrs/R | head -n 120</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#' Array arithmetic
+#'
+#' @description
+#' - `rray_add()` adds two arrays elementwise.
+#'
+#' - `rray_subtract()` subtracts two arrays elementwise.
+#'
+#' - `rray_multiply()` multiplies two arrays elementwise.
+#'
+#' - `rray_divide()` divides two arrays elementwise.
+#'
+#' - `rray_exponentiate()` raises the elements of one array to the power of
+#'   the elements of another.
+#'
+#' @details
+#' The arrays are broadcast to common dimensions first, so they do not have to
+#' be the same shape.
+#'
+#' If the result of an integer operation would overflow, an error is thrown.
+#'
+#' @section Casting:
+#' Certain inputs are upcast, changing the return type:
+#'
+#' - `rray_add()`: logicals are cast to integer.
+#'
+#' - `rray_subtract()`: logicals are cast to integer.
+#'
+#' - `rray_multiply()`: logicals are cast to integer.
+#'
+#' - `rray_divide()`: logicals and integers are cast to double.
+#'
+#' - `rray_exponentiate()`: logicals and integers are cast to double.
+#'
+#' @param x An array.
+#'
+#' @param y An array.
+#'
+#' @returns
+#' An array with the common dimensions of `x` and `y`.
+#'
+#' @name arithmetic
+#' @examples
+#' x &lt;- array(1:6, c(3L, 2L))
+#'
+#' rray_add(x, 1L)
+#' rray_subtract(x, 1L)
+#' rray_multiply(x, 2L)
+#' rray_divide(x, 2L)
+#' rray_exponentiate(x, 2L)
+#'
+#' # Adding 10 to column 1 and 20 to column 2 via broadcasting
+#' rray_add(x, array(c(10L, 20L), c(1L, 2L)))
+#'
+#' # Scaling column 1 by 2 and column 2 by 3 the same way
+#' rray_multiply(x, array(c(2L, 3L), c(1L, 2L)))
+#'
+#' # Names are collected from both inputs, one axis at a time
+#' rows &lt;- array(1:3, c(3L, 1L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;)))
+#' cols &lt;- array(c(10L, 20L), c(1L, 2L), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+#' rray_add(rows, cols)
+#'
+#' # A broadcast axis loses its names, because they no longer describe the
+#' # result. `only` names a single row, but the result has three.
+#' cols &lt;- array(c(10L, 20L), c(1L, 2L), dimnames = list(&quot;only&quot;, c(&quot;c1&quot;, &quot;c2&quot;)))
+#' rray_add(x, cols)
+NULL
+
+#' @rdname arithmetic
+#' @export
+rray_add &lt;- function(x, y) {
+  .Call(ffi_rray_add, x, y, environment())
+}
+
+#' @rdname arithmetic
+#' @export
+rray_subtract &lt;- function(x, y) {
+  .Call(ffi_rray_subtract, x, y, environment())
+}
+
+#' @rdname arithmetic
+#' @export
+rray_multiply &lt;- function(x, y) {
+  .Call(ffi_rray_multiply, x, y, environment())
+}
+
+#' @rdname arithmetic
+#' @export
+rray_divide &lt;- function(x, y) {
+  .Call(ffi_rray_divide, x, y, environment())
+}
+
+#' @rdname arithmetic
+#' @export
+rray_exponentiate &lt;- function(x, y) {
+  .Call(ffi_rray_exponentiate, x, y, environment())
+}
+#include &quot;arithmetic.h&quot;
+
+#include &quot;broadcast-names.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;size.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_binary_arithmetic(
+  r_obj* x,
+  r_obj* y,
+  rray_binary_arithmetic_switch_fn fn_switch,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  check_unclassed(y, y_arg, error_call);
+
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+  y = KEEP(arg_as_array(y, y_arg, error_call));
+
+  const rray_binary_arithmetic_fn fn =
+    fn_switch(x, y, x_arg, y_arg, error_call);
+
+  r_obj* x_dimensions = r_dim(x);
+  r_obj* y_dimensions = r_dim(y);
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int y_dimensionality =
+    rray_dimensionality_from_dimensions(y_dimensions);
+
+  r_obj* dimensions = KEEP(rray_dimensions2(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    x_arg,
+    y_arg,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  struct rray_iterator2 it;
+  rray_iterator2_init(
+    &amp;it,
+    size,
+    v_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality
+  );
+
+  r_obj* out = KEEP(fn(x, y, size, &amp;it, error_call));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+r_no_return void stop_unsupported_arithmetic(
+  const char* op,
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't apply `%s` to %s and %s.&quot;,
+    op,
+    rray_arg_type_format(x_arg, rray_typeof(x)),
+    rray_arg_type_format(y_arg, rray_typeof(y))
+  );
+}
+
+r_no_return void stop_int_overflow(struct r_lazy error_call) {
+  r_abort_lazy_call(error_call, &quot;Integer overflow.&quot;);
+}
+#include &quot;arithmetic-add.h&quot;
+
+#include &lt;limits.h&gt;
+</pre><p class="cut">262 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Designing S3 double dispatch pattern</strong></p>
+<p><strong>Planning explicit pairwise arithmetic dispatch</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Designing S3 double dispatch pattern</strong></p>
+<p><strong>Planning explicit pairwise arithmetic dispatch</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '1,150p' ~/files/r/packages/vctrs/R/arith.R; sed -n '1,145p' ~/f…</summary>
+<pre>$ sed -n '1,150p' ~/files/r/packages/vctrs/R/arith.R; sed -n '1,145p' ~/files/r/packages/vctrs/R/proxy.R; rg -n &quot;S3method|UseMethod|NextMethod|classed|unclass|proxy|restore|reconstruct&quot; R NAMESPACE tests/testthat | head -n 250; sed -n '1,130p' src/type.c; sed -n '1,100p' src/utils.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#' Arithmetic operations
+#'
+#' This generic provides a common double dispatch mechanism for all infix
+#' operators (`+`, `-`, `/`, `*`, `^`, `%%`, `%/%`, `!`, `&amp;`, `|`). It is used
+#' to power the default arithmetic and boolean operators for [vctr]s objects,
+#' overcoming the limitations of the base [Ops] generic.
+#'
+#' `vec_arith_base()` is provided as a convenience for writing methods. It
+#' recycles `x` and `y` to common length then calls the base operator with the
+#' underlying [vec_data()].
+#'
+#' `vec_arith()` is also used in `diff.vctrs_vctr()` method via `-`.
+#'
+#' @param op An arithmetic operator as a string
+#' @param x,y A pair of vectors. For `!`, unary `+` and unary `-`, `y` will be
+#'   a sentinel object of class `MISSING`, as created by `MISSING()`.
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @seealso [stop_incompatible_op()] for signalling that an arithmetic
+#'   operation is not permitted/supported.
+#' @seealso See [vec_math()] for the equivalent for the unary mathematical
+#'   functions.
+#' @export
+#' @keywords internal
+#' @examples
+#' d &lt;- as.Date(&quot;2018-01-01&quot;)
+#' dt &lt;- as.POSIXct(&quot;2018-01-02 12:00&quot;)
+#' t &lt;- as.difftime(12, unit = &quot;hours&quot;)
+#'
+#' vec_arith(&quot;-&quot;, dt, 1)
+#' vec_arith(&quot;-&quot;, dt, t)
+#' vec_arith(&quot;-&quot;, dt, d)
+#'
+#' vec_arith(&quot;+&quot;, dt, 86400)
+#' vec_arith(&quot;+&quot;, dt, t)
+#' vec_arith(&quot;+&quot;, t, t)
+#'
+#' vec_arith(&quot;/&quot;, t, t)
+#' vec_arith(&quot;/&quot;, t, 2)
+#'
+#' vec_arith(&quot;*&quot;, t, 2)
+vec_arith &lt;- function(op, x, y, ...) {
+  check_dots_empty0(...)
+  UseMethod(&quot;vec_arith&quot;, x)
+}
+
+#' @export
+#' @rdname vec_arith
+vec_arith.default &lt;- function(op, x, y, ...) {
+  stop_incompatible_op(op, x, y)
+}
+
+# Atomic vectors ----------------------------------------------------------
+
+#' @rdname vec_arith
+#' @export vec_arith.logical
+#' @method vec_arith logical
+#' @export
+vec_arith.logical &lt;- function(op, x, y, ...) UseMethod(&quot;vec_arith.logical&quot;, y)
+#' @method vec_arith.logical default
+#' @export
+vec_arith.logical.default &lt;- function(op, x, y, ...) {
+  stop_incompatible_op(op, x, y)
+}
+#' @method vec_arith.logical logical
+#' @export
+vec_arith.logical.logical &lt;- function(op, x, y, ...) vec_arith_base(op, x, y)
+#' @method vec_arith.logical numeric
+#' @export
+vec_arith.logical.numeric &lt;- function(op, x, y, ...) vec_arith_base(op, x, y)
+
+#' @rdname vec_arith
+#' @export vec_arith.numeric
+#' @method vec_arith numeric
+#' @export
+vec_arith.numeric &lt;- function(op, x, y, ...) UseMethod(&quot;vec_arith.numeric&quot;, y)
+#' @method vec_arith.numeric default
+#' @export
+vec_arith.numeric.default &lt;- function(op, x, y, ...) {
+  stop_incompatible_op(op, x, y)
+}
+#' @method vec_arith.numeric logical
+#' @export
+vec_arith.numeric.logical &lt;- function(op, x, y, ...) vec_arith_base(op, x, y)
+#' @method vec_arith.numeric numeric
+#' @export
+vec_arith.numeric.numeric &lt;- function(op, x, y, ...) vec_arith_base(op, x, y)
+
+# Helpers -----------------------------------------------------------------
+
+#' @export
+#' @rdname vec_arith
+vec_arith_base &lt;- function(op, x, y) {
+  args &lt;- vec_recycle_common(x, y)
+
+  op_fn &lt;- getExportedValue(&quot;base&quot;, op)
+  op_fn(vec_data(args[[1L]]), vec_data(args[[2L]]))
+}
+
+#' @export
+#' @rdname vec_arith
+MISSING &lt;- function() {
+  structure(list(), class = &quot;MISSING&quot;)
+}
+#' Proxy and restore
+#'
+#' @description
+#'
+#' `r lifecycle::badge(&quot;experimental&quot;)`
+#'
+#' `vec_proxy()` returns the data structure containing the values of a
+#' vector. This data structure is usually the vector itself. In this
+#' case the proxy is the [identity function][base::identity], which is
+#' the default `vec_proxy()` method.
+#'
+#' Only experts should implement special `vec_proxy()` methods, for
+#' these cases:
+#'
+#' - A vector has vectorised attributes, i.e. metadata for
+#'   each element of the vector. These _record types_ are implemented
+#'   in vctrs by returning a data frame in the proxy method. If you're
+#'   starting your class from scratch, consider deriving from the
+#'   [`rcrd`][new_rcrd] class. It implements the appropriate data
+#'   frame proxy and is generally the preferred way to create a record
+#'   class.
+#'
+#' - When you're implementing a vector on top of a non-vector type,
+#'   like an environment or an S4 object. This is currently only
+#'   partially supported.
+#'
+#' - S3 lists are considered scalars by default. This is the safe
+#'   choice for list objects such as returned by `stats::lm()`. To
+#'   declare that your S3 list class is a vector, you normally add
+#'   `&quot;list&quot;` to the right of your class vector. Explicit inheritance
+#'   from list is generally the preferred way to declare an S3 list in
+#'   R, for instance it makes it possible to dispatch on
+#'   `generic.list` S3 methods.
+#'
+#'   If you can't modify your class vector, you can implement an
+#'   identity proxy (i.e. a proxy method that just returns its input)
+#'   to let vctrs know this is a vector list and not a scalar.
+#'
+#' `vec_restore()` is the inverse operation of `vec_proxy()`. It
+#' should only be called on vector proxies.
+#'
+#' - It undoes the transformations of `vec_proxy()`.
+#'
+#' - It restores attributes and classes. These may be lost when the
+#'   memory values are manipulated. For example slicing a subset of a
+#'   vector's proxy causes a new proxy to be allocated.
+#'
+#' By default vctrs restores all attributes and classes
+#' automatically. You only need to implement a `vec_restore()` method
+#' if your class has attributes that depend on the data.
+#'
+#' @param x A vector.
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @section Proxying:
+#'
+#' You should only implement `vec_proxy()` when your type is designed
+#' around a non-vector class. I.e. anything that is not either:
+#'
+#' * An atomic vector
+#' * A bare list
+#' * A data frame
+#'
+#' In this case, implement `vec_proxy()` to return such a vector
+#' class. The vctrs operations such as [vec_slice()] are applied on
+#' the proxy and `vec_restore()` is called to restore the original
+#' representation of your type.
+#'
+#' The most common case where you need to implement `vec_proxy()` is
+#' for S3 lists. In vctrs, S3 lists are treated as scalars by
+#' default. This way we don't treat objects like model fits as
+#' vectors. To prevent vctrs from treating your S3 list as a scalar,
+#' unclass it in the `vec_proxy()` method. For instance, here is the
+#' definition for `list_of`:
+#'
+#' ```
+#' vec_proxy.vctrs_list_of &lt;- function(x) {
+#'   unclass(x)
+#' }
+#' ```
+#'
+#' Another case where you need to implement a proxy is [record
+#' types][new_rcrd]. Record types should return a data frame, as in
+#' the `POSIXlt` method:
+#'
+#' ```
+#' vec_proxy.POSIXlt &lt;- function(x) {
+#'   new_data_frame(unclass(x))
+#' }
+#' ```
+#'
+#' Note that you don't need to implement `vec_proxy()` when your class</pre><p class="cut">273 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing S3 dispatch challenges in rray</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing S3 dispatch challenges in rray</strong></p>
+<p><strong>Evaluating multidispatch and method naming in rray</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing S3 dispatch challenges in rray</strong></p>
+<p><strong>Evaluating multidispatch and method naming in rray</strong></p>
+<p><strong>Designing S3 arithmetic dispatch with restoration protocol</strong></p>
+</details>
+<p>The current split is already useful: <code>rray_binary_arithmetic()</code> owns broadcasting, storage-type selection, names, and the fast loop, while <code>check_unclassed()</code> is the gate that rejects classed inputs. I would keep that C path as the engine and put the future policy entirely in R dispatch.</p>
+
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing R matrix method dispatch</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing R matrix method dispatch</strong></p>
+<p><strong>Designing dual dispatch for mixed classes</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing R matrix method dispatch</strong></p>
+<p><strong>Designing dual dispatch for mixed classes</strong></p>
+<p><strong>Refining nested S3 dispatch strategy</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '1,180p' DESCRIPTION; sed -n '1,220p' NAMESPACE; rg -n &quot;vec_data|vec_restore|vctrs&quot; R …</summary>
+<pre>$ sed -n '1,180p' DESCRIPTION; sed -n '1,220p' NAMESPACE; rg -n &quot;vec_data|vec_restore|vctrs&quot; R src DESCRIPTION NAMESPACE | head -n 200; Rscript -e 'g &lt;- function(x, y) {if (!is.object(x) &amp;&amp; !is.object(y)) return(&quot;fast&quot;); UseMethod(&quot;g&quot;, x)}; g.default &lt;- function(x, y) {if (is.object(x)) return(&quot;x-error&quot;); UseMethod(&quot;g.default&quot;, y)}; g.default.foo &lt;- function(x, y) &quot;bare-foo&quot;; g.foo &lt;- function(x,y) UseMethod(&quot;g.foo&quot;, y); g.foo.numeric &lt;- function(x,y) &quot;foo-numeric&quot;; print(g(1:2,1:2)); print(g(1:2,structure(1:2,class=&quot;foo&quot;))); print(g(structure(1:2,class=&quot;foo&quot;),1:2))'</pre><pre class="output">Script completed
+Wall time 0.6 seconds
+Output:
+
+Package: rray4
+Title: Array Helpers
+Version: 0.0.0.9000
+Authors@R:
+    person(&quot;Davis&quot;, &quot;Vaughan&quot;, , &quot;davis@posit.co&quot;, role = c(&quot;aut&quot;, &quot;cre&quot;))
+Description: A toolkit for broadcasting, reshaping, reducing, and indexing
+    arrays.
+License: MIT + file LICENSE
+URL: https://github.com/DavisVaughan/rray4
+BugReports: https://github.com/DavisVaughan/rray4/issues
+Imports:
+    rlang,
+    vctrs
+Suggests:
+    testthat (&gt;= 3.0.0)
+Config/build/compilation-database: true
+Config/testthat/edition: 3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+# Generated by roxygen2: do not edit by hand
+
+export(rray_add)
+export(rray_axis_names)
+export(rray_broadcast)
+export(rray_broadcast_common)
+export(rray_col_names)
+export(rray_dimensionality)
+export(rray_dimensions)
+export(rray_dimensions_common)
+export(rray_divide)
+export(rray_equal)
+export(rray_exponentiate)
+export(rray_greater_than)
+export(rray_greater_than_or_equal)
+export(rray_less_than)
+export(rray_less_than_or_equal)
+export(rray_multiply)
+export(rray_names)
+export(rray_not_equal)
+export(rray_pmax)
+export(rray_pmin)
+export(rray_prod)
+export(rray_row_names)
+export(rray_set_axis_names)
+export(rray_set_col_names)
+export(rray_set_dimensions)
+export(rray_set_names)
+export(rray_set_row_names)
+export(rray_size)
+export(rray_split)
+export(rray_squeeze)
+export(rray_subtract)
+export(rray_sum)
+import(rlang)
+import(vctrs)
+useDynLib(rray4, .registration = TRUE)
+NAMESPACE:36:import(vctrs)
+DESCRIPTION:13:    vctrs
+R/rray4-package.R:8:#' @import vctrs
+src/rlang/c-utils.h:161:// https://github.com/r-lib/vctrs/pull/1968
+src/rlang/dyn-array.c:15:    r_obj* vec_data = r_alloc_vector(type, capacity);
+src/rlang/dyn-array.c:16:    r_list_poke(shelter, 1, vec_data);
+src/rlang/dyn-array.c:25:    p_vec-&gt;data = vec_data;
+src/rlang/dyn-array.c:38:        p_vec-&gt;v_data = r_vec_begin0(type, vec_data);
+src/rlang/dyn-array.c:41:    p_vec-&gt;v_data_const = r_vec_cbegin0(type, vec_data);
+src/utils.c:147:    r_parse(&quot;vctrs::vec_cast(x, to, x_arg = x_arg, to_arg = to_arg)&quot;);
+[1] &quot;fast&quot;
+[1] &quot;bare-foo&quot;
+[1] &quot;foo-numeric&quot;</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'library(vctrs); x &lt;- structure(array(1:4,c(2,2)), class=c(&quot;foo&quot;,&quot;matrix&quot;,&quot;array&quot;)…</summary>
+<pre>$ Rscript -e 'library(vctrs); x &lt;- structure(array(1:4,c(2,2)), class=c(&quot;foo&quot;,&quot;matrix&quot;,&quot;array&quot;), unit=&quot;x&quot;); str(vec_data(x)); print(attributes(vec_data(x))); str(vec_proxy(x)); print(attributes(vec_proxy(x))); print(vec_restore(vec_data(x), x))'</pre><pre class="output">Script completed
+Wall time 0.6 seconds
+Output:
+
+ int [1:2, 1:2] 1 2 3 4
+$dim
+[1] 2 2
+
+ 'foo' int [1:2, 1:2] 1 2 3 4
+ - attr(*, &quot;unit&quot;)= chr &quot;x&quot;
+$dim
+[1] 2 2
+
+$class
+[1] &quot;foo&quot;    &quot;matrix&quot; &quot;array&quot; 
+
+$unit
+[1] &quot;x&quot;
+
+     [,1] [,2]
+[1,]    1    3
+[2,]    2    4
+attr(,&quot;class&quot;)
+[1] &quot;foo&quot;    &quot;matrix&quot; &quot;array&quot; 
+attr(,&quot;unit&quot;)
+[1] &quot;x&quot;</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning custom vector addition with restoration</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning custom vector addition with restoration</strong></p>
+<p><strong>Designing method dispatch for rray_add</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning custom vector addition with restoration</strong></p>
+<p><strong>Designing method dispatch for rray_add</strong></p>
+<p><strong>Refining S3 dispatch and base helper design</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning custom vector addition with restoration</strong></p>
+<p><strong>Designing method dispatch for rray_add</strong></p>
+<p><strong>Refining S3 dispatch and base helper design</strong></p>
+<p><strong>Planning helper exports and double dispatch</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning custom vector addition with restoration</strong></p>
+<p><strong>Designing method dispatch for rray_add</strong></p>
+<p><strong>Refining S3 dispatch and base helper design</strong></p>
+<p><strong>Planning helper exports and double dispatch</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n &quot;^vec_data|ffi_vec_data|vec_data &lt;-&quot; ~/files/r/packages/vctrs/R ~…</summary>
+<pre>$ rg -n &quot;^vec_data|ffi_vec_data|vec_data &lt;-&quot; ~/files/r/packages/vctrs/R ~/files/r/packages/vctrs/src | head -n 80; sed -n '145,240p' ~/files/r/packages/vctrs/R/proxy.R; sed -n '255,360p' ~/files/r/packages/vctrs/R/proxy.R</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+~/files/r/packages/vctrs/R/proxy.R:202:vec_data &lt;- function(x) {
+}
+
+#' @rdname vec_proxy
+#' @param to The original vector to restore to.
+#' @export
+vec_restore &lt;- function(x, to, ...) {
+  check_dots_empty0(...)
+  return(.Call(ffi_vec_restore, x, to))
+  UseMethod(&quot;vec_restore&quot;, to)
+}
+vec_restore_dispatch &lt;- function(x, to, ...) {
+  UseMethod(&quot;vec_restore&quot;, to)
+}
+#' @export
+vec_restore.default &lt;- function(x, to, ...) {
+  .Call(ffi_vec_restore_default, x, to)
+}
+vec_restore_default &lt;- function(x, to, ...) {
+  .Call(ffi_vec_restore_default, x, to)
+}
+
+vec_proxy_recurse &lt;- function(x, ...) {
+  .Call(ffi_vec_proxy_recurse, x)
+}
+vec_restore_recurse &lt;- function(x, to, ...) {
+  .Call(ffi_vec_restore_recurse, x, to)
+}
+
+#' Extract underlying data
+#'
+#' @description
+#'
+#' `r lifecycle::badge(&quot;experimental&quot;)`
+#'
+#' Extract the data underlying an S3 vector object, i.e. the underlying
+#' (named) atomic vector, data frame, or list.
+#'
+#' @param x A vector or object implementing `vec_proxy()`.
+#' @return The data underlying `x`, free from any attributes except the names.
+#'
+#' @section Difference with `vec_proxy()`:
+#'
+#' * `vec_data()` returns unstructured data. The only attributes
+#'   preserved are names, dims, and dimnames.
+#'
+#'   Currently, due to the underlying memory architecture of R, this
+#'   creates a full copy of the data for atomic vectors.
+#'
+#' * `vec_proxy()` may return structured data. This generic is the
+#'   main customisation point for accessing memory values in vctrs,
+#'   along with [vec_restore()].
+#'
+#'   Methods must return a vector type. Records and data frames will
+#'   be processed rowwise.
+#'
+#' @keywords internal
+#' @export
+vec_data &lt;- function(x) {
+  obj_check_vector(x)
+  x &lt;- vec_proxy(x)
+
+  if (is.data.frame(x)) {
+    return(new_data_frame(x, row.names = .row_names_info(x, 0L)))
+  }
+
+  if (has_dim(x)) {
+    x &lt;- vec_set_attributes(x, list(dim = dim(x), dimnames = dimnames(x)))
+  } else {
+    x &lt;- vec_set_attributes(x, list(names = names(x)))
+  }
+
+  # Unset S4 bit in vector-like S4 objects
+  as_not_s4(x)
+}
+as_not_s4 &lt;- function(x) {
+  .Call(ffi_as_not_s4, x)
+}</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating class stripping and copying strategies</strong></p>
+<p><strong>Designing zero-copy storage generic with class handling</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating class stripping and copying strategies</strong></p>
+<p><strong>Designing zero-copy storage generic with class handling</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating class stripping and copying strategies</strong></p>
+<p><strong>Designing zero-copy storage generic with class handling</strong></p>
+<p><strong>Planning class-aware base addition implementation</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating class stripping and copying strategies</strong></p>
+<p><strong>Designing zero-copy storage generic with class handling</strong></p>
+<p><strong>Planning class-aware base addition implementation</strong></p>
+<p><strong>Outlining multi-dispatch and restoration strategies</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating class stripping and copying strategies</strong></p>
+<p><strong>Designing zero-copy storage generic with class handling</strong></p>
+<p><strong>Planning class-aware base addition implementation</strong></p>
+<p><strong>Outlining multi-dispatch and restoration strategies</strong></p>
+<p><strong>Defining S3 double-dispatch methods for class pairs</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating class stripping and copying strategies</strong></p>
+<p><strong>Designing zero-copy storage generic with class handling</strong></p>
+<p><strong>Planning class-aware base addition implementation</strong></p>
+<p><strong>Outlining multi-dispatch and restoration strategies</strong></p>
+<p><strong>Defining S3 double-dispatch methods for class pairs</strong></p>
+</details>
+<p>I would use vctrs-style nested S3 dispatch, followed by a deliberately non-generic native helper. The pair method grants permission, the native helper performs the calculation, and the pair method decides how to restore the result.</p>
+<pre><code class="language-r">rray_add &lt;- function(x, y) {
+  if (!is.object(x) &amp;&amp; !is.object(y)) {
+    return(rray_add_base(x, y))
+  }
+
+  UseMethod(&quot;rray_add&quot;, x)
+}
+
+rray_add.default &lt;- function(x, y) {
+  if (is.object(x)) {
+    stop_incompatible_add(x, y)
+  }
+
+  UseMethod(&quot;rray_add.default&quot;, y)
+}
+
+rray_add.default.default &lt;- function(x, y) {
+  stop_incompatible_add(x, y)
+}
+</code></pre>
+<p>A class author would provide the second dispatch:</p>
+<pre><code class="language-r">rray_add.quantity &lt;- function(x, y) {
+  UseMethod(&quot;rray_add.quantity&quot;, y)
+}
+
+rray_add.quantity.default &lt;- function(x, y) {
+  stop_incompatible_add(x, y)
+}
+
+rray_add.quantity.quantity &lt;- function(x, y) {
+  check_compatible_units(x, y)
+
+  out &lt;- rray_add_base(x, y)
+
+  vec_restore(out, x)
+}
+</code></pre>
+<p>This has the desired properties:</p>
+<ul>
+<li><code>quantity + quantity</code> exists only because <code>rray_add.quantity.quantity()</code> opts into it.</li>
+<li><code>quantity + duration</code> remains an error unless someone defines <code>rray_add.quantity.duration()</code>.</li>
+<li>The reverse direction is separate. <code>rray_add.duration.quantity()</code> must also exist if it is valid.</li>
+<li>A method can restore from <code>x</code>, restore from <code>y</code>, construct a different class, or leave the result bare.</li>
+</ul>
+<p>For interoperability with bare inputs, the class author could explicitly provide methods such as:</p>
+<pre><code class="language-r">rray_add.quantity.numeric &lt;- function(x, y) {
+  out &lt;- rray_add_base(x, y)
+  vec_restore(out, x)
+}
+
+rray_add.default.quantity &lt;- function(x, y) {
+  out &lt;- rray_add_base(x, y)
+  vec_restore(out, y)
+}
+</code></pre>
+<p>The exact base-type bridge may need methods for <code>numeric</code>, <code>integer</code>, <code>array</code>, and similar implicit S3 classes. I would keep those explicit rather than providing a permissive fallback.</p>
+<p><code>rray_add_base()</code> would be the extension API around the existing fast implementation:</p>
+<pre><code class="language-r">rray_add_base &lt;- function(x, y) {
+  .Call(ffi_rray_add_base, x, y, environment())
+}
+</code></pre>
+<p>Its contract would be narrow:</p>
+<ul>
+<li>Do no S3 dispatch.</li>
+<li>Treat <code>x</code> and <code>y</code> according to their underlying R storage types.</li>
+<li>Perform the existing broadcasting, casting, names handling, and native loop.</li>
+<li>Ignore their classes.</li>
+<li>Return a bare array.</li>
+<li>Never restore a class automatically.</li>
+</ul>
+<p>For an ordinary atomic S3 class, the C code can read the storage directly without first copying through <code>vec_data()</code>. Classes with a different proxy representation can extract it themselves:</p>
+<pre><code class="language-r">out &lt;- rray_add_base(vec_data(x), vec_data(y))
+</code></pre>
+<p>On the C side, I would split the current path at <code>check_unclassed()</code>:</p>
+<ol>
+<li>The ordinary bare-array entry point remains strict.</li>
+<li>The extension entry point skips the class check.</li>
+<li>Both call the same <code>rray_binary_arithmetic()</code> machinery beneath that check.</li>
+</ol>
+<p>I would use <code>vec_restore()</code> as the default reconstruction tool rather than inventing another restoration generic. It already has the right contract: the native result supplies the new storage, dimensions, and names, while the original object supplies its class and other attributes. When the result class depends on both operands, such as multiplication of units, the pair method can call a constructor instead.</p>
+<p>The important boundary is that <code>rray_add_base()</code> does not itself authorize arithmetic. Only a concrete pair method should be able to reach it. I would also keep separate generics for add, subtract, multiply, and so on. That makes permission operation-specific, so defining multiplication for two classes does not accidentally authorize addition.</p>
+
+</section>
+<p class="divider">Sep 10, 2026, 22:59 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>It’s a tough balance because on one hand I’d like the rray system to be reliable to program with and that relies on authors doing reasonable things and upholding invariants. The vctrs system is nice to program with for example</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing vctrs reliability design</strong></p>
+<p><strong>Designing generic arithmetic pair negotiation</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing vctrs reliability design</strong></p>
+<p><strong>Designing generic arithmetic pair negotiation</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing vctrs reliability design</strong></p>
+<p><strong>Designing generic arithmetic pair negotiation</strong></p>
+<p><strong>Refining arithmetic operation planning framework</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing vctrs reliability design</strong></p>
+<p><strong>Designing generic arithmetic pair negotiation</strong></p>
+<p><strong>Refining arithmetic operation planning framework</strong></p>
+<p><strong>Defining invariant enforcement for arithmetic methods</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing vctrs reliability design</strong></p>
+<p><strong>Designing generic arithmetic pair negotiation</strong></p>
+<p><strong>Refining arithmetic operation planning framework</strong></p>
+<p><strong>Defining invariant enforcement for arithmetic methods</strong></p>
+<p><strong>Recommending progressive arithmetic method design</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing vctrs reliability design</strong></p>
+<p><strong>Designing generic arithmetic pair negotiation</strong></p>
+<p><strong>Refining arithmetic operation planning framework</strong></p>
+<p><strong>Defining invariant enforcement for arithmetic methods</strong></p>
+<p><strong>Recommending progressive arithmetic method design</strong></p>
+</details>
+<p>Yes. The useful boundary is to trust authors with semantic decisions, while rray continues to enforce structural invariants.</p>
+<p>I would revise the earlier idea slightly: the raw unchecked C entry point should remain internal. The extension API should be a safe helper that owns the full mechanical pipeline:</p>
+<pre><code class="language-r">rray_add.quantity.quantity &lt;- function(x, y) {
+  check_compatible_units(x, y)
+
+  y &lt;- vec_cast(y, x)
+
+  rray_add_base(x, y, .to = x)
+}
+</code></pre>
+<p>Conceptually, <code>rray_add_base()</code> would:</p>
+<ol>
+<li>Access the underlying storage without dispatching again.</li>
+<li>Run rray’s native broadcasting and addition.</li>
+<li>Produce the dimensions and names itself.</li>
+<li>Restore the result with <code>vec_restore(out, .to)</code>.</li>
+<li>Check that restoration did not change structural properties such as size and dimensions.</li>
+</ol>
+<p>The method author decides only:</p>
+<ul>
+<li>Whether the pair is meaningful.</li>
+<li>Whether either operand needs conversion.</li>
+<li>What the output prototype is.</li>
+</ul>
+<p>For a result that should be bare:</p>
+<pre><code class="language-r">rray_add_base(x, y)
+</code></pre>
+<p>For a result that retains the left class:</p>
+<pre><code class="language-r">rray_add_base(x, y, .to = x)
+</code></pre>
+<p>For a result with metadata derived from both inputs:</p>
+<pre><code class="language-r">to &lt;- new_quantity_ptype(unit = common_unit(x, y))
+rray_add_base(x, y, .to = to)
+</code></pre>
+<p>For operations where the output represents something different:</p>
+<pre><code class="language-r">to &lt;- new_quantity_ptype(unit = multiply_units(x, y))
+rray_multiply_base(x, y, .to = to)
+</code></pre>
+<p>This feels closer to why vctrs is pleasant. A correct method is short and mostly declarative. Authors do not have to reproduce broadcasting, names handling, storage promotion, native invocation, or reconstruction mechanics.</p>
+<p>There should still be hard errors by default:</p>
+<pre><code class="language-r">rray_add.quantity.default &lt;- function(x, y) {
+  stop_incompatible_add(x, y)
+}
+</code></pre>
+<p>I would avoid any default method that says “both objects have numeric storage, so addition is probably fine.” Numeric storage is an implementation detail, not permission to add the classes.</p>
+<p>There is a possible stronger design where the double-dispatch method returns a calculation plan:</p>
+<pre><code class="language-r">rray_add_plan.quantity.quantity &lt;- function(x, y) {
+  rray_arith_plan(
+    x = x,
+    y = vec_cast(y, x),
+    to = x
+  )
+}
+</code></pre>
+<p>Then <code>rray_add()</code> would execute the plan itself. That gives rray even more control, but it also creates a new abstraction that might become awkward for unusual classes. I would not start there.</p>
+<p>The smaller vctrs-like design seems like the right balance:</p>
+<ul>
+<li>Pair methods explicitly authorize semantics.</li>
+<li><code>vec_cast()</code> handles required conversions.</li>
+<li><code>rray_add_base()</code> handles array mechanics.</li>
+<li><code>vec_restore()</code> handles reconstruction.</li>
+<li>The default is always incompatibility.</li>
+<li>Authors can violate the contract, as with any S3 method, but the correct path is the shortest and easiest one.</li>
+</ul>
+
+</section>
+</main>
+</body>
+</html>

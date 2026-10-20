@@ -1,0 +1,2069 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documenting the optimization sections of strided-iterator.h</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-61">rray timeline</a>
+<h1>Documenting the optimization sections of <code>strided-iterator.h</code></h1>
+<p class="facts">Codex · Sep 12, 2026 · 9 prompts · 23 replies · <a href="https://github.com/r-lib/rray/pull/61">#61</a></p>
+</header>
+<main>
+<p class="divider">Sep 12, 2026, 19:10 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I have since merged in these optimizations in strided-iterator.h</p>
+<p>Now I’d like to document them well</p>
+<p>Add feature/document branch</p>
+<p>Before “For broadcasting” add</p>
+<p>// ———- (all the way across)<br />
+// Examples<br />
+//</p>
+<p>Then after the examples</p>
+<p>// ——<br />
+// Optimization - Coalescing<br />
+//<br />
+// &lt;bring up coalesce docs from below &gt;</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning feature branch creation</strong></p>
+</details>
+<p>I’ll create <code>feature/document</code>, then reorganize the iterator documentation so the examples come before broadcasting and the coalescing explanation sits with the optimization it describes. I’ll preserve the existing technical content and comment style.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; rg --files src | rg 'strided-iterator|iterator' &amp;&amp; rg -n &quot;For …</summary>
+<pre>$ git status --short --branch &amp;&amp; rg --files src | rg 'strided-iterator|iterator' &amp;&amp; rg -n &quot;For broadcasting|Coalesc|Examples|Optimization&quot; src plans --glob '!src/rlang/**'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## main...origin/main
+src/decl/strided-iterator-decl.h
+src/point-iterator.h
+src/strided-iterator.h
+plans/n-ary.md:324:### Coalescing interaction
+plans/optimize-stride-one.md:40:Not simply &quot;the first axis has a dimension of 1&quot;. Coalescing absorbs leading
+plans/implementation.md:309:**Coalesce.** Used by anything with two or more array inputs. For each axis of
+plans/implementation.md:328:that an earlier input already filled. Coalescing is just that &quot;don't overwrite&quot;
+src/strided-iterator.h:15:// For broadcasting, the dimensions you broadcast to make up the larger point
+src/strided-iterator.h:370:// Coalescing axes is an important optimization used to reduce the number of
+src/strided-iterator.h:392://   Coalescing produces dimensions [6, 4], making it the same as the broadcast</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Inspecting entire header structure</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '1,460p' src/strided-iterator.h</summary>
+<pre>$ sed -n '1,460p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator
+//
+// Walks the multidimensional point space defined by `v_dimensions`. Reports a
+// 1D `location` in an alternate subspace defined by `v_strides`.
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can fetch
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can fetch `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can fetch `location`s back into your original array
+// to pull from.
+struct rray_strided_iterator {
+  r_ssize index;
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize location;
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator rray_strided_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_max_dimensionality(dimensionality);
+
+  struct rray_strided_iterator it;
+
+  it.index = 0;
+  it.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    it.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    it.v_strides[i] = v_strides[i];
+  }
+  memset(it.v_point, 0, sizeof(r_ssize) * dimensionality);
+  it.location = 0;
+
+  it.dimensionality = rray__strided_iterator_axes_coalesce(
+    it.v_dimensions,
+    it.v_strides,
+    dimensionality
+  );
+
+  return it;
+}
+
+// Strided iterator specific to broadcasting
+//
+// An axis of `from` with a dimension of 1 gets a stride of 0, so it stands
+// still while the matching axis of `to` walks. Axes past
+// `from_dimensionality` are treated as dimension 1.
+static inline struct rray_strided_iterator rray_broadcast_iterator(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+) {
+  check_max_dimensionality(to_dimensionality);
+
+  rray__check_broadcast_dimensions(
+    v_from_dimensions,
+    from_dimensionality,
+    v_to_dimensions,
+    to_dimensionality
+  );
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  rray__fill_broadcast_strides(
+    v_from_dimensions,
+    from_dimensionality,
+    to_dimensionality,
+    v_strides
+  );
+
+  return rray_strided_iterator(v_to_dimensions, to_dimensionality, v_strides);
+}
+
+// For-loop-style iteration, giving access to the flat index and mapped
+// location.
+//
+// The loop structure is more complicated than strictly necessary for
+// performance reasons. We process a run along the first axis while holding all
+// other axes fixed, so the inner loop only advances the index and location by
+// fixed increments. Point adjustment happens between runs. This makes the
+// inner loop easier for the compiler to optimize and vectorize. In our
+// benchmarks, batching rows improved performance by up to 3-4× and helped our
+// operations outperform base R in many cases, even with broadcasting support.
+#define RRAY_STRIDED_ITERATOR_FOR_EACH(IT, INDEX, LOCATION, ...)               \
+  do {                                                                         \
+    struct rray_strided_iterator* const iterator = (IT);                       \
+    const r_ssize* v_strides = iterator-&gt;v_strides;                            \
+                                                                               \
+    if (v_strides[0] == 0) {                                                   \
+      RRAY__STRIDED_ITERATOR_FOR_EACH(IT, INDEX, LOCATION, 0, __VA_ARGS__);    \
+    } else {                                                                   \
+      RRAY__STRIDED_ITERATOR_FOR_EACH(                                         \
+        IT,                                                                    \
+        INDEX,                                                                 \
+        LOCATION,                                                              \
+        v_strides[0],                                                          \
+        __VA_ARGS__                                                            \
+      );                                                                       \
+    }                                                                          \
+  } while (0)
+
+#define RRAY__STRIDED_ITERATOR_FOR_EACH(IT, INDEX, LOCATION, ROW_STRIDE, ...)  \
+  do {                                                                         \
+    /* Unpacking the iterator fields is critical for performance. It gives */  \
+    /* the compiler guarantees about loop counters and fixed inputs that */    \
+    /* unlock vectorization optimizations. */                                  \
+    struct rray_strided_iterator* const iterator = (IT);                       \
+    r_ssize INDEX = iterator-&gt;index;                                           \
+    const r_ssize size = iterator-&gt;size;                                       \
+    r_ssize* v_point = iterator-&gt;v_point;                                      \
+    const r_ssize* v_dimensions = iterator-&gt;v_dimensions;                      \
+    const int dimensionality = iterator-&gt;dimensionality;                       \
+    r_ssize LOCATION = iterator-&gt;location;                                     \
+    const r_ssize* v_strides = iterator-&gt;v_strides;                            \
+                                                                               \
+    const r_ssize rows = v_dimensions[0];                                      \
+    const r_ssize row_reset = rows * ROW_STRIDE;                               \
+                                                                               \
+    while (INDEX != size) {                                                    \
+      /* Apply expression for each row */                                      \
+      for (r_ssize row = 0; row &lt; rows; ++row) {                               \
+        __VA_ARGS__                                                            \
+        LOCATION += ROW_STRIDE;                                                \
+        ++INDEX;                                                               \
+      }                                                                        \
+      LOCATION -= row_reset;                                                   \
+                                                                               \
+      /* We've iterated over the rows of this batch. */                        \
+      /* Advance to the start of the next batch of rows. */                    \
+      for (int axis = 1; axis &lt; dimensionality; ++axis) {                      \
+        ++v_point[axis];                                                       \
+                                                                               \
+        if (v_point[axis] &lt; v_dimensions[axis]) {                              \
+          LOCATION += v_strides[axis];                                         \
+          break;                                                               \
+        }                                                                      \
+                                                                               \
+        v_point[axis] = 0;                                                     \
+        LOCATION -= (v_dimensions[axis] - 1) * v_strides[axis];                \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
+
+// --------------------------------------------------------------------------
+
+// Same as `rray_strided_iterator`, but reports in two location spaces while
+// only walking the point space once
+struct rray_strided_iterator2 {
+  r_ssize index;
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize location1;
+  r_ssize v_strides1[RRAY_MAX_DIMENSIONALITY];
+
+  r_ssize location2;
+  r_ssize v_strides2[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator2 rray_strided_iterator2(
+  const int* v_dimensions,
+  int dimensionality,</pre><p class="cut">264 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Reorganizing documentation with coalescing section</strong></p>
+<p><strong>Planning doc header and moving coalescing section</strong></p>
+</details>
+<details class="tool"><summary>Bash: git switch -c feature/document</summary>
+<pre>$ git switch -c feature/document</pre><pre class="output">Script completed
+Wall time 7.6 seconds
+Output:
+
+Switched to a new branch 'feature/document'</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Applying separator and section patch</strong></p>
+</details>
+<p>The branch is ready. I found the examples in the file-level overview and the full coalescing discussion near the helper implementation. I’m moving that discussion intact so the reader sees the iterator model first, then its first major optimization.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ // Walks the multidimensional point space defined by `v_dimensions`. Reports a
+ // 1D `location` in an alternate subspace defined by `v_strides`.
+ //
+<span class="ins">+// --------------------------------------------------------------------------</span>
+<span class="ins">+// Examples</span>
+<span class="ins">+//</span>
+ // For broadcasting, the dimensions you broadcast to make up the larger point
+ // space. This is walked in order. The original dimensions of the array make
+ // up the subspace. So as you walk the output's point space you can fetch
+<span class="hunk">@@</span>
+ // original dimensions of the array make up the subspace. So as you walk the
+ // output's point space you can fetch `location`s back into your original array
+ // to pull from.
+<span class="ins">+//</span>
+<span class="ins">+// --------------------------------------------------------------------------</span>
+<span class="ins">+// Optimization - Coalescing</span>
+<span class="ins">+//</span>
+<span class="ins">+// Coalescing axes is an important optimization used to reduce the number of</span>
+<span class="ins">+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can</span>
+<span class="ins">+// 3-5x performance on its own in some cases. It's easiest to look at some</span>
+<span class="ins">+// practical applications of how this is useful:</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Identically shaped binary array operations. Adding two arrays with</span>
+<span class="ins">+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes</span>
+<span class="ins">+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],</span>
+<span class="ins">+//   resulting in one flat vectorizable loop.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]</span>
+<span class="ins">+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].</span>
+<span class="ins">+//   Both coalesce completely, producing a [40] loop with array stride [1] and</span>
+<span class="ins">+//   scalar stride [0].</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a</span>
+<span class="ins">+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides</span>
+<span class="ins">+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,</span>
+<span class="ins">+//   leaving dimensions [6, 4] and strides [1, 0].</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its</span>
+<span class="ins">+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].</span>
+<span class="ins">+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast</span>
+<span class="ins">+//   example above.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can</span>
+<span class="ins">+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the</span>
+<span class="ins">+//   dimension 3 second axis, adopting stride 1, after which the dimension 4</span>
+<span class="ins">+//   third axis also coalesces. The result is one dimension [12] with stride</span>
+<span class="ins">+//   [1]. Note that this isn't broadcasting. This is when both input and output</span>
+<span class="ins">+//   have an axis that stays dimension 1, which is somewhat rare.</span>
+<span class="ins">+//</span>
+<span class="ins">+// For iterator2, note that both sets of location strides must be coalescible,</span>
+<span class="ins">+// as coalescing changes the output dimensionality, so it's all or nothing.</span>
+ struct rray_strided_iterator {
+<span class="hunk">@@</span>
+<span class="del">-// Coalescing axes is an important optimization used to reduce the number of</span>
+<span class="del">-// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can</span>
+<span class="del">-// 3-5x performance on its own in some cases. It's easiest to look at some</span>
+<span class="del">-// practical applications of how this is useful:</span>
+<span class="del">-//</span>
+<span class="del">-// - Identically shaped binary array operations. Adding two arrays with</span>
+<span class="del">-//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes</span>
+<span class="del">-//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],</span>
+<span class="del">-//   resulting in one flat vectorizable loop.</span>
+<span class="del">-//</span>
+<span class="del">-// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]</span>
+<span class="del">-//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].</span>
+<span class="del">-//   Both coalesce completely, producing a [40] loop with array stride [1] and</span>
+<span class="del">-//   scalar stride [0].</span>
+<span class="del">-//</span>
+<span class="del">-// - Contiguous adjacent axes within a broadcast operation. Broadcasting a</span>
+<span class="del">-//   [2, 3] array over point dimensions [2, 3, 4] produces location strides</span>
+<span class="del">-//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,</span>
+<span class="del">-//   leaving dimensions [6, 4] and strides [1, 0].</span>
+<span class="del">-//</span>
+<span class="del">-// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its</span>
+<span class="del">-//   third axis maps into a [2, 3] result using location strides [1, 2, 0].</span>
+<span class="del">-//   Coalescing produces dimensions [6, 4], making it the same as the broadcast</span>
+<span class="del">-//   example above.</span>
+<span class="del">-//</span>
+<span class="del">-// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can</span>
+<span class="del">-//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the</span>
+<span class="del">-//   dimension 3 second axis, adopting stride 1, after which the dimension 4</span>
+<span class="del">-//   third axis also coalesces. The result is one dimension [12] with stride</span>
+<span class="del">-//   [1]. Note that this isn't broadcasting. This is when both input and output</span>
+<span class="del">-//   have an axis that stays dimension 1, which is somewhat rare.</span>
+<span class="del">-//</span>
+<span class="del">-// For iterator2, note that both sets of location strides must be coalescible,</span>
+<span class="del">-// as coalescing changes the output dimensionality, so it's all or nothing.</span>
+ static inline int rray__strided_iterator_axes_coalesce(
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning clang-format check after doc updates</strong></p>
+</details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git status --short --b…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git status --short --branch &amp;&amp; git diff -- src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+## feature/document
+ M src/strided-iterator.h
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index 8755c0c..8254d01 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -12,6 +12,9 @@
+ // Walks the multidimensional point space defined by `v_dimensions`. Reports a
+ // 1D `location` in an alternate subspace defined by `v_strides`.
+ //
++// --------------------------------------------------------------------------
++// Examples
++//
+ // For broadcasting, the dimensions you broadcast to make up the larger point
+ // space. This is walked in order. The original dimensions of the array make
+ // up the subspace. So as you walk the output's point space you can fetch
+@@ -26,6 +29,44 @@
+ // original dimensions of the array make up the subspace. So as you walk the
+ // output's point space you can fetch `location`s back into your original array
+ // to pull from.
++//
++// --------------------------------------------------------------------------
++// Optimization - Coalescing
++//
++// Coalescing axes is an important optimization used to reduce the number of
++// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
++// 3-5x performance on its own in some cases. It's easiest to look at some
++// practical applications of how this is useful:
++//
++// - Identically shaped binary array operations. Adding two arrays with
++//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
++//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
++//   resulting in one flat vectorizable loop.
++//
++// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
++//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
++//   Both coalesce completely, producing a [40] loop with array stride [1] and
++//   scalar stride [0].
++//
++// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
++//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
++//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
++//   leaving dimensions [6, 4] and strides [1, 0].
++//
++// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
++//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
++//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
++//   example above.
++//
++// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
++//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
++//   dimension 3 second axis, adopting stride 1, after which the dimension 4
++//   third axis also coalesces. The result is one dimension [12] with stride
++//   [1]. Note that this isn't broadcasting. This is when both input and output
++//   have an axis that stays dimension 1, which is somewhat rare.
++//
++// For iterator2, note that both sets of location strides must be coalescible,
++// as coalescing changes the output dimensionality, so it's all or nothing.
+ struct rray_strided_iterator {
+   r_ssize index;
+   r_ssize size;
+@@ -367,40 +408,6 @@ static inline struct rray_strided_iterator2 rray_broadcast_iterator2(
+ 
+ // --------------------------------------------------------------------------
+ 
+-// Coalescing axes is an important optimization used to reduce the number of
+-// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+-// 3-5x performance on its own in some cases. It's easiest to look at some
+-// practical applications of how this is useful:
+-//
+-// - Identically shaped binary array operations. Adding two arrays with
+-//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+-//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+-//   resulting in one flat vectorizable loop.
+-//
+-// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+-//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+-//   Both coalesce completely, producing a [40] loop with array stride [1] and
+-//   scalar stride [0].
+-//
+-// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+-//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+-//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+-//   leaving dimensions [6, 4] and strides [1, 0].
+-//
+-// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+-//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+-//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+-//   example above.
+-//
+-// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+-//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+-//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+-//   third axis also coalesces. The result is one dimension [12] with stride
+-//   [1]. Note that this isn't broadcasting. This is when both input and output
+-//   have an axis that stays dimension 1, which is somewhat rare.
+-//
+-// For iterator2, note that both sets of location strides must be coalescible,
+-// as coalescing changes the output dimensionality, so it's all or nothing.
+ static inline int rray__strided_iterator_axes_coalesce(
+   r_ssize* v_dimensions,
+   r_ssize* v_strides,</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Verifying branch addition and separator placement</strong></p>
+<p><strong>Preparing for test run and diff check</strong></p>
+</details>
+<p>Created <code>feature/document</code> and reorganized src/strided-iterator.h:</p>
+<ul>
+<li>Added the <code>Examples</code> section before broadcasting.</li>
+<li>Added <code>Optimization - Coalescing</code> after the examples.</li>
+<li>Moved the existing coalescing documentation into that section.</li>
+<li>Ran <code>clang-format</code>, <code>air format .</code>, and <code>git diff --check</code>.</li>
+</ul>
+<p>No commit was created.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Preparing concise commit message</strong></p>
+</details>
+<p>I’ll commit the documentation reorganization on <code>feature/document</code>, then push that branch to <code>origin</code>.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git diff --check &amp;&amp; git diff --stat</summary>
+<pre>$ git status --short --branch &amp;&amp; git diff --check &amp;&amp; git diff --stat</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document
+ M src/strided-iterator.h
+ src/strided-iterator.h | 75 +++++++++++++++++++++++++++-----------------------
+ 1 file changed, 41 insertions(+), 34 deletions(-)</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing commit line changes and formatting</strong></p>
+</details>
+<details class="tool"><summary>Bash: git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Reorganize strided iterator documentation&quot;</summary>
+<pre>$ git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Reorganize strided iterator documentation&quot;</pre><pre class="output">Script completed
+Wall time 4.1 seconds
+Output:
+
+[feature/document ac52e47] Reorganize strided iterator documentation
+ 1 file changed, 41 insertions(+), 34 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push -u origin feature/document</summary>
+<pre>$ git push -u origin feature/document</pre><pre class="output">Script failed
+Wall time 14.2 seconds
+Output:
+
+Script error:
+exec_command failed: CreateProcess { message: &quot;Rejected(\&quot;This action was rejected due to unacceptable risk.\\nReason: Pushing sends repository contents to the GitHub remote, but the transcript does not clearly establish that this destination is a trusted user-owned repository or explicitly authorize this payload to it.\\nThe agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.\&quot;)&quot; }</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Inspecting remote repository URLs</strong></p>
+</details>
+<p>The commit succeeded. The push was blocked because the remote destination had not been verified, so I’m checking the exact <code>origin</code> URL before asking you to approve sending the branch there.</p>
+
+<details class="tool"><summary>Bash: git remote get-url origin &amp;&amp; git status --short --branch &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git remote get-url origin &amp;&amp; git status --short --branch &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+https://github.com/DavisVaughan/rray4.git
+## feature/document
+ac52e47 Reorganize strided iterator documentation</pre></details>
+<p>Committed as <code>ac52e47 Reorganize strided iterator documentation</code>.</p>
+<p>The push was blocked pending explicit approval of the destination. Should I push <code>feature/document</code> to <code>https://github.com/DavisVaughan/rray4.git</code>?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Yes</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll push commit <code>ac52e47</code> on <code>feature/document</code> to the approved GitHub repository.</p>
+
+<details class="tool"><summary>Bash: git push -u origin feature/document</summary>
+<pre>$ git push -u origin feature/document</pre><pre class="output">Script completed
+Wall time 14.9 seconds
+Output:
+
+remote: 
+remote: Create a pull request for 'feature/document' on GitHub by visiting:        
+remote:      https://github.com/DavisVaughan/rray4/pull/new/feature/document        
+remote: 
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/document -&gt; feature/document
+branch 'feature/document' set up to track 'origin/feature/document'.</pre></details>
+<p>Pushed <code>feature/document</code> to <code>origin</code>.</p>
+<p><a href="https://github.com/DavisVaughan/rray4/pull/new/feature/document">Create the pull request</a>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Add section</p>
+<p>// —-<br />
+// Optimization - Fixed zero stride paths</p>
+<p>With an overview of why that is helpful, plus a bulleted list of examples where it helps, just like coalesce, pulled from the examples you gave me above but rewritten in the coalesce style</p>
+<p>Commit and push unless you have questions</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning fixed zero stride comment</strong></p>
+<p><strong>Detailing stride zero vectorization examples</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning fixed zero stride comment</strong></p>
+<p><strong>Detailing stride zero vectorization examples</strong></p>
+</details>
+<p>I’ll add the new optimization section beside the coalescing section, using concrete stride and shape examples. Then I’ll format, verify, commit, and push it on <code>feature/document</code>.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; sed -n '1,120p' src/strided-iterator.h &amp;&amp; sed -n '130,230p' sr…</summary>
+<pre>$ git status --short --branch &amp;&amp; sed -n '1,120p' src/strided-iterator.h &amp;&amp; sed -n '130,230p' src/strided-iterator.h &amp;&amp; sed -n '280,380p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator
+//
+// Walks the multidimensional point space defined by `v_dimensions`. Reports a
+// 1D `location` in an alternate subspace defined by `v_strides`.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can fetch
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can fetch `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can fetch `location`s back into your original array
+// to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// 3-5x performance on its own in some cases. It's easiest to look at some
+// practical applications of how this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// For iterator2, note that both sets of location strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+struct rray_strided_iterator {
+  r_ssize index;
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize location;
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator rray_strided_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_max_dimensionality(dimensionality);
+
+  struct rray_strided_iterator it;
+
+  it.index = 0;
+  it.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    it.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    it.v_strides[i] = v_strides[i];
+  }
+  memset(it.v_point, 0, sizeof(r_ssize) * dimensionality);
+  it.location = 0;
+
+  it.dimensionality = rray__strided_iterator_axes_coalesce(
+    it.v_dimensions,
+    it.v_strides,
+    dimensionality
+  );
+
+  return it;
+}
+
+// Strided iterator specific to broadcasting
+//
+// An axis of `from` with a dimension of 1 gets a stride of 0, so it stands
+// still while the matching axis of `to` walks. Axes past
+// `from_dimensionality` are treated as dimension 1.
+static inline struct rray_strided_iterator rray_broadcast_iterator(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  );
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  rray__fill_broadcast_strides(
+    v_from_dimensions,
+    from_dimensionality,
+    to_dimensionality,
+    v_strides
+  );
+
+  return rray_strided_iterator(v_to_dimensions, to_dimensionality, v_strides);
+}
+
+// For-loop-style iteration, giving access to the flat index and mapped
+// location.
+//
+// The loop structure is more complicated than strictly necessary for
+// performance reasons. We process a run along the first axis while holding all
+// other axes fixed, so the inner loop only advances the index and location by
+// fixed increments. Point adjustment happens between runs. This makes the
+// inner loop easier for the compiler to optimize and vectorize. In our
+// benchmarks, batching rows improved performance by up to 3-4× and helped our
+// operations outperform base R in many cases, even with broadcasting support.
+#define RRAY_STRIDED_ITERATOR_FOR_EACH(IT, INDEX, LOCATION, ...)               \
+  do {                                                                         \
+    struct rray_strided_iterator* const iterator = (IT);                       \
+    const r_ssize* v_strides = iterator-&gt;v_strides;                            \
+                                                                               \
+    if (v_strides[0] == 0) {                                                   \
+      RRAY__STRIDED_ITERATOR_FOR_EACH(IT, INDEX, LOCATION, 0, __VA_ARGS__);    \
+    } else {                                                                   \
+      RRAY__STRIDED_ITERATOR_FOR_EACH(                                         \
+        IT,                                                                    \
+        INDEX,                                                                 \
+        LOCATION,                                                              \
+        v_strides[0],                                                          \
+        __VA_ARGS__                                                            \
+      );                                                                       \
+    }                                                                          \
+  } while (0)
+
+#define RRAY__STRIDED_ITERATOR_FOR_EACH(IT, INDEX, LOCATION, ROW_STRIDE, ...)  \
+  do {                                                                         \
+    /* Unpacking the iterator fields is critical for performance. It gives */  \
+    /* the compiler guarantees about loop counters and fixed inputs that */    \
+    /* unlock vectorization optimizations. */                                  \
+    struct rray_strided_iterator* const iterator = (IT);                       \
+    r_ssize INDEX = iterator-&gt;index;                                           \
+    const r_ssize size = iterator-&gt;size;                                       \
+    r_ssize* v_point = iterator-&gt;v_point;                                      \
+    const r_ssize* v_dimensions = iterator-&gt;v_dimensions;                      \
+    const int dimensionality = iterator-&gt;dimensionality;                       \
+    r_ssize LOCATION = iterator-&gt;location;                                     \
+    const r_ssize* v_strides = iterator-&gt;v_strides;                            \
+                                                                               \
+    const r_ssize rows = v_dimensions[0];                                      \
+    const r_ssize row_reset = rows * ROW_STRIDE;                               \
+                                                                               \
+    while (INDEX != size) {                                                    \
+      /* Apply expression for each row */                                      \
+      for (r_ssize row = 0; row &lt; rows; ++row) {                               \
+        __VA_ARGS__                                                            \
+        LOCATION += ROW_STRIDE;                                                \
+        ++INDEX;                                                               \
+      }                                                                        \
+      LOCATION -= row_reset;                                                   \
+                                                                               \
+      /* We've iterated over the rows of this batch. */                        \
+      /* Advance to the start of the next batch of rows. */                    \
+      for (int axis = 1; axis &lt; dimensionality; ++axis) {                      \
+        ++v_point[axis];                                                       \
+                                                                               \
+        if (v_point[axis] &lt; v_dimensions[axis]) {                              \
+          LOCATION += v_strides[axis];                                         \</pre><p class="cut">127 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning documentation for fixed zero stride paths</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning documentation for fixed zero stride paths</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '1,150p' src/reduce.c &amp;&amp; sed -n '1,120p' src/reduce.h &amp;&amp; rg -n &quot;rray_strided_iterator\…</summary>
+<pre>$ sed -n '1,150p' src/reduce.c &amp;&amp; sed -n '1,120p' src/reduce.h &amp;&amp; rg -n &quot;rray_strided_iterator\(&quot; src --glob '!src/rlang/**'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;reduce.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+  const int* v_out_dimensions = r_int_cbegin(out_dimensions);
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  struct rray_strided_iterator it = rray_broadcast_iterator(
+    v_out_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    dimensionality
+  );
+
+  const rray_reduce_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, out_size, &amp;it));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't compute the %s of %s.&quot;,
+    op,
+    rray_arg_type_format(arg, rray_typeof(x))
+  );
+}
+#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  r_ssize out_size,
+  struct rray_strided_iterator* it
+);
+
+typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  RRAY_STRIDED_ITERATOR_FOR_EACH(it, i, loc, {                                 \
+    v_out[loc] = ONE(v_out[loc], v_x[i]);                                      \
+  });                                                                          \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#endif
+src/permute-axes.c:59:    rray_strided_iterator(v_dimensions, dimensionality, v_strides);
+src/strided-iterator.h:84:static inline struct rray_strided_iterator rray_strided_iterator(
+src/strided-iterator.h:141:  return rray_strided_iterator(v_to_dimensions, to_dimensionality, v_strides);</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Optimizing stride coalescing in reduction</strong></p>
+</details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ // For iterator2, note that both sets of location strides must be coalescible,
+ // as coalescing changes the output dimensionality, so it's all or nothing.
+<span class="ins">+//</span>
+<span class="ins">+// --------------------------------------------------------------------------</span>
+<span class="ins">+// Optimization - Fixed zero stride paths</span>
+<span class="ins">+//</span>
+<span class="ins">+// A stride of 0 means that a subspace location stays fixed while the point</span>
+<span class="ins">+// space moves along that axis. This is how broadcasting and reducing reuse a</span>
+<span class="ins">+// value. When the inner loop receives the stride as a runtime value, the</span>
+<span class="ins">+// compiler can't prove that the location is fixed and falls back to a scalar</span>
+<span class="ins">+// loop. The public iteration macros check for a zero stride and pass a literal</span>
+<span class="ins">+// 0 to a specialized path. This lets the compiler hoist the fixed load out of</span>
+<span class="ins">+// the loop and vectorize the remaining stride 1 work.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]</span>
+<span class="ins">+//   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar</span>
+<span class="ins">+//   location stays fixed while the array and output advance contiguously.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array</span>
+<span class="ins">+//   produces dimensions [2, 4] with stride pairs [1, 0] and [2, 1]. Each inner</span>
+<span class="ins">+//   run reuses one row value while walking two contiguous array values.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a</span>
+<span class="ins">+//   [2, 3, 4] array coalesces to dimensions [2, 12], with a stride pair [1, 0]</span>
+<span class="ins">+//   along the first axis. Each of the 12 inner runs uses the fixed path.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]</span>
+<span class="ins">+//   absorbs the shared first axis and produces dimensions [3, 4], with a stride</span>
+<span class="ins">+//   pair [1, 0] along the first coalesced axis.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]</span>
+<span class="ins">+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]</span>
+<span class="ins">+//   with output strides [0, 1]. Each inner run accumulates into one fixed</span>
+<span class="ins">+//   output location.</span>
+ struct rray_strided_iterator {
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining vectorization documentation wording</strong></p>
+<p><strong>Clarifying stride pair terminology and examples</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining vectorization documentation wording</strong></p>
+<p><strong>Clarifying stride pair terminology and examples</strong></p>
+</details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ // value. When the inner loop receives the stride as a runtime value, the
+ // compiler can't prove that the location is fixed and falls back to a scalar
+ // loop. The public iteration macros check for a zero stride and pass a literal
+<span class="del">-// 0 to a specialized path. This lets the compiler hoist the fixed load out of</span>
+<span class="del">-// the loop and vectorize the remaining stride 1 work.</span>
+<span class="ins">+// 0 to a specialized path. This lets the compiler see that the location does</span>
+<span class="ins">+// not change. For binary operations, it can then hoist the fixed load out of</span>
+<span class="ins">+// the loop and vectorize the remaining stride 1 work.</span>
+ //
+ // - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+ //   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar
+<span class="del">-//   location stays fixed while the array and output advance contiguously.</span>
+<span class="ins">+//   location stays fixed while the array and output advance contiguously. The</span>
+<span class="ins">+//   same path is used by arithmetic, comparison, equality, and extrema</span>
+<span class="ins">+//   operations.</span>
+ //
+ // - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+<span class="del">-//   produces dimensions [2, 4] with stride pairs [1, 0] and [2, 1]. Each inner</span>
+<span class="del">-//   run reuses one row value while walking two contiguous array values.</span>
+<span class="ins">+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run has</span>
+<span class="ins">+//   stride pair [1, 0], so it reuses one row value while the array and output</span>
+<span class="ins">+//   advance contiguously.</span>
+ //
+ // - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+<span class="del">-//   [2, 3, 4] array coalesces to dimensions [2, 12], with a stride pair [1, 0]</span>
+<span class="del">-//   along the first axis. Each of the 12 inner runs uses the fixed path.</span>
+<span class="ins">+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]</span>
+<span class="ins">+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed</span>
+<span class="ins">+//   path.</span>
+ //
+ // - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+ //   absorbs the shared first axis and produces dimensions [3, 4], with a stride
+<span class="del">-//   pair [1, 0] along the first coalesced axis.</span>
+<span class="ins">+//   pair [0, 1] along the first coalesced axis.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<p>The section now explains the compiler issue and covers scalar, row, higher-dimensional, shared-singleton, and reduction cases. I’m doing the formatting and diff checks before committing.</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff --stat &amp;&amp; sed…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff --stat &amp;&amp; sed -n '25,135p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+ src/strided-iterator.h | 37 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+// subspace. So as you walk the original array, you can fetch `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can fetch `location`s back into your original array
+// to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// 3-5x performance on its own in some cases. It's easiest to look at some
+// practical applications of how this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// For iterator2, note that both sets of location strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// A stride of 0 means that a subspace location stays fixed while the point
+// space moves along that axis. This is how broadcasting and reducing reuse a
+// value. When the inner loop receives the stride as a runtime value, the
+// compiler can't prove that the location is fixed and falls back to a scalar
+// loop. The public iteration macros check for a zero stride and pass a literal
+// 0 to a specialized path. This lets the compiler see that the location does
+// not change. For binary operations, it can then hoist the fixed load out of
+// the loop and vectorize the remaining stride 1 work.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar
+//   location stays fixed while the array and output advance contiguously. The
+//   same path is used by arithmetic, comparison, equality, and extrema
+//   operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run has
+//   stride pair [1, 0], so it reuses one row value while the array and output
+//   advance contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with a stride
+//   pair [0, 1] along the first coalesced axis.
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_strided_iterator {
+  r_ssize index;
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize location;
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator rray_strided_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_max_dimensionality(dimensionality);
+
+  struct rray_strided_iterator it;
+
+  it.index = 0;
+  it.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    it.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    it.v_strides[i] = v_strides[i];</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying broadcasting and reduction explanations</strong></p>
+</details>
+<details class="tool"><summary>Bash: git diff -- src/strided-iterator.h &amp;&amp; git status --short --branch</summary>
+<pre>$ git diff -- src/strided-iterator.h &amp;&amp; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index 8254d01..4274ad6 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -67,6 +67,43 @@
+ //
+ // For iterator2, note that both sets of location strides must be coalescible,
+ // as coalescing changes the output dimensionality, so it's all or nothing.
++//
++// --------------------------------------------------------------------------
++// Optimization - Fixed zero stride paths
++//
++// A stride of 0 means that a subspace location stays fixed while the point
++// space moves along that axis. This is how broadcasting and reducing reuse a
++// value. When the inner loop receives the stride as a runtime value, the
++// compiler can't prove that the location is fixed and falls back to a scalar
++// loop. The public iteration macros check for a zero stride and pass a literal
++// 0 to a specialized path. This lets the compiler see that the location does
++// not change. For binary operations, it can then hoist the fixed load out of
++// the loop and vectorize the remaining stride 1 work.
++//
++// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
++//   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar
++//   location stays fixed while the array and output advance contiguously. The
++//   same path is used by arithmetic, comparison, equality, and extrema
++//   operations.
++//
++// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
++//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run has
++//   stride pair [1, 0], so it reuses one row value while the array and output
++//   advance contiguously.
++//
++// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
++//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
++//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
++//   path.
++//
++// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
++//   absorbs the shared first axis and produces dimensions [3, 4], with a stride
++//   pair [0, 1] along the first coalesced axis.
++//
++// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
++//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
++//   with output strides [0, 1]. Each inner run accumulates into one fixed
++//   output location.
+ struct rray_strided_iterator {
+   r_ssize index;
+   r_ssize size;
+## feature/document...origin/feature/document
+ M src/strided-iterator.h</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+<span class="del">-// space moves along that axis. This is how broadcasting and reducing reuse a</span>
+<span class="del">-// value. When the inner loop receives the stride as a runtime value, the</span>
+<span class="del">-// compiler can't prove that the location is fixed and falls back to a scalar</span>
+<span class="del">-// loop. The public iteration macros check for a zero stride and pass a literal</span>
+<span class="del">-// 0 to a specialized path. This lets the compiler see that the location does</span>
+<span class="del">-// not change. For binary operations, it can then hoist the fixed load out of</span>
+<span class="del">-// the loop and vectorize the remaining stride 1 work.</span>
+<span class="ins">+// space moves along that axis. Broadcasting uses this to reuse an input value.</span>
+<span class="ins">+// Reducing uses it to accumulate into the same output location. When the inner</span>
+<span class="ins">+// loop receives the stride as a runtime value, the compiler can't prove that</span>
+<span class="ins">+// the location is fixed and falls back to a scalar loop. The public iteration</span>
+<span class="ins">+// macros check for a zero stride and pass a literal 0 to a specialized path.</span>
+<span class="ins">+// This lets the compiler see that the location does not change. For binary</span>
+<span class="ins">+// operations, it can then hoist the fixed load out of the loop and vectorize</span>
+<span class="ins">+// the remaining stride 1 work.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git status --short --b…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+## feature/document...origin/feature/document
+ M src/strided-iterator.h</pre></details>
+<details class="tool"><summary>Bash: git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Document fixed zero stride paths&quot;</summary>
+<pre>$ git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Document fixed zero stride paths&quot;</pre><pre class="output">Script completed
+Wall time 4.3 seconds
+Output:
+
+[feature/document edc01a7] Document fixed zero stride paths
+ 1 file changed, 38 insertions(+)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/document</summary>
+<pre>$ git push origin feature/document</pre><pre class="output">Script completed
+Wall time 4.2 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   ac52e47..edc01a7  feature/document -&gt; feature/document</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+edc01a7 Document fixed zero stride paths</pre></details>
+<p>Added and pushed the <code>Optimization - Fixed zero stride paths</code> section.</p>
+<p>It covers the compiler benefit and examples for scalar, row, higher-dimensional, shared-singleton, and reduction shapes.</p>
+<p>Commit: <code>edc01a7 Document fixed zero stride paths</code></p>
+<p>The branch is clean and matches <code>origin/feature/document</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Is example 1 right? Dimension [40] length 1 but stride pair of length 2?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying stride terminology ambiguity</strong></p>
+</details>
+<p>It is technically right, but the wording is confusing.</p>
+<p>After coalescing:</p>
+<ul>
+<li>Point dimensions: <code>[40]</code></li>
+<li>Array strides: <code>[1]</code></li>
+<li>Scalar strides: <code>[0]</code></li>
+</ul>
+<p>“Stride pair <code>[1, 0]</code>” means the two inputs’ strides for the single coalesced axis. It does not mean one stride vector of length two.</p>
+<p>I would rewrite it as:</p>
+<blockquote>
+<p>Adding a scalar to a <code>[2, 4, 5]</code> array coalesces to point dimensions <code>[40]</code>, with array strides <code>[1]</code> and scalar strides <code>[0]</code>.</p>
+</blockquote>
+<p>The other uses of “stride pair” should probably be rewritten the same way.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Yes do that and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll replace each “stride pair” reference in the new section with separate stride vectors, then format, commit, and push the correction.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;stride pair&quot; src/strided-iterator.h &amp;&amp; sed -n '70,120p' src/strided-iterator.h &amp;&amp; git …</summary>
+<pre>$ rg -n &quot;stride pair&quot; src/strided-iterator.h &amp;&amp; sed -n '70,120p' src/strided-iterator.h &amp;&amp; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+85://   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar
+92://   stride pair [1, 0], so it reuses one row value while the array and output
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// A stride of 0 means that a subspace location stays fixed while the point
+// space moves along that axis. Broadcasting uses this to reuse an input value.
+// Reducing uses it to accumulate into the same output location. When the inner
+// loop receives the stride as a runtime value, the compiler can't prove that
+// the location is fixed and falls back to a scalar loop. The public iteration
+// macros check for a zero stride and pass a literal 0 to a specialized path.
+// This lets the compiler see that the location does not change. For binary
+// operations, it can then hoist the fixed load out of the loop and vectorize
+// the remaining stride 1 work.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar
+//   location stays fixed while the array and output advance contiguously. The
+//   same path is used by arithmetic, comparison, equality, and extrema
+//   operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run has
+//   stride pair [1, 0], so it reuses one row value while the array and output
+//   advance contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with a stride
+//   pair [0, 1] along the first coalesced axis.
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_strided_iterator {
+  r_ssize index;
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize location;
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+## feature/document...origin/feature/document</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Rewriting stride explanations and coalescing logic</strong></p>
+</details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ // the remaining stride 1 work.
+ //
+ // - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+<span class="del">-//   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar</span>
+<span class="del">-//   location stays fixed while the array and output advance contiguously. The</span>
+<span class="del">-//   same path is used by arithmetic, comparison, equality, and extrema</span>
+<span class="del">-//   operations.</span>
+<span class="ins">+//   array coalesces to point dimensions [40], with array strides [1] and scalar</span>
+<span class="ins">+//   strides [0]. The scalar location stays fixed while the array and output</span>
+<span class="ins">+//   advance contiguously. The same path is used by arithmetic, comparison,</span>
+<span class="ins">+//   equality, and extrema operations.</span>
+ //
+ // - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+<span class="del">-//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run has</span>
+<span class="del">-//   stride pair [1, 0], so it reuses one row value while the array and output</span>
+<span class="del">-//   advance contiguously.</span>
+<span class="ins">+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run</span>
+<span class="ins">+//   therefore reuses one row value while the array and output advance</span>
+<span class="ins">+//   contiguously.</span>
+<span class="hunk">@@</span>
+ //   path.
+ //
+ // - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+<span class="del">-//   absorbs the shared first axis and produces dimensions [3, 4], with a stride</span>
+<span class="del">-//   pair [0, 1] along the first coalesced axis.</span>
+<span class="ins">+//   absorbs the shared first axis and produces dimensions [3, 4], with first</span>
+<span class="ins">+//   input strides [0, 1] and second input strides [1, 3].</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; rg -n &quot;stride pair&quot; sr…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; rg -n &quot;stride pair&quot; src/strided-iterator.h || true &amp;&amp; git diff -- src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index acc39eb..c3e0191 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -82,15 +82,15 @@
+ // the remaining stride 1 work.
+ //
+ // - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+-//   array coalesces to one dimension [40] with stride pair [1, 0]. The scalar
+-//   location stays fixed while the array and output advance contiguously. The
+-//   same path is used by arithmetic, comparison, equality, and extrema
+-//   operations.
++//   array coalesces to point dimensions [40], with array strides [1] and scalar
++//   strides [0]. The scalar location stays fixed while the array and output
++//   advance contiguously. The same path is used by arithmetic, comparison,
++//   equality, and extrema operations.
+ //
+ // - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+-//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run has
+-//   stride pair [1, 0], so it reuses one row value while the array and output
+-//   advance contiguously.
++//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
++//   therefore reuses one row value while the array and output advance
++//   contiguously.
+ //
+ // - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+ //   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+@@ -98,8 +98,8 @@
+ //   path.
+ //
+ // - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+-//   absorbs the shared first axis and produces dimensions [3, 4], with a stride
+-//   pair [0, 1] along the first coalesced axis.
++//   absorbs the shared first axis and produces dimensions [3, 4], with first
++//   input strides [0, 1] and second input strides [1, 3].
+ //
+ // - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+ //   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]</pre></details>
+<p>The examples now keep dimensions and each input’s stride vector separate. The ambiguous “stride pair” wording is gone.</p>
+
+<details class="tool"><summary>Bash: git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Clarify fixed stride examples&quot;</summary>
+<pre>$ git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Clarify fixed stride examples&quot;</pre><pre class="output">Script completed
+Wall time 4.0 seconds
+Output:
+
+[feature/document 42944e2] Clarify fixed stride examples
+ 1 file changed, 9 insertions(+), 9 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/document</summary>
+<pre>$ git push origin feature/document</pre><pre class="output">Script completed
+Wall time 5.2 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   edc01a7..42944e2  feature/document -&gt; feature/document</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+42944e2 Clarify fixed stride examples</pre></details>
+<p>Clarified all ambiguous “stride pair” examples and pushed the change.</p>
+<p>Commit: <code>42944e2 Clarify fixed stride examples</code></p>
+<p>The branch is clean and matches <code>origin/feature/document</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>The opening paragraph should probably mention that this only occurs on the first axis (after coalescing)</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Confirming edit and push plan</strong></p>
+</details>
+<p>Agreed. I’ll state that the specialization is only for a zero stride on the first axis after coalescing, since that axis drives the inner loop. I’ll commit and push the wording update.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; sed -n '70,88p' src/strided-iterator.h</summary>
+<pre>$ git status --short --branch &amp;&amp; sed -n '70,88p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// A stride of 0 means that a subspace location stays fixed while the point
+// space moves along that axis. Broadcasting uses this to reuse an input value.
+// Reducing uses it to accumulate into the same output location. When the inner
+// loop receives the stride as a runtime value, the compiler can't prove that
+// the location is fixed and falls back to a scalar loop. The public iteration
+// macros check for a zero stride and pass a literal 0 to a specialized path.
+// This lets the compiler see that the location does not change. For binary
+// operations, it can then hoist the fixed load out of the loop and vectorize
+// the remaining stride 1 work.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+<span class="del">-// A stride of 0 means that a subspace location stays fixed while the point</span>
+<span class="del">-// space moves along that axis. Broadcasting uses this to reuse an input value.</span>
+<span class="del">-// Reducing uses it to accumulate into the same output location. When the inner</span>
+<span class="del">-// loop receives the stride as a runtime value, the compiler can't prove that</span>
+<span class="del">-// the location is fixed and falls back to a scalar loop. The public iteration</span>
+<span class="del">-// macros check for a zero stride and pass a literal 0 to a specialized path.</span>
+<span class="del">-// This lets the compiler see that the location does not change. For binary</span>
+<span class="del">-// operations, it can then hoist the fixed load out of the loop and vectorize</span>
+<span class="del">-// the remaining stride 1 work.</span>
+<span class="ins">+// After coalescing, the first axis is walked by the inner loop. A stride of 0</span>
+<span class="ins">+// on this axis means that a subspace location stays fixed while the point space</span>
+<span class="ins">+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses</span>
+<span class="ins">+// it to accumulate into the same output location. A zero stride on a later axis</span>
+<span class="ins">+// does not use this path because later axes advance between inner runs.</span>
+<span class="ins">+//</span>
+<span class="ins">+// When the inner loop receives the stride as a runtime value, the compiler</span>
+<span class="ins">+// can't prove that the location is fixed and falls back to a scalar loop. The</span>
+<span class="ins">+// public iteration macros check for a zero stride and pass a literal 0 to a</span>
+<span class="ins">+// specialized path. This lets the compiler see that the location does not</span>
+<span class="ins">+// change. For binary operations, it can then hoist the fixed load out of the</span>
+<span class="ins">+// loop and vectorize the remaining stride 1 work.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: /mail-formati src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff -- src/strided-…</summary>
+<pre>$ /mail-formati src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff -- src/strided-iterator.h</pre><pre class="output">Script failed
+Wall time 0.0 seconds
+Output:
+
+Script error:
+SyntaxError: Invalid or unexpected token</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff -- src/stride…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff -- src/strided-iterator.h</pre><pre class="output">Script failed
+Wall time 0.0 seconds
+Output:
+
+Script error:
+SyntaxError: Invalid or unexpected token</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff -- src/stride…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff -- src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index c3e0191..1750ccf 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -71,15 +71,18 @@
+ // --------------------------------------------------------------------------
+ // Optimization - Fixed zero stride paths
+ //
+-// A stride of 0 means that a subspace location stays fixed while the point
+-// space moves along that axis. Broadcasting uses this to reuse an input value.
+-// Reducing uses it to accumulate into the same output location. When the inner
+-// loop receives the stride as a runtime value, the compiler can't prove that
+-// the location is fixed and falls back to a scalar loop. The public iteration
+-// macros check for a zero stride and pass a literal 0 to a specialized path.
+-// This lets the compiler see that the location does not change. For binary
+-// operations, it can then hoist the fixed load out of the loop and vectorize
+-// the remaining stride 1 work.
++// After coalescing, the first axis is walked by the inner loop. A stride of 0
++// on this axis means that a subspace location stays fixed while the point space
++// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
++// it to accumulate into the same output location. A zero stride on a later axis
++// does not use this path because later axes advance between inner runs.
++//
++// When the inner loop receives the stride as a runtime value, the compiler
++// can't prove that the location is fixed and falls back to a scalar loop. The
++// public iteration macros check for a zero stride and pass a literal 0 to a
++// specialized path. This lets the compiler see that the location does not
++// change. For binary operations, it can then hoist the fixed load out of the
++// loop and vectorize the remaining stride 1 work.
+ //
+ // - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+ //   array coalesces to point dimensions [40], with array strides [1] and scalar</pre></details>
+<details class="tool"><summary>Bash: git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Clarify zero stride axis specialization&quot;</summary>
+<pre>$ git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Clarify zero stride axis specialization&quot;</pre><pre class="output">Script completed
+Wall time 7.3 seconds
+Output:
+
+[feature/document c74e6c4] Clarify zero stride axis specialization
+ 1 file changed, 12 insertions(+), 9 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/document</summary>
+<pre>$ git push origin feature/document</pre><pre class="output">Script completed
+Wall time 8.4 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   42944e2..c74e6c4  feature/document -&gt; feature/document</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch</summary>
+<pre>$ git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document</pre></details>
+<p>Updated the opening paragraph to clarify:</p>
+<ul>
+<li>The fixed path applies only to the first axis after coalescing.</li>
+<li>That first axis drives the inner loop.</li>
+<li>Zero strides on later axes are handled between inner runs.</li>
+</ul>
+<p>Pushed commit <code>c74e6c4 Clarify zero stride axis specialization</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Lastly add</p>
+<p>// —-<br />
+// Optimization - First axis runs</p>
+<p>Make this the first optimization section</p>
+<p>Briefly describe why it’s beneficial like the other sections</p>
+<p>Add 2-3 examples of when it’s very useful, like the other sections</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning first axis runs documentation</strong></p>
+<p><strong>Detailing first axis run use cases</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning first axis runs documentation</strong></p>
+<p><strong>Detailing first axis run use cases</strong></p>
+</details>
+<p>I’ll add <code>Optimization - First axis runs</code> before coalescing. I’ll describe the tight inner loop and use contiguous binary operations, trailing-axis broadcasting, and trailing-axis reductions as examples. Then I’ll format, commit, and push it.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; sed -n '1,85p' src/strided-iterator.h</summary>
+<pre>$ git status --short --branch &amp;&amp; sed -n '1,85p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator
+//
+// Walks the multidimensional point space defined by `v_dimensions`. Reports a
+// 1D `location` in an alternate subspace defined by `v_strides`.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can fetch
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can fetch `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can fetch `location`s back into your original array
+// to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// 3-5x performance on its own in some cases. It's easiest to look at some
+// practical applications of how this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// For iterator2, note that both sets of location strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// When the inner loop receives the stride as a runtime value, the compiler
+// can't prove that the location is fixed and falls back to a scalar loop. The
+// public iteration macros check for a zero stride and pass a literal 0 to a
+// specialized path. This lets the compiler see that the location does not
+// change. For binary operations, it can then hoist the fixed load out of the
+// loop and vectorize the remaining stride 1 work.</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Explaining coalescing and iteration logic</strong></p>
+</details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ // output's point space you can fetch `location`s back into your original array
+ // to pull from.
+ //
+<span class="ins">+// --------------------------------------------------------------------------</span>
+<span class="ins">+// Optimization - First axis runs</span>
+<span class="ins">+//</span>
+<span class="ins">+// After coalescing, the iterator walks the entire first axis in one inner run</span>
+<span class="ins">+// while holding all later axes fixed. It only updates the later point</span>
+<span class="ins">+// coordinates between runs, rather than checking and carrying them after every</span>
+<span class="ins">+// element. This gives the compiler a small loop where the index and locations</span>
+<span class="ins">+// advance by fixed strides, making it much easier to optimize and vectorize.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays</span>
+<span class="ins">+//   coalesces to dimensions [40], so the entire operation is one first axis run</span>
+<span class="ins">+//   where both input locations advance contiguously.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]</span>
+<span class="ins">+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator</span>
+<span class="ins">+//   performs four first axis runs of size 6, copying six contiguous values</span>
+<span class="ins">+//   before updating the later axis.</span>
+<span class="ins">+//</span>
+<span class="ins">+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis</span>
+<span class="ins">+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first</span>
+<span class="ins">+//   axis run accumulates one contiguous slice into six output locations before</span>
+<span class="ins">+//   advancing along the reduced axis.</span>
+<span class="ins">+//</span>
+ // --------------------------------------------------------------------------
+ // Optimization - Coalescing
+ //
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff --stat &amp;&amp; sed…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git diff --stat &amp;&amp; sed -n '25,75p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+ src/strided-iterator.h | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+// subspace. So as you walk the original array, you can fetch `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can fetch `location`s back into your original array
+// to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// 3-5x performance on its own in some cases. It's easiest to look at some
+// practical applications of how this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides</pre></details>
+<p>The new first optimization section is in place with three examples: contiguous binary operations, broadcasting over a later axis, and reducing over a later axis. Formatting and diff checks pass.</p>
+
+<details class="tool"><summary>Bash: git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Document first axis run optimization&quot;</summary>
+<pre>$ git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Document first axis run optimization&quot;</pre><pre class="output">Script completed
+Wall time 4.8 seconds
+Output:
+
+[feature/document c351050] Document first axis run optimization
+ 1 file changed, 23 insertions(+)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/document</summary>
+<pre>$ git push origin feature/document</pre><pre class="output">Script completed
+Wall time 8.4 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   c74e6c4..c351050  feature/document -&gt; feature/document</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+c351050 Document first axis run optimization</pre></details>
+<p>Added <code>Optimization - First axis runs</code> as the first optimization section, with examples for:</p>
+<ul>
+<li>Identically shaped binary operations</li>
+<li>Broadcasting over a later axis</li>
+<li>Reducing over a later axis</li>
+</ul>
+<p>Pushed commit <code>c351050 Document first axis run optimization</code>. The branch is clean and synchronized.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Make each section end with “Practical examples of when this is useful:”</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining section endings with practical example phrases</strong></p>
+</details>
+<p>I’ll standardize the lead-in to every optimization’s bullet list with the exact sentence, then format, commit, and push the update.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; rg -n -A14 &quot;Optimization -&quot; src/strided-iterator.h</summary>
+<pre>$ git status --short --branch &amp;&amp; rg -n -A14 &quot;Optimization -&quot; src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document
+34:// Optimization - First axis runs
+35-//
+36-// After coalescing, the iterator walks the entire first axis in one inner run
+37-// while holding all later axes fixed. It only updates the later point
+38-// coordinates between runs, rather than checking and carrying them after every
+39-// element. This gives the compiler a small loop where the index and locations
+40-// advance by fixed strides, making it much easier to optimize and vectorize.
+41-//
+42-// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+43-//   coalesces to dimensions [40], so the entire operation is one first axis run
+44-//   where both input locations advance contiguously.
+45-//
+46-// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+47-//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+48-//   performs four first axis runs of size 6, copying six contiguous values
+--
+57:// Optimization - Coalescing
+58-//
+59-// Coalescing axes is an important optimization used to reduce the number of
+60-// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+61-// 3-5x performance on its own in some cases. It's easiest to look at some
+62-// practical applications of how this is useful:
+63-//
+64-// - Identically shaped binary array operations. Adding two arrays with
+65-//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+66-//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+67-//   resulting in one flat vectorizable loop.
+68-//
+69-// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+70-//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+71-//   Both coalesce completely, producing a [40] loop with array stride [1] and
+--
+95:// Optimization - Fixed zero stride paths
+96-//
+97-// After coalescing, the first axis is walked by the inner loop. A stride of 0
+98-// on this axis means that a subspace location stays fixed while the point space
+99-// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+100-// it to accumulate into the same output location. A zero stride on a later axis
+101-// does not use this path because later axes advance between inner runs.
+102-//
+103-// When the inner loop receives the stride as a runtime value, the compiler
+104-// can't prove that the location is fixed and falls back to a scalar loop. The
+105-// public iteration macros check for a zero stride and pass a literal 0 to a
+106-// specialized path. This lets the compiler see that the location does not
+107-// change. For binary operations, it can then hoist the fixed load out of the
+108-// loop and vectorize the remaining stride 1 work.
+109-//</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ // coordinates between runs, rather than checking and carrying them after every
+ // element. This gives the compiler a small loop where the index and locations
+ // advance by fixed strides, making it much easier to optimize and vectorize.
+ //
+<span class="ins">+// Practical examples of when this is useful:</span>
+<span class="ins">+//</span>
+ // - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+<span class="hunk">@@</span>
+ //
+ // Coalescing axes is an important optimization used to reduce the number of
+ // axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+<span class="del">-// 3-5x performance on its own in some cases. It's easiest to look at some</span>
+<span class="del">-// practical applications of how this is useful:</span>
+<span class="ins">+// 3-5x performance on its own in some cases.</span>
+<span class="ins">+//</span>
+<span class="ins">+// Practical examples of when this is useful:</span>
+<span class="hunk">@@</span>
+ // change. For binary operations, it can then hoist the fixed load out of the
+ // loop and vectorize the remaining stride 1 work.
+ //
+<span class="ins">+// Practical examples of when this is useful:</span>
+<span class="ins">+//</span>
+ // - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+ //
+ // Coalescing axes is an important optimization used to reduce the number of
+<span class="del">-// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can</span>
+<span class="del">-// 3-5x performance on its own in some cases.</span>
+<span class="ins">+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can</span>
+<span class="ins">+// improve performance by 3-5x on its own in some cases.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; rg -n &quot;Practical examp…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; rg -n &quot;Practical examples of when this is useful:&quot; src/strided-iterator.h &amp;&amp; git diff --stat &amp;&amp; git diff -- src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+42:// Practical examples of when this is useful:
+65:// Practical examples of when this is useful:
+113:// Practical examples of when this is useful:
+ src/strided-iterator.h | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index a840439..bc100d5 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -39,6 +39,8 @@
+ // element. This gives the compiler a small loop where the index and locations
+ // advance by fixed strides, making it much easier to optimize and vectorize.
+ //
++// Practical examples of when this is useful:
++//
+ // - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+ //   coalesces to dimensions [40], so the entire operation is one first axis run
+ //   where both input locations advance contiguously.
+@@ -58,8 +60,9 @@
+ //
+ // Coalescing axes is an important optimization used to reduce the number of
+ // axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+-// 3-5x performance on its own in some cases. It's easiest to look at some
+-// practical applications of how this is useful:
++// improve performance by 3-5x on its own in some cases.
++//
++// Practical examples of when this is useful:
+ //
+ // - Identically shaped binary array operations. Adding two arrays with
+ //   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+@@ -107,6 +110,8 @@
+ // change. For binary operations, it can then hoist the fixed load out of the
+ // loop and vectorize the remaining stride 1 work.
+ //
++// Practical examples of when this is useful:
++//
+ // - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+ //   array coalesces to point dimensions [40], with array strides [1] and scalar
+ //   strides [0]. The scalar location stays fixed while the array and output</pre></details>
+<p>All three optimization introductions now end with the same practical-examples lead-in. I also corrected the existing “3-5x performance” sentence while preserving its meaning.</p>
+
+<details class="tool"><summary>Bash: git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Standardize optimization example introductio…</summary>
+<pre>$ git add src/strided-iterator.h &amp;&amp; git commit -m &quot;Standardize optimization example introductions&quot;</pre><pre class="output">Script completed
+Wall time 7.0 seconds
+Output:
+
+[feature/document 69c6331] Standardize optimization example introductions
+ 1 file changed, 7 insertions(+), 2 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/document</summary>
+<pre>$ git push origin feature/document</pre><pre class="output">Script completed
+Wall time 17.1 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   c351050..69c6331  feature/document -&gt; feature/document</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch</summary>
+<pre>$ git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/document...origin/feature/document</pre></details>
+<p>Standardized all three sections with:</p>
+<blockquote>
+<p>Practical examples of when this is useful:</p>
+</blockquote>
+<p>Also corrected the existing coalescing sentence to “improve performance by 3-5x.”</p>
+<p>Pushed commit <code>69c6331 Standardize optimization example introductions</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

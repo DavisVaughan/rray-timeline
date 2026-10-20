@@ -1,0 +1,1962 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Passing error_call to reduce kernels with RRAY_REDUCE_ARGS</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-109">rray timeline</a>
+<h1>Passing <code>error_call</code> to reduce kernels with <code>RRAY_REDUCE_ARGS</code></h1>
+<p class="facts">Claude · Oct 1, 2026 · 7 prompts · 13 replies · <a href="https://github.com/r-lib/rray/pull/109">#109</a></p>
+</header>
+<main>
+<p class="divider">Oct 1, 2026, 15:23 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Let’s chat about one-add.h</p>
+<p>Note how we can’t directly call the add version in some cases due to inability to pass error_call through</p>
+<p>I believe we can add ONE_ARGS to RRAY_REDUCE to fix this</p>
+<p>What do you think about that? Is that the cleanest way to make them share?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat src/one-add.h &amp;&amp; grep -rn &quot;RRAY_REDUCE\|ONE_ARGS&quot; src --include=*.h --include=*.c | grep …</summary>
+<pre>cat src/one-add.h &amp;&amp; grep -rn &quot;RRAY_REDUCE\|ONE_ARGS&quot; src --include=*.h --include=*.c | grep -v &quot;^src/rlang&quot; | head -80</pre><pre class="output">#ifndef RRAY_ONE_ADD_H
+#define RRAY_ONE_ADD_H
+
+#include &lt;limits.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arithmetic.h&quot;
+#include &quot;missing.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// - `x = 1`, `y = 1`: returns `2`.
+// - `x = 1`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = INT_MAX`: returns `NA`.
+// - `x = 1`, `y = INT_MAX`: errors.
+static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+    stop_int_overflow(error_call);
+  }
+
+  return x + y;
+}
+
+static inline double rray_add_dbl_one(double x, double y) {
+  return x + y;
+}
+
+static inline r_complex rray_add_cpl_one(r_complex x, r_complex y) {
+  return (r_complex) {.r = x.r + y.r, .i = x.i + y.i};
+}
+
+// --------------------------------------------------------------------------
+// Reduce
+
+// `out` is an integer, `x` is a logical
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `NA`.
+// - `out = NA`, `x = 1`: returns `NA`.
+static inline int rray_sum_lgl_one(int out, int x) {
+  if (rray_int_is_missing(out)) {
+    return r_globals.na_int;
+  }
+
+  if (rray_lgl_is_missing(x)) {
+    return r_globals.na_int;
+  }
+
+  // Since long vectors aren't supported in arrays,
+  // we can't ever integer overflow in a logical array
+
+  return out + x;
+}
+
+// `out` is an integer that is never `NA`, `x` is a logical
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `1`.
+static inline int rray_sum_lgl_one_na_rm(int out, int x) {
+  if (rray_lgl_is_missing(x)) {
+    return out;
+  }
+
+  return out + x;
+}
+
+static inline void check_sum_int_overflow(int out, int x) {
+  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {
+    r_abort(&quot;Integer overflow.&quot;);
+  }
+}
+
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `NA`.
+// - `out = NA`, `x = INT_MAX`: returns `NA`.
+// - `out = 1`, `x = INT_MAX`: errors.
+static inline int rray_sum_int_one(int out, int x) {
+  if (rray_int_is_missing(out)) {
+    return r_globals.na_int;
+  }
+
+  if (rray_int_is_missing(x)) {
+    return r_globals.na_int;
+  }
+
+  check_sum_int_overflow(out, x);
+
+  return out + x;
+}
+
+// `out` is never `NA`
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `1`.
+// - `out = 1`, `x = INT_MAX`: errors.
+static inline int rray_sum_int_one_na_rm(int out, int x) {
+  if (rray_int_is_missing(x)) {
+    return out;
+  }
+
+  check_sum_int_overflow(out, x);
+
+  return out + x;
+}
+
+// Purposefully choose to match `rray_add()` rather than `sum()` regarding
+// `c(NA, NaN)` behavior. Base R `sum()` forces `NA` if present, but `+`
+// doesn't, so R is inconsistent. It's much faster to avoid checking for this,
+// so we just say &quot;it's implementation defined&quot; for both add and sum in rray.
+static inline double rray_sum_dbl_one(double out, double x) {
+  return rray_add_dbl_one(out, x);
+}
+
+// `out` is never missing
+// - `out = 1`, `x = 2`: returns `3`.
+// - `out = 1`, `x = NA`: returns `1`.
+// - `out = 1`, `x = NaN`: returns `1`.
+static inline double rray_sum_dbl_one_na_rm(double out, double x) {
+  if (rray_dbl_is_missing(x)) {
+    return out;
+  }
+
+  return out + x;
+}
+
+static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x) {
+  return rray_add_cpl_one(out, x);
+}
+
+// Each part is removed on its own
+// - `out = 1+1i`, `x = 2+2i`: returns `3+3i`.
+// - `out = 1+1i`, `x = NA`: returns `1+1i`.
+// - `out = 1+1i`, `x = complex(real = 2, imaginary = NaN)`: returns `3+1i`.
+static inline r_complex rray_sum_cpl_one_na_rm(r_complex out, r_complex x) {
+  return (r_complex) {
+    .r = rray_sum_dbl_one_na_rm(out.r, x.r),
+    .i = rray_sum_dbl_one_na_rm(out.i, x.i),
+  };
+}
+
+#endif
+(eval):1: no matches found: --include=*.h</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;RRAY_REDUCE\|ONE_ARGS\|error_call&quot; src/*.c src/*.h | grep -v rlang | head -80; ls s…</summary>
+<pre>grep -rn &quot;RRAY_REDUCE\|ONE_ARGS\|error_call&quot; src/*.c src/*.h | grep -v rlang | head -80; ls src</pre><pre class="output">src/arithmetic-add.c:14:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-add.c:15:  return rray_add(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+src/arithmetic-add.c:23:  struct r_lazy error_call
+src/arithmetic-add.c:31:    error_call
+src/arithmetic-add.c:40:  struct r_lazy error_call
+src/arithmetic-add.c:87:    stop_unsupported_arithmetic(&quot;+&quot;, x, y, x_arg, y_arg, error_call);
+src/arithmetic-add.c:98:      stop_scalar_input(x, x_arg, error_call);
+src/arithmetic-add.c:100:      stop_scalar_input(y, y_arg, error_call);
+src/arithmetic-add.c:111:  struct r_lazy error_call
+src/arithmetic-add.c:124:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-add.c:132:  struct r_lazy error_call
+src/arithmetic-add.c:145:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-add.c:153:  struct r_lazy error_call
+src/arithmetic-add.c:166:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-add.c:174:  struct r_lazy error_call
+src/arithmetic-add.c:195:  struct r_lazy error_call
+src/arithmetic-add.c:216:  struct r_lazy error_call
+src/arithmetic-add.c:237:  struct r_lazy error_call
+src/arithmetic-add.c:258:  struct r_lazy error_call
+src/arithmetic-add.c:271:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-add.c:279:  struct r_lazy error_call
+src/arithmetic-add.c:300:  struct r_lazy error_call
+src/arithmetic-add.c:321:  struct r_lazy error_call
+src/arithmetic-add.c:342:  struct r_lazy error_call
+src/arithmetic-add.c:363:  struct r_lazy error_call
+src/arithmetic-add.c:384:  struct r_lazy error_call
+src/arithmetic-add.c:405:  struct r_lazy error_call
+src/arithmetic-add.c:426:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-exponentiate.c:16:  return rray_exponentiate(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+src/arithmetic-exponentiate.c:24:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:32:    error_call
+src/arithmetic-exponentiate.c:41:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:87:    stop_unsupported_arithmetic(&quot;^&quot;, x, y, x_arg, y_arg, error_call);
+src/arithmetic-exponentiate.c:98:      stop_scalar_input(x, x_arg, error_call);
+src/arithmetic-exponentiate.c:100:      stop_scalar_input(y, y_arg, error_call);
+src/arithmetic-exponentiate.c:111:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:124:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:132:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:145:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:153:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:166:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:174:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:187:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:195:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:208:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:216:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:229:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:237:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:250:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:258:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:271:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:279:  struct r_lazy error_call
+src/arithmetic-exponentiate.c:292:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-exponentiate.c:299:  struct r_lazy error_call
+src/arithmetic-multiply.c:14:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-multiply.c:15:  return rray_multiply(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+src/arithmetic-multiply.c:23:  struct r_lazy error_call
+src/arithmetic-multiply.c:31:    error_call
+src/arithmetic-multiply.c:40:  struct r_lazy error_call
+src/arithmetic-multiply.c:93:    stop_unsupported_arithmetic(&quot;*&quot;, x, y, x_arg, y_arg, error_call);
+src/arithmetic-multiply.c:104:      stop_scalar_input(x, x_arg, error_call);
+src/arithmetic-multiply.c:106:      stop_scalar_input(y, y_arg, error_call);
+src/arithmetic-multiply.c:117:  struct r_lazy error_call
+src/arithmetic-multiply.c:130:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-multiply.c:138:  struct r_lazy error_call
+src/arithmetic-multiply.c:151:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-multiply.c:159:  struct r_lazy error_call
+src/arithmetic-multiply.c:172:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-multiply.c:180:  struct r_lazy error_call
+src/arithmetic-multiply.c:201:  struct r_lazy error_call
+src/arithmetic-multiply.c:222:  struct r_lazy error_call
+src/arithmetic-multiply.c:243:  struct r_lazy error_call
+src/arithmetic-multiply.c:264:  struct r_lazy error_call
+src/arithmetic-multiply.c:277:    RRAY_BINARY_ARGS(error_call)
+src/arithmetic-multiply.c:285:  struct r_lazy error_call
+src/arithmetic-multiply.c:306:  struct r_lazy error_call
+src/arithmetic-multiply.c:327:  struct r_lazy error_call
+src/arithmetic-multiply.c:348:  struct r_lazy error_call
+src/arithmetic-multiply.c:369:  struct r_lazy error_call
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+one-add.h
+one-extremum.h
+one-logical.h
+one-multiply.h
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-extremum.c
+reduce-extremum.h
+reduce-extremum.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-prod.c
+reduce-prod.h
+reduce-prod.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c</pre><p class="cut">71 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/reduce.h src/binary.h; cat src/reduce-sum.c; sed -n 100,200p src/arithmetic-add.c; ca…</summary>
+<pre>cat src/reduce.h src/binary.h; cat src/reduce-sum.c; sed -n 100,200p src/arithmetic-add.c; cat src/one-multiply.h; grep -rn &quot;r_abort\|stop_.*overflow&quot; src/*.h src/reduce*.c src/arithmetic.c src/extremum.c src/logical.c</pre><pre class="output">#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+// --------------------------------------------------------------------------
+// rray_reduce
+
+// Flat reduction is useful when the output element is the only state carried
+// between input elements. It walks `x` once in storage order, updating the
+// output element that each input contributes to. This is faster than nested
+// reduction because it reads `x` linearly and avoids a separate inner traversal
+// for each output element.
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+
+typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize out_start = 0;                                                       \
+  const r_ssize out_run_stride = rray_strided_iterator_plan_run_stride(plan);  \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize out_loc = out_start;                                               \
+                                                                               \
+    if (out_run_stride == 0) {                                                 \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+        out_loc += out_run_stride;                                             \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(out_start, v_point, plan);                      \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+// --------------------------------------------------------------------------
+// rray_reduce_nested
+
+// Nested reduction is needed when an output element cannot hold all reduction
+// state, such as the sum and count required by a mean. The outer plan walks the
+// retained axes to select each output element, and the inner plan walks the
+// reduction axes to compute it. Conceptually, this is like using
+// `rray_permute_axes()` to bring the reduction axes to the front, without
+// materializing the permuted array.
+
+typedef r_obj* (*rray_reduce_nested_fn)(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+
+typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE_OUTER(                                                     \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  ONE                                                                          \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  r_ssize out_run_start = 0;                                                   \
+  const r_ssize out_run_size =                                                 \
+    rray_strided_iterator_plan_run_size(outer_plan);                           \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride =                                                 \
+    rray_strided_iterator_plan_run_stride(outer_plan);                         \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(outer_plan, v_point);                  \
+                                                                               \
+  while (out_run_start != size) {                                              \
+    const r_ssize out_run_end = out_run_start + out_run_size;                  \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \
+      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \
+      x_loc += x_run_stride;                                                   \
+    }                                                                          \
+                                                                               \
+    out_run_start = out_run_end;                                               \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+  do {                                                                         \
+    const r_ssize size = rray_strided_iterator_plan_size(inner_plan);          \
+                                                                               \
+    r_ssize run_start = 0;                                                     \
+    const r_ssize run_size = rray_strided_iterator_plan_run_size(inner_plan);  \
+                                                                               \
+    const r_ssize x_run_stride =                                               \
+      rray_strided_iterator_plan_run_stride(inner_plan);                       \
+                                                                               \
+    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \
+    rray_strided_iterator_plan_point_init(inner_plan, v_point);                \
+                                                                               \
+    while (run_start != size) {                                                \
+      const r_ssize run_end = run_start + run_size;                            \
+      r_ssize x_loc = x_start;                                                 \
+                                                                               \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        ACCUMULATE;                                                            \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+                                                                               \
+      run_start = run_end;                                                     \
+      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, inner_plan);                \
+    }                                                                          \
+  } while (0)
+
+// --------------------------------------------------------------------------
+// stop_unsupported_reduce
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call</pre><p class="cut">516 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 1,80p src/reduce.c; grep -rn -B3 -A6 &quot;overflow&quot; tests/testthat/_snaps/reduce-sum.md te…</summary>
+<pre>sed -n 1,80p src/reduce.c; grep -rn -B3 -A6 &quot;overflow&quot; tests/testthat/_snaps/reduce-sum.md tests/testthat/_snaps/*sum* 2&gt;/dev/null | head -40; grep -rln &quot;RRAY_REDUCE(&quot; src</pre><pre class="output">#include &quot;reduce.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-decl.h&quot;
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * dimensionality);
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out_dimensions[v_axes[i] - 1] = 1;
+  }
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+    v_out_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    dimensionality
+  );
+
+  const rray_reduce_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, out_size, &amp;plan));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+tests/testthat/_snaps/reduce-sum.md-38-      Error in `rray_sum()`:
+tests/testthat/_snaps/reduce-sum.md-39-      ! `axes` must not contain missing values.
+tests/testthat/_snaps/reduce-sum.md-40-
+tests/testthat/_snaps/reduce-sum.md:41:# errors on integer overflow
+tests/testthat/_snaps/reduce-sum.md-42-
+tests/testthat/_snaps/reduce-sum.md-43-    Code
+tests/testthat/_snaps/reduce-sum.md-44-      rray_sum(x, 1L)
+tests/testthat/_snaps/reduce-sum.md-45-    Condition
+tests/testthat/_snaps/reduce-sum.md-46-      Error in `rray_sum()`:
+tests/testthat/_snaps/reduce-sum.md:47:      ! Integer overflow.
+tests/testthat/_snaps/reduce-sum.md-48-
+tests/testthat/_snaps/reduce-sum.md-49-# errors on integer underflow
+tests/testthat/_snaps/reduce-sum.md-50-
+tests/testthat/_snaps/reduce-sum.md-51-    Code
+tests/testthat/_snaps/reduce-sum.md-52-      rray_sum(x, 1L)
+tests/testthat/_snaps/reduce-sum.md-53-    Condition
+tests/testthat/_snaps/reduce-sum.md-54-      Error in `rray_sum()`:
+tests/testthat/_snaps/reduce-sum.md:55:      ! Integer overflow.
+tests/testthat/_snaps/reduce-sum.md-56-
+tests/testthat/_snaps/reduce-sum.md:57:# errors on integer overflow with `na_rm = TRUE`
+tests/testthat/_snaps/reduce-sum.md-58-
+tests/testthat/_snaps/reduce-sum.md-59-    Code
+tests/testthat/_snaps/reduce-sum.md-60-      rray_sum(x, 1L, na_rm = TRUE)
+tests/testthat/_snaps/reduce-sum.md-61-    Condition
+tests/testthat/_snaps/reduce-sum.md-62-      Error in `rray_sum()`:
+tests/testthat/_snaps/reduce-sum.md:63:      ! Integer overflow.
+tests/testthat/_snaps/reduce-sum.md-64-
+tests/testthat/_snaps/reduce-sum.md-65-# `na_rm` must be `TRUE` or `FALSE`
+tests/testthat/_snaps/reduce-sum.md-66-
+tests/testthat/_snaps/reduce-sum.md-67-    Code
+tests/testthat/_snaps/reduce-sum.md-68-      rray_sum(x, 1L, na_rm = NA)
+tests/testthat/_snaps/reduce-sum.md-69-    Condition
+tests/testthat/_snaps/reduce-sum.md-38-      Error in `rray_sum()`:
+tests/testthat/_snaps/reduce-sum.md-39-      ! `axes` must not contain missing values.
+tests/testthat/_snaps/reduce-sum.md-40-
+tests/testthat/_snaps/reduce-sum.md:41:# errors on integer overflow
+tests/testthat/_snaps/reduce-sum.md-42-
+tests/testthat/_snaps/reduce-sum.md-43-    Code
+tests/testthat/_snaps/reduce-sum.md-44-      rray_sum(x, 1L)
+tests/testthat/_snaps/reduce-sum.md-45-    Condition
+src/reduce.h
+src/reduce-prod.c
+src/reduce-logical.c
+src/reduce-sum.c
+src/reduce-extremum.c</pre></details>
+<p>Yes, I think that's the right fix. It also matches what <code>RRAY_BINARY</code> already does, so it's a consistency win and not just a workaround.</p>
+<p><strong>What changes</strong></p>
+<ul>
+<li>
+<p><code>rray_reduce_fn</code> takes a <code>struct r_lazy error_call</code>, and <code>rray_reduce()</code> passes its own through.</p>
+</li>
+<li>
+<p><code>RRAY_REDUCE</code> gets a last <code>ONE_ARGS</code> parameter, and its two call sites become <code>ONE(v_out[out_loc], v_x[i] ONE_ARGS)</code>.</p>
+</li>
+<li>
+<p>Every flat reduce kernel takes <code>error_call</code> (extremum, logical, prod, sum). Kernels that don't need it pass the no-args marker. Binary kernels already work this way: <code>rray_add_lgl_dbl()</code> takes <code>error_call</code> and passes <code>RRAY_BINARY_NO_ARGS</code>.</p>
+</li>
+</ul>
+<p><strong>What it lets <code>one-add.h</code> drop</strong></p>
+<ul>
+<li>
+<p><code>check_sum_int_overflow()</code> goes away. That also gets rid of its bare <code>r_abort()</code>, which ignores <code>error_call</code>. The snapshot shows <code>rray_sum()</code> only because <code>r_abort()</code> picks up the current R frame, so the error call would be wrong if another C function ever called <code>rray_sum()</code>.</p>
+</li>
+<li>
+<p><code>rray_sum_int_one()</code> goes away, and <code>rray_sum_int</code> passes <code>rray_add_int_one</code> with the args marker instead.</p>
+</li>
+<li>
+<p><code>rray_sum_int_one_na_rm()</code> shrinks to a missing check on <code>x</code>, then <code>return rray_add_int_one(out, x, error_call)</code>. The add helper re-checks <code>out</code> for <code>NA</code>, which is redundant here but cheap.</p>
+</li>
+<li>
+<p><code>rray_sum_lgl_one()</code> stays. Per the earlier rule, int helpers don't run on logical data.</p>
+</li>
+</ul>
+<p><strong>One thing I'd change in your plan: the marker name</strong></p>
+<p><code>RRAY_BINARY_ARGS</code> / <code>RRAY_BINARY_NO_ARGS</code> live in <code>binary.h</code>, and seeing <code>RRAY_BINARY_ARGS(error_call)</code> inside a reduce kernel reads wrong. The macro is just <code>, __VA_ARGS__</code>, so nothing about it is specific to binary ops. I'd rename it to <code>RRAY_ONE_ARGS(...)</code> / <code>RRAY_ONE_NO_ARGS</code>, to match the <code>ONE_ARGS</code> parameter both macros take, and put it in one small shared header that <code>binary.h</code> and <code>reduce.h</code> both include. The other option is a parallel <code>RRAY_REDUCE_ARGS</code>, which duplicates a one-line macro under a second name.</p>
+<p><strong>Other options, both worse</strong></p>
+<ul>
+<li>
+<p>Keep <code>r_abort()</code> in the sum helpers. The error call stays wrong and the duplicate overflow check stays.</p>
+</li>
+<li>
+<p>Pass state through a context struct or a static. That's more machinery than one extra argument, and it breaks the pattern binary already set.</p>
+</li>
+</ul>
+<p><strong>Questions before I'd start</strong></p>
+<ol>
+<li>
+<p>Should the nested path (<code>rray_reduce_nested_fn</code>, <code>RRAY_REDUCE_OUTER</code>) get <code>error_call</code> too, for symmetry? Mean accumulates in double, so nothing needs it today. I lean yes so the two reduce APIs look the same, but it's dead weight for now.</p>
+</li>
+<li>
+<p>Should <code>rray_sum_dbl_one()</code>, <code>rray_sum_cpl_one()</code>, <code>rray_prod_dbl_one()</code>, and <code>rray_prod_cpl_one()</code> stay as thin wrappers? Once <code>ONE_ARGS</code> exists, the kernels could pass <code>rray_add_dbl_one</code> and friends directly. But the wrappers hold your comments about <code>c(NA, NaN)</code> and recovering infinities, and those would need a new home. I'd keep the wrappers.</p>
+</li>
+<li>
+<p>Should the marker rename be its own PR first, with the reduce change stacked on top? I'd split it that way.</p>
+</li>
+</ol>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<ul>
+<li>
+<p>“rray_sum_int_one() goes away” no we should keep all wrappers</p>
+</li>
+<li>
+<p>yes in nested path</p>
+</li>
+<li>
+<p>call it RRAY REDUCE ARGS</p>
+</li>
+<li>
+<p>do it all together</p>
+</li>
+</ul>
+<p>On branch feature/error-call</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git checkout -b feature/error-call &amp;&amp; sed -n 80,140p src/reduce.c &amp;&amp; cat src/reduce-mean.c &amp;&amp;…</summary>
+<pre>git checkout -b feature/error-call &amp;&amp; sed -n 80,140p src/reduce.c &amp;&amp; cat src/reduce-mean.c &amp;&amp; grep -n &quot;RRAY_REDUCE\|^static r_obj\|plan$\|ONE\b&quot; src/reduce-extremum.c src/reduce-logical.c src/reduce-prod.c | head -80; ls src/decl | grep reduce</pre><pre class="output">Switched to a new branch 'feature/error-call'
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* retained_axes =
+    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+  const int* v_retained_axes = r_int_cbegin(retained_axes);
+  const r_ssize retained_axes_size = r_length(retained_axes);
+
+  const struct rray_strided_iterator_plan outer_plan =
+    rray_reduce_nested_iterator_plan(
+      v_x_dimensions,
+      v_x_strides,
+      v_retained_axes,
+      retained_axes_size
+    );
+
+  const struct rray_strided_iterator_plan inner_plan =
+    rray_reduce_nested_iterator_plan(
+      v_x_dimensions,
+      v_x_strides,
+      v_axes,
+      axes_size
+    );
+
+  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * dimensionality);
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out_dimensions[v_axes[i] - 1] = 1;
+  }
+
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(7);
+  return out;
+}
+
+static struct rray_strided_iterator_plan rray_reduce_nested_iterator_plan(
+  const int* v_x_dimensions,
+  const r_ssize* v_x_strides,
+#include &quot;reduce-mean.h&quot;
+
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-mean-decl.h&quot;
+
+r_obj* ffi_rray_mean(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_mean(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_mean(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce_nested(x, axes, na_rm, rray_mean_switch, arg, error_call);
+}
+
+static rray_reduce_nested_fn rray_mean_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return na_rm ? rray_mean_lgl_na_rm : rray_mean_lgl;
+  case RRAY_TYPE_integer:
+    return na_rm ? rray_mean_int_na_rm : rray_mean_int;
+  case RRAY_TYPE_double:
+    return na_rm ? rray_mean_dbl_na_rm : rray_mean_dbl;
+
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;mean&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_mean_lgl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+) {
+  RRAY_REDUCE_OUTER(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    rray_mean_lgl_one
+  );
+}
+
+static r_obj* rray_mean_lgl_na_rm(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+) {
+  RRAY_REDUCE_OUTER(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    rray_mean_lgl_one_na_rm
+  );
+}
+
+static r_obj* rray_mean_int(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+) {
+  RRAY_REDUCE_OUTER(
+    int,
+    r_int_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    rray_mean_int_one
+  );
+}
+
+static r_obj* rray_mean_int_na_rm(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+) {
+  RRAY_REDUCE_OUTER(
+    int,
+    r_int_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    rray_mean_int_one_na_rm
+  );
+}
+
+static r_obj* rray_mean_dbl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+) {
+  RRAY_REDUCE_OUTER(
+    double,
+    r_dbl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    rray_mean_dbl_one
+  );
+}
+
+static r_obj* rray_mean_dbl_na_rm(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+) {
+  RRAY_REDUCE_OUTER(
+    double,</pre><p class="cut">262 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/decl/reduce-sum-decl.h src/decl/reduce-mean-decl.h; sed -n 55,90p src/reduce-prod.c</summary>
+<pre>cat src/decl/reduce-sum-decl.h src/decl/reduce-mean-decl.h; sed -n 55,90p src/reduce-prod.c</pre><pre class="output">static rray_reduce_fn rray_sum_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_sum_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_int(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_int_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_dbl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_dbl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_cpl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_cpl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static rray_reduce_nested_fn rray_mean_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_mean_lgl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static r_obj* rray_mean_lgl_na_rm(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static r_obj* rray_mean_int(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static r_obj* rray_mean_int_na_rm(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static r_obj* rray_mean_dbl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static r_obj* rray_mean_dbl_na_rm(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+
+static inline double rray_mean_lgl_one(
+  const int* v_x,
+  r_ssize x_start,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static inline double rray_mean_lgl_one_na_rm(
+  const int* v_x,
+  r_ssize x_start,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static inline double rray_mean_int_one(
+  const int* v_x,
+  r_ssize x_start,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static inline double rray_mean_int_one_na_rm(
+  const int* v_x,
+  r_ssize x_start,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static inline double rray_mean_dbl_one(
+  const double* v_x,
+  r_ssize x_start,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+static inline double rray_mean_dbl_one_na_rm(
+  const double* v_x,
+  r_ssize x_start,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_prod_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    1.0,
+    rray_prod_lgl_one
+  );
+}
+
+static r_obj* rray_prod_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    1.0,
+    rray_prod_lgl_one_na_rm
+  );
+}</pre></details>
+<p>Now the mechanical edits across kernels and decls.</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+files = [&quot;extremum&quot;,&quot;logical&quot;,&quot;prod&quot;,&quot;sum&quot;,&quot;mean&quot;]
+for f in files:
+    for path in [f&quot;src/reduce-{f}.c&quot;, f&quot;src/decl/reduce-{f}-decl.h&quot;]:
+        s = open(path).read()
+        # kernel signatures (flat and nested), not the inline one helpers
+        s = re.sub(r&quot;(static r_obj\* rray_\w+\(\n  r_obj\* x,\n(?:  r_ssize out_size,\n  const struct rray_strided_iterator_plan\* plan|  const struct rray_strided_iterator_plan\* outer_plan,\n  const struct rray_strided_iterator_plan\* inner_plan))\n\)&quot;,
+                   r&quot;\1,\n  struct r_lazy error_call\n)&quot;, s)
+        if path.endswith(&quot;.c&quot;):
+            def repl(m):
+                body = m.group(0)
+                one = re.search(r&quot;(\w+)\n  \);$&quot;, body).group(1)
+                args = &quot;RRAY_REDUCE_ARGS(error_call)&quot; if one in (&quot;rray_sum_int_one&quot;,&quot;rray_sum_int_one_na_rm&quot;) else &quot;RRAY_REDUCE_NO_ARGS&quot;
+                return body[:-len(&quot;\n  );&quot;)] + f&quot;,\n    {args}\n  );&quot;
+            s = re.sub(r&quot;RRAY_REDUCE(?:_OUTER)?\((?:\n    [^\n]*)+\n  \);&quot;, repl, s)
+        open(path,&quot;w&quot;).write(s)
+EOF
+git diff --stat; grep -c &quot;struct r_lazy error_call\n)&quot; src/reduce-*.c; grep -c &quot;RRAY_REDUCE_NO_ARGS\|RRAY_REDUCE_ARGS&quot; src/reduce-*.c</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Bash: grep -n -B1 &quot;^  );&quot; src/reduce-*.c | grep -v &quot;  );&quot; | grep -v &quot;^--&quot;; grep -n &quot;plan$&quot; src/redu…</summary>
+<pre>grep -n -B1 &quot;^  );&quot; src/reduce-*.c | grep -v &quot;  );&quot; | grep -v &quot;^--&quot;; grep -n &quot;plan$&quot; src/reduce-*.c src/decl/reduce-*-decl.h | grep -v &quot;outer_plan,\|inner_plan$&quot; | head; grep -n &quot;inner_plan$&quot; src/reduce-*.c src/decl/reduce-*-decl.h | head -30</pre><pre class="output">src/reduce-logical.c-83-    rray_all_lgl_one
+src/reduce-logical.c-99-    rray_all_lgl_one_na_rm
+src/reduce-logical.c-115-    rray_any_lgl_one
+src/reduce-logical.c-131-    rray_any_lgl_one_na_rm
+src/reduce-extremum.c-121-    rray_max_lgl_one
+src/reduce-extremum.c-137-    rray_max_lgl_one_na_rm
+src/reduce-extremum.c-153-    rray_max_int_one
+src/reduce-extremum.c-169-    rray_max_int_one_na_rm
+src/reduce-extremum.c-185-    rray_max_dbl_one
+src/reduce-extremum.c-201-    rray_max_dbl_one_na_rm
+src/reduce-extremum.c-217-    rray_min_lgl_one
+src/reduce-extremum.c-233-    rray_min_lgl_one_na_rm
+src/reduce-extremum.c-249-    rray_min_int_one
+src/reduce-extremum.c-265-    rray_min_int_one_na_rm
+src/reduce-extremum.c-281-    rray_min_dbl_one
+src/reduce-extremum.c-297-    rray_min_dbl_one_na_rm
+src/reduce-mean.c-68-    rray_mean_lgl_one
+src/reduce-mean.c-83-    rray_mean_lgl_one_na_rm
+src/reduce-mean.c-98-    rray_mean_int_one
+src/reduce-mean.c-113-    rray_mean_int_one_na_rm
+src/reduce-mean.c-128-    rray_mean_dbl_one
+src/reduce-mean.c-143-    rray_mean_dbl_one_na_rm
+src/reduce-sum.c-71-    rray_sum_lgl_one
+src/reduce-sum.c-87-    rray_sum_lgl_one_na_rm
+src/reduce-sum.c-103-    rray_sum_int_one
+src/reduce-sum.c-119-    rray_sum_int_one_na_rm
+src/reduce-sum.c-135-    rray_sum_dbl_one
+src/reduce-sum.c-151-    rray_sum_dbl_one_na_rm
+src/reduce-sum.c-167-    rray_sum_cpl_one
+src/reduce-sum.c-183-    rray_sum_cpl_one_na_rm
+src/reduce-prod.c-71-    rray_prod_lgl_one
+src/reduce-prod.c-87-    rray_prod_lgl_one_na_rm
+src/reduce-prod.c-103-    rray_prod_int_one
+src/reduce-prod.c-119-    rray_prod_int_one_na_rm
+src/reduce-prod.c-135-    rray_prod_dbl_one
+src/reduce-prod.c-151-    rray_prod_dbl_one_na_rm
+src/reduce-prod.c-167-    rray_prod_cpl_one
+src/reduce-prod.c-183-    rray_prod_cpl_one_na_rm
+src/reduce-logical.c:74:  const struct rray_strided_iterator_plan* plan
+src/reduce-logical.c:90:  const struct rray_strided_iterator_plan* plan
+src/reduce-logical.c:106:  const struct rray_strided_iterator_plan* plan
+src/reduce-logical.c:122:  const struct rray_strided_iterator_plan* plan
+src/reduce-extremum.c:112:  const struct rray_strided_iterator_plan* plan
+src/reduce-extremum.c:128:  const struct rray_strided_iterator_plan* plan
+src/reduce-extremum.c:144:  const struct rray_strided_iterator_plan* plan
+src/reduce-extremum.c:160:  const struct rray_strided_iterator_plan* plan
+src/reduce-extremum.c:176:  const struct rray_strided_iterator_plan* plan
+src/reduce-extremum.c:192:  const struct rray_strided_iterator_plan* plan
+src/reduce-mean.c:60:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:75:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:90:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:105:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:120:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:135:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:150:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:170:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:189:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:209:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:227:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:281:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:11:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:16:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:21:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:26:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:31:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:36:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:42:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:47:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:52:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:57:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:62:  const struct rray_strided_iterator_plan* inner_plan
+src/decl/reduce-mean-decl.h:67:  const struct rray_strided_iterator_plan* inner_plan</pre></details>
+<details class="tool"><summary>Read src/reduce-sum.c</summary>
+<pre class="output">1	#include &quot;reduce-sum.h&quot;
+2	
+3	#include &quot;one-add.h&quot;
+4	#include &quot;reduce.h&quot;
+5	#include &quot;type.h&quot;</pre></details>
+<details class="tool"><summary>Read src/reduce-prod.c</summary>
+<pre class="output">1	#include &quot;reduce-prod.h&quot;
+2	
+3	#include &quot;one-multiply.h&quot;
+4	#include &quot;reduce.h&quot;
+5	#include &quot;type.h&quot;</pre></details>
+<details class="tool"><summary>Read src/reduce-extremum.c</summary>
+<pre class="output">1	#include &quot;reduce-extremum.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	#include &lt;math.h&gt;
+5	</pre></details>
+<details class="tool"><summary>Read src/reduce-logical.c</summary>
+<pre class="output">1	#include &quot;reduce-logical.h&quot;
+2	
+3	#include &quot;logical.h&quot;
+4	#include &quot;one-logical.h&quot;
+5	#include &quot;reduce.h&quot;</pre></details>
+<details class="tool"><summary>Read src/reduce-mean.c</summary>
+<pre class="output">1	#include &quot;reduce-mean.h&quot;
+2	
+3	#include &quot;reduce.h&quot;
+4	#include &quot;type.h&quot;
+5	#include &quot;utils.h&quot;</pre></details>
+<details class="tool"><summary>Read src/decl/reduce-sum-decl.h</summary>
+<pre class="output">1	static rray_reduce_fn rray_sum_switch(
+2	  r_obj* x,
+3	  bool na_rm,
+4	  struct rray_arg* arg,
+5	  struct r_lazy error_call</pre></details>
+<details class="tool"><summary>Read src/decl/reduce-prod-decl.h</summary>
+<pre class="output">1	static rray_reduce_fn rray_prod_switch(
+2	  r_obj* x,
+3	  bool na_rm,
+4	  struct rray_arg* arg,
+5	  struct r_lazy error_call</pre></details>
+<details class="tool"><summary>Read src/decl/reduce-extremum-decl.h</summary>
+<pre class="output">1	static rray_reduce_fn rray_max_switch(
+2	  r_obj* x,
+3	  bool na_rm,
+4	  struct rray_arg* arg,
+5	  struct r_lazy error_call</pre></details>
+<details class="tool"><summary>Read src/decl/reduce-logical-decl.h</summary>
+<pre class="output">1	static rray_reduce_fn rray_all_switch(
+2	  r_obj* x,
+3	  bool na_rm,
+4	  struct rray_arg* arg,
+5	  struct r_lazy error_call</pre></details>
+<details class="tool"><summary>Read src/decl/reduce-mean-decl.h</summary>
+<pre class="output">1	static rray_reduce_nested_fn rray_mean_switch(
+2	  r_obj* x,
+3	  bool na_rm,
+4	  struct rray_arg* arg,
+5	  struct r_lazy error_call</pre></details>
+<details class="tool"><summary>Read src/reduce.h</summary>
+<pre class="output">1	#ifndef RRAY_REDUCE_H
+2	#define RRAY_REDUCE_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	#include &quot;strided-iterator.h&quot;
+8	
+9	// --------------------------------------------------------------------------
+10	// rray_reduce</pre></details>
+<details class="tool"><summary>Read src/reduce.c</summary>
+<pre class="output">1	#include &quot;reduce.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;</pre></details>
+<details class="tool"><summary>Read src/one-add.h</summary>
+<pre class="output">1	#ifndef RRAY_ONE_ADD_H
+2	#define RRAY_ONE_ADD_H
+3	
+4	#include &lt;limits.h&gt;
+5	</pre></details>
+<p>Flat kernel signatures:</p>
+
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-prod.c</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-prod.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-extremum.c</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-logical.c</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-logical.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/decl/reduce-sum-decl.h</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/reduce-sum-decl.h has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/decl/reduce-prod-decl.h</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/reduce-prod-decl.h has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/decl/reduce-extremum-decl.h</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/reduce-extremum-decl.h has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/decl/reduce-logical-decl.h</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/reduce-logical-decl.h has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* outer_plan,</span>
+<span class="del">-  const struct rray_strided_iterator_plan* inner_plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* outer_plan,</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* inner_plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/decl/reduce-mean-decl.h</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* outer_plan,</span>
+<span class="del">-  const struct rray_strided_iterator_plan* inner_plan</span>
+<span class="del">-)</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* outer_plan,</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* inner_plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/reduce-mean-decl.h has been updated. All occurrences were successfully replaced.</pre></details>
+<p>Expected until the macros and typedefs catch up. Now the <code>ONE_ARGS</code> at each call site:</p>
+
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-_one</span>
+<span class="del">-  );</span>
+<span class="ins">+_one,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-_one_na_rm</span>
+<span class="del">-  );</span>
+<span class="ins">+_one_na_rm,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-prod.c</summary>
+<pre class="diff"><span class="del">-_one</span>
+<span class="del">-  );</span>
+<span class="ins">+_one,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-prod.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-prod.c</summary>
+<pre class="diff"><span class="del">-_one_na_rm</span>
+<span class="del">-  );</span>
+<span class="ins">+_one_na_rm,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-prod.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-extremum.c</summary>
+<pre class="diff"><span class="del">-_one</span>
+<span class="del">-  );</span>
+<span class="ins">+_one,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-extremum.c</summary>
+<pre class="diff"><span class="del">-_one_na_rm</span>
+<span class="del">-  );</span>
+<span class="ins">+_one_na_rm,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-logical.c</summary>
+<pre class="diff"><span class="del">-_one</span>
+<span class="del">-  );</span>
+<span class="ins">+_one,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-logical.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-logical.c</summary>
+<pre class="diff"><span class="del">-_one_na_rm</span>
+<span class="del">-  );</span>
+<span class="ins">+_one_na_rm,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-logical.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-_one</span>
+<span class="del">-  );</span>
+<span class="ins">+_one,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-_one_na_rm</span>
+<span class="del">-  );</span>
+<span class="ins">+_one_na_rm,</span>
+<span class="ins">+    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-    rray_sum_int_one,</span>
+<span class="del">-    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+    rray_sum_int_one,</span>
+<span class="ins">+    RRAY_REDUCE_ARGS(error_call)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-    rray_sum_int_one_na_rm,</span>
+<span class="del">-    RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+    rray_sum_int_one_na_rm,</span>
+<span class="ins">+    RRAY_REDUCE_ARGS(error_call)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated successfully.</pre></details>
+<p>Now <code>reduce.h</code>: markers, typedefs, and the two macros.</p>
+
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-#include &quot;strided-iterator.h&quot;</span>
+<span class="del">-</span>
+<span class="del">-// --------------------------------------------------------------------------</span>
+<span class="del">-// rray_reduce</span>
+<span class="ins">+#include &quot;strided-iterator.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+#define RRAY_REDUCE_ARGS(...) , __VA_ARGS__</span>
+<span class="ins">+#define RRAY_REDUCE_NO_ARGS</span>
+<span class="ins">+</span>
+<span class="ins">+// --------------------------------------------------------------------------</span>
+<span class="ins">+// rray_reduce</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-  r_ssize out_size,</span>
+<span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-);</span>
+<span class="ins">+  r_ssize out_size,</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-  const struct rray_strided_iterator_plan* outer_plan,</span>
+<span class="del">-  const struct rray_strided_iterator_plan* inner_plan</span>
+<span class="del">-);</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* outer_plan,</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* inner_plan,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-  OUT_INIT,                                                                    \</span>
+<span class="del">-  ONE                                                                          \</span>
+<span class="del">-)                                                                              \</span>
+<span class="ins">+  OUT_INIT,                                                                    \</span>
+<span class="ins">+  ONE,                                                                         \</span>
+<span class="ins">+  ONE_ARGS                                                                     \</span>
+<span class="ins">+)                                                                              \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \</span>
+<span class="ins">+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i] ONE_ARGS);                 \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-  OUT_DEREF,                                                                   \</span>
+<span class="del">-  ONE                                                                          \</span>
+<span class="del">-)                                                                              \</span>
+<span class="del">-  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \</span>
+<span class="ins">+  OUT_DEREF,                                                                   \</span>
+<span class="ins">+  ONE,                                                                         \</span>
+<span class="ins">+  ONE_ARGS                                                                     \</span>
+<span class="ins">+)                                                                              \</span>
+<span class="ins">+  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \</span>
+<span class="ins">+      v_out[i] = ONE(v_x, x_loc, inner_plan ONE_ARGS);                         \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(fn(x, out_size, &amp;plan));</span>
+<span class="ins">+  r_obj* out = KEEP(fn(x, out_size, &amp;plan, error_call));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/reduce.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));</span>
+<span class="ins">+  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan, error_call));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.c has been updated successfully.</pre></details>
+<p>Now the sum helpers in <code>one-add.h</code>, keeping the wrappers:</p>
+
+<details class="tool"><summary>Read src/one-add.h</summary>
+<pre class="output">68	  return out + x;
+69	}
+70	
+71	static inline void check_sum_int_overflow(int out, int x) {
+72	  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {
+73	    r_abort(&quot;Integer overflow.&quot;);
+74	  }
+75	}
+76	
+77	// - `out = 1`, `x = 1`: returns `2`.
+78	// - `out = 1`, `x = NA`: returns `NA`.
+79	// - `out = NA`, `x = INT_MAX`: returns `NA`.
+80	// - `out = 1`, `x = INT_MAX`: errors.
+81	static inline int rray_sum_int_one(int out, int x) {
+82	  if (rray_int_is_missing(out)) {
+83	    return r_globals.na_int;
+84	  }
+85	
+86	  if (rray_int_is_missing(x)) {
+87	    return r_globals.na_int;
+88	  }
+89	
+90	  check_sum_int_overflow(out, x);
+91	
+92	  return out + x;
+93	}
+94	
+95	// `out` is never `NA`
+96	// - `out = 1`, `x = 1`: returns `2`.
+97	// - `out = 1`, `x = NA`: returns `1`.
+98	// - `out = 1`, `x = INT_MAX`: errors.
+99	static inline int rray_sum_int_one_na_rm(int out, int x) {
+100	  if (rray_int_is_missing(x)) {
+101	    return out;
+102	  }
+103	
+104	  check_sum_int_overflow(out, x);
+105	
+106	  return out + x;
+107	}</pre></details>
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-static inline void check_sum_int_overflow(int out, int x) {</span>
+<span class="del">-  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {</span>
+<span class="del">-    r_abort(&quot;Integer overflow.&quot;);</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// - `out = 1`, `x = 1`: returns `2`.</span>
+<span class="del">-// - `out = 1`, `x = NA`: returns `NA`.</span>
+<span class="del">-// - `out = NA`, `x = INT_MAX`: returns `NA`.</span>
+<span class="del">-// - `out = 1`, `x = INT_MAX`: errors.</span>
+<span class="del">-static inline int rray_sum_int_one(int out, int x) {</span>
+<span class="del">-  if (rray_int_is_missing(out)) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  if (rray_int_is_missing(x)) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  check_sum_int_overflow(out, x);</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// `out` is never `NA`</span>
+<span class="del">-// - `out = 1`, `x = 1`: returns `2`.</span>
+<span class="del">-// - `out = 1`, `x = NA`: returns `1`.</span>
+<span class="del">-// - `out = 1`, `x = INT_MAX`: errors.</span>
+<span class="del">-static inline int rray_sum_int_one_na_rm(int out, int x) {</span>
+<span class="del">-  if (rray_int_is_missing(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  check_sum_int_overflow(out, x);</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="ins">+// - `out = 1`, `x = 1`: returns `2`.</span>
+<span class="ins">+// - `out = 1`, `x = NA`: returns `NA`.</span>
+<span class="ins">+// - `out = NA`, `x = INT_MAX`: returns `NA`.</span>
+<span class="ins">+// - `out = 1`, `x = INT_MAX`: errors.</span>
+<span class="ins">+static inline int rray_sum_int_one(</span>
+<span class="ins">+  int out,</span>
+<span class="ins">+  int x,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  return rray_add_int_one(out, x, error_call);</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+// `out` is never `NA`</span>
+<span class="ins">+// - `out = 1`, `x = 1`: returns `2`.</span>
+<span class="ins">+// - `out = 1`, `x = NA`: returns `1`.</span>
+<span class="ins">+// - `out = 1`, `x = INT_MAX`: errors.</span>
+<span class="ins">+static inline int rray_sum_int_one_na_rm(</span>
+<span class="ins">+  int out,</span>
+<span class="ins">+  int x,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  if (rray_int_is_missing(x)) {</span>
+<span class="ins">+    return out;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return rray_add_int_one(out, x, error_call);</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::test(filter = …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output"> M src/decl/reduce-extremum-decl.h
+ M src/decl/reduce-logical-decl.h
+ M src/decl/reduce-mean-decl.h
+ M src/decl/reduce-prod-decl.h
+ M src/decl/reduce-sum-decl.h
+ M src/one-add.h
+ M src/reduce-extremum.c
+ M src/reduce-logical.c
+ M src/reduce-mean.c
+ M src/reduce-prod.c
+ M src/reduce-sum.c
+ M src/reduce.c
+ M src/reduce.h
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 477 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -5; git diff src/reduce.h src/one-add.h src/reduce-…</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -5; git diff src/reduce.h src/one-add.h src/reduce-sum.c | head -150</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 3497 ]
+diff --git a/src/one-add.h b/src/one-add.h
+index 91a6fa6..58e24d7 100644
+--- a/src/one-add.h
++++ b/src/one-add.h
+@@ -68,42 +68,28 @@ static inline int rray_sum_lgl_one_na_rm(int out, int x) {
+   return out + x;
+ }
+ 
+-static inline void check_sum_int_overflow(int out, int x) {
+-  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {
+-    r_abort(&quot;Integer overflow.&quot;);
+-  }
+-}
+-
+ // - `out = 1`, `x = 1`: returns `2`.
+ // - `out = 1`, `x = NA`: returns `NA`.
+ // - `out = NA`, `x = INT_MAX`: returns `NA`.
+ // - `out = 1`, `x = INT_MAX`: errors.
+-static inline int rray_sum_int_one(int out, int x) {
+-  if (rray_int_is_missing(out)) {
+-    return r_globals.na_int;
+-  }
+-
+-  if (rray_int_is_missing(x)) {
+-    return r_globals.na_int;
+-  }
+-
+-  check_sum_int_overflow(out, x);
+-
+-  return out + x;
++static inline int rray_sum_int_one(int out, int x, struct r_lazy error_call) {
++  return rray_add_int_one(out, x, error_call);
+ }
+ 
+ // `out` is never `NA`
+ // - `out = 1`, `x = 1`: returns `2`.
+ // - `out = 1`, `x = NA`: returns `1`.
+ // - `out = 1`, `x = INT_MAX`: errors.
+-static inline int rray_sum_int_one_na_rm(int out, int x) {
++static inline int rray_sum_int_one_na_rm(
++  int out,
++  int x,
++  struct r_lazy error_call
++) {
+   if (rray_int_is_missing(x)) {
+     return out;
+   }
+ 
+-  check_sum_int_overflow(out, x);
+-
+-  return out + x;
++  return rray_add_int_one(out, x, error_call);
+ }
+ 
+ // Purposefully choose to match `rray_add()` rather than `sum()` regarding
+diff --git a/src/reduce-sum.c b/src/reduce-sum.c
+index db26910..6a97b60 100644
+--- a/src/reduce-sum.c
++++ b/src/reduce-sum.c
+@@ -59,7 +59,8 @@ static rray_reduce_fn rray_sum_switch(
+ static r_obj* rray_sum_lgl(
+   r_obj* x,
+   r_ssize out_size,
+-  const struct rray_strided_iterator_plan* plan
++  const struct rray_strided_iterator_plan* plan,
++  struct r_lazy error_call
+ ) {
+   RRAY_REDUCE(
+     int,
+@@ -68,14 +69,16 @@ static r_obj* rray_sum_lgl(
+     int,
+     r_int_begin,
+     0,
+-    rray_sum_lgl_one
++    rray_sum_lgl_one,
++    RRAY_REDUCE_NO_ARGS
+   );
+ }
+ 
+ static r_obj* rray_sum_lgl_na_rm(
+   r_obj* x,
+   r_ssize out_size,
+-  const struct rray_strided_iterator_plan* plan
++  const struct rray_strided_iterator_plan* plan,
++  struct r_lazy error_call
+ ) {
+   RRAY_REDUCE(
+     int,
+@@ -84,14 +87,16 @@ static r_obj* rray_sum_lgl_na_rm(
+     int,
+     r_int_begin,
+     0,
+-    rray_sum_lgl_one_na_rm
++    rray_sum_lgl_one_na_rm,
++    RRAY_REDUCE_NO_ARGS
+   );
+ }
+ 
+ static r_obj* rray_sum_int(
+   r_obj* x,
+   r_ssize out_size,
+-  const struct rray_strided_iterator_plan* plan
++  const struct rray_strided_iterator_plan* plan,
++  struct r_lazy error_call
+ ) {
+   RRAY_REDUCE(
+     int,
+@@ -100,14 +105,16 @@ static r_obj* rray_sum_int(
+     int,
+     r_int_begin,
+     0,
+-    rray_sum_int_one
++    rray_sum_int_one,
++    RRAY_REDUCE_ARGS(error_call)
+   );
+ }
+ 
+ static r_obj* rray_sum_int_na_rm(
+   r_obj* x,
+   r_ssize out_size,
+-  const struct rray_strided_iterator_plan* plan
++  const struct rray_strided_iterator_plan* plan,
++  struct r_lazy error_call
+ ) {
+   RRAY_REDUCE(
+     int,
+@@ -116,14 +123,16 @@ static r_obj* rray_sum_int_na_rm(
+     int,
+     r_int_begin,
+     0,
+-    rray_sum_int_one_na_rm
++    rray_sum_int_one_na_rm,
++    RRAY_REDUCE_ARGS(error_call)
+   );
+ }
+ 
+ static r_obj* rray_sum_dbl(
+   r_obj* x,
+   r_ssize out_size,
+-  const struct rray_strided_iterator_plan* plan
++  const struct rray_strided_iterator_plan* plan,
++  struct r_lazy error_call
+ ) {
+   RRAY_REDUCE(
+     double,
+@@ -132,14 +141,16 @@ static r_obj* rray_sum_dbl(
+     double,
+     r_dbl_begin,
+     0.0,
+-    rray_sum_dbl_one</pre></details>
+<p>The change is done on the new branch <code>feature/error-call</code>. All 3497 tests pass, and the <code>rray_sum()</code> overflow snapshots didn't change. I haven't committed anything.</p>
+<p><strong>What changed</strong></p>
+<ul>
+<li>
+<p><strong><code>src/reduce.h</code>:</strong> I added <code>RRAY_REDUCE_ARGS(...)</code> and <code>RRAY_REDUCE_NO_ARGS</code> near the top, the same way <code>binary.h</code> defines its pair. Both <code>rray_reduce_fn</code> and <code>rray_reduce_nested_fn</code> now take <code>struct r_lazy error_call</code>. <code>RRAY_REDUCE</code> and <code>RRAY_REDUCE_OUTER</code> each take a last <code>ONE_ARGS</code> parameter.</p>
+</li>
+<li>
+<p><strong><code>src/reduce.c</code>:</strong> <code>rray_reduce()</code> and <code>rray_reduce_nested()</code> pass <code>error_call</code> to <code>fn()</code>.</p>
+</li>
+<li>
+<p><strong>Every reduce kernel</strong> (sum, prod, extremum, logical, mean, plus their decl headers) takes <code>error_call</code>. Only <code>rray_sum_int</code> and <code>rray_sum_int_na_rm</code> pass <code>RRAY_REDUCE_ARGS(error_call)</code>. The rest pass <code>RRAY_REDUCE_NO_ARGS</code>.</p>
+</li>
+<li>
+<p><strong><code>src/one-add.h</code>:</strong> all the wrappers are still there.</p>
+<ul>
+<li><code>check_sum_int_overflow()</code> is gone, along with its bare <code>r_abort()</code>.</li>
+<li><code>rray_sum_int_one()</code> now just calls <code>rray_add_int_one(out, x, error_call)</code>.</li>
+<li><code>rray_sum_int_one_na_rm()</code> returns early when <code>x</code> is missing, then calls the same function.</li>
+</ul>
+</li>
+</ul>
+<p><strong>Checks</strong></p>
+<ul>
+<li>
+<p>I ran <code>clang-format</code> over all files.</p>
+</li>
+<li>
+<p>Protection pass: the diff adds no new <code>r_obj*</code> values. <code>error_call</code> only carries the frame, and the caller already holds it, so nothing new needs protecting.</p>
+</li>
+</ul>
+<p><strong>One thing to know</strong></p>
+<p><code>rray_sum_int_one_na_rm()</code> now goes through <code>rray_add_int_one()</code>, which also checks whether <code>out</code> is <code>NA</code>. That check can never be true on the <code>na_rm</code> path, so it costs one extra comparison per element.</p>
+
+</section>
+<p class="divider">Oct 1, 2026, 16:33 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Since sum int one na rm can be improved by avoiding the check, do it! Thats the point of separate core functions</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/one-add.h</summary>
+<pre class="output">79	// `out` is never `NA`
+80	// - `out = 1`, `x = 1`: returns `2`.
+81	// - `out = 1`, `x = NA`: returns `1`.
+82	// - `out = 1`, `x = INT_MAX`: errors.
+83	static inline int rray_sum_int_one_na_rm(
+84	  int out,
+85	  int x,
+86	  struct r_lazy error_call
+87	) {
+88	  if (rray_int_is_missing(x)) {
+89	    return out;
+90	  }
+91	
+92	  return rray_add_int_one(out, x, error_call);</pre></details>
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-  if (rray_int_is_missing(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return rray_add_int_one(out, x, error_call);</span>
+<span class="ins">+  if (rray_int_is_missing(x)) {</span>
+<span class="ins">+    return out;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {</span>
+<span class="ins">+    stop_int_overflow(error_call);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return out + x;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 |…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -3</pre><pre class="output"> M src/decl/reduce-extremum-decl.h
+ M src/decl/reduce-logical-decl.h
+ M src/decl/reduce-mean-decl.h
+ M src/decl/reduce-prod-decl.h
+ M src/decl/reduce-sum-decl.h
+ M src/one-add.h
+ M src/reduce-extremum.c
+ M src/reduce-logical.c
+ M src/reduce-mean.c
+ M src/reduce-prod.c
+ M src/reduce-sum.c
+ M src/reduce.c
+ M src/reduce.h
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 3497 ]</pre></details>
+<p>I changed <code>rray_sum_int_one_na_rm()</code> so it no longer goes through <code>rray_add_int_one()</code>. It returns <code>out</code> early when <code>x</code> is missing, then does the overflow check itself and raises it with <code>stop_int_overflow(error_call)</code>, so there's no extra <code>NA</code> check on <code>out</code>. <code>rray_sum_int_one()</code> still delegates to <code>rray_add_int_one()</code>, since it does need that check.</p>
+<p>I ran <code>clang-format</code> over all files, and all 3497 tests pass.</p>
+<p>The trade-off is that the overflow condition is now written out in two places, <code>rray_add_int_one()</code> and <code>rray_sum_int_one_na_rm()</code>. That's the same duplication the old <code>check_sum_int_overflow()</code> had.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push to the branch</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add -A src &amp;&amp; git commit -q -m &quot;Pass error_call through to reduce kernels with RRAY_REDUC…</summary>
+<pre>git add -A src &amp;&amp; git commit -q -m &quot;Pass error_call through to reduce kernels with RRAY_REDUCE_ARGS&quot; &amp;&amp; git push -u origin feature/error-call 2&gt;&amp;1 | tail -3 &amp;&amp; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/error-call -&gt; feature/error-call
+branch 'feature/error-call' set up to track 'origin/feature/error-call'.
+7ec184f Pass error_call through to reduce kernels with RRAY_REDUCE_ARGS</pre></details>
+<p>I committed the change as <code>7ec184f</code> with the message &quot;Pass error_call through to reduce kernels with RRAY_REDUCE_ARGS&quot; and pushed it to <code>origin/feature/error-call</code>. Per your instructions, the commit has no co-author trailer.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Since sum int one calls add int one you can remove the comment table for sum int one</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-// - `out = 1`, `x = 1`: returns `2`.</span>
+<span class="del">-// - `out = 1`, `x = NA`: returns `NA`.</span>
+<span class="del">-// - `out = NA`, `x = INT_MAX`: returns `NA`.</span>
+<span class="del">-// - `out = 1`, `x = INT_MAX`: errors.</span>
+<span class="del">-static inline int rray_sum_int_one(</span>
+<span class="ins">+static inline int rray_sum_int_one(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output"> src/one-add.h | 4 ----
+ 1 file changed, 4 deletions(-)</pre></details>
+<p>I deleted the four-line comment table above <code>rray_sum_int_one()</code> in <code>src/one-add.h</code>. <code>clang-format</code> made no other changes. The table above <code>rray_add_int_one()</code> already covers the same cases.</p>
+<p>It's not committed yet. Should I commit and push it to <code>feature/error-call</code>?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Darn I just merged the PR. Clean up locally then commit this to main</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git stash -q &amp;&amp; git checkout -q main &amp;&amp; git pull -q origin main &amp;&amp; git log --oneline -3 &amp;&amp; gi…</summary>
+<pre>git stash -q &amp;&amp; git checkout -q main &amp;&amp; git pull -q origin main &amp;&amp; git log --oneline -3 &amp;&amp; git stash pop -q &amp;&amp; git diff --stat</pre><pre class="output">1324d00 Pass error_call through to reduce kernels with RRAY_REDUCE_ARGS (#109)
+e687a5d Move the multiply and prod one helpers into one-multiply.h (#108)
+713313a Move the add and sum one helpers into one-add.h (#107)
+ src/one-add.h | 4 ----
+ 1 file changed, 4 deletions(-)</pre></details>
+<p>Main has the squash-merged PR (#109), and the change applies cleanly on top. Now I'll delete the local and remote branch, then commit.</p>
+
+<details class="tool"><summary>Bash: git diff 7ec184f 1324d00 --stat -- src ':!src/one-add.h'; git branch -D feature/error-call &amp;&amp;…</summary>
+<pre>git diff 7ec184f 1324d00 --stat -- src ':!src/one-add.h'; git branch -D feature/error-call &amp;&amp; git fetch -q --prune origin &amp;&amp; git branch -a | grep error-call; git commit -qam &quot;Remove the redundant example table from rray_sum_int_one()&quot; &amp;&amp; git log --oneline -2 &amp;&amp; git status -sb | head -1</pre><pre class="output">Deleted branch feature/error-call (was 7ec184f).
+9e171e1 Remove the redundant example table from rray_sum_int_one()
+1324d00 Pass error_call through to reduce kernels with RRAY_REDUCE_ARGS (#109)
+## main...origin/main [ahead 1]</pre></details>
+<p>I committed the comment removal to <code>main</code> as <code>9e171e1</code> (&quot;Remove the redundant example table from rray_sum_int_one()&quot;). It's not pushed: <code>main</code> is one commit ahead of <code>origin/main</code>.</p>
+<p>Cleanup:</p>
+<ul>
+<li>
+<p><strong>Synced main:</strong> I switched to <code>main</code> and pulled. It now has your squash merge (#109), and the merged code matches what was on the branch.</p>
+</li>
+<li>
+<p><strong>Local branch:</strong> I deleted <code>feature/error-call</code>. I had to force the delete, because git doesn't count a squash merge as merged.</p>
+</li>
+<li>
+<p><strong>Remote branch:</strong> after a prune it no longer shows up, so GitHub already deleted it when you merged.</p>
+</li>
+</ul>
+<p>Want me to push <code>main</code>?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Yes</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git push -u origin main 2&gt;&amp;1 | tail -2 &amp;&amp; git status -sb | head -1</summary>
+<pre>git push -u origin main 2&gt;&amp;1 | tail -2 &amp;&amp; git status -sb | head -1</pre><pre class="output">   1324d00..9e171e1  main -&gt; main
+branch 'main' set up to track 'origin/main'.
+## main...origin/main</pre></details>
+<p>I pushed <code>main</code> to <code>origin</code>, so commit <code>9e171e1</code> is now on GitHub. Local <code>main</code> and <code>origin/main</code> are in sync.</p>
+
+</section>
+</main>
+</body>
+</html>

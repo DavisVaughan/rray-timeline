@@ -1,0 +1,2160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarking the stride-1 memcpy() fast path in rray_split()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-77">rray timeline</a>
+<h1>Benchmarking the stride-1 <code>memcpy()</code> fast path in <code>rray_split()</code></h1>
+<p class="facts">Claude · Sep 18, 2026 · 4 prompts · 13 replies · <a href="https://github.com/r-lib/rray/pull/77">#77</a></p>
+</header>
+<main>
+<p class="divider">Sep 18, 2026, 13:18 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Does the memcpy for stride 1 in stack actually improve things? Benchmark with and without it</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll look at the stack code first.</p>
+
+<details class="tool"><summary>Bash: ls ~/files/r/packages/rray4/src/ &amp;&amp; ls ~/files/r/packages/rray4/bench/ …</summary>
+<pre>ls ~/files/r/packages/rray4/src/ &amp;&amp; ls ~/files/r/packages/rray4/bench/ 2&gt;/dev/null</pre><pre class="output">arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extremum.c
+extremum.h
+extremum.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+split.c
+split.h
+split.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o
+broadcast.R
+combine.R
+extremum.R
+iterator.R
+matrix-stats.R
+mean.R
+reduce-logical.R
+stride-zero.R</pre></details>
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I mean split</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat src/split.c</summary>
+<pre>cat src/split.c</pre><pre class="output">#include &quot;split.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/split-decl.h&quot;
+
+r_obj* ffi_rray_split(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_split(ffi_x, axis, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_split(
+  r_obj* x,
+  int axis,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_max_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_x_dimensions[axis - 1];
+
+  dimensions = KEEP(arg_as_split_dimensions(
+    dimensions,
+    axis_dimension,
+    rray_args.dimensions,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  const bool uniform = r_length(dimensions) == 1;
+
+  const r_ssize out_size =
+    uniform ? axis_dimension / v_dimensions[0] : r_length(dimensions);
+
+  r_obj* out = KEEP(r_alloc_list(out_size));
+
+  r_obj* x_names = r_dim_names(x);
+  if (x_names != r_null &amp;&amp; names_are_all_null(x_names)) {
+    x_names = r_null;
+  }
+
+  r_obj* axis_names =
+    (x_names == r_null) ? r_null : r_list_get(x_names, axis - 1);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+  const r_ssize axis_stride = v_x_strides[axis - 1];
+
+  const enum r_type type = r_typeof(x);
+
+  r_obj* out_elt_dimensions = r_null;
+  r_keep_loc out_elt_dimensions_loc;
+  KEEP_HERE(out_elt_dimensions, &amp;out_elt_dimensions_loc);
+
+  struct rray_strided_iterator_plan plan = {0};
+  int plan_dimension = -1;
+  r_ssize out_elt_size = 0;
+
+  int axis_offset = 0;
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    const int dimension = uniform ? v_dimensions[0] : v_dimensions[i];
+
+    if (dimension != plan_dimension) {
+      out_elt_dimensions = rray_set_axes_dimension(
+        v_x_dimensions,
+        dimensionality,
+        &amp;axis,
+        1,
+        dimension
+      );
+      KEEP_AT(out_elt_dimensions, out_elt_dimensions_loc);
+
+      plan = rray_strided_iterator_plan(
+        r_int_cbegin(out_elt_dimensions),
+        dimensionality,
+        v_x_strides
+      );
+
+      plan_dimension = dimension;
+      out_elt_size = rray_strided_iterator_plan_size(&amp;plan);
+    }
+
+    r_obj* out_elt = r_alloc_vector(type, out_elt_size);
+    r_list_poke(out, i, out_elt);
+    r_attrib_poke_dim(out_elt, out_elt_dimensions);
+
+    rray_split_fill(x, out_elt, axis_offset * axis_stride, &amp;plan);
+
+    if (axis_names != r_null) {
+      r_obj* out_elt_names = KEEP(rray_split_elt_names(
+        x_names,
+        dimensionality,
+        axis,
+        axis_names,
+        axis_offset,
+        dimension
+      ));
+      r_attrib_poke_dim_names(out_elt, out_elt_names);
+      FREE(1);
+    } else if (x_names != r_null) {
+      r_attrib_poke_dim_names(out_elt, x_names);
+    }
+
+    axis_offset += dimension;
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* arg_as_split_dimensions(
+  r_obj* dimensions,
+  int axis_dimension,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  dimensions = KEEP(arg_as_integer(dimensions, arg));
+
+  if (r_attrib_has_any(dimensions)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s can't have attributes.&quot;,
+      rray_arg_format(arg)
+    );
+  }
+
+  const r_ssize size = r_length(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  r_ssize total = 0;
+
+  for (r_ssize i = 0; i &lt; size; ++i) {
+    const int dimension = v_dimensions[i];
+
+    if (dimension == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (dimension &lt; 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain negative values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    total += dimension;
+  }
+
+  if (size == 1) {
+    const int dimension = v_dimensions[0];
+
+    if (dimension == 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value must be positive, not 0.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis_dimension % dimension != 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;A single %s value of %d must evenly divide the `axis` dimension &quot;
+        &quot;of %d.&quot;,
+        rray_arg_format(arg),
+        dimension,
+        axis_dimension
+      );
+    }
+  } else if (total != axis_dimension) {
+    r_abort_lazy_call(</pre><p class="cut">212 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: cat src/strided-iterator.h; echo ====; cat bench/iterator.R 2&gt;/dev/null; echo ====; cat bench…</summary>
+<pre>cat src/strided-iterator.h; echo ====; cat bench/iterator.R 2&gt;/dev/null; echo ====; cat bench/stride-zero.R</pre><pre class="output">Exit code 1
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+/
+
+... [8284 characters truncated] ...
+
+d_iterator2_plan* plan
+) {
+  return plan-&gt;size;
+}
+static inline r_ssize rray_strided_iterator2_plan_run_size(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;v_dimensions[0];
+}
+static inline r_ssize rray_strided_iterator2_plan_run_stride1(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;v_strides1[0];
+}
+static inline r_ssize rray_strided_iterator2_plan_run_stride2(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;v_strides2[0];
+}
+static inline void rray_strided_iterator2_plan_point_init(
+  const struct rray_strided_iterator2_plan* plan,
+  r_ssize* v_point
+) {
+  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);
+}
+
+#define RRAY_STRIDED_ITERATOR_NEXT2(START1, START2, V_POINT, PLAN)             \
+  for (int axis = 1; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+    ++V_POINT[axis];                                                           \
+    if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+      START1 += PLAN-&gt;v_strides1[axis];                                        \
+      START2 += PLAN-&gt;v_strides2[axis];                                        \
+      break;                                                                   \
+    }                                                                          \
+    V_POINT[axis] = 0;                                                         \
+    START1 -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides1[axis];         \
+    START2 -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides2[axis];         \
+  }
+
+// --------------------------------------------------------------------------
+
+static inline int rray__strided_iterator_axes_coalesce(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides,
+  int dimensionality
+) {
+  int out_axis = 0;
+
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize left_dimension = v_dimensions[out_axis];
+    const r_ssize left_stride = v_strides[out_axis];
+    const r_ssize right_dimension = v_dimensions[axis];
+    const r_ssize right_stride = v_strides[axis];
+
+    const bool coalescible = rray__strided_iterator_axes_coalescible(
+      left_dimension,
+      left_stride,
+      right_dimension,
+      right_stride
+    );
+
+    if (coalescible) {
+      if (left_dimension == 1) {
+        v_strides[out_axis] = right_stride;
+      }
+      v_dimensions[out_axis] = left_dimension * right_dimension;
+    } else {
+      ++out_axis;
+      v_dimensions[out_axis] = right_dimension;
+      v_strides[out_axis] = right_stride;
+    }
+  }
+
+  return out_axis + 1;
+}
+
+static inline int rray__strided_iterator_axes_coalesce2(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides1,
+  r_ssize* v_strides2,
+  int dimensionality
+) {
+  int out_axis = 0;
+
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize left_dimension = v_dimensions[out_axis];
+    const r_ssize left_stride1 = v_strides1[out_axis];
+    const r_ssize left_stride2 = v_strides2[out_axis];
+    const r_ssize right_dimension = v_dimensions[axis];
+    const r_ssize right_stride1 = v_strides1[axis];
+    const r_ssize right_stride2 = v_strides2[axis];
+
+    const bool coalescible1 = rray__strided_iterator_axes_coalescible(
+      left_dimension,</pre><p class="cut">70 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat bench/stride-zero.R; echo &quot;-----&quot;; cat bench/combine.R</summary>
+<pre>cat bench/stride-zero.R; echo &quot;-----&quot;; cat bench/combine.R</pre><pre class="output">devtools::load_all(quiet = TRUE)
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+n &lt;- 1e6L
+matrix_dimensions &lt;- c(1000L, 1000L)
+array_dimensions &lt;- c(100L, 100L, 100L)
+six_dimensions &lt;- rep(10L, 6L)
+
+x &lt;- seq(1, 2, length.out = n)
+y &lt;- seq(2, 3, length.out = n)
+
+matrix_x &lt;- array(x, matrix_dimensions)
+matrix_y &lt;- array(y, matrix_dimensions)
+scalar &lt;- array(2, c(1L, 1L))
+row &lt;- array(seq(2, 3, length.out = 1000L), c(1L, 1000L))
+column &lt;- array(seq(2, 3, length.out = 1000L), c(1000L, 1L))
+
+array_x &lt;- array(x, array_dimensions)
+array_inner &lt;- array(
+  seq(2, 3, length.out = 10000L),
+  c(1L, 100L, 100L)
+)
+array_later &lt;- array(
+  seq(2, 3, length.out = 10000L),
+  c(100L, 1L, 100L)
+)
+
+shared_x &lt;- array(x, c(1L, 1000L, 1000L))
+shared_inner &lt;- array(
+  seq(2, 3, length.out = 1000L),
+  c(1L, 1L, 1000L)
+)
+shared_y &lt;- array(y, c(1L, 1000L, 1000L))
+
+six_x &lt;- array(x, six_dimensions)
+six_inner &lt;- array(
+  seq(2, 3, length.out = 1000L),
+  c(1L, 10L, 1L, 10L, 1L, 10L)
+)
+six_outer &lt;- array(
+  seq(2, 3, length.out = 1000L),
+  c(10L, 1L, 10L, 1L, 10L, 1L)
+)
+
+product_x &lt;- array(seq(1, 1.000001, length.out = n), matrix_dimensions)
+logical_x &lt;- array(rep(c(TRUE, FALSE), length.out = n), matrix_dimensions)
+
+results &lt;- list()
+
+cat(&quot;\nrray_add() with a scalar on the right\n&quot;)
+# rray_add() with [1000, 1000] and right [1, 1]
+results[[&quot;shape/scalar_right&quot;]] &lt;- bench::mark(
+  result = rray_add(matrix_x, scalar),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/scalar_right&quot;]])
+
+cat(&quot;\nrray_add() with a scalar on the left\n&quot;)
+# rray_add() with left [1, 1] and [1000, 1000]
+results[[&quot;shape/scalar_left&quot;]] &lt;- bench::mark(
+  result = rray_add(scalar, matrix_x),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/scalar_left&quot;]])
+
+cat(&quot;\nrray_add() with a row array on the right\n&quot;)
+# rray_add() with [1000, 1000] and right [1, 1000]
+results[[&quot;shape/row_right&quot;]] &lt;- bench::mark(
+  result = rray_add(matrix_x, row),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/row_right&quot;]])
+
+cat(&quot;\nrray_add() with a row array on the left\n&quot;)
+# rray_add() with left [1, 1000] and [1000, 1000]
+results[[&quot;shape/row_left&quot;]] &lt;- bench::mark(
+  result = rray_add(row, matrix_x),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/row_left&quot;]])
+
+cat(&quot;\nrray_add() with a 3D inner broadcast on the right\n&quot;)
+# rray_add() with [100, 100, 100] and right [1, 100, 100]
+results[[&quot;shape/3d_inner_right&quot;]] &lt;- bench::mark(
+  result = rray_add(array_x, array_inner),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/3d_inner_right&quot;]])
+
+cat(&quot;\nrray_add() with a 3D inner broadcast on the left\n&quot;)
+# rray_add() with left [1, 100, 100] and [100, 100, 100]
+results[[&quot;shape/3d_inner_left&quot;]] &lt;- bench::mark(
+  result = rray_add(array_inner, array_x),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/3d_inner_left&quot;]])
+
+cat(&quot;\nrray_add() after a shared leading singleton axis\n&quot;)
+# rray_add() with [1, 1000, 1000] and right [1, 1, 1000]
+results[[&quot;shape/shared_leading_right&quot;]] &lt;- bench::mark(
+  result = rray_add(shared_x, shared_inner),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/shared_leading_right&quot;]])
+
+cat(&quot;\nrray_add() with the shared singleton input on the left\n&quot;)
+# rray_add() with left [1, 1, 1000] and [1, 1000, 1000]
+results[[&quot;shape/shared_leading_left&quot;]] &lt;- bench::mark(
+  result = rray_add(shared_inner, shared_x),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/shared_leading_left&quot;]])
+
+cat(&quot;\nrray_add() with alternating inner broadcasts on the right\n&quot;)
+# rray_add() with full 6D and right [1, 10, 1, 10, 1, 10]
+results[[&quot;shape/alternating_inner_right&quot;]] &lt;- bench::mark(
+  result = rray_add(six_x, six_inner),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/alternating_inner_right&quot;]])
+
+cat(&quot;\nrray_add() with alternating inner broadcasts on the left\n&quot;)
+# rray_add() with left [1, 10, 1, 10, 1, 10] and full 6D
+results[[&quot;shape/alternating_inner_left&quot;]] &lt;- bench::mark(
+  result = rray_add(six_inner, six_x),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;shape/alternating_inner_left&quot;]])
+
+cat(&quot;\nrray_add() with identical shapes as a control\n&quot;)
+# rray_add() with two [1000, 1000] arrays
+results[[&quot;control/identical&quot;]] &lt;- bench::mark(
+  result = rray_add(matrix_x, matrix_y),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;control/identical&quot;]])
+
+cat(&quot;\nrray_add() with a column array as a control\n&quot;)
+# rray_add() with [1000, 1000] and right [1000, 1]
+results[[&quot;control/column&quot;]] &lt;- bench::mark(
+  result = rray_add(matrix_x, column),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;control/column&quot;]])
+
+cat(&quot;\nrray_add() with a later-axis broadcast as a control\n&quot;)
+# rray_add() with [100, 100, 100] and right [100, 1, 100]
+results[[&quot;control/later_axis&quot;]] &lt;- bench::mark(
+  result = rray_add(array_x, array_later),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;control/later_axis&quot;]])
+
+cat(&quot;\nrray_add() with matching leading singletons as a control\n&quot;)
+# rray_add() with two [1, 1000, 1000] arrays
+results[[&quot;control/matching_leading&quot;]] &lt;- bench::mark(
+  result = rray_add(shared_x, shared_y),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;control/matching_leading&quot;]])
+
+cat(&quot;\nrray_add() with an alternating outer broadcast as a control\n&quot;)
+# rray_add() with full 6D and right [10, 1, 10, 1, 10, 1]
+results[[&quot;control/alternating_outer&quot;]] &lt;- bench::mark(
+  result = rray_add(six_x, six_outer),
+  iterations = iterations,
+  check = FALSE,
+  memory = FALSE
+)
+print(results[[&quot;control/alternating_outer&quot;]])</pre><p class="cut">519 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;r_memcpy&quot; src/rlang/*.h | head -20; echo ---; git status --short; git log --oneline…</summary>
+<pre>grep -rn &quot;r_memcpy&quot; src/rlang/*.h | head -20; echo ---; git status --short; git log --oneline -1</pre><pre class="output">src/rlang/c-utils.h:163:static inline void r_memcpy(void* dest, const void* src, size_t count) {
+src/rlang/c-utils.h:171:// See `r_memcpy()` for rationale
+src/rlang/vec.h:426:        r_memcpy(r_vec_begin(out), v_src, n * r_vec_elt_sizeof0(type));
+src/rlang/vec.h:455:    r_memcpy(r_raw_begin(out), src, size);
+---
+?? bench/combine.R
+0bc90c1 Describe `rray_split()` outputs as arrays instead of chunks</pre></details>
+<details class="tool"><summary>Bash: sed -n 155,180p src/rlang/c-utils.h; echo ---; cat R/split.R 2&gt;/dev/null | head -60</summary>
+<pre>sed -n 155,180p src/rlang/c-utils.h; echo ---; cat R/split.R 2&gt;/dev/null | head -60</pre><pre class="output">// memory. As of R 4.5.0, `DATAPTR()` and friends return `(void*) 1` on 0-length
+// R objects, so we must be extremely careful to never use dereference those
+// pointers. In particular, it is not safe to call `memcpy(dest, src, 0)` on
+// some machines (likely with sanitizers active) when either `dest` or `src`
+// resolve to `(void*) 1`.
+//
+// https://github.com/r-lib/vctrs/pull/1968
+// https://github.com/r-devel/r-svn/blob/9976c3d7f08c754593d01ba8380afb6be803dde2/src/main/memory.c#L4137-L4150
+static inline void r_memcpy(void* dest, const void* src, size_t count) {
+    if (count) {
+        memcpy(dest, src, count);
+    }
+}
+
+// Slightly safer version of `memset()` for use with R object memory
+//
+// See `r_memcpy()` for rationale
+static inline void r_memset(void* dest, int value, size_t count) {
+    if (count) {
+        memset(dest, value, count);
+    }
+}
+
+#endif
+---
+#' Split an array along an axis
+#'
+#' @description
+#' `rray_split()` divides `x` into contiguous arrays along `axis`. Every array
+#' keeps the dimensionality of `x`, only the dimension along `axis` changes.
+#'
+#' `dimensions` describes those arrays in one of two ways:
+#'
+#' - A single value is the dimension of every array. It must be positive and
+#'   must evenly divide the dimension of `x` along `axis`.
+#'
+#' - A vector of any other length gives the dimension of each array directly.
+#'   The values must be non-negative and must sum to the dimension of `x` along
+#'   `axis`.
+#'
+#' Combining the arrays along the same axis reconstructs `x`.
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer between 1 and the dimensionality of `x`.
+#'
+#' @param dimensions An integer vector of output dimensions along `axis`.
+#'
+#' @returns
+#' An unnamed list of arrays with the same dimensionality as `x`.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:12, c(6, 2))
+#'
+#' # Three arrays of two rows
+#' rray_split(x, 1, 2)
+#'
+#' # Arrays of one and five rows
+#' rray_split(x, 1, c(1, 5))
+#'
+#' # One array per column
+#' rray_split(x, 2, 1)
+#'
+#' # Arrays of dimension zero are allowed in the explicit form
+#' rray_split(x, 2, c(0, 2))
+#'
+#' # Splitting and combining along the same axis are inverses
+#' rray_combine(!!!rray_split(x, 1, 3), .axis = 1)
+rray_split &lt;- function(x, axis, dimensions) {
+  .Call(ffi_rray_split, x, axis, dimensions, environment())
+}</pre></details>
+<p>Now I'll write a benchmark for <code>rray_split()</code> that isolates the run-stride-1 path.</p>
+
+<details class="tool"><summary>Write bench/split.R</summary>
+<pre>devtools::load_all(quiet = TRUE)
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;50&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+label &lt;- Sys.getenv(&quot;RRAY_BENCH_LABEL&quot;, &quot;current&quot;)
+
+options(width = 120L)
+
+n &lt;- 1e6L
+
+dbl_matrix &lt;- array(seq(1, 2, length.out = n), c(1000L, 1000L))
+int_matrix &lt;- array(seq_len(n), c(1000L, 1000L))
+lgl_matrix &lt;- array(rep(c(TRUE, FALSE), length.out = n), c(1000L, 1000L))
+raw_matrix &lt;- array(as.raw(rep(1:255, length.out = n)), c(1000L, 1000L))
+
+dbl_cube &lt;- array(seq(1, 2, length.out = n), c(100L, 100L, 100L))
+dbl_six &lt;- array(seq(1, 2, length.out = n), rep(10L, 6L))
+
+dbl_tall &lt;- array(seq(1, 2, length.out = n), c(1000000L, 1L))
+dbl_wide &lt;- array(seq(1, 2, length.out = n), c(4L, 250000L))
+
+results &lt;- list()
+
+benchmark_case &lt;- function(case, expr) {
+  expr &lt;- substitute(expr)
+  gc()
+  result &lt;- bench::mark(
+    result = eval(expr, parent.frame()),
+    iterations = iterations,
+    check = FALSE,
+    memory = FALSE,
+    filter_gc = FALSE
+  )
+  results[[case]] &lt;&lt;- data.frame(
+    case = case,
+    median_ms = as.numeric(result$median) * 1000,
+    row.names = NULL
+  )
+  invisible()
+}
+
+benchmark_case(&quot;dbl matrix axis 1 by 1&quot;, rray_split(dbl_matrix, 1L, 1L))
+benchmark_case(&quot;dbl matrix axis 1 by 2&quot;, rray_split(dbl_matrix, 1L, 2L))
+benchmark_case(&quot;dbl matrix axis 1 by 4&quot;, rray_split(dbl_matrix, 1L, 4L))
+benchmark_case(&quot;dbl matrix axis 1 by 8&quot;, rray_split(dbl_matrix, 1L, 8L))
+benchmark_case(&quot;dbl matrix axis 1 by 16&quot;, rray_split(dbl_matrix, 1L, 16L))
+benchmark_case(&quot;dbl matrix axis 1 by 100&quot;, rray_split(dbl_matrix, 1L, 100L))
+benchmark_case(&quot;dbl matrix axis 1 by 500&quot;, rray_split(dbl_matrix, 1L, 500L))
+
+benchmark_case(&quot;int matrix axis 1 by 1&quot;, rray_split(int_matrix, 1L, 1L))
+benchmark_case(&quot;int matrix axis 1 by 4&quot;, rray_split(int_matrix, 1L, 4L))
+benchmark_case(&quot;int matrix axis 1 by 16&quot;, rray_split(int_matrix, 1L, 16L))
+benchmark_case(&quot;int matrix axis 1 by 100&quot;, rray_split(int_matrix, 1L, 100L))
+
+benchmark_case(&quot;lgl matrix axis 1 by 4&quot;, rray_split(lgl_matrix, 1L, 4L))
+benchmark_case(&quot;lgl matrix axis 1 by 100&quot;, rray_split(lgl_matrix, 1L, 100L))
+
+benchmark_case(&quot;raw matrix axis 1 by 4&quot;, rray_split(raw_matrix, 1L, 4L))
+benchmark_case(&quot;raw matrix axis 1 by 100&quot;, rray_split(raw_matrix, 1L, 100L))
+
+benchmark_case(&quot;dbl matrix axis 2 by 1&quot;, rray_split(dbl_matrix, 2L, 1L))
+benchmark_case(&quot;dbl matrix axis 2 by 100&quot;, rray_split(dbl_matrix, 2L, 100L))
+benchmark_case(&quot;dbl matrix axis 2 by 500&quot;, rray_split(dbl_matrix, 2L, 500L))
+
+benchmark_case(&quot;dbl cube axis 1 by 10&quot;, rray_split(dbl_cube, 1L, 10L))
+benchmark_case(&quot;dbl cube axis 2 by 10&quot;, rray_split(dbl_cube, 2L, 10L))
+benchmark_case(&quot;dbl cube axis 3 by 10&quot;, rray_split(dbl_cube, 3L, 10L))
+
+benchmark_case(&quot;dbl 6d axis 1 by 5&quot;, rray_split(dbl_six, 1L, 5L))
+benchmark_case(&quot;dbl 6d axis 3 by 5&quot;, rray_split(dbl_six, 3L, 5L))
+
+benchmark_case(&quot;dbl tall axis 1 by 500000&quot;, rray_split(dbl_tall, 1L, 500000L))
+benchmark_case(&quot;dbl wide axis 1 by 1&quot;, rray_split(dbl_wide, 1L, 1L))
+benchmark_case(&quot;dbl wide axis 1 by 2&quot;, rray_split(dbl_wide, 1L, 2L))
+
+summary &lt;- do.call(rbind, results)
+summary$median_ms &lt;- round(summary$median_ms, 3L)
+
+cat(&quot;\nLabel:&quot;, label, &quot;\n\n&quot;)
+print(summary, row.names = FALSE)
+
+if (nzchar(output)) {
+  saveRDS(list(label = label, summary = summary), output)
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/bench/split.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format bench/split.R &amp;&amp; RRAY_BENCH_ITERATIONS=50 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH_…</summary>
+<pre>air format bench/split.R &amp;&amp; RRAY_BENCH_ITERATIONS=50 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH_OUTPUT=/tmp/split-with.rds Rscript bench/split.R 2&gt;&amp;1 | tail -45</pre><pre class="output">Error: A single `dimensions` value of 16 must evenly divide the `axis` dimension of 1000.
+Execution halted</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -i '' 's/by 16&quot;, rray_split(\(.*\), 1L, 16L)/by 20&quot;, rray_split(\1, 1L, 20L)/' bench/spli…</summary>
+<pre>sed -i '' 's/by 16&quot;, rray_split(\(.*\), 1L, 16L)/by 20&quot;, rray_split(\1, 1L, 20L)/' bench/split.R &amp;&amp; grep -n &quot;by 20&quot; bench/split.R</pre><pre class="output">Blocked: this is a sed in-place edit. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Edit bench/split.R</summary>
+<pre class="diff"><span class="del">-benchmark_case(&quot;dbl matrix axis 1 by 16&quot;, rray_split(dbl_matrix, 1L, 16L))</span>
+<span class="ins">+benchmark_case(&quot;dbl matrix axis 1 by 20&quot;, rray_split(dbl_matrix, 1L, 20L))</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/split.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit bench/split.R</summary>
+<pre class="diff"><span class="del">-benchmark_case(&quot;int matrix axis 1 by 16&quot;, rray_split(int_matrix, 1L, 16L))</span>
+<span class="ins">+benchmark_case(&quot;int matrix axis 1 by 20&quot;, rray_split(int_matrix, 1L, 20L))</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/split.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: RRAY_BENCH_ITERATIONS=50 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH_OUTPUT=/tmp/split-with.rds R…</summary>
+<pre>RRAY_BENCH_ITERATIONS=50 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH_OUTPUT=/tmp/split-with.rds Rscript bench/split.R 2&gt;&amp;1 | tail -45</pre><pre class="output">Label: with-memcpy 
+
+                      case median_ms
+    dbl matrix axis 1 by 1     1.077
+    dbl matrix axis 1 by 2     2.131
+    dbl matrix axis 1 by 4     1.399
+    dbl matrix axis 1 by 8     1.380
+   dbl matrix axis 1 by 20     1.121
+  dbl matrix axis 1 by 100     0.990
+  dbl matrix axis 1 by 500     0.815
+    int matrix axis 1 by 1     0.615
+    int matrix axis 1 by 4     1.013
+   int matrix axis 1 by 20     0.547
+  int matrix axis 1 by 100     0.433
+    lgl matrix axis 1 by 4     1.016
+  lgl matrix axis 1 by 100     0.446
+    raw matrix axis 1 by 4     0.999
+  raw matrix axis 1 by 100     0.117
+    dbl matrix axis 2 by 1     0.726
+  dbl matrix axis 2 by 100     0.434
+  dbl matrix axis 2 by 500     0.434
+     dbl cube axis 1 by 10     1.514
+     dbl cube axis 2 by 10     0.834
+     dbl cube axis 3 by 10     0.432
+        dbl 6d axis 1 by 5     1.161
+        dbl 6d axis 3 by 5     0.816
+ dbl tall axis 1 by 500000     0.441
+      dbl wide axis 1 by 1     0.781
+      dbl wide axis 1 by 2     1.874</pre></details>
+<details class="tool"><summary>Edit bench/split.R</summary>
+<pre class="diff"><span class="del">-  results[[case]] &lt;&lt;- data.frame(</span>
+<span class="del">-    case = case,</span>
+<span class="del">-    median_ms = as.numeric(result$median) * 1000,</span>
+<span class="del">-    row.names = NULL</span>
+<span class="del">-  )</span>
+<span class="ins">+  results[[case]] &lt;&lt;- data.frame(</span>
+<span class="ins">+    case = case,</span>
+<span class="ins">+    min_ms = as.numeric(result$min) * 1000,</span>
+<span class="ins">+    median_ms = as.numeric(result$median) * 1000,</span>
+<span class="ins">+    row.names = NULL</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/split.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit bench/split.R</summary>
+<pre class="diff"><span class="del">-summary &lt;- do.call(rbind, results)</span>
+<span class="del">-summary$median_ms &lt;- round(summary$median_ms, 3L)</span>
+<span class="ins">+summary &lt;- do.call(rbind, results)</span>
+<span class="ins">+summary$min_ms &lt;- round(summary$min_ms, 3L)</span>
+<span class="ins">+summary$median_ms &lt;- round(summary$median_ms, 3L)</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/split.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format bench/split.R &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH…</summary>
+<pre>air format bench/split.R &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH_OUTPUT=/tmp/split-with.rds Rscript bench/split.R 2&gt;&amp;1 | tail -45</pre><pre class="output">Label: with-memcpy 
+
+                      case min_ms median_ms
+    dbl matrix axis 1 by 1  0.623     0.936
+    dbl matrix axis 1 by 2  1.732     2.038
+    dbl matrix axis 1 by 4  1.256     1.413
+    dbl matrix axis 1 by 8  1.021     1.291
+   dbl matrix axis 1 by 20  0.796     1.067
+  dbl matrix axis 1 by 100  0.678     0.943
+  dbl matrix axis 1 by 500  0.365     0.786
+    int matrix axis 1 by 1  0.413     0.618
+    int matrix axis 1 by 4  0.814     0.979
+   int matrix axis 1 by 20  0.359     0.491
+  int matrix axis 1 by 100  0.234     0.396
+    lgl matrix axis 1 by 4  0.821     0.984
+  lgl matrix axis 1 by 100  0.308     0.420
+    raw matrix axis 1 by 4  0.945     0.994
+  raw matrix axis 1 by 100  0.053     0.107
+    dbl matrix axis 2 by 1  0.394     0.724
+  dbl matrix axis 2 by 100  0.143     0.411
+  dbl matrix axis 2 by 500  0.148     0.416
+     dbl cube axis 1 by 10  1.184     1.441
+     dbl cube axis 2 by 10  0.456     0.797
+     dbl cube axis 3 by 10  0.145     0.411
+        dbl 6d axis 1 by 5  0.790     1.125
+        dbl 6d axis 3 by 5  0.384     0.788
+ dbl tall axis 1 by 500000  0.147     0.411
+      dbl wide axis 1 by 1  0.381     0.748
+      dbl wide axis 1 by 2  1.564     1.883</pre></details>
+<p>Now build without the memcpy branch.</p>
+
+<details class="tool"><summary>Bash: cp src/split.c /tmp/split.c.orig &amp;&amp; echo saved</summary>
+<pre>cp src/split.c /tmp/split.c.orig &amp;&amp; echo saved</pre><pre class="output">saved</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    if (x_run_stride == 1) {                                                   \</span>
+<span class="del">-      r_memcpy(                                                                \</span>
+<span class="del">-        v_out + run_start,                                                     \</span>
+<span class="del">-        v_x + x_start,                                                         \</span>
+<span class="del">-        sizeof(CTYPE) * (size_t) run_size                                      \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      r_ssize x_loc = x_start;                                                 \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="del">-        x_loc += x_run_stride;                                                 \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="ins">+    r_ssize x_loc = x_start;                                                   \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    for (r_ssize i = run_start; i &lt; run_end; ++i) {                            \</span>
+<span class="ins">+      v_out[i] = v_x[x_loc];                                                   \</span>
+<span class="ins">+      x_loc += x_run_stride;                                                   \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=without-memcpy RRAY_BENCH_OUTPUT=/tmp/split-withou…</summary>
+<pre>RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=without-memcpy RRAY_BENCH_OUTPUT=/tmp/split-without.rds Rscript bench/split.R 2&gt;&amp;1 | tail -45</pre><pre class="output">Label: without-memcpy 
+
+                      case min_ms median_ms
+    dbl matrix axis 1 by 1  0.619     0.963
+    dbl matrix axis 1 by 2  1.110     1.498
+    dbl matrix axis 1 by 4  0.700     1.121
+    dbl matrix axis 1 by 8  0.331     0.695
+   dbl matrix axis 1 by 20  0.259     0.637
+  dbl matrix axis 1 by 100  0.204     0.596
+  dbl matrix axis 1 by 500  0.374     0.595
+    int matrix axis 1 by 1  0.409     0.616
+    int matrix axis 1 by 4  0.674     0.869
+   int matrix axis 1 by 20  0.228     0.354
+  int matrix axis 1 by 100  0.216     0.296
+    lgl matrix axis 1 by 4  0.678     0.866
+  lgl matrix axis 1 by 100  0.154     0.296
+    raw matrix axis 1 by 4  0.653     0.712
+  raw matrix axis 1 by 100  0.074     0.112
+    dbl matrix axis 2 by 1  0.391     0.753
+  dbl matrix axis 2 by 100  0.428     0.558
+  dbl matrix axis 2 by 500  0.350     0.564
+     dbl cube axis 1 by 10  0.485     0.648
+     dbl cube axis 2 by 10  0.405     0.574
+     dbl cube axis 3 by 10  0.441     0.576
+        dbl 6d axis 1 by 5  0.726     0.911
+        dbl 6d axis 3 by 5  0.374     0.583
+ dbl tall axis 1 by 500000  0.358     0.571
+      dbl wide axis 1 by 1  0.591     0.753
+      dbl wide axis 1 by 2  1.136     1.318</pre></details>
+<details class="tool"><summary>Bash: RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=without-memcpy-run2 RRAY_BENCH_OUTPUT=/tmp/split-w…</summary>
+<pre>RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=without-memcpy-run2 RRAY_BENCH_OUTPUT=/tmp/split-without2.rds Rscript bench/split.R 2&gt;&amp;1 | tail -30</pre><pre class="output">Label: without-memcpy-run2 
+
+                      case min_ms median_ms
+    dbl matrix axis 1 by 1  0.626     0.965
+    dbl matrix axis 1 by 2  1.252     1.502
+    dbl matrix axis 1 by 4  0.938     1.128
+    dbl matrix axis 1 by 8  0.321     0.681
+   dbl matrix axis 1 by 20  0.232     0.612
+  dbl matrix axis 1 by 100  0.167     0.556
+  dbl matrix axis 1 by 500  0.134     0.554
+    int matrix axis 1 by 1  0.410     0.616
+    int matrix axis 1 by 4  0.684     0.858
+   int matrix axis 1 by 20  0.294     0.357
+  int matrix axis 1 by 100  0.266     0.333
+    lgl matrix axis 1 by 4  0.676     0.864
+  lgl matrix axis 1 by 100  0.212     0.334
+    raw matrix axis 1 by 4  0.654     0.711
+  raw matrix axis 1 by 100  0.083     0.116
+    dbl matrix axis 2 by 1  0.500     0.745
+  dbl matrix axis 2 by 100  0.401     0.587
+  dbl matrix axis 2 by 500  0.360     0.584
+     dbl cube axis 1 by 10  0.554     0.671
+     dbl cube axis 2 by 10  0.407     0.589
+     dbl cube axis 3 by 10  0.405     0.593
+        dbl 6d axis 1 by 5  0.735     0.921
+        dbl 6d axis 3 by 5  0.372     0.605
+ dbl tall axis 1 by 500000  0.369     0.592
+      dbl wide axis 1 by 1  0.572     0.771
+      dbl wide axis 1 by 2  1.143     1.334</pre></details>
+<details class="tool"><summary>Bash: cp /tmp/split.c.orig src/split.c &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=with-memcpy-ru…</summary>
+<pre>cp /tmp/split.c.orig src/split.c &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=with-memcpy-run2 RRAY_BENCH_OUTPUT=/tmp/split-with2.rds Rscript bench/split.R 2&gt;&amp;1 | tail -30</pre><pre class="output">Label: with-memcpy-run2 
+
+                      case min_ms median_ms
+    dbl matrix axis 1 by 1  0.650     0.948
+    dbl matrix axis 1 by 2  1.809     2.006
+    dbl matrix axis 1 by 4  1.141     1.387
+    dbl matrix axis 1 by 8  0.941     1.305
+   dbl matrix axis 1 by 20  0.769     1.077
+  dbl matrix axis 1 by 100  0.672     0.939
+  dbl matrix axis 1 by 500  0.380     0.784
+    int matrix axis 1 by 1  0.407     0.619
+    int matrix axis 1 by 4  0.830     0.973
+   int matrix axis 1 by 20  0.467     0.537
+  int matrix axis 1 by 100  0.353     0.426
+    lgl matrix axis 1 by 4  0.814     0.973
+  lgl matrix axis 1 by 100  0.270     0.422
+    raw matrix axis 1 by 4  0.937     0.996
+  raw matrix axis 1 by 100  0.083     0.110
+    dbl matrix axis 2 by 1  0.456     0.739
+  dbl matrix axis 2 by 100  0.306     0.422
+  dbl matrix axis 2 by 500  0.272     0.415
+     dbl cube axis 1 by 10  1.350     1.483
+     dbl cube axis 2 by 10  0.631     0.815
+     dbl cube axis 3 by 10  0.342     0.415
+        dbl 6d axis 1 by 5  0.947     1.125
+        dbl 6d axis 3 by 5  0.557     0.795
+ dbl tall axis 1 by 500000  0.284     0.427
+      dbl wide axis 1 by 1  0.379     0.766
+      dbl wide axis 1 by 2  1.697     1.869</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    if (x_run_stride == 1) {                                                   \</span>
+<span class="del">-      r_memcpy(                                                                \</span>
+<span class="del">-        v_out + run_start,                                                     \</span>
+<span class="del">-        v_x + x_start,                                                         \</span>
+<span class="del">-        sizeof(CTYPE) * (size_t) run_size                                      \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="ins">+    if (x_run_stride == 1) {                                                   \</span>
+<span class="ins">+      const CTYPE* v_x_run = v_x + x_start;                                    \</span>
+<span class="ins">+      CTYPE* v_out_run = v_out + run_start;                                    \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = 0; i &lt; run_size; ++i) {                                 \</span>
+<span class="ins">+        v_out_run[i] = v_x_run[i];                                             \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+    } else {                                                                   \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=stride1-loop RRAY_BENCH_OUTPUT=/tmp/split-loop.rds…</summary>
+<pre>RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=stride1-loop RRAY_BENCH_OUTPUT=/tmp/split-loop.rds Rscript bench/split.R 2&gt;&amp;1 | tail -30</pre><pre class="output">Label: stride1-loop 
+
+                      case min_ms median_ms
+    dbl matrix axis 1 by 1  0.599     0.976
+    dbl matrix axis 1 by 2  1.088     1.435
+    dbl matrix axis 1 by 4  0.634     1.033
+    dbl matrix axis 1 by 8  0.313     0.692
+   dbl matrix axis 1 by 20  0.244     0.645
+  dbl matrix axis 1 by 100  0.202     0.596
+  dbl matrix axis 1 by 500  0.169     0.586
+    int matrix axis 1 by 1  0.406     0.621
+    int matrix axis 1 by 4  0.611     0.789
+   int matrix axis 1 by 20  0.283     0.344
+  int matrix axis 1 by 100  0.218     0.295
+    lgl matrix axis 1 by 4  0.682     0.841
+  lgl matrix axis 1 by 100  0.172     0.326
+    raw matrix axis 1 by 4  0.583     0.642
+  raw matrix axis 1 by 100  0.072     0.113
+    dbl matrix axis 2 by 1  0.365     0.744
+  dbl matrix axis 2 by 100  0.415     0.575
+  dbl matrix axis 2 by 500  0.357     0.571
+     dbl cube axis 1 by 10  0.491     0.641
+     dbl cube axis 2 by 10  0.405     0.569
+     dbl cube axis 3 by 10  0.431     0.572
+        dbl 6d axis 1 by 5  0.673     0.854
+        dbl 6d axis 3 by 5  0.370     0.591
+ dbl tall axis 1 by 500000  0.354     0.577
+      dbl wide axis 1 by 1  0.552     0.753
+      dbl wide axis 1 by 2  1.103     1.309</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+w1 &lt;- readRDS(&quot;/tmp/split-with.rds&quot;)$summary
+w2 &lt;- readRDS(&quot;/tmp/split-with2.rds&quot;)$summary
+o1 &lt;- readRDS(&quot;/tmp/split-without.rds&quot;)$summary
+o2 &lt;- readRDS(&quot;/tmp/split-without2.rds&quot;)$summary
+l &lt;- readRDS(&quot;/tmp/split-loop.rds&quot;)$summary
+best &lt;- function(a, b) pmin(a$min_ms, b$min_ms)
+d &lt;- data.frame(
+  case = w1$case,
+  memcpy = best(w1, w2),
+  none = best(o1, o2),
+  loop = l$min_ms
+)
+d$memcpy_vs_none &lt;- round(d$memcpy / d$none, 2)
+d$memcpy &lt;- round(d$memcpy, 3); d$none &lt;- round(d$none, 3); d$loop &lt;- round(d$loop, 3)
+options(width = 110)
+print(d, row.names = FALSE)'</pre><pre class="output">                      case memcpy  none  loop memcpy_vs_none
+    dbl matrix axis 1 by 1  0.623 0.619 0.599           1.01
+    dbl matrix axis 1 by 2  1.732 1.110 1.088           1.56
+    dbl matrix axis 1 by 4  1.141 0.700 0.634           1.63
+    dbl matrix axis 1 by 8  0.941 0.321 0.313           2.93
+   dbl matrix axis 1 by 20  0.769 0.232 0.244           3.31
+  dbl matrix axis 1 by 100  0.672 0.167 0.202           4.02
+  dbl matrix axis 1 by 500  0.365 0.134 0.169           2.72
+    int matrix axis 1 by 1  0.407 0.409 0.406           1.00
+    int matrix axis 1 by 4  0.814 0.674 0.611           1.21
+   int matrix axis 1 by 20  0.359 0.228 0.283           1.57
+  int matrix axis 1 by 100  0.234 0.216 0.218           1.08
+    lgl matrix axis 1 by 4  0.814 0.676 0.682           1.20
+  lgl matrix axis 1 by 100  0.270 0.154 0.172           1.75
+    raw matrix axis 1 by 4  0.937 0.653 0.583           1.43
+  raw matrix axis 1 by 100  0.053 0.074 0.072           0.72
+    dbl matrix axis 2 by 1  0.394 0.391 0.365           1.01
+  dbl matrix axis 2 by 100  0.143 0.401 0.415           0.36
+  dbl matrix axis 2 by 500  0.148 0.350 0.357           0.42
+     dbl cube axis 1 by 10  1.184 0.485 0.491           2.44
+     dbl cube axis 2 by 10  0.456 0.405 0.405           1.13
+     dbl cube axis 3 by 10  0.145 0.405 0.431           0.36
+        dbl 6d axis 1 by 5  0.790 0.726 0.673           1.09
+        dbl 6d axis 3 by 5  0.384 0.372 0.370           1.03
+ dbl tall axis 1 by 500000  0.147 0.358 0.354           0.41
+      dbl wide axis 1 by 1  0.379 0.572 0.552           0.66
+      dbl wide axis 1 by 2  1.564 1.136 1.103           1.38</pre></details>
+<p>Let me pin down where the crossover is with a run-size sweep.</p>
+
+<details class="tool"><summary>Edit bench/split.R</summary>
+<pre class="diff"><span class="del">-benchmark_case(&quot;dbl tall axis 1 by 500000&quot;, rray_split(dbl_tall, 1L, 500000L))</span>
+<span class="ins">+benchmark_case(&quot;run sweep 1000&quot;, rray_split(dbl_sweep, 1L, 1000L))</span>
+<span class="ins">+benchmark_case(&quot;run sweep 5000&quot;, rray_split(dbl_sweep, 1L, 5000L))</span>
+<span class="ins">+benchmark_case(&quot;run sweep 25000&quot;, rray_split(dbl_sweep, 1L, 25000L))</span>
+<span class="ins">+benchmark_case(&quot;run sweep 50000&quot;, rray_split(dbl_sweep, 1L, 50000L))</span>
+<span class="ins">+</span>
+<span class="ins">+benchmark_case(&quot;dbl tall axis 1 by 500000&quot;, rray_split(dbl_tall, 1L, 500000L))</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/split.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit bench/split.R</summary>
+<pre class="diff"><span class="del">-dbl_tall &lt;- array(seq(1, 2, length.out = n), c(1000000L, 1L))</span>
+<span class="ins">+dbl_sweep &lt;- array(seq(1, 2, length.out = n), c(100000L, 10L))</span>
+<span class="ins">+dbl_tall &lt;- array(seq(1, 2, length.out = n), c(1000000L, 1L))</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/split.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format bench/split.R &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=stride1-loop RRAY_BENC…</summary>
+<pre>air format bench/split.R &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=stride1-loop RRAY_BENCH_OUTPUT=/tmp/split-loop.rds Rscript bench/split.R 2&gt;&amp;1 | grep -E &quot;sweep|tall|Label&quot;</pre><pre class="output">Label: stride1-loop 
+            run sweep 1000  0.184     0.436
+            run sweep 5000  0.178     0.586
+           run sweep 25000  0.166     0.577
+           run sweep 50000  0.164     0.588
+ dbl tall axis 1 by 500000  0.165     0.594</pre></details>
+<details class="tool"><summary>Bash: cp /tmp/split.c.orig src/split.c &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=with-memcpy RR…</summary>
+<pre>cp /tmp/split.c.orig src/split.c &amp;&amp; RRAY_BENCH_ITERATIONS=200 RRAY_BENCH_LABEL=with-memcpy RRAY_BENCH_OUTPUT=/tmp/split-with3.rds Rscript bench/split.R 2&gt;&amp;1 | tail -32</pre><pre class="output">                      case min_ms median_ms
+    dbl matrix axis 1 by 1  0.666     0.962
+    dbl matrix axis 1 by 2  1.639     1.948
+    dbl matrix axis 1 by 4  0.978     1.307
+    dbl matrix axis 1 by 8  0.987     1.286
+   dbl matrix axis 1 by 20  0.825     1.081
+  dbl matrix axis 1 by 100  0.664     0.968
+  dbl matrix axis 1 by 500  0.380     0.790
+    int matrix axis 1 by 1  0.399     0.630
+    int matrix axis 1 by 4  0.812     0.958
+   int matrix axis 1 by 20  0.343     0.494
+  int matrix axis 1 by 100  0.236     0.405
+    lgl matrix axis 1 by 4  0.813     0.977
+  lgl matrix axis 1 by 100  0.230     0.403
+    raw matrix axis 1 by 4  0.951     0.999
+  raw matrix axis 1 by 100  0.057     0.107
+    dbl matrix axis 2 by 1  0.315     0.702
+  dbl matrix axis 2 by 100  0.148     0.413
+  dbl matrix axis 2 by 500  0.149     0.414
+     dbl cube axis 1 by 10  1.284     1.493
+     dbl cube axis 2 by 10  0.612     0.822
+     dbl cube axis 3 by 10  0.241     0.430
+        dbl 6d axis 1 by 5  0.956     1.154
+        dbl 6d axis 3 by 5  0.606     0.816
+            run sweep 1000  0.513     0.830
+            run sweep 5000  0.392     0.490
+           run sweep 25000  0.300     0.445
+           run sweep 50000  0.292     0.438
+ dbl tall axis 1 by 500000  0.284     0.428
+      dbl wide axis 1 by 1  0.560     0.767
+      dbl wide axis 1 by 2  1.696     1.867</pre></details>
+<p>The large-copy cases are swinging run to run. Let me alternate builds and take the best of several reps.</p>
+
+<details class="tool"><summary>Bash: cp /tmp/split.c.orig /tmp/split-memcpy.c</summary>
+<pre>cp /tmp/split.c.orig /tmp/split-memcpy.c
+cp src/split.c /tmp/check.c &amp;&amp; diff -q /tmp/check.c /tmp/split-memcpy.c &amp;&amp; echo &quot;memcpy variant is current&quot;</pre><pre class="output">memcpy variant is current</pre></details>
+<details class="tool tool-error"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+src &lt;- readLines(&quot;/tmp/split-memcpy.c&quot;)
+start &lt;- grep(&quot;if \\(x_run_stride == 1\\) \\{&quot;, src)
+stopifnot(length(start) == 1L)
+# lines of the memcpy branch through the closing else brace
+block &lt;- src[start:(start + 14L)]
+cat(block, sep = &quot;\n&quot;)'</pre><pre class="output">Exit code 1
+Error: '\(' is an unrecognized escape in character string (&lt;input&gt;:1:20)
+Execution halted</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    if (x_run_stride == 1) {                                                   \</span>
+<span class="del">-      r_memcpy(                                                                \</span>
+<span class="del">-        v_out + run_start,                                                     \</span>
+<span class="del">-        v_x + x_start,                                                         \</span>
+<span class="del">-        sizeof(CTYPE) * (size_t) run_size                                      \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      r_ssize x_loc = x_start;                                                 \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="del">-        x_loc += x_run_stride;                                                 \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="ins">+    r_ssize x_loc = x_start;                                                   \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    for (r_ssize i = run_start; i &lt; run_end; ++i) {                            \</span>
+<span class="ins">+      v_out[i] = v_x[x_loc];                                                   \</span>
+<span class="ins">+      x_loc += x_run_stride;                                                   \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cp src/split.c /tmp/split-none.c &amp;&amp; for rep in 1 2 3; do</summary>
+<pre>cp src/split.c /tmp/split-none.c &amp;&amp; for rep in 1 2 3; do
+  for variant in memcpy none; do
+    cp /tmp/split-$variant.c src/split.c
+    RRAY_BENCH_ITERATIONS=150 RRAY_BENCH_LABEL=$variant RRAY_BENCH_OUTPUT=/tmp/split-$variant-$rep.rds Rscript bench/split.R &gt; /dev/null 2&gt;&amp;1
+    echo &quot;done $variant rep $rep&quot;
+  done
+done</pre><pre class="output">done memcpy rep 1
+done none rep 1
+done memcpy rep 2
+done none rep 2
+done memcpy rep 3
+done none rep 3</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+read_variant &lt;- function(variant) {
+  reps &lt;- lapply(1:3, function(i) readRDS(sprintf(&quot;/tmp/split-%s-%d.rds&quot;, variant, i))$summary)
+  mins &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  meds &lt;- do.call(cbind, lapply(reps, function(r) r$median_ms))
+  data.frame(case = reps[[1]]$case, min = apply(mins, 1, min), med = apply(meds, 1, min))
+}
+m &lt;- read_variant(&quot;memcpy&quot;)
+n &lt;- read_variant(&quot;none&quot;)
+d &lt;- data.frame(
+  case = m$case,
+  memcpy_min = round(m$min, 3), none_min = round(n$min, 3),
+  memcpy_med = round(m$med, 3), none_med = round(n$med, 3),
+  ratio_min = round(m$min / n$min, 2),
+  ratio_med = round(m$med / n$med, 2)
+)
+options(width = 130)
+print(d, row.names = FALSE)'</pre><pre class="output">                      case memcpy_min none_min memcpy_med none_med ratio_min ratio_med
+    dbl matrix axis 1 by 1      0.608    0.598      0.941    0.940      1.02      1.00
+    dbl matrix axis 1 by 2      1.632    1.107      1.954    1.433      1.47      1.36
+    dbl matrix axis 1 by 4      0.978    0.709      1.315    1.057      1.38      1.24
+    dbl matrix axis 1 by 8      1.032    0.322      1.286    0.694      3.20      1.85
+   dbl matrix axis 1 by 20      0.838    0.252      1.087    0.619      3.33      1.76
+  dbl matrix axis 1 by 100      0.677    0.259      0.942    0.560      2.61      1.68
+  dbl matrix axis 1 by 500      0.378    0.132      0.777    0.559      2.86      1.39
+    int matrix axis 1 by 1      0.389    0.404      0.599    0.610      0.96      0.98
+    int matrix axis 1 by 4      0.812    0.674      0.979    0.851      1.20      1.15
+   int matrix axis 1 by 20      0.356    0.163      0.518    0.345      2.18      1.50
+  int matrix axis 1 by 100      0.232    0.131      0.397    0.325      1.77      1.22
+    lgl matrix axis 1 by 4      0.811    0.674      0.972    0.845      1.20      1.15
+  lgl matrix axis 1 by 100      0.255    0.127      0.410    0.326      2.01      1.26
+    raw matrix axis 1 by 4      0.936    0.653      0.994    0.706      1.43      1.41
+  raw matrix axis 1 by 100      0.057    0.063      0.110    0.112      0.90      0.98
+    dbl matrix axis 2 by 1      0.321    0.364      0.727    0.718      0.88      1.01
+  dbl matrix axis 2 by 100      0.153    0.316      0.418    0.563      0.48      0.74
+  dbl matrix axis 2 by 500      0.150    0.357      0.412    0.568      0.42      0.73
+     dbl cube axis 1 by 10      1.213    0.356      1.459    0.639      3.41      2.28
+     dbl cube axis 2 by 10      0.533    0.226      0.799    0.552      2.36      1.45
+     dbl cube axis 3 by 10      0.158    0.209      0.414    0.553      0.76      0.75
+        dbl 6d axis 1 by 5      0.790    0.566      1.133    0.901      1.40      1.26
+        dbl 6d axis 3 by 5      0.393    0.253      0.785    0.596      1.55      1.32
+            run sweep 1000      0.481    0.188      0.788    0.525      2.56      1.50
+            run sweep 5000      0.236    0.163      0.467    0.415      1.45      1.13
+           run sweep 25000      0.166    0.240      0.425    0.571      0.69      0.74
+           run sweep 50000      0.155    0.240      0.416    0.573      0.65      0.73
+ dbl tall axis 1 by 500000      0.145    0.235      0.413    0.567      0.62      0.73
+      dbl wide axis 1 by 1      0.379    0.405      0.749    0.760      0.94      0.99
+      dbl wide axis 1 by 2      1.547    0.975      1.852    1.311      1.59      1.41</pre></details>
+<p>Now let me test a size-gated variant to see if it captures both wins.</p>
+
+<details class="tool"><summary>Bash: cp /tmp/split-memcpy.c src/split.c &amp;&amp; echo restored</summary>
+<pre>cp /tmp/split-memcpy.c src/split.c &amp;&amp; echo restored</pre><pre class="output">restored</pre></details>
+<details class="tool"><summary>Read src/split.c</summary>
+<pre class="output">288	#define RRAY_SPLIT_FILL_ATOMIC(CTYPE, CONST_DEREF, DEREF)                      \
+289	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+290	                                                                               \
+291	  const CTYPE* v_x = CONST_DEREF(x);                                           \
+292	  CTYPE* v_out = DEREF(out);                                                   \
+293	                                                                               \
+294	  r_ssize run_start = 0;                                                       \
+295	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+296	  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+297	                                                                               \
+298	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+299	  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+300	                                                                               \
+301	  while (run_start != size) {                                                  \
+302	    const r_ssize run_end = run_start + run_size;                              \
+303	                                                                               \
+304	    if (x_run_stride == 1) {                                                   \
+305	      r_memcpy(                                                                \
+306	        v_out + run_start,                                                     \
+307	        v_x + x_start,                                                         \
+308	        sizeof(CTYPE) * (size_t) run_size                                      \
+309	      );                                                                       \
+310	    } else {                                                                   \
+311	      r_ssize x_loc = x_start;                                                 \
+312	                                                                               \
+313	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+314	        v_out[i] = v_x[x_loc];                                                 \
+315	        x_loc += x_run_stride;                                                 \
+316	      }                                                                        \
+317	    }                                                                          \</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \</span>
+<span class="del">-  rray_strided_iterator_plan_point_init(plan, v_point);                        \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  while (run_start != size) {                                                  \</span>
+<span class="del">-    const r_ssize run_end = run_start + run_size;                              \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    if (x_run_stride == 1) {                                                   \</span>
+<span class="ins">+  const bool memcpyable =                                                      \</span>
+<span class="ins">+    x_run_stride == 1 &amp;&amp; sizeof(CTYPE) * (size_t) run_size &gt;= 131072;          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \</span>
+<span class="ins">+  rray_strided_iterator_plan_point_init(plan, v_point);                        \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  while (run_start != size) {                                                  \</span>
+<span class="ins">+    const r_ssize run_end = run_start + run_size;                              \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    if (memcpyable) {                                                          \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cp src/split.c /tmp/split-gated.c &amp;&amp; for rep in 1 2 3; do</summary>
+<pre>cp src/split.c /tmp/split-gated.c &amp;&amp; for rep in 1 2 3; do
+  cp /tmp/split-gated.c src/split.c
+  RRAY_BENCH_ITERATIONS=150 RRAY_BENCH_LABEL=gated RRAY_BENCH_OUTPUT=/tmp/split-gated-$rep.rds Rscript bench/split.R &gt; /dev/null 2&gt;&amp;1
+  echo &quot;done gated rep $rep&quot;
+done</pre><pre class="output">done gated rep 1
+done gated rep 2
+done gated rep 3</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+read_variant &lt;- function(variant) {
+  reps &lt;- lapply(1:3, function(i) readRDS(sprintf(&quot;/tmp/split-%s-%d.rds&quot;, variant, i))$summary)
+  mins &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  meds &lt;- do.call(cbind, lapply(reps, function(r) r$median_ms))
+  data.frame(case = reps[[1]]$case, min = apply(mins, 1, min), med = apply(meds, 1, min))
+}
+m &lt;- read_variant(&quot;memcpy&quot;); n &lt;- read_variant(&quot;none&quot;); g &lt;- read_variant(&quot;gated&quot;)
+d &lt;- data.frame(
+  case = m$case,
+  memcpy = round(m$min, 3), none = round(n$min, 3), gated = round(g$min, 3),
+  memcpy_vs_none = round(m$min / n$min, 2),
+  gated_vs_none = round(g$min / n$min, 2)
+)
+options(width = 130)
+print(d, row.names = FALSE)'</pre><pre class="output">                      case memcpy  none gated memcpy_vs_none gated_vs_none
+    dbl matrix axis 1 by 1  0.608 0.598 0.598           1.02          1.00
+    dbl matrix axis 1 by 2  1.632 1.107 1.078           1.47          0.97
+    dbl matrix axis 1 by 4  0.978 0.709 0.775           1.38          1.09
+    dbl matrix axis 1 by 8  1.032 0.322 0.339           3.20          1.05
+   dbl matrix axis 1 by 20  0.838 0.252 0.279           3.33          1.11
+  dbl matrix axis 1 by 100  0.677 0.259 0.191           2.61          0.74
+  dbl matrix axis 1 by 500  0.378 0.132 0.171           2.86          1.30
+    int matrix axis 1 by 1  0.389 0.404 0.409           0.96          1.01
+    int matrix axis 1 by 4  0.812 0.674 0.743           1.20          1.10
+   int matrix axis 1 by 20  0.356 0.163 0.195           2.18          1.20
+  int matrix axis 1 by 100  0.232 0.131 0.150           1.77          1.15
+    lgl matrix axis 1 by 4  0.811 0.674 0.741           1.20          1.10
+  lgl matrix axis 1 by 100  0.255 0.127 0.152           2.01          1.20
+    raw matrix axis 1 by 4  0.936 0.653 0.722           1.43          1.11
+  raw matrix axis 1 by 100  0.057 0.063 0.060           0.90          0.95
+    dbl matrix axis 2 by 1  0.321 0.364 0.359           0.88          0.99
+  dbl matrix axis 2 by 100  0.153 0.316 0.174           0.48          0.55
+  dbl matrix axis 2 by 500  0.150 0.357 0.268           0.42          0.75
+     dbl cube axis 1 by 10  1.213 0.356 0.474           3.41          1.33
+     dbl cube axis 2 by 10  0.533 0.226 0.178           2.36          0.79
+     dbl cube axis 3 by 10  0.158 0.209 0.270           0.76          1.29
+        dbl 6d axis 1 by 5  0.790 0.566 0.781           1.40          1.38
+        dbl 6d axis 3 by 5  0.393 0.253 0.366           1.55          1.45
+            run sweep 1000  0.481 0.188 0.195           2.56          1.04
+            run sweep 5000  0.236 0.163 0.386           1.45          2.37
+           run sweep 25000  0.166 0.240 0.291           0.69          1.21
+           run sweep 50000  0.155 0.240 0.286           0.65          1.19
+ dbl tall axis 1 by 500000  0.145 0.235 0.278           0.62          1.18
+      dbl wide axis 1 by 1  0.379 0.405 0.564           0.94          1.39
+      dbl wide axis 1 by 2  1.547 0.975 1.110           1.59          1.14</pre></details>
+<p>The gated batch drifted, it wasn't interleaved. Re-running all three variants interleaved.</p>
+
+<details class="tool"><summary>Bash: for rep in 1 2 3 4; do</summary>
+<pre>for rep in 1 2 3 4; do
+  for variant in memcpy none gated; do
+    cp /tmp/split-$variant.c src/split.c
+    RRAY_BENCH_ITERATIONS=150 RRAY_BENCH_LABEL=$variant RRAY_BENCH_OUTPUT=/tmp/x-$variant-$rep.rds Rscript bench/split.R &gt; /dev/null 2&gt;&amp;1
+  done
+  echo &quot;done rep $rep&quot;
+done</pre><pre class="output">done rep 1
+done rep 2
+done rep 3
+done rep 4</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+read_variant &lt;- function(variant) {
+  reps &lt;- lapply(1:4, function(i) readRDS(sprintf(&quot;/tmp/x-%s-%d.rds&quot;, variant, i))$summary)
+  mins &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  data.frame(case = reps[[1]]$case, min = apply(mins, 1, min))
+}
+m &lt;- read_variant(&quot;memcpy&quot;); n &lt;- read_variant(&quot;none&quot;); g &lt;- read_variant(&quot;gated&quot;)
+d &lt;- data.frame(
+  case = m$case,
+  memcpy = round(m$min, 3), none = round(n$min, 3), gated = round(g$min, 3),
+  memcpy_vs_none = round(m$min / n$min, 2),
+  gated_vs_none = round(g$min / n$min, 2)
+)
+options(width = 130)
+print(d, row.names = FALSE)'</pre><pre class="output">                      case memcpy  none gated memcpy_vs_none gated_vs_none
+    dbl matrix axis 1 by 1  0.594 0.666 0.590           0.89          0.89
+    dbl matrix axis 1 by 2  1.631 1.108 1.079           1.47          0.97
+    dbl matrix axis 1 by 4  0.970 0.700 0.769           1.39          1.10
+    dbl matrix axis 1 by 8  1.017 0.318 0.338           3.20          1.06
+   dbl matrix axis 1 by 20  0.778 0.236 0.277           3.30          1.17
+  dbl matrix axis 1 by 100  0.628 0.168 0.179           3.74          1.07
+  dbl matrix axis 1 by 500  0.456 0.133 0.134           3.43          1.01
+    int matrix axis 1 by 1  0.396 0.409 0.409           0.97          1.00
+    int matrix axis 1 by 4  0.811 0.674 0.743           1.20          1.10
+   int matrix axis 1 by 20  0.351 0.162 0.194           2.17          1.20
+  int matrix axis 1 by 100  0.253 0.126 0.127           2.01          1.01
+    lgl matrix axis 1 by 4  0.811 0.674 0.743           1.20          1.10
+  lgl matrix axis 1 by 100  0.250 0.124 0.127           2.02          1.02
+    raw matrix axis 1 by 4  0.935 0.653 0.723           1.43          1.11
+  raw matrix axis 1 by 100  0.057 0.063 0.063           0.90          1.00
+    dbl matrix axis 2 by 1  0.317 0.357 0.355           0.89          0.99
+  dbl matrix axis 2 by 100  0.252 0.185 0.230           1.36          1.24
+  dbl matrix axis 2 by 500  0.277 0.153 0.149           1.81          0.97
+     dbl cube axis 1 by 10  1.256 0.261 0.381           4.81          1.46
+     dbl cube axis 2 by 10  0.552 0.171 0.172           3.23          1.01
+     dbl cube axis 3 by 10  0.160 0.174 0.159           0.92          0.91
+        dbl 6d axis 1 by 5  0.791 0.564 0.620           1.40          1.10
+        dbl 6d axis 3 by 5  0.439 0.174 0.177           2.52          1.02
+            run sweep 1000  0.474 0.185 0.187           2.56          1.01
+            run sweep 5000  0.221 0.163 0.187           1.36          1.15
+           run sweep 25000  0.166 0.162 0.161           1.02          0.99
+           run sweep 50000  0.165 0.156 0.157           1.06          1.01
+ dbl tall axis 1 by 500000  0.154 0.155 0.146           0.99          0.94
+      dbl wide axis 1 by 1  0.405 0.379 0.376           1.07          0.99
+      dbl wide axis 1 by 2  1.553 0.975 0.948           1.59          0.97</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+cases &lt;- c(&quot;dbl matrix axis 2 by 100&quot;, &quot;dbl matrix axis 2 by 500&quot;, &quot;dbl tall axis 1 by 500000&quot;,
+           &quot;run sweep 25000&quot;, &quot;dbl matrix axis 1 by 1&quot;, &quot;dbl cube axis 3 by 10&quot;)
+for (variant in c(&quot;memcpy&quot;, &quot;none&quot;)) {
+  reps &lt;- lapply(1:4, function(i) readRDS(sprintf(&quot;/tmp/x-%s-%d.rds&quot;, variant, i))$summary)
+  m &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  rownames(m) &lt;- reps[[1]]$case
+  cat(&quot;\n&quot;, variant, &quot;\n&quot;)
+  print(round(m[cases, ], 3))
+}'</pre><pre class="output"> memcpy 
+                           [,1]  [,2]  [,3]  [,4]
+dbl matrix axis 2 by 100  0.280 0.252 0.281 0.280
+dbl matrix axis 2 by 500  0.279 0.277 0.278 0.281
+dbl tall axis 1 by 500000 0.277 0.154 0.278 0.278
+run sweep 25000           0.291 0.166 0.292 0.291
+dbl matrix axis 1 by 1    0.848 0.834 0.594 0.743
+dbl cube axis 3 by 10     0.279 0.160 0.281 0.280
+
+ none 
+                           [,1]  [,2]  [,3]  [,4]
+dbl matrix axis 2 by 100  0.185 0.366 0.188 0.254
+dbl matrix axis 2 by 500  0.157 0.362 0.163 0.153
+dbl tall axis 1 by 500000 0.363 0.155 0.156 0.160
+run sweep 25000           0.360 0.366 0.178 0.162
+dbl matrix axis 1 by 1    0.715 0.825 0.672 0.666
+dbl cube axis 3 by 10     0.174 0.371 0.194 0.238</pre></details>
+<details class="tool"><summary>Bash: cp /tmp/split-memcpy.c src/split.c &amp;&amp; git diff --stat &amp;&amp; git status --short &amp;&amp; grep -ln &quot;r_me…</summary>
+<pre>cp /tmp/split-memcpy.c src/split.c &amp;&amp; git diff --stat &amp;&amp; git status --short &amp;&amp; grep -ln &quot;r_memcpy&quot; src/*.c</pre><pre class="output">?? bench/combine.R
+?? bench/split.R
+src/arg.c
+src/combine.c
+src/dimensions.c
+src/split.c
+src/wrapper.c</pre></details>
+<details class="tool"><summary>Bash: grep -n -B4 -A10 &quot;r_memcpy&quot; src/combine.c | head -40</summary>
+<pre>grep -n -B4 -A10 &quot;r_memcpy&quot; src/combine.c | head -40</pre><pre class="output">93-    v_out_strides
+94-  );
+95-
+96-  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+97:  r_memcpy(
+98-    v_x_broadcast_dimensions,
+99-    v_out_dimensions,
+100-    sizeof(int) * out_dimensionality
+101-  );
+102-
+103-  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+104-
+105-  r_ssize axis_offset = 0;
+106-
+107-  for (r_ssize i = 0; i &lt; xs_size; ++i) {</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^split')&quot; 2&gt;&amp;1 | tail -12</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^split')&quot; 2&gt;&amp;1 | tail -12</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 245 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+read_variant &lt;- function(variant) {
+  reps &lt;- lapply(1:4, function(i) readRDS(sprintf(&quot;/tmp/x-%s-%d.rds&quot;, variant, i))$summary)
+  m &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  data.frame(case = reps[[1]]$case, min = apply(m, 1, min))
+}
+m &lt;- read_variant(&quot;memcpy&quot;); n &lt;- read_variant(&quot;none&quot;)
+keep &lt;- c(&quot;dbl cube axis 1 by 10&quot;,&quot;dbl matrix axis 1 by 100&quot;,&quot;dbl matrix axis 1 by 8&quot;,
+          &quot;run sweep 1000&quot;,&quot;dbl 6d axis 3 by 5&quot;,&quot;dbl matrix axis 1 by 2&quot;,&quot;raw matrix axis 1 by 4&quot;,
+          &quot;dbl matrix axis 2 by 500&quot;,&quot;dbl matrix axis 2 by 100&quot;,&quot;run sweep 25000&quot;,
+          &quot;dbl tall axis 1 by 500000&quot;,&quot;dbl cube axis 3 by 10&quot;,&quot;dbl matrix axis 1 by 1&quot;)
+d &lt;- data.frame(case = m$case, memcpy_ms = round(m$min,3), loop_ms = round(n$min,3),
+                ratio = round(m$min/n$min,2))
+d &lt;- d[match(keep, d$case), ]
+print(d, row.names = FALSE)'</pre><pre class="output">                      case memcpy_ms loop_ms ratio
+     dbl cube axis 1 by 10     1.256   0.261  4.81
+  dbl matrix axis 1 by 100     0.628   0.168  3.74
+    dbl matrix axis 1 by 8     1.017   0.318  3.20
+            run sweep 1000     0.474   0.185  2.56
+        dbl 6d axis 3 by 5     0.439   0.174  2.52
+    dbl matrix axis 1 by 2     1.631   1.108  1.47
+    raw matrix axis 1 by 4     0.935   0.653  1.43
+  dbl matrix axis 2 by 500     0.277   0.153  1.81
+  dbl matrix axis 2 by 100     0.252   0.185  1.36
+           run sweep 25000     0.166   0.162  1.02
+ dbl tall axis 1 by 500000     0.154   0.155  0.99
+     dbl cube axis 3 by 10     0.160   0.174  0.92
+    dbl matrix axis 1 by 1     0.594   0.666  0.89</pre></details>
+<p>No, it makes things worse. It should come out.</p>
+<h2>Numbers</h2>
+<p>Three builds, alternated within one loop so they see the same machine state, 4 reps of 150 iterations each, min across reps. Times in ms, all cases move the same 8 MB.</p>
+<pre><code>                     case      memcpy   loop  ratio
+    dbl cube axis 1 by 10       1.256  0.261   4.81
+ dbl matrix axis 1 by 100       0.628  0.168   3.74
+   dbl matrix axis 1 by 8       1.017  0.318   3.20
+           run sweep 1000       0.474  0.185   2.56
+       dbl 6d axis 3 by 5       0.439  0.174   2.52
+ dbl matrix axis 2 by 500       0.277  0.153   1.81
+   dbl matrix axis 1 by 2       1.631  1.108   1.47
+   raw matrix axis 1 by 4       0.935  0.653   1.43
+ dbl matrix axis 2 by 100       0.252  0.185   1.36
+          run sweep 25000       0.166  0.162   1.02
+dbl tall axis 1 by 500000       0.154  0.155   0.99
+    dbl cube axis 3 by 10       0.160  0.174   0.92
+   dbl matrix axis 1 by 1       0.594  0.666   0.89
+</code></pre>
+<p>The noise floor is about 10%. <code>dbl matrix axis 1 by 1</code> proves it: splitting <code>[1000, 1000]</code> on axis 1 by 1 coalesces to stride 1000, so the memcpy branch is never taken and both builds run identical code, yet they differ by 11%. Every row at 0.89 to 1.02 is a tie, not a win. So <code>r_memcpy()</code> never wins, and loses by up to 4.8x.</p>
+<h2>Why</h2>
+<p>Two effects, both about short runs:</p>
+<ul>
+<li>
+<p>Call overhead. <code>dbl cube axis 1 by 10</code> does 100,000 calls of 80 bytes each. The 1.0 ms gap works out to ~10 ns per call.</p>
+</li>
+<li>
+<p>Lost overlap. <code>run sweep 1000</code> copies 8 KB per run but jumps 800 KB between runs. The gap there is ~290 ns per call, far more than call overhead. An inline loop lets the CPU start the next run's cache misses while the current one finishes. A call into libc's memcpy is opaque, so the runs serialize.</p>
+</li>
+</ul>
+<p>The one case memcpy is meant for, a single big contiguous copy, is a tie. Those cases are bimodal at roughly 0.16 ms or 0.28 ms depending on page state, and both builds hit both modes. My first, non-interleaved runs showed memcpy winning 2x there; that was mode luck, and it vanished once I alternated the builds.</p>
+<p>I also tried a third build that used memcpy only above 128 KB per run. It was no better than just deleting the branch, and it cost about 10% on tiny runs because the test still sits inside the run loop.</p>
+<h2>State</h2>
+<p><code>src/split.c</code> is back to the committed version and <code>devtools::test(filter = '^split')</code> passes 245. The only new file is <code>bench/split.R</code>, untracked.</p>
+<p>Want me to delete the branch? It touches only <code>RRAY_SPLIT_FILL_ATOMIC()</code>, which collapses to the plain strided loop. Worth noting the same pattern will show up in <code>rray_combine()</code> if it has one, so it may be worth checking there too.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Remove it from split fill and commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/split.c</summary>
+<pre class="output">288	#define RRAY_SPLIT_FILL_ATOMIC(CTYPE, CONST_DEREF, DEREF)                      \
+289	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+290	                                                                               \
+291	  const CTYPE* v_x = CONST_DEREF(x);                                           \
+292	  CTYPE* v_out = DEREF(out);                                                   \
+293	                                                                               \
+294	  r_ssize run_start = 0;                                                       \
+295	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+296	  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+297	                                                                               \
+298	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+299	  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+300	                                                                               \
+301	  while (run_start != size) {                                                  \
+302	    const r_ssize run_end = run_start + run_size;                              \
+303	                                                                               \
+304	    if (x_run_stride == 1) {                                                   \
+305	      r_memcpy(                                                                \
+306	        v_out + run_start,                                                     \
+307	        v_x + x_start,                                                         \
+308	        sizeof(CTYPE) * (size_t) run_size                                      \
+309	      );                                                                       \
+310	    } else {                                                                   \
+311	      r_ssize x_loc = x_start;                                                 \
+312	                                                                               \
+313	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+314	        v_out[i] = v_x[x_loc];                                                 \
+315	        x_loc += x_run_stride;                                                 \
+316	      }                                                                        \
+317	    }                                                                          \
+318	                                                                               \
+319	    run_start = run_end;                                                       \
+320	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+321	  }
+322	
+323	#define RRAY_SPLIT_FILL_BARRIER(CONST_DEREF, POKE)                             \</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    if (x_run_stride == 1) {                                                   \</span>
+<span class="del">-      r_memcpy(                                                                \</span>
+<span class="del">-        v_out + run_start,                                                     \</span>
+<span class="del">-        v_x + x_start,                                                         \</span>
+<span class="del">-        sizeof(CTYPE) * (size_t) run_size                                      \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      r_ssize x_loc = x_start;                                                 \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="del">-        x_loc += x_run_stride;                                                 \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="ins">+    r_ssize x_loc = x_start;                                                   \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    for (r_ssize i = run_start; i &lt; run_end; ++i) {                            \</span>
+<span class="ins">+      v_out[i] = v_x[x_loc];                                                   \</span>
+<span class="ins">+      x_loc += x_run_stride;                                                   \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output"> src/split.c | 16 ++++------------
+ 1 file changed, 4 insertions(+), 12 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git diff</summary>
+<pre>git diff</pre><pre class="output">diff --git a/src/split.c b/src/split.c
+index 9ef097b..eecae5c 100644
+--- a/src/split.c
++++ b/src/split.c
+@@ -301,19 +301,11 @@ static void rray_split_fill(
+   while (run_start != size) {                                                  \
+     const r_ssize run_end = run_start + run_size;                              \
+                                                                                \
+-    if (x_run_stride == 1) {                                                   \
+-      r_memcpy(                                                                \
+-        v_out + run_start,                                                     \
+-        v_x + x_start,                                                         \
+-        sizeof(CTYPE) * (size_t) run_size                                      \
+-      );                                                                       \
+-    } else {                                                                   \
+-      r_ssize x_loc = x_start;                                                 \
++    r_ssize x_loc = x_start;                                                   \
+                                                                                \
+-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+-        v_out[i] = v_x[x_loc];                                                 \
+-        x_loc += x_run_stride;                                                 \
+-      }                                                                        \
++    for (r_ssize i = run_start; i &lt; run_end; ++i) {                            \
++      v_out[i] = v_x[x_loc];                                                   \
++      x_loc += x_run_stride;                                                   \
+     }                                                                          \
+                                                                                \
+     run_start = run_end;                                                       \</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -20</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -20</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1880 ]</pre></details>
+<details class="tool"><summary>Bash: git log --oneline -3 &amp;&amp; git branch -vv | grep '^\*'</summary>
+<pre>git log --oneline -3 &amp;&amp; git branch -vv | grep '^\*'</pre><pre class="output">0bc90c1 Describe `rray_split()` outputs as arrays instead of chunks
+4ecf50d Name the `rray_split()` chunk argument `dimensions`
+6a0462d Rewrite `rray_split()` to split one axis into sized chunks
+* feature/split                0bc90c1 [origin/feature/split] Describe `rray_split()` outputs as arrays instead of chunks</pre></details>
+<details class="tool"><summary>Bash: git add src/split.c &amp;&amp; git commit -m &quot;Remove the stride 1 \`memcpy()\` path from \`rray_split…</summary>
+<pre>git add src/split.c &amp;&amp; git commit -m &quot;Remove the stride 1 \`memcpy()\` path from \`rray_split()\` fill&quot; &amp;&amp; git push origin feature/split</pre><pre class="output">[feature/split 76aaba4] Remove the stride 1 `memcpy()` path from `rray_split()` fill
+ 1 file changed, 4 insertions(+), 12 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   0bc90c1..76aaba4  feature/split -&gt; feature/split</pre></details>
+<p>Done. <code>76aaba4</code> is on <code>origin/feature/split</code>.</p>
+<ul>
+<li>
+<p><code>RRAY_SPLIT_FILL_ATOMIC()</code> now always uses the strided loop, matching <code>RRAY_SPLIT_FILL_BARRIER()</code>.</p>
+</li>
+<li>
+<p><code>clang-format</code> run over all of <code>src/</code>, full suite passes 1880.</p>
+</li>
+</ul>
+<p>I committed only <code>src/split.c</code>. <code>bench/split.R</code> is still untracked, along with your <code>bench/combine.R</code>. Say the word if you want the benchmark committed too.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Oh one thing you should try is keeping the branch but replacing the memcpy call with the simplest loop possible. I assume all you could optimize would be an explicit +1 of the x loc but it’s worth a try</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Good idea. Let me test two shapes of that against the current build, interleaved.</p>
+
+<details class="tool"><summary>Bash: cp src/split.c /tmp/s-none.c &amp;&amp; sed -n '288,320p' src/split.c</summary>
+<pre>cp src/split.c /tmp/s-none.c &amp;&amp; sed -n '288,320p' src/split.c</pre><pre class="output">#define RRAY_SPLIT_FILL_ATOMIC(CTYPE, CONST_DEREF, DEREF)                      \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  const CTYPE* v_x = CONST_DEREF(x);                                           \
+  CTYPE* v_out = DEREF(out);                                                   \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+                                                                               \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    for (r_ssize i = run_start; i &lt; run_end; ++i) {                            \
+      v_out[i] = v_x[x_loc];                                                   \
+      x_loc += x_run_stride;                                                   \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+  }
+
+#define RRAY_SPLIT_FILL_BARRIER(CONST_DEREF, POKE)                             \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \
+                                                                               \
+  r_ssize run_start = 0;                                                       \</pre></details>
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    r_ssize x_loc = x_start;                                                   \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    for (r_ssize i = run_start; i &lt; run_end; ++i) {                            \</span>
+<span class="del">-      v_out[i] = v_x[x_loc];                                                   \</span>
+<span class="del">-      x_loc += x_run_stride;                                                   \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    run_start = run_end;                                                       \</span>
+<span class="del">-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-#define RRAY_SPLIT_FILL_BARRIER(CONST_DEREF, POKE)                             \</span>
+<span class="ins">+    r_ssize x_loc = x_start;                                                   \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    if (x_run_stride == 1) {                                                   \</span>
+<span class="ins">+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="ins">+        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="ins">+        ++x_loc;                                                               \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+    } else {                                                                   \</span>
+<span class="ins">+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="ins">+        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="ins">+        x_loc += x_run_stride;                                                 \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    run_start = run_end;                                                       \</span>
+<span class="ins">+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+#define RRAY_SPLIT_FILL_BARRIER(CONST_DEREF, POKE)                             \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/split.c &amp;&amp; cp src/split.c /tmp/s-incr.c &amp;&amp; sed -n '301,325p' src/split.c</summary>
+<pre>clang-format -i src/split.c &amp;&amp; cp src/split.c /tmp/s-incr.c &amp;&amp; sed -n '301,325p' src/split.c</pre><pre class="output">  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+                                                                               \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    if (x_run_stride == 1) {                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[i] = v_x[x_loc];                                                 \
+        ++x_loc;                                                               \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[i] = v_x[x_loc];                                                 \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+  }
+
+#define RRAY_SPLIT_FILL_BARRIER(CONST_DEREF, POKE)                             \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \</pre></details>
+<p>Now the pointer-offset shape.</p>
+
+<details class="tool"><summary>Edit src/split.c</summary>
+<pre class="diff"><span class="del">-    if (x_run_stride == 1) {                                                   \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="del">-        ++x_loc;                                                               \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="ins">+    if (x_run_stride == 1) {                                                   \</span>
+<span class="ins">+      const CTYPE* v_x_run = v_x + x_start;                                    \</span>
+<span class="ins">+      CTYPE* v_out_run = v_out + run_start;                                    \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = 0; i &lt; run_size; ++i) {                                 \</span>
+<span class="ins">+        v_out_run[i] = v_x_run[i];                                             \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+    } else {                                                                   \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/split.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/split.c &amp;&amp; cp src/split.c /tmp/s-ptr.c &amp;&amp; for rep in 1 2 3 4; do</summary>
+<pre>clang-format -i src/split.c &amp;&amp; cp src/split.c /tmp/s-ptr.c &amp;&amp; for rep in 1 2 3 4; do
+  for variant in none incr ptr; do
+    cp /tmp/s-$variant.c src/split.c
+    RRAY_BENCH_ITERATIONS=150 RRAY_BENCH_LABEL=$variant RRAY_BENCH_OUTPUT=/tmp/y-$variant-$rep.rds Rscript bench/split.R &gt; /dev/null 2&gt;&amp;1
+  done
+  echo &quot;done rep $rep&quot;
+done</pre><pre class="output">done rep 1
+done rep 2
+done rep 3
+done rep 4</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+read_variant &lt;- function(variant) {
+  reps &lt;- lapply(1:4, function(i) readRDS(sprintf(&quot;/tmp/y-%s-%d.rds&quot;, variant, i))$summary)
+  m &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  data.frame(case = reps[[1]]$case, min = apply(m, 1, min))
+}
+n &lt;- read_variant(&quot;none&quot;); i &lt;- read_variant(&quot;incr&quot;); p &lt;- read_variant(&quot;ptr&quot;)
+d &lt;- data.frame(
+  case = n$case,
+  none = round(n$min, 3), incr = round(i$min, 3), ptr = round(p$min, 3),
+  incr_vs_none = round(i$min / n$min, 2),
+  ptr_vs_none = round(p$min / n$min, 2)
+)
+options(width = 130)
+print(d, row.names = FALSE)'</pre><pre class="output">                      case  none  incr   ptr incr_vs_none ptr_vs_none
+    dbl matrix axis 1 by 1 0.616 0.644 0.592         1.05        0.96
+    dbl matrix axis 1 by 2 1.118 1.113 1.044         1.00        0.93
+    dbl matrix axis 1 by 4 0.714 0.705 0.637         0.99        0.89
+    dbl matrix axis 1 by 8 0.318 0.318 0.312         1.00        0.98
+   dbl matrix axis 1 by 20 0.233 0.240 0.252         1.03        1.08
+  dbl matrix axis 1 by 100 0.166 0.165 0.193         0.99        1.16
+  dbl matrix axis 1 by 500 0.137 0.143 0.170         1.04        1.24
+    int matrix axis 1 by 1 0.397 0.404 0.409         1.02        1.03
+    int matrix axis 1 by 4 0.674 0.673 0.604         1.00        0.90
+   int matrix axis 1 by 20 0.163 0.166 0.153         1.02        0.94
+  int matrix axis 1 by 100 0.150 0.128 0.127         0.85        0.85
+    lgl matrix axis 1 by 4 0.672 0.675 0.674         1.00        1.00
+  lgl matrix axis 1 by 100 0.151 0.128 0.125         0.85        0.83
+    raw matrix axis 1 by 4 0.654 0.653 0.583         1.00        0.89
+  raw matrix axis 1 by 100 0.066 0.060 0.063         0.91        0.95
+    dbl matrix axis 2 by 1 0.362 0.355 0.375         0.98        1.04
+  dbl matrix axis 2 by 100 0.355 0.158 0.167         0.45        0.47
+  dbl matrix axis 2 by 500 0.162 0.155 0.157         0.96        0.97
+     dbl cube axis 1 by 10 0.337 0.263 0.258         0.78        0.77
+     dbl cube axis 2 by 10 0.301 0.170 0.168         0.56        0.56
+     dbl cube axis 3 by 10 0.336 0.174 0.158         0.52        0.47
+        dbl 6d axis 1 by 5 0.707 0.564 0.508         0.80        0.72
+        dbl 6d axis 3 by 5 0.370 0.173 0.171         0.47        0.46
+            run sweep 1000 0.192 0.187 0.187         0.97        0.97
+            run sweep 5000 0.388 0.165 0.371         0.43        0.96
+           run sweep 25000 0.354 0.158 0.372         0.45        1.05
+           run sweep 50000 0.358 0.156 0.351         0.44        0.98
+ dbl tall axis 1 by 500000 0.351 0.158 0.363         0.45        1.03
+      dbl wide axis 1 by 1 0.561 0.378 0.509         0.67        0.91
+      dbl wide axis 1 by 2 1.140 0.980 1.046         0.86        0.92</pre></details>
+<p>Those 0.45 ratios are the bimodal mode artifact again. More reps.</p>
+
+<details class="tool"><summary>Bash: for rep in 5 6 7 8 9 10 11 12; do</summary>
+<pre>for rep in 5 6 7 8 9 10 11 12; do
+  for variant in none incr ptr; do
+    cp /tmp/s-$variant.c src/split.c
+    RRAY_BENCH_ITERATIONS=150 RRAY_BENCH_LABEL=$variant RRAY_BENCH_OUTPUT=/tmp/y-$variant-$rep.rds Rscript bench/split.R &gt; /dev/null 2&gt;&amp;1
+  done
+  echo &quot;done rep $rep&quot;
+done</pre><pre class="output">done rep 5
+done rep 6
+done rep 7
+done rep 8
+done rep 9
+done rep 10
+done rep 11
+done rep 12</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+read_variant &lt;- function(variant) {
+  reps &lt;- lapply(1:12, function(i) readRDS(sprintf(&quot;/tmp/y-%s-%d.rds&quot;, variant, i))$summary)
+  m &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  data.frame(case = reps[[1]]$case, min = apply(m, 1, min))
+}
+n &lt;- read_variant(&quot;none&quot;); i &lt;- read_variant(&quot;incr&quot;); p &lt;- read_variant(&quot;ptr&quot;)
+d &lt;- data.frame(
+  case = n$case,
+  none = round(n$min, 3), incr = round(i$min, 3), ptr = round(p$min, 3),
+  incr_vs_none = round(i$min / n$min, 2),
+  ptr_vs_none = round(p$min / n$min, 2)
+)
+options(width = 130)
+print(d, row.names = FALSE)'</pre><pre class="output">                      case  none  incr   ptr incr_vs_none ptr_vs_none
+    dbl matrix axis 1 by 1 0.599 0.600 0.592         1.00        0.99
+    dbl matrix axis 1 by 2 1.102 1.106 1.044         1.00        0.95
+    dbl matrix axis 1 by 4 0.699 0.705 0.637         1.01        0.91
+    dbl matrix axis 1 by 8 0.317 0.318 0.310         1.00        0.98
+   dbl matrix axis 1 by 20 0.233 0.235 0.240         1.01        1.03
+  dbl matrix axis 1 by 100 0.166 0.165 0.165         0.99        0.99
+  dbl matrix axis 1 by 500 0.132 0.133 0.132         1.01        1.00
+    int matrix axis 1 by 1 0.397 0.393 0.397         0.99        1.00
+    int matrix axis 1 by 4 0.672 0.673 0.601         1.00        0.89
+   int matrix axis 1 by 20 0.161 0.166 0.153         1.03        0.95
+  int matrix axis 1 by 100 0.126 0.113 0.111         0.90        0.88
+    lgl matrix axis 1 by 4 0.671 0.672 0.672         1.00        1.00
+  lgl matrix axis 1 by 100 0.128 0.127 0.125         0.99        0.98
+    raw matrix axis 1 by 4 0.653 0.653 0.583         1.00        0.89
+  raw matrix axis 1 by 100 0.063 0.060 0.060         0.95        0.95
+    dbl matrix axis 2 by 1 0.359 0.355 0.362         0.99        1.01
+  dbl matrix axis 2 by 100 0.151 0.158 0.158         1.05        1.05
+  dbl matrix axis 2 by 500 0.156 0.155 0.157         0.99        1.01
+     dbl cube axis 1 by 10 0.261 0.263 0.258         1.01        0.99
+     dbl cube axis 2 by 10 0.170 0.170 0.168         1.00        0.99
+     dbl cube axis 3 by 10 0.175 0.174 0.158         0.99        0.90
+        dbl 6d axis 1 by 5 0.564 0.564 0.508         1.00        0.90
+        dbl 6d axis 3 by 5 0.171 0.173 0.171         1.01        1.00
+            run sweep 1000 0.187 0.185 0.187         0.99        1.00
+            run sweep 5000 0.179 0.165 0.163         0.92        0.91
+           run sweep 25000 0.159 0.158 0.190         0.99        1.19
+           run sweep 50000 0.159 0.156 0.167         0.98        1.05
+ dbl tall axis 1 by 500000 0.160 0.158 0.163         0.99        1.02
+      dbl wide axis 1 by 1 0.377 0.378 0.380         1.00        1.01
+      dbl wide axis 1 by 2 0.976 0.980 0.929         1.00        0.95</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+cases &lt;- c(&quot;dbl matrix axis 1 by 4&quot;,&quot;int matrix axis 1 by 4&quot;,&quot;raw matrix axis 1 by 4&quot;,
+           &quot;int matrix axis 1 by 100&quot;,&quot;dbl 6d axis 1 by 5&quot;,&quot;run sweep 25000&quot;,&quot;dbl matrix axis 1 by 1&quot;)
+for (variant in c(&quot;none&quot;,&quot;incr&quot;,&quot;ptr&quot;)) {
+  reps &lt;- lapply(1:12, function(i) readRDS(sprintf(&quot;/tmp/y-%s-%d.rds&quot;, variant, i))$summary)
+  m &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  rownames(m) &lt;- reps[[1]]$case
+  cat(&quot;\n&quot;, variant, &quot;\n&quot;)
+  print(round(m[cases, ], 3))
+}'</pre><pre class="output"> none 
+                          [,1]  [,2]  [,3]  [,4]  [,5]  [,6]  [,7]  [,8]  [,9]
+dbl matrix axis 1 by 4   0.721 0.716 0.719 0.714 0.715 0.712 0.748 0.719 0.699
+int matrix axis 1 by 4   0.677 0.674 0.674 0.674 0.674 0.673 0.672 0.675 0.673
+raw matrix axis 1 by 4   0.654 0.654 0.654 0.654 0.654 0.657 0.665 0.654 0.660
+int matrix axis 1 by 100 0.151 0.172 0.150 0.151 0.129 0.126 0.126 0.130 0.133
+dbl 6d axis 1 by 5       0.728 0.731 0.707 0.732 0.720 0.564 0.564 0.737 0.732
+run sweep 25000          0.354 0.373 0.359 0.372 0.356 0.350 0.159 0.359 0.375
+dbl matrix axis 1 by 1   0.664 0.616 0.649 0.628 0.599 0.671 0.716 0.737 0.692
+                         [,10] [,11] [,12]
+dbl matrix axis 1 by 4   0.715 0.715 0.714
+int matrix axis 1 by 4   0.673 0.697 0.675
+raw matrix axis 1 by 4   0.658 0.656 0.653
+int matrix axis 1 by 100 0.134 0.127 0.128
+dbl 6d axis 1 by 5       0.731 0.570 0.567
+run sweep 25000          0.366 0.238 0.241
+dbl matrix axis 1 by 1   0.611 0.875 0.823
+
+ incr 
+                          [,1]  [,2]  [,3]  [,4]  [,5]  [,6]  [,7]  [,8]  [,9]
+dbl matrix axis 1 by 4   0.705 0.710 0.714 0.720 0.715 0.710 0.717 0.713 0.716
+int matrix axis 1 by 4   0.673 0.676 0.678 0.675 0.680 0.673 0.674 0.677 0.682
+raw matrix axis 1 by 4   0.656 0.673 0.653 0.654 0.654 0.658 0.654 0.654 0.656
+int matrix axis 1 by 100 0.132 0.129 0.128 0.128 0.174 0.127 0.133 0.125 0.127
+dbl 6d axis 1 by 5       0.726 0.720 0.564 0.566 0.735 0.738 0.719 0.565 0.728
+run sweep 25000          0.362 0.369 0.371 0.158 0.370 0.371 0.366 0.245 0.362
+dbl matrix axis 1 by 1   0.644 0.855 0.851 0.914 0.827 0.702 0.632 0.770 0.801
+                         [,10] [,11] [,12]
+dbl matrix axis 1 by 4   0.715 0.719 0.733
+int matrix axis 1 by 4   0.673 0.674 0.673
+raw matrix axis 1 by 4   0.673 0.654 0.655
+int matrix axis 1 by 100 0.113 0.152 0.127
+dbl 6d axis 1 by 5       0.725 0.729 0.565
+run sweep 25000          0.360 0.360 0.250
+dbl matrix axis 1 by 1   0.656 0.600 0.809
+
+ ptr 
+                          [,1]  [,2]  [,3]  [,4]  [,5]  [,6]  [,7]  [,8]  [,9]
+dbl matrix axis 1 by 4   0.660 0.637 0.653 0.654 0.652 0.645 0.650 0.649 0.653
+int matrix axis 1 by 4   0.608 0.607 0.604 0.607 0.607 0.604 0.604 0.601 0.605
+raw matrix axis 1 by 4   0.594 0.583 0.586 0.584 0.584 0.583 0.597 0.585 0.583
+int matrix axis 1 by 100 0.151 0.130 0.127 0.173 0.127 0.172 0.111 0.126 0.152
+dbl 6d axis 1 by 5       0.690 0.682 0.508 0.677 0.508 0.674 0.673 0.508 0.681
+run sweep 25000          0.378 0.376 0.385 0.372 0.190 0.371 0.361 0.360 0.360
+dbl matrix axis 1 by 1   0.837 0.592 0.612 0.820 0.795 0.596 0.768 0.721 0.804
+                         [,10] [,11] [,12]
+dbl matrix axis 1 by 4   0.654 0.637 0.656
+int matrix axis 1 by 4   0.605 0.606 0.604
+raw matrix axis 1 by 4   0.584 0.584 0.601
+int matrix axis 1 by 100 0.152 0.152 0.171
+dbl 6d axis 1 by 5       0.671 0.680 0.671
+run sweep 25000          0.366 0.369 0.356
+dbl matrix axis 1 by 1   0.607 0.612 0.873</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+cases &lt;- c(&quot;dbl matrix axis 1 by 8&quot;,&quot;dbl matrix axis 1 by 20&quot;,&quot;dbl matrix axis 1 by 100&quot;,
+           &quot;lgl matrix axis 1 by 4&quot;,&quot;dbl cube axis 1 by 10&quot;,&quot;dbl matrix axis 1 by 2&quot;,&quot;dbl wide axis 1 by 2&quot;)
+out &lt;- lapply(c(&quot;none&quot;,&quot;incr&quot;,&quot;ptr&quot;), function(variant) {
+  reps &lt;- lapply(1:12, function(i) readRDS(sprintf(&quot;/tmp/y-%s-%d.rds&quot;, variant, i))$summary)
+  m &lt;- do.call(cbind, lapply(reps, function(r) r$min_ms))
+  rownames(m) &lt;- reps[[1]]$case
+  apply(m[cases, ], 1, median)
+})
+d &lt;- data.frame(case = cases, none = round(out[[1]],3), incr = round(out[[2]],3), ptr = round(out[[3]],3))
+d$ptr_vs_none &lt;- round(d$ptr / d$none, 2)
+print(d, row.names = FALSE)' </pre><pre class="output">                     case  none  incr   ptr ptr_vs_none
+   dbl matrix axis 1 by 8 0.324 0.329 0.312        0.96
+  dbl matrix axis 1 by 20 0.288 0.262 0.255        0.89
+ dbl matrix axis 1 by 100 0.194 0.216 0.246        1.27
+   lgl matrix axis 1 by 4 0.675 0.675 0.674        1.00
+    dbl cube axis 1 by 10 0.420 0.445 0.440        1.05
+   dbl matrix axis 1 by 2 1.127 1.132 1.066        0.95
+     dbl wide axis 1 by 2 1.142 1.140 1.104        0.97</pre></details>
+<details class="tool"><summary>Bash: cp /tmp/s-none.c src/split.c &amp;&amp; git status --short &amp;&amp; git diff --stat</summary>
+<pre>cp /tmp/s-none.c src/split.c &amp;&amp; git status --short &amp;&amp; git diff --stat</pre><pre class="output">?? bench/combine.R
+?? bench/split.R</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^split')&quot; 2&gt;&amp;1 | tail -4</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^split')&quot; 2&gt;&amp;1 | tail -4</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 245 ]</pre></details>
+<p>Neither one is a real win. Your <code>++x_loc</code> hunch was right about the mechanism and it buys nothing.</p>
+<h2>What I tested</h2>
+<p>Twelve interleaved reps of three builds, min per rep:</p>
+<ul>
+<li>
+<p><code>none</code>: what's committed now, one loop with the runtime stride.</p>
+</li>
+<li>
+<p><code>incr</code>: keep the <code>x_run_stride == 1</code> branch, same loop shape, but <code>++x_loc</code> instead of <code>x_loc += x_run_stride</code>.</p>
+</li>
+<li>
+<p><code>ptr</code>: keep the branch, base pointers off <code>x_start</code> and <code>run_start</code>, loop <code>for (i = 0; i &lt; run_size; ++i) v_out_run[i] = v_x_run[i]</code>.</p>
+</li>
+</ul>
+<h2>Result</h2>
+<p><code>incr</code> is a dead tie, 0.99 to 1.03 against <code>none</code> on all 30 cases, often matching to the third decimal. Clang is already generating the same thing for both arms, so the branch buys nothing to specialize on.</p>
+<p><code>ptr</code> looked like a consistent 9 to 11% win on the short-run cases, stable across all 12 reps:</p>
+<pre><code>                   case   none   incr    ptr
+ dbl matrix axis 1 by 4  0.715  0.715  0.652
+ int matrix axis 1 by 4  0.674  0.675  0.605
+ raw matrix axis 1 by 4  0.654  0.655  0.584
+ lgl matrix axis 1 by 4  0.671  0.672  0.672
+</code></pre>
+<p>Look at the last two rows. <code>rray_split_fill_lgl()</code> and <code>rray_split_fill_int()</code> expand the same macro with the same <code>CTYPE</code>, <code>r_lgl_cbegin()</code> and <code>r_int_cbegin()</code> both hand back an <code>int*</code>, and the two inputs are the same shape. Identical work, identical generated loop. In the <code>ptr</code> build one of them got 10% faster and the other did not move at all. That is code layout, not the loop shape. The <code>raw</code> and <code>dbl</code> rows are the same size of effect, so I read them the same way.</p>
+<p>Everything else lands inside the noise, and the large bulk-copy cases stay bimodal at roughly 0.16 ms or 0.36 ms in every build, which is why the earlier 4-rep table showed fake 2x swings.</p>
+<p>So there's nothing here worth a branch. The tree is back at <code>76aaba4</code>, tests pass, nothing new to commit.</p>
+
+</section>
+</main>
+</body>
+</html>

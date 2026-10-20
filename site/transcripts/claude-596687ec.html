@@ -1,0 +1,1768 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing whether building the iterator inside locate.c kernels matters</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-134">rray timeline</a>
+<h1>Testing whether building the iterator inside <code>locate.c</code> kernels matters</h1>
+<p class="facts">Claude · Oct 6, 2026 · 2 prompts · 13 replies · <a href="https://github.com/r-lib/rray/pull/134">#134</a></p>
+</header>
+<main>
+<p class="divider">Oct 6, 2026, 22:38 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>We are working on locate.c</p>
+<p>look at the past commits to see how we got here</p>
+<p>One thing we’ve noticed is that the iterator MUST be built in the function that uses it otherwise things can be slow</p>
+<p>Can you test this? Look at other functions for guidance</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git log --stat -3 | head -60 &amp;&amp; cat src/locate.c &amp;&amp; ls src &amp;&amp; cat ~/.claude/projects/-Users-d…</summary>
+<pre>git log --stat -3 | head -60 &amp;&amp; cat src/locate.c &amp;&amp; ls src &amp;&amp; cat ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_many_small_outputs.md ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_benchmarking_against_main.md ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_second_caller_breaks_inlining.md</pre><pre class="output">commit 77492cade046c0424b614d77f39ee2b920c4b278
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Tue Oct 6 18:36:13 2026 -0400
+
+    Move `rray_locate_max()` and `rray_locate_min()` to the run iterator
+
+ src/decl/locate-decl.h |  30 ++++-----
+ src/locate.c           | 164 ++++++++++++++++++++++++++++++++-----------------
+ 2 files changed, 120 insertions(+), 74 deletions(-)
+
+commit afc87af0d56968d985e24653af491dc82bc98b5d
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Tue Oct 6 16:53:00 2026 -0400
+
+    Add `rray_locate_max()` and `rray_locate_min()`
+
+ NAMESPACE                       |   2 +
+ R/locate.R                      |  69 +++++++
+ _pkgdown.yml                    |   1 +
+ man/rray-locate.Rd              |  63 ++++++
+ plans/extensions.md             |   2 +-
+ plans/implementation.md         |  32 +--
+ src/decl/locate-decl.h          |  85 ++++++++
+ src/init.c                      |  14 ++
+ src/locate.c                    | 435 ++++++++++++++++++++++++++++++++++++++++
+ src/locate.h                    |  24 +++
+ tests/testthat/_snaps/locate.md | 129 ++++++++++++
+ tests/testthat/helper-locate.R  |  28 +++
+ tests/testthat/test-locate.R    | 231 +++++++++++++++++++++
+ 13 files changed, 1084 insertions(+), 31 deletions(-)
+
+commit 61d9f1e2b436e6297aabbe4a6ceb502168d607cf
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Tue Oct 6 16:21:51 2026 -0400
+
+    Add plan for faster stride 0 loops in min and max (#133)
+
+ plans/min-max.md | 299 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 299 insertions(+)
+#include &quot;locate.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;missing.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+enum rray_locate_op {
+  RRAY_LOCATE_max,
+  RRAY_LOCATE_min
+};
+
+typedef void (*rray_locate_fn)(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+
+#include &quot;decl/locate-decl.h&quot;
+
+r_obj* ffi_rray_locate_max(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_locate_max(ffi_x, axis, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_locate_max(
+  r_obj* x,
+  int axis,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_locate(x, axis, na_rm, RRAY_LOCATE_max, arg, error_call);
+}
+
+r_obj* ffi_rray_locate_min(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_locate_min(ffi_x, axis, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_locate_min(
+  r_obj* x,
+  int axis,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_locate(x, axis, na_rm, RRAY_LOCATE_min, arg, error_call);
+}
+
+static r_obj* rray_locate(
+  r_obj* x,
+  int axis,
+  bool na_rm,
+  enum rray_locate_op op,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  const rray_locate_fn fn = rray_locate_switch(x, op, arg, error_call);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * dimensionality);
+  v_out_dimensions[axis - 1] = 1;
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  r_obj* out = KEEP(r_alloc_integer(out_size));
+  int* v_out = r_int_begin(out);
+
+  if (v_x_dimensions[axis - 1] == 0) {
+    for (r_ssize i = 0; i &lt; out_size; ++i) {
+      v_out[i] = r_globals.na_int;
+    }
+  } else {
+    r_ssize v_out_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+    rray_fill_broadcast_strides_from_dimensions(
+      v_out_dimensions,
+      dimensionality,
+      dimensionality,
+      v_out_broadcast_strides
+    );
+
+    r_ssize v_position_strides[RRAY_MAX_DIMENSIONALITY] = {0};
+    v_position_strides[axis - 1] = 1;
+
+    struct rray_run_iterator it;
+    rray_run_iterator_init2(
+      &amp;it,
+      v_x_dimensions,
+      dimensionality,
+      v_out_broadcast_strides,
+      v_position_strides
+    );
+
+    r_obj* best = KEEP(r_alloc_vector(r_typeof(x), out_size));
+    fn(x, best, na_rm, &amp;it, v_out);
+    FREE(1);
+  }
+
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* axes = KEEP(r_int(axis));
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+static rray_locate_fn rray_locate_switch(
+  r_obj* x,
+  enum rray_locate_op op,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    switch (op) {
+    case RRAY_LOCATE_max:
+      return rray_locate_max_lgl;
+    case RRAY_LOCATE_min:
+      return rray_locate_min_lgl;
+    }</pre><p class="cut">576 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;run_iterator&quot; src/*.c | grep -v &quot;^src/locate&quot; | head -50; ls bench 2&gt;/dev/null; sed …</summary>
+<pre>grep -n &quot;run_iterator&quot; src/*.c | grep -v &quot;^src/locate&quot; | head -50; ls bench 2&gt;/dev/null; sed -n 1,200p src/reduce-extremum.c</pre><pre class="output">src/broadcast.c:149:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+src/broadcast.c:150:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/broadcast.c:151:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/broadcast.c:153:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+src/broadcast.c:154:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+src/broadcast.c:172:  struct rray_run_iterator it;                                                 \
+src/broadcast.c:173:  rray_run_iterator_init1(                                                     \
+src/broadcast.c:180:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/broadcast.c:191:  struct rray_run_iterator it;                                                 \
+src/broadcast.c:192:  rray_run_iterator_init1(                                                     \
+src/broadcast.c:199:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/combine.c:312:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next2(&amp;it)) {         \
+src/combine.c:313:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/combine.c:314:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/combine.c:316:    r_ssize out_loc = out_start + rray_run_iterator_loc(&amp;it, 0);               \
+src/combine.c:317:    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \
+src/combine.c:319:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 1);                             \
+src/combine.c:320:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 1);                 \
+src/combine.c:340:  struct rray_run_iterator it;                                                 \
+src/combine.c:341:  rray_run_iterator_init2(                                                     \
+src/combine.c:356:  struct rray_run_iterator it;                                                 \
+src/combine.c:357:  rray_run_iterator_init2(                                                     \
+src/index.c:383:  for (; !rray_run_iterator_done(&amp;it); NEXT(&amp;it)) {                            \
+src/index.c:384:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/index.c:385:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/index.c:387:    const r_ssize* v_location = rray_run_iterator_v_loc(&amp;it);                  \
+src/index.c:388:    const r_ssize* v_strides = rray_run_iterator_v_strides(&amp;it);               \
+src/index.c:404:  for (; !rray_run_iterator_done(&amp;it); NEXT(&amp;it)) {                            \
+src/index.c:405:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/index.c:406:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/index.c:408:    const r_ssize* v_location = rray_run_iterator_v_loc(&amp;it);                  \
+src/index.c:409:    const r_ssize* v_strides = rray_run_iterator_v_strides(&amp;it);               \
+src/index.c:428:      RRAY_INDEX_LOOP_MISSING(POKE, MISSING, rray_run_iterator_next1, 1);      \
+src/index.c:431:      RRAY_INDEX_LOOP_MISSING(POKE, MISSING, rray_run_iterator_next2, 2);      \
+src/index.c:434:      RRAY_INDEX_LOOP_MISSING(POKE, MISSING, rray_run_iterator_next3, 3);      \
+src/index.c:437:      RRAY_INDEX_LOOP_MISSING(POKE, MISSING, rray_run_iterator_next4, 4);      \
+src/index.c:443:        rray_run_iterator_next,                                                \
+src/index.c:451:      RRAY_INDEX_LOOP(POKE, rray_run_iterator_next1, 1);                       \
+src/index.c:454:      RRAY_INDEX_LOOP(POKE, rray_run_iterator_next2, 2);                       \
+src/index.c:457:      RRAY_INDEX_LOOP(POKE, rray_run_iterator_next3, 3);                       \
+src/index.c:460:      RRAY_INDEX_LOOP(POKE, rray_run_iterator_next4, 4);                       \
+src/index.c:463:      RRAY_INDEX_LOOP(POKE, rray_run_iterator_next, indices_size);             \
+src/index.c:471:  struct rray_run_iterator it;                                                 \
+src/index.c:472:  rray_run_iterator_init(                                                      \
+src/index.c:480:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/index.c:491:  struct rray_run_iterator it;                                                 \
+src/index.c:492:  rray_run_iterator_init(                                                      \
+src/index.c:500:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/permute-axes.c:132:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+src/permute-axes.c:133:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+binary.R
+broadcast.R
+combine.R
+extremum.R
+index.R
+iterator.R
+matrix-stats.R
+mean.R
+permute-axes.R
+reduce-logical.R
+reduce.R
+slice.R
+split.R
+stride-zero.R
+#include &quot;reduce-extremum.h&quot;
+
+#include &lt;limits.h&gt;
+#include &lt;math.h&gt;
+
+#include &quot;one-extremum.h&quot;
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-extremum-decl.h&quot;
+
+r_obj* ffi_rray_max(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_max(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_min(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_min(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_max(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_max_switch, arg, error_call);
+}
+
+r_obj* rray_min(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_min_switch, arg, error_call);
+}
+
+static rray_reduce_fn rray_max_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return rray_max_lgl;
+  case RRAY_TYPE_integer:
+    return rray_max_int;
+  case RRAY_TYPE_double:
+    return rray_max_dbl;
+
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;maximum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static rray_reduce_fn rray_min_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return rray_min_lgl;
+  case RRAY_TYPE_integer:
+    return rray_min_int;
+  case RRAY_TYPE_double:
+    return rray_min_dbl;
+
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;minimum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_max_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  if (na_rm) {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      0,
+      rray_max_lgl_one_na_rm
+    );
+  } else {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      0,
+      rray_max_lgl_one
+    );
+  }</pre><p class="cut">64 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;RRAY_REDUCE\b&quot; -A60 src/reduce.h | head -90; cat bench/extremum.R; grep -n &quot;run_iter…</summary>
+<pre>grep -n &quot;RRAY_REDUCE\b&quot; -A60 src/reduce.h | head -90; cat bench/extremum.R; grep -n &quot;run_iterator_init2\|rray_run_iterator_init\b&quot; -A25 src/strided-iterator.h | head -80; git show afc87af -- src/locate.c | sed -n 1,400p | grep -n &quot;it\b\|iterator&quot; | head -40</pre><pre class="output">47:#define RRAY_REDUCE(                                                           \
+48-  X_CTYPE,                                                                     \
+49-  X_CONST_DEREF,                                                               \
+50-  OUT_RTYPE,                                                                   \
+51-  OUT_CTYPE,                                                                   \
+52-  OUT_DEREF,                                                                   \
+53-  OUT_INIT,                                                                    \
+54-  ONE                                                                          \
+55-)                                                                              \
+56-  struct rray_run_iterator it;                                                 \
+57-  rray_run_iterator_init1(                                                     \
+58-    &amp;it,                                                                       \
+59-    v_dimensions,                                                              \
+60-    dimensionality,                                                            \
+61-    v_out_broadcast_strides                                                    \
+62-  );                                                                           \
+63-                                                                               \
+64-  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+65-  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+66-                                                                               \
+67-  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+68-    v_out[i] = OUT_INIT;                                                       \
+69-  }                                                                            \
+70-                                                                               \
+71-  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+72-                                                                               \
+73-  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+74-    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+75-    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+76-                                                                               \
+77-    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);                           \
+78-    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \
+79-                                                                               \
+80-    if (out_stride == 0) {                                                     \
+81-      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+82-        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+83-      }                                                                        \
+84-    } else {                                                                   \
+85-      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+86-        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+87-        out_loc += out_stride;                                                 \
+88-      }                                                                        \
+89-    }                                                                          \
+90-  }                                                                            \
+91-                                                                               \
+92-  FREE(1);                                                                     \
+93-  return out;
+94-
+95-// --------------------------------------------------------------------------
+96-// stop_unsupported_reduce
+97-
+98-r_no_return void stop_unsupported_reduce(
+99-  const char* op,
+100-  r_obj* x,
+101-  struct rray_arg* arg,
+102-  struct r_lazy error_call
+103-);
+104-
+105-#endif
+devtools::load_all(quiet = TRUE)
+
+size &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_SIZE&quot;, &quot;1000000&quot;))
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;15&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+side &lt;- as.integer(sqrt(size))
+if (side * side != size) {
+  stop(&quot;`RRAY_BENCH_SIZE` must be a perfect square.&quot;, call. = FALSE)
+}
+
+dimensions &lt;- c(side, side)
+
+cases &lt;- expand.grid(
+  operation = c(&quot;pmax&quot;, &quot;pmin&quot;),
+  type = c(&quot;integer&quot;, &quot;double&quot;),
+  na_rm = c(FALSE, TRUE),
+  missing = c(&quot;none&quot;, &quot;sparse&quot;, &quot;dense&quot;),
+  traversal = c(&quot;contiguous&quot;, &quot;scalar&quot;, &quot;broadcast_axis0&quot;, &quot;broadcast_axis1&quot;),
+  stringsAsFactors = FALSE
+)
+
+make_values &lt;- function(n, type, offset) {
+  values &lt;- (seq_len(n) * (offset * 2L + 1L)) %% 2001L - 1000L
+
+  if (type == &quot;integer&quot;) {
+    as.integer(values)
+  } else {
+    as.double(values) + offset / 10
+  }
+}
+
+add_missing &lt;- function(x, type, missing, offset) {
+  if (missing == &quot;none&quot;) {
+    return(x)
+  }
+
+  step &lt;- if (missing == &quot;sparse&quot;) 101L + offset else 2L + offset
+  start &lt;- 1L + offset
+
+  if (start &gt; length(x)) {
+    return(x)
+  }
+
+  locations &lt;- seq.int(start, length(x), by = step)
+
+  if (type == &quot;integer&quot;) {
+    x[locations] &lt;- NA_integer_
+  } else {
+    midpoint &lt;- length(locations) %/% 2L
+    na_locations &lt;- locations[seq_len(midpoint)]
+    nan_locations &lt;- locations[seq.int(midpoint + 1L, length(locations))]
+    x[na_locations] &lt;- NA_real_
+    x[nan_locations] &lt;- NaN
+  }
+
+  x
+}
+
+make_inputs &lt;- function(type, missing, traversal) {
+  x &lt;- make_values(size, type, 1L)
+
+  y_size &lt;- switch(
+    traversal,
+    contiguous = size,
+    scalar = 1L,
+    broadcast_axis0 = side,
+    broadcast_axis1 = side
+  )
+  y &lt;- make_values(y_size, type, 2L)
+
+  x &lt;- add_missing(x, type, missing, 0L)
+  y &lt;- add_missing(y, type, missing, 1L)
+
+  x &lt;- array(x, dimensions)
+  y &lt;- switch(
+    traversal,
+    contiguous = array(y, dimensions),
+    scalar = array(y, c(1L, 1L)),
+    broadcast_axis0 = array(y, c(1L, side)),
+    broadcast_axis1 = array(y, c(side, 1L))
+  )
+
+  list(x = x, y = y)
+}
+
+results &lt;- vector(&quot;list&quot;, nrow(cases))
+
+for (i in seq_len(nrow(cases))) {
+  case &lt;- cases[i, ]
+  inputs &lt;- make_inputs(case$type, case$missing, case$traversal)
+  fn &lt;- switch(case$operation, pmax = rray_max, pmin = rray_min)
+
+  measurement &lt;- bench::mark(
+    extremum = fn(inputs$x, inputs$y, na_rm = case$na_rm),
+    iterations = iterations,
+    check = FALSE,
+    memory = FALSE,
+    filter_gc = FALSE
+  )
+
+  results[[i]] &lt;- cbind(
+    case,
+    median_ns = as.numeric(measurement$median) * 1e9,
+    itr_per_sec = as.numeric(measurement$`itr/sec`)
+  )
+}
+
+results &lt;- do.call(rbind, results)
+row.names(results) &lt;- NULL
+
+print(results, row.names = FALSE)
+
+if (nzchar(output)) {
+  saveRDS(
+    list(
+      results = results,
+      size = size,
+      iterations = iterations,
+      revision = system2(&quot;git&quot;, c(&quot;rev-parse&quot;, &quot;HEAD&quot;), stdout = TRUE)
+    ),
+    output
+  )
+}
+167:static inline void rray_run_iterator_init(
+168-  struct rray_run_iterator* it,
+169-  const int* v_dimensions,
+170-  int dimensionality,
+171-  const r_ssize* const* v_v_strides,
+172-  r_ssize n
+173-) {
+174-  check_dimensionality(dimensionality);
+175-
+176-  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+177-    r_stop_internal(
+178-      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+179-      n,
+180-      RRAY_MAX_INPUTS
+181-    );
+182-  }
+183-</pre><p class="cut">50 more lines cut</p></details>
+<p>Plan: build a variant where each typed kernel builds its own iterator (the <code>RRAY_REDUCE</code> shape in <code>src/reduce.h</code>), then benchmark it against HEAD from a worktree.</p>
+
+<details class="tool tool-error"><summary>Bash: git worktree add --detach /tmp/rray4-head HEAD &gt;/dev/null 2&gt;&amp;1; python3 - &lt;&lt;'EOF'</summary>
+<pre>git worktree add --detach /tmp/rray4-head HEAD &gt;/dev/null 2&gt;&amp;1; python3 - &lt;&lt;'EOF'
+import re
+p='src/locate.c'
+s=open(p).read()
+old_sig=&quot;&quot;&quot;  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+)&quot;&quot;&quot;
+new_sig=&quot;&quot;&quot;  r_obj* best,
+  bool na_rm,
+  const int* v_x_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  const r_ssize* v_position_strides,
+  int* v_out
+)&quot;&quot;&quot;
+assert s.count(old_sig)==7
+s=s.replace(old_sig,new_sig)
+old_call=&quot;&quot;&quot;    struct rray_run_iterator it;
+    rray_run_iterator_init2(
+      &amp;it,
+      v_x_dimensions,
+      dimensionality,
+      v_out_broadcast_strides,
+      v_position_strides
+    );
+
+    r_obj* best = KEEP(r_alloc_vector(r_typeof(x), out_size));
+    fn(x, best, na_rm, &amp;it, v_out);&quot;&quot;&quot;
+new_call=&quot;&quot;&quot;    r_obj* best = KEEP(r_alloc_vector(r_typeof(x), out_size));
+    fn(
+      x,
+      best,
+      na_rm,
+      v_x_dimensions,
+      dimensionality,
+      v_out_broadcast_strides,
+      v_position_strides,
+      v_out
+    );&quot;&quot;&quot;
+assert old_call in s
+s=s.replace(old_call,new_call)
+start=s.index(&quot;#define RRAY_LOCATE(&quot;)
+end=s.index(&quot;static void rray_locate_max_lgl(&quot;)
+m=s[start:end]
+m=m.replace(&quot;rray_run_iterator_done(it)&quot;,&quot;rray_run_iterator_done(&amp;it)&quot;).replace(&quot;rray_run_iterator_next2(it)&quot;,&quot;rray_run_iterator_next2(&amp;it)&quot;)
+m=re.sub(r&quot;rray_run_iterator_(start|end|loc|stride)\(it&quot;, r&quot;rray_run_iterator_\1(&amp;it&quot;, m)
+m=m.replace(&quot;&quot;&quot;  const CTYPE* v_x = CONST_DEREF(x);&quot;&quot;&quot;,&quot;&quot;&quot;  struct rray_run_iterator it;
+  rray_run_iterator_init2(
+    &amp;it,
+    v_x_dimensions,
+    dimensionality,
+    v_out_broadcast_strides,
+    v_position_strides
+  );
+
+  const CTYPE* v_x = CONST_DEREF(x);&quot;&quot;&quot;,1)
+s=s[:start]+m+s[end:]
+open(p,'w').write(s)
+d='src/decl/locate-decl.h'
+t=open(d).read()
+print(t.count(old_sig))
+t=t.replace(old_sig,new_sig)
+open(d,'w').write(t)
+EOF
+clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool tool-error"><summary>Bash: git worktree add --detach /tmp/rray4-head HEAD &amp;&amp; cat src/decl/locate-decl.h</summary>
+<pre>git worktree add --detach /tmp/rray4-head HEAD &amp;&amp; cat src/decl/locate-decl.h</pre><pre class="output">Exit code 128
+Preparing worktree (detached HEAD 77492ca)
+fatal: '/tmp/rray4-head' already exists</pre></details>
+<details class="tool"><summary>Read src/locate.c</summary>
+<pre class="output">1	#include &quot;locate.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;missing.h&quot;
+7	#include &quot;reduce-names.h&quot;
+8	#include &quot;size.h&quot;
+9	#include &quot;strided-iterator.h&quot;
+10	#include &quot;strides.h&quot;
+11	#include &quot;type.h&quot;
+12	#include &quot;utils.h&quot;
+13	
+14	enum rray_locate_op {
+15	  RRAY_LOCATE_max,
+16	  RRAY_LOCATE_min
+17	};
+18	
+19	typedef void (*rray_locate_fn)(
+20	  r_obj* x,
+21	  r_obj* best,
+22	  bool na_rm,
+23	  struct rray_run_iterator* it,
+24	  int* v_out
+25	);
+26	
+27	#include &quot;decl/locate-decl.h&quot;
+28	
+29	r_obj* ffi_rray_locate_max(
+30	  r_obj* ffi_x,</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray4-head &amp;&amp; git status --short | head; git log -1 --oneline; cd ~/files/…</summary>
+<pre>cd /tmp/rray4-head &amp;&amp; git status --short | head; git log -1 --oneline; cd ~/files/r/packages/rray4 &amp;&amp; git worktree list &amp;&amp; cat src/decl/locate-decl.h</pre><pre class="output">a44f0a0 Move rray_mean() to the flat walk with sum, correction, and count buffers
+~/files/r/packages/rray4  77492ca [feature/locate]
+/private/tmp/rray4-head              a44f0a0 (detached HEAD)
+/private/tmp/rray4-sum-main          dbcb228 (detached HEAD)
+/private/tmp/rray4-sum-proto         dbcb228 (detached HEAD)
+/private/tmp/rray4-sum-proto2        dbcb228 (detached HEAD)
+static r_obj* rray_locate(
+  r_obj* x,
+  int axis,
+  bool na_rm,
+  enum rray_locate_op op,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+static rray_locate_fn rray_locate_switch(
+  r_obj* x,
+  enum rray_locate_op op,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_no_return void stop_unsupported_locate(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static void rray_locate_max_lgl(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+static void rray_locate_max_int(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+static void rray_locate_max_dbl(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+
+static void rray_locate_min_lgl(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+static void rray_locate_min_int(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+static void rray_locate_min_dbl(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);
+
+static inline bool rray_locate_max_lgl_one(int x, int best);
+static inline bool rray_locate_max_lgl_one_na_rm(int x, int best);
+static inline bool rray_locate_max_int_one(int x, int best);
+static inline bool rray_locate_max_int_one_na_rm(int x, int best);
+static inline bool rray_locate_max_dbl_one(double x, double best);
+static inline bool rray_locate_max_dbl_one_na_rm(double x, double best);
+
+static inline bool rray_locate_min_lgl_one(int x, int best);
+static inline bool rray_locate_min_lgl_one_na_rm(int x, int best);
+static inline bool rray_locate_min_int_one(int x, int best);
+static inline bool rray_locate_min_int_one_na_rm(int x, int best);
+static inline bool rray_locate_min_dbl_one(double x, double best);
+static inline bool rray_locate_min_dbl_one_na_rm(double x, double best);</pre></details>
+<p>An old <code>/tmp/rray4-head</code> worktree from another session exists, so I'll leave it alone and use a new path.</p>
+
+<details class="tool"><summary>Bash: git worktree add --detach /tmp/rray4-locate-head HEAD</summary>
+<pre>git worktree add --detach /tmp/rray4-locate-head HEAD</pre><pre class="output">Preparing worktree (detached HEAD 77492ca)
+HEAD is now at 77492ca Move `rray_locate_max()` and `rray_locate_min()` to the run iterator</pre></details>
+<details class="tool"><summary>Read src/decl/locate-decl.h</summary>
+<pre class="output">1	static r_obj* rray_locate(
+2	  r_obj* x,
+3	  int axis,
+4	  bool na_rm,
+5	  enum rray_locate_op op,
+6	  struct rray_arg* arg,
+7	  struct r_lazy error_call
+8	);
+9	static rray_locate_fn rray_locate_switch(
+10	  r_obj* x,
+11	  enum rray_locate_op op,
+12	  struct rray_arg* arg,
+13	  struct r_lazy error_call
+14	);
+15	
+16	static r_no_return void stop_unsupported_locate(
+17	  const char* op,
+18	  r_obj* x,
+19	  struct rray_arg* arg,
+20	  struct r_lazy error_call
+21	);
+22	
+23	static void rray_locate_max_lgl(
+24	  r_obj* x,
+25	  r_obj* best,
+26	  bool na_rm,
+27	  struct rray_run_iterator* it,
+28	  int* v_out
+29	);
+30	static void rray_locate_max_int(
+31	  r_obj* x,
+32	  r_obj* best,
+33	  bool na_rm,
+34	  struct rray_run_iterator* it,
+35	  int* v_out
+36	);
+37	static void rray_locate_max_dbl(
+38	  r_obj* x,
+39	  r_obj* best,
+40	  bool na_rm,
+41	  struct rray_run_iterator* it,
+42	  int* v_out
+43	);
+44	
+45	static void rray_locate_min_lgl(
+46	  r_obj* x,
+47	  r_obj* best,
+48	  bool na_rm,
+49	  struct rray_run_iterator* it,
+50	  int* v_out
+51	);
+52	static void rray_locate_min_int(
+53	  r_obj* x,
+54	  r_obj* best,
+55	  bool na_rm,
+56	  struct rray_run_iterator* it,
+57	  int* v_out
+58	);
+59	static void rray_locate_min_dbl(
+60	  r_obj* x,
+61	  r_obj* best,
+62	  bool na_rm,
+63	  struct rray_run_iterator* it,
+64	  int* v_out
+65	);
+66	
+67	static inline bool rray_locate_max_lgl_one(int x, int best);
+68	static inline bool rray_locate_max_lgl_one_na_rm(int x, int best);
+69	static inline bool rray_locate_max_int_one(int x, int best);
+70	static inline bool rray_locate_max_int_one_na_rm(int x, int best);
+71	static inline bool rray_locate_max_dbl_one(double x, double best);
+72	static inline bool rray_locate_max_dbl_one_na_rm(double x, double best);
+73	
+74	static inline bool rray_locate_min_lgl_one(int x, int best);
+75	static inline bool rray_locate_min_lgl_one_na_rm(int x, int best);
+76	static inline bool rray_locate_min_int_one(int x, int best);
+77	static inline bool rray_locate_min_int_one_na_rm(int x, int best);
+78	static inline bool rray_locate_min_dbl_one(double x, double best);
+79	static inline bool rray_locate_min_dbl_one_na_rm(double x, double best);
+80	</pre></details>
+<p>Now the edits: signatures everywhere (replace_all), the call site, and the macro.</p>
+
+<details class="tool"><summary>Edit src/decl/locate-decl.h</summary>
+<pre class="diff"><span class="del">-  bool na_rm,</span>
+<span class="del">-  struct rray_run_iterator* it,</span>
+<span class="del">-  int* v_out</span>
+<span class="ins">+  bool na_rm,</span>
+<span class="ins">+  const int* v_x_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_out_broadcast_strides,</span>
+<span class="ins">+  const r_ssize* v_position_strides,</span>
+<span class="ins">+  int* v_out</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/locate-decl.h has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/locate.c</summary>
+<pre class="diff"><span class="del">-  bool na_rm,</span>
+<span class="del">-  struct rray_run_iterator* it,</span>
+<span class="del">-  int* v_out</span>
+<span class="ins">+  bool na_rm,</span>
+<span class="ins">+  const int* v_x_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_out_broadcast_strides,</span>
+<span class="ins">+  const r_ssize* v_position_strides,</span>
+<span class="ins">+  int* v_out</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/locate.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/locate.c</summary>
+<pre class="diff"><span class="del">-    struct rray_run_iterator it;</span>
+<span class="del">-    rray_run_iterator_init2(</span>
+<span class="del">-      &amp;it,</span>
+<span class="del">-      v_x_dimensions,</span>
+<span class="del">-      dimensionality,</span>
+<span class="del">-      v_out_broadcast_strides,</span>
+<span class="del">-      v_position_strides</span>
+<span class="del">-    );</span>
+<span class="del">-</span>
+<span class="del">-    r_obj* best = KEEP(r_alloc_vector(r_typeof(x), out_size));</span>
+<span class="del">-    fn(x, best, na_rm, &amp;it, v_out);</span>
+<span class="ins">+    r_obj* best = KEEP(r_alloc_vector(r_typeof(x), out_size));</span>
+<span class="ins">+    fn(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      best,</span>
+<span class="ins">+      na_rm,</span>
+<span class="ins">+      v_x_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_out_broadcast_strides,</span>
+<span class="ins">+      v_position_strides,</span>
+<span class="ins">+      v_out</span>
+<span class="ins">+    );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/locate.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/locate.c</summary>
+<pre class="diff"><span class="del">-  const CTYPE* v_x = CONST_DEREF(x);                                           \</span>
+<span class="del">-  CTYPE* v_best = DEREF(best);                                                 \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  for (; !rray_run_iterator_done(it); rray_run_iterator_next2(it)) {           \</span>
+<span class="del">-    r_ssize start = rray_run_iterator_start(it);                               \</span>
+<span class="del">-    const r_ssize end = rray_run_iterator_end(it);                             \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    r_ssize out_loc = rray_run_iterator_loc(it, 0);                            \</span>
+<span class="del">-    const r_ssize out_stride = rray_run_iterator_stride(it, 0);                \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    int position = (int) rray_run_iterator_loc(it, 1) + 1;                     \</span>
+<span class="del">-    const int position_stride = (int) rray_run_iterator_stride(it, 1);         \</span>
+<span class="ins">+  struct rray_run_iterator it;                                                 \</span>
+<span class="ins">+  rray_run_iterator_init2(                                                     \</span>
+<span class="ins">+    &amp;it,                                                                       \</span>
+<span class="ins">+    v_x_dimensions,                                                            \</span>
+<span class="ins">+    dimensionality,                                                            \</span>
+<span class="ins">+    v_out_broadcast_strides,                                                   \</span>
+<span class="ins">+    v_position_strides                                                         \</span>
+<span class="ins">+  );                                                                           \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  const CTYPE* v_x = CONST_DEREF(x);                                           \</span>
+<span class="ins">+  CTYPE* v_best = DEREF(best);                                                 \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next2(&amp;it)) {         \</span>
+<span class="ins">+    r_ssize start = rray_run_iterator_start(&amp;it);                              \</span>
+<span class="ins">+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);                           \</span>
+<span class="ins">+    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    int position = (int) rray_run_iterator_loc(&amp;it, 1) + 1;                    \</span>
+<span class="ins">+    const int position_stride = (int) rray_run_iterator_stride(&amp;it, 1);        \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/locate.c has been updated successfully.</pre></details>
+<details class="tool tool-error"><summary>Edit src/locate.c</summary>
+<pre class="diff"><span class="del">-typedef void (*rray_locate_fn)(</span>
+<span class="del">-  r_obj* x,</span>
+<span class="del">-  r_obj* best,</span>
+<span class="del">-  bool na_rm,</span>
+<span class="del">-  struct rray_run_iterator* it,</span>
+<span class="del">-  int* v_out</span>
+<span class="del">-);</span>
+<span class="ins">+typedef void (*rray_locate_fn)(</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  r_obj* best,</span>
+<span class="ins">+  bool na_rm,</span>
+<span class="ins">+  const int* v_x_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_out_broadcast_strides,</span>
+<span class="ins">+  const r_ssize* v_position_strides,</span>
+<span class="ins">+  int* v_out</span>
+<span class="ins">+);</span></pre><pre class="output">&lt;tool_use_error&gt;String to replace not found in file.
+String: typedef void (*rray_locate_fn)(
+  r_obj* x,
+  r_obj* best,
+  bool na_rm,
+  struct rray_run_iterator* it,
+  int* v_out
+);&lt;/tool_use_error&gt;</pre></details>
+<p>The typedef was already caught by <code>replace_all</code>. Formatting and running the locate tests:</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^l…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^locate')&quot; 2&gt;&amp;1 | tail -5</pre><pre class="output"> src/decl/locate-decl.h | 30 ++++++++++++++++-----
+ src/locate.c           | 72 +++++++++++++++++++++++++++++++++++---------------
+ 2 files changed, 75 insertions(+), 27 deletions(-)
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 119 ]</pre></details>
+<p>Tests pass. Now a benchmark script, run from both roots:</p>
+
+<details class="tool tool-error"><summary>Write /tmp/bench-locate.R</summary>
+<pre>args &lt;- commandArgs(trailingOnly = TRUE)
+root &lt;- args[[1]]
+output &lt;- args[[2]]
+iterations &lt;- as.integer(args[[3]])
+
+devtools::load_all(root, quiet = TRUE)
+
+set.seed(1)
+
+shapes &lt;- list(
+  square = c(1000L, 1000L),
+  tall = c(500000L, 2L),
+  wide = c(2L, 500000L),
+  cube = c(100L, 100L, 100L),
+  tiny = c(5L, 5L)
+)
+
+make_x &lt;- function(type, shape, missing) {
+  n &lt;- prod(shape)
+  x &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+    integer = sample.int(1e6L, n, replace = TRUE),
+    double = runif(n)
+  )
+  if (missing == &quot;sparse&quot;) {
+    x[seq.int(1L, n, by = 101L)] &lt;- NA
+  }
+  array(x, shape)
+}
+
+cases &lt;- expand.grid(
+  op = c(&quot;max&quot;, &quot;min&quot;),
+  type = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;),
+  shape = names(shapes),
+  axis = 1:3,
+  na_rm = c(FALSE, TRUE),
+  missing = c(&quot;none&quot;, &quot;sparse&quot;),
+  stringsAsFactors = FALSE
+)
+cases &lt;- cases[cases$axis &lt;= lengths(shapes[cases$shape]), ]
+cases &lt;- cases[cases$op == &quot;max&quot; | cases$type == &quot;double&quot;, ]
+
+results &lt;- vector(&quot;list&quot;, nrow(cases))
+
+for (i in seq_len(nrow(cases))) {
+  case &lt;- cases[i, ]
+  x &lt;- make_x(case$type, shapes[[case$shape]], case$missing)
+  fn &lt;- switch(case$op, max = rray_locate_max, min = rray_locate_min)
+  axis &lt;- case$axis
+  na_rm &lt;- case$na_rm
+
+  measurement &lt;- bench::mark(
+    fn(x, axis, na_rm = na_rm),
+    iterations = iterations,
+    check = FALSE,
+    memory = FALSE,
+    filter_gc = FALSE
+  )
+
+  results[[i]] &lt;- cbind(case, median_ns = as.numeric(measurement$median) * 1e9)
+}
+
+saveRDS(do.call(rbind, results), output)</pre><pre class="output">&lt;tool_use_error&gt;File has not been read yet. Read it first before writing to it.&lt;/tool_use_error&gt;</pre></details>
+<details class="tool"><summary>Bash: head -20 /tmp/bench-locate.R; ls -la /tmp/bench-locate.R</summary>
+<pre>head -20 /tmp/bench-locate.R; ls -la /tmp/bench-locate.R</pre><pre class="output">args &lt;- commandArgs(TRUE)
+pkgload::load_all(args[[1]], quiet = TRUE)
+
+set.seed(1)
+dbl &lt;- matrix(rnorm(16e6), 4000)
+int &lt;- matrix(sample.int(1e6, 16e6, TRUE), 4000)
+dbl_short &lt;- matrix(rnorm(16e6), 10)
+dbl_cube &lt;- array(rnorm(8e6), c(200, 200, 200))
+dbl_vec &lt;- rnorm(16e6)
+dbl_na &lt;- dbl
+dbl_na[sample.int(length(dbl), 1e4)] &lt;- NA
+
+cases &lt;- list(
+  &quot;dbl [4000, 4000] axis 1&quot; = \() rray_locate_max(dbl, 1L),
+  &quot;dbl [4000, 4000] axis 1 na_rm&quot; = \() rray_locate_max(dbl, 1L, na_rm = TRUE),
+  &quot;dbl [4000, 4000] axis 2&quot; = \() rray_locate_max(dbl, 2L),
+  &quot;dbl [4000, 4000] axis 2 na_rm&quot; = \() rray_locate_max(dbl, 2L, na_rm = TRUE),
+  &quot;dbl sparse NA axis 1&quot; = \() rray_locate_max(dbl_na, 1L),
+  &quot;dbl sparse NA axis 2&quot; = \() rray_locate_max(dbl_na, 2L),
+  &quot;dbl min [4000, 4000] axis 1&quot; = \() rray_locate_min(dbl, 1L),
+-rw-r--r--@ 1 davis  wheel  1584 Oct  6 18:21 /tmp/bench-locate.R</pre></details>
+<p>That file is from an earlier session, so I'll write mine under a different name.</p>
+
+<details class="tool"><summary>Write /tmp/bench-locate-iterator.R</summary>
+<pre>args &lt;- commandArgs(trailingOnly = TRUE)
+root &lt;- args[[1]]
+output &lt;- args[[2]]
+iterations &lt;- as.integer(args[[3]])
+
+devtools::load_all(root, quiet = TRUE)
+
+set.seed(1)
+
+shapes &lt;- list(
+  square = c(1000L, 1000L),
+  tall = c(500000L, 2L),
+  wide = c(2L, 500000L),
+  cube = c(100L, 100L, 100L),
+  tiny = c(5L, 5L)
+)
+
+make_x &lt;- function(type, shape, missing) {
+  n &lt;- prod(shape)
+  x &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+    integer = sample.int(1e6L, n, replace = TRUE),
+    double = runif(n)
+  )
+  if (missing == &quot;sparse&quot;) {
+    x[seq.int(1L, n, by = 101L)] &lt;- NA
+  }
+  array(x, shape)
+}
+
+cases &lt;- expand.grid(
+  op = c(&quot;max&quot;, &quot;min&quot;),
+  type = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;),
+  shape = names(shapes),
+  axis = 1:3,
+  na_rm = c(FALSE, TRUE),
+  missing = c(&quot;none&quot;, &quot;sparse&quot;),
+  stringsAsFactors = FALSE
+)
+cases &lt;- cases[cases$axis &lt;= lengths(shapes[cases$shape]), ]
+cases &lt;- cases[cases$op == &quot;max&quot; | cases$type == &quot;double&quot;, ]
+
+results &lt;- vector(&quot;list&quot;, nrow(cases))
+
+for (i in seq_len(nrow(cases))) {
+  case &lt;- cases[i, ]
+  x &lt;- make_x(case$type, shapes[[case$shape]], case$missing)
+  fn &lt;- switch(case$op, max = rray_locate_max, min = rray_locate_min)
+  axis &lt;- case$axis
+  na_rm &lt;- case$na_rm
+
+  measurement &lt;- bench::mark(
+    fn(x, axis, na_rm = na_rm),
+    iterations = iterations,
+    check = FALSE,
+    memory = FALSE,
+    filter_gc = FALSE
+  )
+
+  results[[i]] &lt;- cbind(case, median_ns = as.numeric(measurement$median) * 1e9)
+}
+
+saveRDS(do.call(rbind, results), output)</pre><pre class="output">File created successfully at: /tmp/bench-locate-iterator.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; Rscript -e &quot;devtools::load_all('/tmp/rray4-locate-head', quiet = TRUE)&quot; &gt;/dev/null…</summary>
+<pre>cd /tmp &amp;&amp; Rscript -e &quot;devtools::load_all('/tmp/rray4-locate-head', quiet = TRUE)&quot; &gt;/dev/null 2&gt;&amp;1; for r in 1 2 3; do Rscript bench-locate-iterator.R /tmp/rray4-locate-head /tmp/loc-head-$r.rds 40 || exit 1; Rscript bench-locate-iterator.R ~/files/r/packages/rray4 /tmp/loc-local-$r.rds 40 || exit 1; done; echo done</pre><pre class="output">done
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; Rscript -e '</summary>
+<pre>cd /tmp &amp;&amp; Rscript -e '
+read &lt;- function(p) { x &lt;- lapply(1:3, \(r) readRDS(sprintf(&quot;/tmp/loc-%s-%d.rds&quot;, p, r))); out &lt;- x[[1]]; out$median_ns &lt;- apply(sapply(x, `[[`, &quot;median_ns&quot;), 1, min); out }
+h &lt;- read(&quot;head&quot;); l &lt;- read(&quot;local&quot;)
+h$head_us &lt;- round(h$median_ns / 1e3, 1); h$local_us &lt;- round(l$median_ns / 1e3, 1)
+h$ratio &lt;- round(l$median_ns / h$median_ns, 2); h$median_ns &lt;- NULL
+options(width = 200); print(h[order(h$ratio), ], row.names = FALSE)'</pre><pre class="output">  op    type  shape axis na_rm missing head_us local_us ratio
+ max integer   wide    2 FALSE    none  1547.6   1126.5  0.73
+ min  double   tiny    2 FALSE  sparse     1.1      1.0  0.90
+ max  double   tiny    2 FALSE    none     1.1      1.0  0.92
+ max integer   tiny    1 FALSE  sparse     1.1      1.0  0.92
+ max logical   wide    1 FALSE  sparse  1315.1   1227.4  0.93
+ max integer   cube    2 FALSE  sparse   881.7    823.8  0.93
+ min  double   tiny    2  TRUE  sparse     1.1      1.0  0.93
+ max logical   wide    1 FALSE    none  1271.1   1200.4  0.94
+ max  double   tiny    1 FALSE    none     1.0      0.9  0.94
+ max integer   cube    2 FALSE    none   909.4    853.7  0.94
+ max integer   cube    3 FALSE    none   881.3    828.2  0.94
+ max logical   tall    2  TRUE    none  1363.7   1287.1  0.94
+ max integer   cube    3 FALSE  sparse   864.1    808.9  0.94
+ min  double   tiny    1 FALSE    none     1.0      1.0  0.96
+ max logical   tiny    2  TRUE    none     1.0      0.9  0.96
+ max integer   tiny    2  TRUE    none     1.0      0.9  0.96
+ min  double   tiny    2  TRUE    none     1.0      0.9  0.96
+ min  double   wide    1 FALSE  sparse  3316.1   3178.0  0.96
+ min  double   tiny    1  TRUE  sparse     1.1      1.1  0.96
+ max  double   wide    1 FALSE    none  3369.1   3276.4  0.97
+ max integer square    2 FALSE    none   621.4    604.1  0.97
+ max integer square    2 FALSE  sparse   455.3    440.2  0.97
+ max integer   wide    1  TRUE  sparse  1342.7   1298.3  0.97
+ min  double   wide    1 FALSE    none  3359.6   3295.1  0.98
+ max integer   tall    2 FALSE    none  1991.2   1952.7  0.98
+ min  double   tall    2 FALSE    none  2837.7   2767.3  0.98
+ max logical   wide    2 FALSE    none  1153.8   1127.3  0.98
+ max integer   wide    1  TRUE    none  1341.0   1311.2  0.98
+ max logical   tiny    1  TRUE    none     1.0      0.9  0.98
+ max  double   wide    2  TRUE    none  1152.6   1127.2  0.98
+ max  double   wide    1 FALSE  sparse  3383.0   3321.5  0.98
+ max logical   tiny    1 FALSE  sparse     1.0      0.9  0.98
+ max integer   tall    2 FALSE  sparse  1983.2   1938.9  0.98
+ max  double   tall    2 FALSE  sparse  2903.4   2859.4  0.98
+ max  double   wide    2 FALSE  sparse  1292.7   1267.1  0.98
+ min  double   wide    2 FALSE  sparse  1293.5   1267.0  0.98
+ max logical   cube    2 FALSE  sparse   669.2    654.2  0.98
+ max  double   wide    2  TRUE  sparse  1152.7   1127.7  0.98
+ max  double   cube    2 FALSE    none  1198.0   1190.8  0.99
+ min  double   cube    2 FALSE    none  1205.4   1198.6  0.99
+ max logical   cube    3 FALSE    none   691.8    685.3  0.99
+ max integer   tall    2  TRUE    none  2027.3   2014.6  0.99
+ max  double   tall    2  TRUE    none  2894.0   2877.6  0.99
+ max logical   cube    3  TRUE    none   554.4    549.8  0.99
+ max logical square    2 FALSE  sparse   435.3    430.9  0.99
+ max  double square    2 FALSE  sparse   691.4    687.1  0.99
+ min  double   tall    2 FALSE  sparse  2910.8   2883.1  0.99
+ min  double   cube    2 FALSE  sparse  1187.7   1181.7  0.99
+ max  double   cube    3 FALSE  sparse  1142.2   1135.8  0.99
+ max logical   wide    1  TRUE  sparse  1336.8   1320.8  0.99
+ max logical   tall    2  TRUE  sparse  1359.4   1343.8  0.99
+ max logical   cube    2  TRUE  sparse   471.2    468.8  0.99
+ max integer   cube    2  TRUE  sparse   689.3    685.3  0.99
+ max logical square    1 FALSE    none  1484.5   1487.6  1.00
+ max integer square    1 FALSE    none  1479.5   1480.6  1.00
+ max  double square    1 FALSE    none   892.6    892.7  1.00
+ min  double square    1 FALSE    none   891.2    891.8  1.00
+ max logical   tall    1 FALSE    none  1481.3   1480.6  1.00
+ max integer   tall    1 FALSE    none  1481.1   1480.9  1.00
+ max  double   tall    1 FALSE    none   844.7    844.4  1.00
+ min  double   tall    1 FALSE    none   845.1    844.7  1.00
+ max logical   cube    1 FALSE    none  1427.1   1423.7  1.00
+ max integer   cube    1 FALSE    none  1422.8   1422.3  1.00
+ max  double   cube    1 FALSE    none  1164.9   1167.9  1.00
+ min  double   cube    1 FALSE    none  1172.4   1176.2  1.00
+ max logical   tiny    1 FALSE    none     0.9      0.9  1.00
+ max logical square    2 FALSE    none   574.4    574.7  1.00
+ max  double square    2 FALSE    none   890.6    888.7  1.00
+ min  double square    2 FALSE    none   892.8    893.1  1.00
+ max  double   tall    2 FALSE    none  2871.6   2884.6  1.00
+ max  double   wide    2 FALSE    none  1546.6   1546.7  1.00
+ min  double   wide    2 FALSE    none  1547.3   1547.1  1.00
+ max logical   cube    2 FALSE    none   597.1    596.3  1.00
+ min  double   tiny    2 FALSE    none     0.9      0.9  1.00
+ max  double   cube    3 FALSE    none  1181.0   1180.9  1.00
+ min  double   cube    3 FALSE    none  1184.2   1183.9  1.00
+ max  double square    1  TRUE    none  3591.0   3590.5  1.00
+ min  double square    1  TRUE    none  3590.5   3592.4  1.00
+ max logical   tall    1  TRUE    none   352.4    352.7  1.00
+ max integer   tall    1  TRUE    none   352.6    352.6  1.00
+ max  double   tall    1  TRUE    none  3653.8   3654.5  1.00
+ min  double   tall    1  TRUE    none  3656.1   3653.4  1.00
+ max  double   cube    1  TRUE    none  2987.5   2985.4  1.00
+ min  double   cube    1  TRUE    none  2986.9   2985.7  1.00
+ max  double   tiny    1  TRUE    none     1.0      1.0  1.00
+ max logical square    2  TRUE    none   396.8    396.7  1.00
+ max integer square    2  TRUE    none   454.0    454.9  1.00
+ max  double square    2  TRUE    none   621.8    621.9  1.00
+ max integer   wide    2  TRUE    none  1125.6   1127.8  1.00
+ max integer   cube    2  TRUE    none   684.6    687.9  1.00
+ max  double   cube    2  TRUE    none   918.4    922.1  1.00
+ max integer   cube    3  TRUE    none   676.2    676.3  1.00
+ max  double   cube    3  TRUE    none   895.6    895.9  1.00
+ min  double   cube    3  TRUE    none   898.1    896.1  1.00
+ max logical square    1 FALSE  sparse   370.1    370.4  1.00
+ max integer square    1 FALSE  sparse   369.9    369.7  1.00
+ max  double square    1 FALSE  sparse   654.3    656.6  1.00
+ min  double square    1 FALSE  sparse   654.2    657.1  1.00
+ max logical   tall    1 FALSE  sparse   283.1    282.3  1.00
+ max integer   tall    1 FALSE  sparse   282.1    282.2  1.00
+ max  double   tall    1 FALSE  sparse   601.6    601.1  1.00
+ min  double   tall    1 FALSE  sparse   601.6    601.5  1.00
+ max integer   cube    1 FALSE  sparse   999.4   1003.1  1.00
+ max  double   cube    1 FALSE  sparse  1150.6   1155.1  1.00
+ min  double   cube    1 FALSE  sparse  1149.8   1152.9  1.00
+ min  double square    2 FALSE  sparse   690.9    689.8  1.00
+ max logical   wide    2 FALSE  sparse  1130.0   1125.3  1.00
+ max integer   wide    2 FALSE  sparse  1127.9   1125.0  1.00
+ max  double   cube    2 FALSE  sparse  1177.4   1175.1  1.00
+ max logical   tiny    2 FALSE  sparse     0.9      0.9  1.00
+ max integer   tiny    2 FALSE  sparse     1.0      1.0  1.00
+ max logical   cube    3 FALSE  sparse   605.8    603.2  1.00
+ min  double   cube    3 FALSE  sparse  1157.2   1153.4  1.00
+ max  double square    1  TRUE  sparse  3590.5   3588.9  1.00
+ min  double square    1  TRUE  sparse  3590.1   3589.1  1.00
+ max logical   tall    1  TRUE  sparse   352.6    354.1  1.00
+ max integer   tall    1  TRUE  sparse   352.5    352.6  1.00
+ max  double   tall    1  TRUE  sparse  3661.6   3653.1  1.00
+ min  double   tall    1  TRUE  sparse  3655.1   3652.9  1.00
+ max  double   cube    1  TRUE  sparse  2985.6   2983.0  1.00
+ min  double   cube    1  TRUE  sparse  2981.7   2980.8  1.00
+ max logical square    2  TRUE  sparse   396.7    397.3  1.00
+ max  double square    2  TRUE  sparse   621.3    621.1  1.00
+ max integer   tall    2  TRUE  sparse  2015.7   2008.0  1.00
+ max  double   tall    2  TRUE  sparse  2874.6   2881.1  1.00
+ min  double   tall    2  TRUE  sparse  2904.7   2904.3  1.00
+ max integer   wide    2  TRUE  sparse  1126.2   1125.2  1.00
+ max  double   cube    2  TRUE  sparse   921.5    923.0  1.00
+ max logical   tiny    2  TRUE  sparse     0.9      0.9  1.00
+ max integer   tiny    2  TRUE  sparse     0.9      0.9  1.00
+ max  double   tiny    2  TRUE  sparse     0.9      0.9  1.00
+ max logical   cube    3  TRUE  sparse   553.6    556.2  1.00
+ max integer   cube    3  TRUE  sparse   672.1    671.9  1.00
+ max  double   cube    3  TRUE  sparse   895.3    896.2  1.00
+ min  double   cube    3  TRUE  sparse   899.2    897.6  1.00
+ max logical   wide    1  TRUE    none  1318.2   1330.8  1.01
+ min  double square    2  TRUE    none   621.1    626.6  1.01
+ max logical   cube    2  TRUE    none   467.2    470.9  1.01
+ min  double   cube    2  TRUE    none   920.6    925.5  1.01
+ max logical   cube    1 FALSE  sparse   994.9   1003.5  1.01
+ max integer square    2  TRUE  sparse   452.5    459.2  1.01
+ min  double square    2  TRUE  sparse   617.2    620.5  1.01
+ min  double   cube    2  TRUE  sparse   911.7    922.6  1.01
+ max logical   tall    2 FALSE    none  1260.9   1281.3  1.02
+ max integer   tiny    2 FALSE    none     0.9      1.0  1.02
+ min  double   tall    2  TRUE    none  2878.7   2926.4  1.02
+ max  double   tiny    1 FALSE  sparse     0.9      1.0  1.02
+ min  double   tiny    1 FALSE  sparse     0.9      1.0  1.02
+ max logical   tall    2 FALSE  sparse  1287.4   1315.8  1.02
+ max logical   tiny    1  TRUE  sparse     0.9      1.0  1.02
+ max integer   tiny    1  TRUE  sparse     0.9      1.0  1.02
+ max integer   tiny    1 FALSE    none     0.9      1.0  1.04
+ max logical   tiny    2 FALSE    none     0.9      1.0  1.04
+ min  double   wide    1  TRUE    none  1413.6   1471.4  1.04
+ max integer   tiny    1  TRUE    none     0.9      1.0  1.04
+ max  double   tiny    2 FALSE  sparse     0.9      1.0  1.04
+ max  double   wide    1  TRUE  sparse  1351.1   1404.0  1.04
+ max  double   tiny    1  TRUE  sparse     0.9      1.0  1.04
+ max  double   wide    1  TRUE    none  1389.4   1461.0  1.05
+ min  double   wide    1  TRUE  sparse  1415.8   1485.0  1.05
+ max integer   wide    1 FALSE    none  1198.9   1267.2  1.06
+ max integer   wide    1 FALSE  sparse  1233.0   1311.2  1.06
+ max logical   cube    1  TRUE    none   388.9    420.4  1.08
+ min  double   tiny    1  TRUE    none     1.0      1.1  1.08
+ max logical   cube    1  TRUE  sparse   388.6    419.3  1.08
+ min  double   wide    2  TRUE    none  1152.5   1267.9  1.10
+ min  double   wide    2  TRUE  sparse  1153.3   1267.2  1.10
+ max logical   wide    2  TRUE    none  1126.6   1266.5  1.12
+ max  double   tiny    2  TRUE    none     0.9      1.1  1.13
+ max logical   wide    2  TRUE  sparse  1125.2   1267.1  1.13
+ max integer   cube    1  TRUE    none   382.9    437.3  1.14
+ max integer   cube    1  TRUE  sparse   382.7    436.2  1.14
+ max logical square    1  TRUE    none   339.6    403.4  1.19
+ max logical square    1  TRUE  sparse   339.9    403.6  1.19
+ max integer square    1  TRUE    none   342.2    465.6  1.36
+ max integer square    1  TRUE  sparse   342.5    465.7  1.36
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Mixed results, not a clean win. A few cases moved more than 10%, so I'll rerun those with more iterations before trusting them.</p>
+
+<details class="tool"><summary>Write /tmp/bench-locate-iterator-focus.R</summary>
+<pre>args &lt;- commandArgs(trailingOnly = TRUE)
+root &lt;- args[[1]]
+output &lt;- args[[2]]
+
+devtools::load_all(root, quiet = TRUE)
+
+set.seed(1)
+
+lgl_square &lt;- array(sample(c(TRUE, FALSE), 1e6, TRUE), c(1000, 1000))
+int_square &lt;- array(sample.int(1e6L, 1e6, TRUE), c(1000, 1000))
+int_cube &lt;- array(sample.int(1e6L, 1e6, TRUE), c(100, 100, 100))
+int_wide &lt;- array(sample.int(1e6L, 1e6, TRUE), c(2, 500000))
+lgl_wide &lt;- array(sample(c(TRUE, FALSE), 1e6, TRUE), c(2, 500000))
+dbl_wide &lt;- array(runif(1e6), c(2, 500000))
+
+cases &lt;- list(
+  &quot;int square axis 1 na_rm&quot; = \() rray_locate_max(int_square, 1L, na_rm = TRUE),
+  &quot;lgl square axis 1 na_rm&quot; = \() rray_locate_max(lgl_square, 1L, na_rm = TRUE),
+  &quot;int cube axis 1 na_rm&quot; = \() rray_locate_max(int_cube, 1L, na_rm = TRUE),
+  &quot;lgl wide axis 2 na_rm&quot; = \() rray_locate_max(lgl_wide, 2L, na_rm = TRUE),
+  &quot;dbl min wide axis 2 na_rm&quot; = \() rray_locate_min(dbl_wide, 2L, na_rm = TRUE),
+  &quot;int wide axis 1&quot; = \() rray_locate_max(int_wide, 1L),
+  &quot;int wide axis 2&quot; = \() rray_locate_max(int_wide, 2L),
+  &quot;int cube axis 2&quot; = \() rray_locate_max(int_cube, 2L),
+  &quot;int square axis 2&quot; = \() rray_locate_max(int_square, 2L)
+)
+
+results &lt;- lapply(cases, function(case) {
+  measurement &lt;- bench::mark(
+    case(),
+    iterations = 200,
+    check = FALSE,
+    memory = FALSE,
+    filter_gc = FALSE
+  )
+  as.numeric(measurement$median) * 1e9
+})
+
+saveRDS(unlist(results), output)</pre><pre class="output">File created successfully at: /tmp/bench-locate-iterator-focus.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; for r in 1 2 3; do Rscript bench-locate-iterator-focus.R /tmp/rray4-locate-head /t…</summary>
+<pre>cd /tmp &amp;&amp; for r in 1 2 3; do Rscript bench-locate-iterator-focus.R /tmp/rray4-locate-head /tmp/locf-head-$r.rds || exit 1; Rscript bench-locate-iterator-focus.R ~/files/r/packages/rray4 /tmp/locf-local-$r.rds || exit 1; done; Rscript -e '
+h &lt;- sapply(1:3, \(r) readRDS(sprintf(&quot;/tmp/locf-head-%d.rds&quot;, r)))
+l &lt;- sapply(1:3, \(r) readRDS(sprintf(&quot;/tmp/locf-local-%d.rds&quot;, r)))
+print(data.frame(head_us = round(h / 1e3), local_us = round(l / 1e3), ratio = round(apply(l, 1, min) / apply(h, 1, min), 2)))'
+cd ~/files/r/packages/rray4 &amp;&amp; nm src/locate.o | grep -i locate; echo ---; nm /tmp/rray4-locate-head/src/locate.o | grep -i locate</pre><pre class="output">                          head_us.1 head_us.2 head_us.3 local_us.1 local_us.2
+int square axis 1 na_rm         343       344       343        468        467
+lgl square axis 1 na_rm         341       341       342        404        404
+int cube axis 1 na_rm           385       385       385        437        438
+lgl wide axis 2 na_rm          1126      1126      1158       1268       1268
+dbl min wide axis 2 na_rm      1187      1248      1188       1269       1267
+int wide axis 1                1202      1136      1196       1166       1350
+int wide axis 2                1549      1549      1548       1157       1168
+int cube axis 2                 908       906       905        854        942
+int square axis 2               630       630       627        604        674
+                          local_us.3 ratio
+int square axis 1 na_rm          467  1.36
+lgl square axis 1 na_rm          404  1.19
+int cube axis 1 na_rm            442  1.13
+lgl wide axis 2 na_rm           1269  1.13
+dbl min wide axis 2 na_rm       1269  1.07
+int wide axis 1                 1274  1.03
+int wide axis 2                 1157  0.75
+int cube axis 2                  851  0.94
+int square axis 2                604  0.96
+0000000000000000 T _ffi_rray_locate_max
+00000000000004dc T _ffi_rray_locate_min
+0000000000000104 t _rray_locate
+00000000000000f0 T _rray_locate_max
+0000000000001dc8 t _rray_locate_max_dbl
+00000000000011d4 t _rray_locate_max_int
+00000000000005e0 t _rray_locate_max_lgl
+00000000000005cc T _rray_locate_min
+0000000000002448 t _rray_locate_min_dbl
+00000000000017c0 t _rray_locate_min_int
+0000000000000bcc t _rray_locate_min_lgl
+0000000000002ac8 t _stop_unsupported_locate
+---
+0000000000000000 T _ffi_rray_locate_max
+00000000000007b4 T _ffi_rray_locate_min
+0000000000000104 t _rray_locate
+00000000000000f0 T _rray_locate_max
+0000000000001e80 t _rray_locate_max_dbl
+000000000000139c t _rray_locate_max_int
+00000000000008b8 t _rray_locate_max_lgl
+00000000000008a4 T _rray_locate_min
+0000000000002478 t _rray_locate_min_dbl
+0000000000001900 t _rray_locate_min_int
+0000000000000e1c t _rray_locate_min_lgl
+0000000000002a70 t _stop_unsupported_locate</pre></details>
+<p>Before reporting, a quick look at the hot loop for the worst case (<code>max</code>, integer, <code>na_rm = TRUE</code>, axis 1) to see why it got slower.</p>
+
+<details class="tool"><summary>Bash: for f in src/locate.o /tmp/rray4-locate-head/src/locate.o; do echo &quot;=== $f&quot;; otool -tvV $f | …</summary>
+<pre>for f in src/locate.o /tmp/rray4-locate-head/src/locate.o; do echo &quot;=== $f&quot;; otool -tvV $f | awk '/^_rray_locate_max_int:/{p=1} /^_rray_locate_min_int:/{p=0} p' &gt; /tmp/asm-$(basename $(dirname $(dirname $f))).s; wc -l /tmp/asm-$(basename $(dirname $(dirname $f))).s; grep -c &quot;sp\]\|\[sp&quot; /tmp/asm-$(basename $(dirname $(dirname $f))).s; done; ls /tmp/asm-*</pre><pre class="output">=== src/locate.o
+     380 /tmp/asm-..s
+50
+=== /tmp/rray4-locate-head/src/locate.o
+     346 /tmp/asm-rray4-locate-head.s
+8
+/tmp/asm-..s
+/tmp/asm-rray4-locate-head.s</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; for f in asm-..s asm-rray4-locate-head.s; do echo &quot;=== $f&quot;; grep -n &quot;csel\|csinc&quot; …</summary>
+<pre>cd /tmp &amp;&amp; for f in asm-..s asm-rray4-locate-head.s; do echo &quot;=== $f&quot;; grep -n &quot;csel\|csinc&quot; $f | head -20; done</pre><pre class="output">=== asm-..s
+45:0000000000001280	csel	x9, x10, x19, eq
+176:000000000000148c	csel	w6, w7, w6, gt
+177:0000000000001490	csel	w3, w4, w3, gt
+332:00000000000016fc	csel	w20, w23, w20, ne
+333:0000000000001700	csel	w6, w5, w6, ne
+=== asm-rray4-locate-head.s
+31:0000000000001410	csel	x9, x10, x19, eq
+142:00000000000015cc	csel	w4, w5, w4, gt
+143:00000000000015d0	csel	w1, w2, w1, gt
+297:0000000000001838	csel	w5, w7, w5, ne
+298:000000000000183c	csel	w3, w2, w3, ne
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool tool-error"><summary>Bash: cd /tmp &amp;&amp; sed -n 160,200p asm-..s; echo =====HEAD; sed -n 126,166p asm-rray4-locate-head.s</summary>
+<pre>cd /tmp &amp;&amp; sed -n 160,200p asm-..s; echo =====HEAD; sed -n 126,166p asm-rray4-locate-head.s</pre><pre class="output">Exit code 1
+000000000000144c	b.ne	0x1430
+0000000000001450	cmp	x4, x6
+0000000000001454	b.ne	0x14b0
+0000000000001458	b	0x14d8
+000000000000145c	ldr	w3, [x22, x1, lsl #2]
+0000000000001460	str	w3, [x21, x17, lsl #2]
+0000000000001464	mov	w3, #0x1
+0000000000001468	str	w3, [x19, x17, lsl #2]
+000000000000146c	add	x1, x1, #0x1
+0000000000001470	add	w4, w5, #0x1
+0000000000001474	ldr	w6, [x21, x17, lsl #2]
+0000000000001478	subs	x2, x2, x1
+000000000000147c	b.le	0x14a0
+0000000000001480	add	x1, x22, x1, lsl #2
+0000000000001484	ldr	w7, [x1], #0x4
+0000000000001488	cmp	w7, w6
+000000000000148c	csel	w6, w7, w6, gt
+0000000000001490	csel	w3, w4, w3, gt
+0000000000001494	add	w4, w4, w5
+0000000000001498	subs	x2, x2, #0x1
+000000000000149c	b.ne	0x1484
+00000000000014a0	str	w6, [x21, x17, lsl #2]
+00000000000014a4	str	w3, [x19, x17, lsl #2]
+00000000000014a8	b	0x14d8
+00000000000014ac	mov	x5, x17
+00000000000014b0	lsl	x4, x5, #2
+00000000000014b4	lsl	x3, x3, #2
+00000000000014b8	sub	x2, x2, x1
+00000000000014bc	add	x1, x22, x1, lsl #2
+00000000000014c0	ldr	w5, [x1], #0x4
+00000000000014c4	str	w5, [x21, x4]
+00000000000014c8	str	w16, [x19, x4]
+00000000000014cc	add	x4, x4, x3
+00000000000014d0	subs	x2, x2, #0x1
+00000000000014d4	b.ne	0x14c0
+00000000000014d8	cmp	w9, #0x2
+00000000000014dc	b.lt	0x1344
+00000000000014e0	add	x1, sp, #0x8
+00000000000014e4	mov	x2, x15
+00000000000014e8	mov	x3, x14
+00000000000014ec	ldp	x17, x0, [x2, #-0x8]
+(eval):1: ====HEAD not found</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; sed -n 126,166p asm-rray4-locate-head.s</summary>
+<pre>cd /tmp &amp;&amp; sed -n 126,166p asm-rray4-locate-head.s</pre><pre class="output">000000000000158c	b.ne	0x1570
+0000000000001590	cmp	x2, x4
+0000000000001594	b.ne	0x15f0
+0000000000001598	b	0x1618
+000000000000159c	ldr	w1, [x22, x9, lsl #2]
+00000000000015a0	str	w1, [x20, x16, lsl #2]
+00000000000015a4	mov	w1, #0x1
+00000000000015a8	str	w1, [x19, x16, lsl #2]
+00000000000015ac	add	x9, x9, #0x1
+00000000000015b0	add	w2, w3, #0x1
+00000000000015b4	ldr	w4, [x20, x16, lsl #2]
+00000000000015b8	subs	x0, x0, x9
+00000000000015bc	b.le	0x15e0
+00000000000015c0	add	x9, x22, x9, lsl #2
+00000000000015c4	ldr	w5, [x9], #0x4
+00000000000015c8	cmp	w5, w4
+00000000000015cc	csel	w4, w5, w4, gt
+00000000000015d0	csel	w1, w2, w1, gt
+00000000000015d4	add	w2, w2, w3
+00000000000015d8	subs	x0, x0, #0x1
+00000000000015dc	b.ne	0x15c4
+00000000000015e0	str	w4, [x20, x16, lsl #2]
+00000000000015e4	str	w1, [x19, x16, lsl #2]
+00000000000015e8	b	0x1618
+00000000000015ec	mov	x3, x16
+00000000000015f0	lsl	x2, x3, #2
+00000000000015f4	lsl	x1, x1, #2
+00000000000015f8	sub	x0, x0, x9
+00000000000015fc	add	x9, x22, x9, lsl #2
+0000000000001600	ldr	w3, [x9], #0x4
+0000000000001604	str	w3, [x20, x2]
+0000000000001608	str	w15, [x19, x2]
+000000000000160c	add	x2, x2, x1
+0000000000001610	subs	x0, x0, #0x1
+0000000000001614	b.ne	0x1600
+0000000000001618	ldr	w9, [x21, #0x408]
+000000000000161c	cmp	w9, #0x2
+0000000000001620	b.lt	0x1484
+0000000000001624	sub	x9, x9, #0x1
+0000000000001628	mov	x0, x14
+000000000000162c	mov	x1, x21
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>The inner loops are identical instruction for instruction in both builds, so the 1.36x is not coming from worse code in the loop. Checking where the loop lands in the final shared library:</p>
+
+<details class="tool"><summary>Bash: for so in src/rray4.so /tmp/rray4-locate-head/src/rray4.so; do echo &quot;=== $so&quot;; otool -tvV $so…</summary>
+<pre>for so in src/rray4.so /tmp/rray4-locate-head/src/rray4.so; do echo &quot;=== $so&quot;; otool -tvV $so | awk '/^_rray_locate_max_int:/{p=1} /^_rray_locate_min_int:/{p=0} p' | grep -B1 -A5 &quot;csel.*gt&quot; | head -8; done</pre><pre class="output">=== src/rray4.so
+0000000000050d4c	cmp	w7, w6
+0000000000050d50	csel	w6, w7, w6, gt
+0000000000050d54	csel	w3, w4, w3, gt
+0000000000050d58	add	w4, w4, w5
+0000000000050d5c	subs	x2, x2, #0x1
+0000000000050d60	b.ne	0x50d48
+0000000000050d64	str	w6, [x21, x17, lsl #2]
+0000000000050d68	str	w3, [x19, x17, lsl #2]
+=== /tmp/rray4-locate-head/src/rray4.so
+0000000000050e8c	cmp	w5, w4
+0000000000050e90	csel	w4, w5, w4, gt
+0000000000050e94	csel	w1, w2, w1, gt
+0000000000050e98	add	w2, w2, w3
+0000000000050e9c	subs	x0, x0, #0x1
+0000000000050ea0	b.ne	0x50e88
+0000000000050ea4	str	w4, [x20, x16, lsl #2]
+0000000000050ea8	str	w1, [x19, x16, lsl #2]</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The hot loop is identical and equally aligned in both versions, yet performance differs (~1.1 vs ~1.6 cycles/element), suggesting a code-layout effect rather than the iterator's location. I'll rebuild both with loops forced to 64-byte alignment to see if the gap closes.</p>
+</details>
+<details class="tool"><summary>Bash: cat ~/.R/Makevars; printf 'CFLAGS=-O2 -falign-loops=64\n' &gt; /tmp/Makevars-align; cat /tmp/Mak…</summary>
+<pre>cat ~/.R/Makevars; printf 'CFLAGS=-O2 -falign-loops=64\n' &gt; /tmp/Makevars-align; cat /tmp/Makevars-align</pre><pre class="output"># -02 for normal compilation optimization
+# -g for debugging symbols (with Instruments)
+# -fno-common to ensure that on gcc10 we avoid multiple definition warnings
+#  by forgetting to add `extern` declarations
+# -Wstrict-prototypes to ensure functions with 0 arguments use `(void)` signatures
+# -fno-omit-frame-pointer possibly makes debugging easier?
+# -ftime-trace for tracing information in chrome://tracing/. See https://aras-p.info/blog/2019/01/16/time-trace-timeline-flame-chart-profiler-for-Clang/
+CFLAGS=-O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always
+CXXFLAGS=-O2 -g -Wall -pedantic -fdiagnostics-color=always
+CFLAGS=-O2 -falign-loops=64</pre></details>
+<details class="tool"><summary>Bash: rm -rf /tmp/rray4-align-head /tmp/rray4-align-local &amp;&amp; rsync -a --exclude .git /tmp/rray4-loc…</summary>
+<pre>rm -rf /tmp/rray4-align-head /tmp/rray4-align-local &amp;&amp; rsync -a --exclude .git /tmp/rray4-locate-head/ /tmp/rray4-align-head/ &amp;&amp; rsync -a --exclude .git ~/files/r/packages/rray4/ /tmp/rray4-align-local/ &amp;&amp; for d in /tmp/rray4-align-head /tmp/rray4-align-local; do R_MAKEVARS_USER=/tmp/Makevars-align Rscript -e &quot;pkgbuild::compile_dll('$d', force = TRUE, quiet = TRUE)&quot; 2&gt;&amp;1 | tail -2; done; for d in /tmp/rray4-align-head /tmp/rray4-align-local; do otool -tvV $d/src/rray4.so | awk '/^_rray_locate_max_int:/{p=1} /^_rray_locate_min_int:/{p=0} p' | grep -A4 &quot;csel.*gt&quot; | grep &quot;b.ne&quot;; done</pre><pre class="output">0000000000050ea0	b.ne	0x50e88
+0000000000050d60	b.ne	0x50d48</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray4-align-local/src &amp;&amp; rm -f *.o *.so &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-align R CMD …</summary>
+<pre>cd /tmp/rray4-align-local/src &amp;&amp; rm -f *.o *.so &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-align R CMD SHLIB -o rray4.so *.c rlang.c 2&gt;&amp;1 | grep -m2 &quot;locate.c\|falign&quot;</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -falign-loops=64 -c arg.c -o arg.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -falign-loops=64 -c arithmetic-add.c -o arithmetic-add.o
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool tool-error"><summary>Bash: cd /tmp/rray4-align-local/src &amp;&amp; ls -la rray4.so; cd /tmp/rray4-align-head/src &amp;&amp; rm -f *.o *…</summary>
+<pre>cd /tmp/rray4-align-local/src &amp;&amp; ls -la rray4.so; cd /tmp/rray4-align-head/src &amp;&amp; rm -f *.o *.so &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-align R CMD SHLIB -o rray4.so *.c &gt;/dev/null 2&gt;&amp;1; ls -la rray4.so; cd /tmp/rray4-align-local/src &amp;&amp; rm -f *.o *.so &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-align R CMD SHLIB -o rray4.so *.c &gt;/dev/null 2&gt;&amp;1; ls -la rray4.so; for d in /tmp/rray4-align-head /tmp/rray4-align-local; do otool -tvV $d/src/rray4.so | awk '/^_rray_locate_max_int:/{p=1} /^_rray_locate_min_int:/{p=0} p' | grep -A4 &quot;csel.*gt&quot; | grep &quot;b.ne&quot;; done</pre><pre class="output">Exit code 1
+ls: rray4.so: No such file or directory
+-rwxr-xr-x@ 1 davis  wheel  789672 Oct  6 18:43 rray4.so
+(eval):1: no matches found: *.so
+ls: rray4.so: No such file or directory
+0000000000063d18	b.ne	0x63d00
+error: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/otool-classic: can't open file: /tmp/rray4-align-local/src/rray4.so (No such file or directory)</pre></details>
+<details class="tool tool-error"><summary>Bash: cd /tmp/rray4-align-local/src &amp;&amp; rm -f rray4.so ./*.o(N) &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-ali…</summary>
+<pre>cd /tmp/rray4-align-local/src &amp;&amp; rm -f rray4.so ./*.o(N) &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-align R CMD SHLIB -o rray4.so *.c &gt;/dev/null 2&gt;&amp;1; ls -la rray4.so; for d in /tmp/rray4-align-head /tmp/rray4-align-local; do otool -tvV $d/src/rray4.so | awk '/^_rray_locate_max_int:/{p=1} /^_rray_locate_min_int:/{p=0} p' | grep -A4 &quot;csel.*gt&quot; | grep &quot;b.ne&quot;; done</pre><pre class="output">Exit code 1
+(eval):1: no matches found: ./*.o(N)
+ls: rray4.so: No such file or directory
+0000000000063d18	b.ne	0x63d00
+error: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/otool-classic: can't open file: /tmp/rray4-align-local/src/rray4.so (No such file or directory)</pre></details>
+<p>Still testing: I'm rebuilding both copies with loops forced to the same alignment, to check whether the slowdown is a code-layout effect.</p>
+
+<details class="tool"><summary>Bash: cd /tmp/rray4-align-local/src &amp;&amp; find . -maxdepth 1 \( -name '*.o' -o -name '*.so' \) -delete…</summary>
+<pre>cd /tmp/rray4-align-local/src &amp;&amp; find . -maxdepth 1 \( -name '*.o' -o -name '*.so' \) -delete &amp;&amp; R_MAKEVARS_USER=/tmp/Makevars-align R CMD SHLIB -o rray4.so *.c &gt; /tmp/shlib.log 2&gt;&amp;1; tail -3 /tmp/shlib.log; ls -la rray4.so; for d in /tmp/rray4-align-head /tmp/rray4-align-local; do otool -tvV $d/src/rray4.so | awk '/^_rray_locate_max_int:/{p=1} /^_rray_locate_min_int:/{p=0} p' | grep -A4 &quot;csel.*gt&quot; | grep &quot;b.ne&quot;; done</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -falign-loops=64 -c utils.c -o utils.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -falign-loops=64 -c wrapper.c -o wrapper.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray4.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o clone.o combine.o compare.o dimensionality.o dimensions.o equal.o extract-assign.o extract-subscript.o extract.o extremum.o index.o init.o insert-axes.o locate.o logical.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-extremum.o reduce-logical.o reduce-mean.o reduce-names.o reduce-prod.o reduce-sum.o reduce.o remove-axes.o rep-each.o rep.o reverse.o rlang.o roll-each.o roll.o size.o slice-assign.o slice-axis.o slice-subscript.o slice.o split.o stack.o strides.o subscript.o syms.o type.o typeof2.o unstack.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+-rwxr-xr-x@ 1 davis  staff  789720 Oct  6 18:43 rray4.so
+0000000000063d18	b.ne	0x63d00
+0000000000063b18	b.ne	0x63b00
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Both hot loops now start on a 64-byte boundary. Rerunning the focused benchmark on these two builds:</p>
+
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; for r in 1 2 3; do Rscript bench-locate-iterator-focus.R /tmp/rray4-align-head /tm…</summary>
+<pre>cd /tmp &amp;&amp; for r in 1 2 3; do Rscript bench-locate-iterator-focus.R /tmp/rray4-align-head /tmp/loca-head-$r.rds || exit 1; Rscript bench-locate-iterator-focus.R /tmp/rray4-align-local /tmp/loca-local-$r.rds || exit 1; done; ls -la --time-style=+%T /tmp/rray4-align-local/src/rray4.so 2&gt;/dev/null || stat -f &quot;%Sm&quot; /tmp/rray4-align-local/src/rray4.so /tmp/rray4-align-head/src/rray4.so; Rscript -e '
+h &lt;- sapply(1:3, \(r) readRDS(sprintf(&quot;/tmp/loca-head-%d.rds&quot;, r)))
+l &lt;- sapply(1:3, \(r) readRDS(sprintf(&quot;/tmp/loca-local-%d.rds&quot;, r)))
+print(data.frame(head_us = round(apply(h, 1, min) / 1e3), local_us = round(apply(l, 1, min) / 1e3), ratio = round(apply(l, 1, min) / apply(h, 1, min), 2)))'</pre><pre class="output">Oct  6 18:43:48 2026
+Oct  6 18:43:34 2026
+                          head_us local_us ratio
+int square axis 1 na_rm       344      342  0.99
+lgl square axis 1 na_rm       344      342  0.99
+int cube axis 1 na_rm         380      385  1.01
+lgl wide axis 2 na_rm        1265     1277  1.01
+dbl min wide axis 2 na_rm    1407     1409  1.00
+int wide axis 1              1361     1364  1.00
+int wide axis 2              1342     1340  1.00
+int cube axis 2               858      860  1.00
+int square axis 2             610      613  1.00
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: rm -rf /tmp/rray4-align-head /tmp/rray4-align-local &amp;&amp; git worktree remove /tmp/rray4-locate-…</summary>
+<pre>rm -rf /tmp/rray4-align-head /tmp/rray4-align-local &amp;&amp; git worktree remove /tmp/rray4-locate-head &amp;&amp; git worktree list &amp;&amp; git status --short</pre><pre class="output">~/files/r/packages/rray4  77492ca [feature/locate]
+/private/tmp/rray4-head              a44f0a0 (detached HEAD)
+/private/tmp/rray4-sum-main          dbcb228 (detached HEAD)
+/private/tmp/rray4-sum-proto         dbcb228 (detached HEAD)
+/private/tmp/rray4-sum-proto2        dbcb228 (detached HEAD)
+ M src/decl/locate-decl.h
+ M src/locate.c</pre></details>
+<details class="tool"><summary>Write ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_loop_alignme…</summary>
+<pre>---
+name: project-loop-alignment-noise
+description: Hot loop placement in the .so can swing rray4 benchmarks by up to 1.36x, rule it out with -falign-loops=64 before blaming a code change
+metadata:
+  type: project
+---
+
+On 2026-10-06, building the run iterator inside each `rray_locate_*()` kernel instead of in `rray_locate()` looked up to 1.36x slower (int, axis 1, `na_rm = TRUE`) and 0.75x faster in another case. The hot loops were identical instruction for instruction. Rebuilding both versions with `CFLAGS=-O2 -falign-loops=64` (through `R_MAKEVARS_USER`) brought every case to within 1%.
+
+**Why:** Apple arm64 cores are sensitive to where a tight loop lands, and any unrelated change can move it.
+
+**How to apply:** when a benchmark gap is consistent but the hot loop's asm (`otool -tvV`) is the same, rebuild both sides with `-falign-loops=64` before deciding anything. See [[project-benchmarking-against-main]] and [[project-second-caller-breaks-inlining]].</pre><pre class="output">File created successfully at: ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_loop_alignment_noise.md</pre></details>
+<details class="tool"><summary>Edit ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/MEMORY.md</summary>
+<pre class="diff"><span class="del">-- [feedback_no_compiler_hints.md]</span>
+<span class="ins">+- [project_loop_alignment_noise.md](project_loop_alignment_noise.md) - Loop placement can swing benchmarks 1.36x, check same asm and rebuild with -falign-loops=64 before blaming a change</span>
+<span class="ins">+- [feedback_no_compiler_hints.md]</span></pre><pre class="output">The file ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/MEMORY.md has been updated successfully.</pre></details>
+<p>For <code>locate.c</code>, where the iterator is built makes no difference to speed. At first some cases looked up to 1.36x slower, but that came from where the compiler happened to place the hot loop in memory, not from moving the iterator.</p>
+<p><strong>What I did</strong></p>
+<p>I changed the working tree so each typed kernel builds its own iterator, the same way <code>RRAY_REDUCE</code> does in <code>src/reduce.h</code>. <code>rray_locate()</code> now passes the dimensions and the two stride arrays down instead of <code>&amp;it</code>. The locate tests pass (119). I compared it against HEAD in a separate worktree, alternating between the two over 3 rounds.</p>
+<p><strong>First result: mixed</strong></p>
+<table>
+<thead>
+<tr>
+<th>case</th>
+<th>HEAD</th>
+<th>kernel builds iterator</th>
+<th>ratio</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>int square, axis 1, <code>na_rm</code></td>
+<td>343 µs</td>
+<td>467 µs</td>
+<td>1.36</td>
+</tr>
+<tr>
+<td>lgl square, axis 1, <code>na_rm</code></td>
+<td>341 µs</td>
+<td>404 µs</td>
+<td>1.19</td>
+</tr>
+<tr>
+<td>int cube, axis 1, <code>na_rm</code></td>
+<td>385 µs</td>
+<td>438 µs</td>
+<td>1.13</td>
+</tr>
+<tr>
+<td>int wide, axis 2</td>
+<td>1549 µs</td>
+<td>1157 µs</td>
+<td>0.75</td>
+</tr>
+<tr>
+<td>most other cases</td>
+<td></td>
+<td></td>
+<td>0.97 to 1.03</td>
+</tr>
+</tbody>
+</table>
+<p>These held up when I reran them with 200 iterations.</p>
+<p><strong>Why those gaps are not real</strong></p>
+<ul>
+<li>
+<p>The inner loop is the same instruction for instruction in both builds. The kernels are also called through a function pointer in both, so building the iterator in the caller doesn't change how they compile.</p>
+</li>
+<li>
+<p>I rebuilt both versions with <code>-falign-loops=64</code>, so the hot loops sit at the same kind of address. Every case then came out within 1% (0.99 to 1.01).</p>
+</li>
+</ul>
+<p>This was a placement effect. Any unrelated edit can move a loop by this much on this machine, in either direction.</p>
+<p><strong>What this means for the rule</strong></p>
+<p>The rule &quot;the iterator must be built in the function that uses it&quot; doesn't hold up for <code>locate.c</code>. The memory about a second caller blocking inlining is a different issue (a helper stops being inlined), and it doesn't apply here.</p>
+<p><strong>State of your tree</strong></p>
+<ul>
+<li>
+<p>The kernel-builds-iterator version is still uncommitted in <code>src/locate.c</code> and <code>src/decl/locate-decl.h</code>. Keep it if you want it to match <code>RRAY_REDUCE</code>, or discard it with <code>git checkout src/locate.c src/decl/locate-decl.h</code>.</p>
+</li>
+<li>
+<p>The benchmark scripts are in <code>/tmp/bench-locate-iterator.R</code> and <code>/tmp/bench-locate-iterator-focus.R</code>. I didn't touch your older <code>/tmp/bench-locate.R</code> or <code>/tmp/rray4-head</code>, and I removed my own temporary worktree and build copies.</p>
+</li>
+<li>
+<p>I saved a memory: when a benchmark gap holds steady but the hot loop's assembly is the same, rebuild both sides with <code>-falign-loops=64</code> before blaming the change.</p>
+</li>
+</ul>
+
+</section>
+<p class="divider">Oct 6, 2026, 23:14 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Clear out the changes you made then</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git checkout src/locate.c src/decl/locate-decl.h &amp;&amp; rm -f /tmp/bench-locate-iterator.R /tmp/b…</summary>
+<pre>git checkout src/locate.c src/decl/locate-decl.h &amp;&amp; rm -f /tmp/bench-locate-iterator.R /tmp/bench-locate-iterator-focus.R /tmp/loc-*.rds /tmp/locf-*.rds /tmp/loca-*.rds /tmp/asm-*.s /tmp/Makevars-align /tmp/shlib.log &amp;&amp; git status --short</pre><pre class="output">Updated 2 paths from the index</pre></details>
+<p>I've cleared everything out. <code>src/locate.c</code> and <code>src/decl/locate-decl.h</code> are back to HEAD, and <code>git status</code> shows a clean tree.</p>
+<p>I also deleted the files I'd left in <code>/tmp</code>: the two benchmark scripts, the result files and the assembly dumps. Your own <code>/tmp/bench-locate.R</code> and the older worktrees are untouched.</p>
+<p>The compiled <code>src/locate.o</code> and <code>rray4.so</code> in the repo were built from my version. The next <code>load_all()</code> will rebuild them from your sources.</p>
+<p>I kept the memory note about checking loop alignment before trusting a benchmark gap. Tell me if you want that removed too.</p>
+
+</section>
+</main>
+</body>
+</html>

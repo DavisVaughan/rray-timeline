@@ -1,0 +1,2807 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rewriting the index plan around positional rray_index(x, ...)</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-83">rray timeline</a>
+<h1>Rewriting the index plan around positional <code>rray_index(x, ...)</code></h1>
+<p class="facts">Codex · Sep 22, 2026 · 2 prompts · 6 replies · <a href="https://github.com/r-lib/rray/pull/83">#83</a></p>
+</header>
+<main>
+<p class="divider">Sep 22, 2026, 00:34 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Read the index plan and slice plan</p>
+<p>We think a signature of rray_index(x, …, cross = FALSE) is a distinct improvement because it removes the axes argument altogether and aligns more with slice</p>
+<p>In the future if we need to we can add rray_slice_axes() and rray_index_axes() if we need more programmatic support</p>
+<p>Rewrite the plans to utilize this new form, fully forgetting the old one</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll find both plan files, read them in full, then rewrite the index design around <code>rray_index(x, ..., cross = FALSE)</code> and remove every trace of the old axes-based form. I’ll also align the slice plan where the two APIs meet.</p>
+
+<details class="tool"><summary>Bash: rg --files -g '*plan*' -g '*.md'</summary>
+<pre>$ rg --files -g '*plan*' -g '*.md'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+AGENTS.md
+tests/testthat/_snaps/extremum.md
+tests/testthat/_snaps/unstack.md
+tests/testthat/_snaps/ptype.md
+tests/testthat/_snaps/arithmetic-subtract.md
+tests/testthat/_snaps/ptype-common.md
+tests/testthat/_snaps/size.md
+tests/testthat/_snaps/cast.md
+tests/testthat/_snaps/reduce-logical.md
+tests/testthat/_snaps/arithmetic-multiply.md
+tests/testthat/_snaps/cast-common.md
+tests/testthat/_snaps/dimensions.md
+tests/testthat/_snaps/arithmetic-divide.md
+tests/testthat/_snaps/equal.md
+tests/testthat/_snaps/combine.md
+tests/testthat/_snaps/broadcast.md
+tests/testthat/_snaps/remove-axes.md
+tests/testthat/_snaps/arithmetic-add.md
+tests/testthat/_snaps/dimensionality.md
+tests/testthat/_snaps/rep.md
+tests/testthat/_snaps/compare.md
+tests/testthat/_snaps/split.md
+tests/testthat/_snaps/names.md
+tests/testthat/_snaps/reduce-mean.md
+tests/testthat/_snaps/reduce-product.md
+tests/testthat/_snaps/reduce-sum.md
+tests/testthat/_snaps/insert-axes.md
+tests/testthat/_snaps/permute-axes.md
+tests/testthat/_snaps/stack.md
+tests/testthat/_snaps/move-axes.md
+tests/testthat/_snaps/arithmetic-exponentiate.md
+plans/mod-and-idiv.md
+plans/null.md
+plans/n-ary.md
+plans/index.md
+plans/slice.md
+plans/extensions.md
+plans/implementation.md
+LICENSE.md</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,260p' plans/index.md &amp;&amp; sed -n '1,320p' plans/slice.md</summary>
+<pre>$ sed -n '1,260p' plans/index.md &amp;&amp; sed -n '1,320p' plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+# Location indexing plan
+
+## Recommendation
+
+Add one general location-indexing function and one single-axis convenience
+function:
+
+```r
+rray_index(x, locations = list(), axes = NULL, cross = FALSE)
+rray_index_assign(
+  x,
+  locations = list(),
+  axes = NULL,
+  value,
+  cross = FALSE
+)
+
+rray_index_axis(x, locations, axis, cross = FALSE)
+rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+```
+
+Each supplied location array controls one source axis. Supplied location arrays
+broadcast to common dimensions and are read pointwise. The `cross` argument
+controls only the source axes that do not have a supplied location array:
+
+- With `cross = FALSE`, unspecified axes receive implicit identity locations.
+  Their source positions pair with matching output positions.
+- With `cross = TRUE`, unspecified axes remain independent. They cross with
+  every point in the common supplied-location space.
+
+Supplied location arrays always pair through broadcasting. `cross` never
+changes them from paired to Cartesian indexing. Users request a Cartesian
+product among supplied arrays by shaping them as an open mesh.
+
+The full indexing family is:
+
+| Operation | Read | Assign |
+|---|---|---|
+| Orthogonal subscripts | `rray_slice()` | `rray_slice_assign()` |
+| One-axis subscript | `rray_slice_axis()` | `rray_slice_assign_axis()` |
+| Location arrays | `rray_index()` | `rray_index_assign()` |
+| One-axis location array | `rray_index_axis()` | `rray_index_assign_axis()` |
+| Flat positions or point matrix | `rray_extract()` | `rray_extract_assign()` |
+
+Do not add replacement functions. Every `_assign()` function returns a modified
+copy of `x`.
+
+## Subscripts and locations
+
+A subscript describes a set of positions on an axis. It can be negative,
+logical, character, missing, or `NULL`. Subscript normalization produces a
+one-dimensional sequence of positive or missing locations. Subscripts on
+different axes form a Cartesian product.
+
+A location array has a narrower meaning. Each non-missing element is one
+positive, one-based position on one source axis. Its dimensions connect that
+position to a point in the result. Zero and negative locations cannot mean
+complement because every element must identify one source position.
+
+This gives the public functions stable contracts:
+
+```r
+rray_slice_axis(x, -1L, axis = 2L)
+# Complement selection
+
+rray_index_axis(x, array(-1L, rray_dimensions(x)), axis = 2L)
+# Error: locations must be positive
+```
+
+The shape or class of an argument never changes an ordinary subscript into a
+location array. The function name determines the rules.
+
+## The location model
+
+Let:
+
+- `D` be the source dimensions.
+- `n` be the dimensionality of `x`.
+- `S` be the selected source axes named by `axes`.
+- `U` be the source axes not in `S`.
+- `L[j]` be the location array for `S[j]`.
+- `G` be the common dimensions of all supplied location arrays.
+
+Every supplied array gives one source coordinate at each point in `G`:
+
+```text
+source[S[j]] = broadcast(L[j])[g]
+```
+
+The selected coordinates are always paired at the same point `g`. Singleton
+dimensions and missing trailing dimensions follow rray's left-aligned
+broadcasting rules.
+
+### Location validation
+
+Each element of `locations` must be a bare integer vector or array. Bare
+vectors normalize to one-dimensional arrays. Factors and other classed integer
+objects are errors.
+
+Every non-missing location must be positive, one based, and no greater than the
+dimension of its source axis.
+
+- Positive integers identify one position.
+- Zero and negative integers are errors.
+- Missing locations produce missing output when reading.
+- Missing locations are errors when assigning.
+- Out-of-bounds locations are errors.
+
+Validation happens before allocating or copying the result. Every supplied
+location is validated even when another result axis has dimension zero.
+
+The first version should accept only integer locations. Logical values are
+masks, character values require name matching, and doubles weaken the contract
+without adding addressing power. Those inputs already belong to slicing or
+extraction.
+
+### Axis selection
+
+`locations` is a list and `axes` identifies the source axis controlled by each
+element.
+
+- `axes` must have the same size as `locations`.
+- Explicit axes must be valid, unique, and strictly increasing.
+- With a nonempty `locations` and `axes = NULL`, there must be one location
+  array per source axis. They map to all source axes in order.
+- With `locations = list()` and `axes = NULL`, no source axes are selected.
+  The result is `x`.
+- Selecting only some source axes requires explicit `axes`.
+
+Requiring increasing axes gives every call one canonical representation and
+makes crossed result placement deterministic.
+
+## `cross = FALSE`
+
+With `cross = FALSE`, every unspecified source axis receives an implicit
+identity location array. For an unselected axis `a`, its identity dimensions
+are:
+
+```text
+(1, ..., D[a], ..., 1)
+```
+
+and its values are:
+
+```text
+1, 2, ..., D[a]
+```
+
+The implementation represents identity locations in the plan. It does not
+allocate them as R arrays.
+
+The supplied location arrays and all implicit identity arrays broadcast to
+common dimensions `H`. Every source axis then has a coordinate at every point
+in `H`, so the result dimensions are exactly `H`:
+
+```text
+out_dimensions = H
+```
+
+For an output point `h`:
+
+```text
+if a is selected:
+  source[a] = broadcast(L[j])[h]
+else:
+  source[a] = identity[a][h]
+
+out[h] = x[source]
+```
+
+### Shape requirements
+
+When at least one but not every source axis is selected, every supplied
+location array must have the same dimensionality as `x`. Its axes then align
+unambiguously with the source axes that receive identities.
+
+On an unspecified source axis `a`, every supplied location dimension must be
+one or `D[a]`. The identity array forces the result dimension to `D[a]`.
+Therefore:
+
+- The result has the same dimensionality as `x`.
+- Every unspecified axis keeps its source dimension.
+- Selected-axis dimensions come from the common location dimensions.
+- A location array cannot enlarge an unspecified source axis, including an
+  axis of `x` whose dimension is one.
+
+When every source axis is selected, there are no identities to align. Supplied
+location arrays can have any dimensionality and the result dimensions are
+their common dimensions `G`.
+
+When no source axes are selected, every axis is an identity. The result has
+dimensions `D` and values identical to `x`.
+
+### Single-axis invariant
+
+For `rray_index_axis(x, locations, axis, cross = FALSE)`, `locations` must have</pre><p class="cut">384 more lines cut</p></details>
+<details class="tool"><summary>Bash: wc -l plans/index.md plans/slice.md &amp;&amp; sed -n '261,620p' plans/index.md &amp;&amp; sed -n '321,700p' …</summary>
+<pre>$ wc -l plans/index.md plans/slice.md &amp;&amp; sed -n '261,620p' plans/index.md &amp;&amp; sed -n '321,700p' plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+    1277 plans/index.md
+     733 plans/slice.md
+    2010 total
+
+```text
+o = (u_before, g, u_after)
+```
+
+construct one source coordinate for every source axis:
+
+```text
+if a is selected:
+  source[a] = broadcast(L[j])[g]
+else:
+  source[a] = the matching coordinate from u_before or u_after
+```
+
+Then:
+
+```text
+out[o] = x[source]
+```
+
+### Shape requirements
+
+Supplied location arrays can have any dimensionality. Their common dimensions
+replace the selected source axes as one block. The result dimensionality is:
+
+```text
+n - length(S) + dimensionality(G)
+```
+
+This is the central crossed-shape invariant. Unlike `cross = FALSE`, a
+single-axis location array does not need to align with the dimensionality of
+`x`.
+
+For source dimensions `(A, B, C)`, `axis = 2`, and location dimensions
+`(J, K)`:
+
+```text
+result dimensions = (A, J, K, C)
+```
+
+Each point in `(J, K)` selects an entire `(A, C)` combination because those
+source axes remain independent.
+
+## Cases where `cross` has no effect
+
+When every source axis is selected, no axis remains to cross or receive an
+identity. Both values of `cross` return common supplied-location dimensions
+`G`.
+
+When no source axis is selected, there is no supplied-location space to cross.
+Both values return `x`.
+
+The flag still belongs in these calls so a program can forward one indexing
+choice without inspecting `axes` first.
+
+## `rray_index()`
+
+```r
+rray_index(x, locations = list(), axes = NULL, cross = FALSE)
+```
+
+`rray_index()` implements the complete model above.
+
+### Argument rules
+
+- `x` must be an array or bare vector supported by rray.
+- Bare vectors normalize to one-dimensional arrays.
+- `locations` must be a list.
+- Every location input must be a bare integer vector or array.
+- `axes` follows the selection rules above.
+- `cross` must be one non-missing logical value.
+- The resulting dimensionality must not exceed rray's supported maximum.
+
+The function returns the same storage type as `x`.
+
+### Missing locations
+
+If any selected coordinate at an output point is missing, that output value is
+missing. The storage-specific results are:
+
+| Type | Missing output |
+|---|---|
+| logical | `NA` |
+| integer | `NA_integer_` |
+| double | `NA_real_` |
+| complex | `NA_complex_` |
+| character | `NA_character_` |
+| raw | `as.raw(0)` |
+| list | `NULL` |
+
+With `cross = TRUE`, a missing point in `G` produces missing values across all
+combinations of the independent source axes. With `cross = FALSE`, it affects
+only the matching identity-paired output point.
+
+### Zero dimensions
+
+Zero dimensions follow the existing common-dimension rules.
+
+- Equal zero dimensions are compatible.
+- Zero and one combine to zero.
+- Zero and a dimension greater than one are incompatible.
+- A crossed unselected zero dimension makes the result empty.
+- An identity zero dimension also makes the common result dimension zero.
+
+All coordinates are still validated before returning an empty result.
+
+## `rray_index_axis()`
+
+```r
+rray_index_axis(x, locations, axis, cross = FALSE)
+```
+
+The axis function is exactly the one-location-array form of `rray_index()`:
+
+```r
+rray_index_axis(x, locations, axis, cross = cross)
+```
+
+is equivalent to:
+
+```r
+rray_index(
+  x,
+  locations = list(locations),
+  axes = axis,
+  cross = cross
+)
+```
+
+It does not add another addressing mode or another set of validation rules.
+Errors should use the `locations` and `axis` argument names from the public
+axis call.
+
+The implementation can use a specialized iterator for the common
+`cross = FALSE` case. That optimization must preserve exact equivalence with
+the general function.
+
+## Worked examples
+
+### 1. Full pointwise indexing
+
+```r
+x &lt;- matrix(1:12, nrow = 3)
+
+rows &lt;- c(1L, 3L, 2L)
+columns &lt;- c(4L, 1L, 3L)
+
+out &lt;- rray_index(
+  x,
+  locations = list(rows, columns)
+)
+
+out
+# [1] 10 3 8
+
+dim(out)
+# [1] 3
+```
+
+Both source axes are selected, so `cross` has no effect. The calculation is:
+
+```text
+out[1] = x[rows[1], columns[1]] = x[1, 4] = 10
+out[2] = x[rows[2], columns[2]] = x[3, 1] = 3
+out[3] = x[rows[3], columns[3]] = x[2, 3] = 8
+```
+
+### 2. Cartesian indexing among supplied arrays
+
+Supplied arrays always pair through broadcasting. Shape them onto different
+axes to request a Cartesian product:
+
+```r
+rows &lt;- array(c(3L, 1L), c(2L, 1L))
+columns &lt;- array(c(4L, 2L, 1L), c(1L, 3L))
+
+out &lt;- rray_index(
+  x,
+  locations = list(rows, columns)
+)
+
+dim(out)
+# [1] 2 3
+```
+
+The common dimensions are `(2, 3)`. Every row location pairs with every column
+location because their singleton dimensions form an open mesh.
+
+Ordinary vectors of lengths two and three do not silently form a Cartesian
+product:
+
+```r
+rray_index(x, list(c(1L, 2L), c(1L, 2L, 3L)))</pre><p class="cut">547 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '621,980p' plans/index.md &amp;&amp; sed -n '981,1320p' plans/index.md &amp;&amp; sed -n '701,760p' pl…</summary>
+<pre>$ sed -n '621,980p' plans/index.md &amp;&amp; sed -n '981,1320p' plans/index.md &amp;&amp; sed -n '701,760p' plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+of `x` with the same dimensions and names.
+
+## Names
+
+Supplied location arrays carry dimension names through the existing common-name
+broadcasting rules.
+
+With `cross = FALSE`:
+
+- Implicit identity arrays carry source names on their non-singleton axes.
+- Unspecified source axes therefore keep their names.
+- Selected source axis names are dropped.
+- Supplied location names can name selected result dimensions.
+- Names on broadcast dimensions coalesce with the ordinary broadcasting rules.
+
+With `cross = TRUE`:
+
+- Unselected source axes keep their names and their relative order.
+- The inserted common location dimensions use names coalesced from the supplied
+  arrays.
+- Selected source axis names are dropped.
+
+When every source axis is selected, result names come only from the common
+supplied-location dimensions.
+
+Assignment always returns the original dimensions and names of `x` unchanged.
+
+## Assignment
+
+```r
+rray_index_assign(
+  x,
+  locations = list(),
+  axes = NULL,
+  value,
+  cross = FALSE
+)
+
+rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+```
+
+Assignment follows the same indexing plan as reading:
+
+1. Normalize and validate `x`, `locations`, `axes`, and `cross`.
+2. Compute the indexing result dimensions.
+3. Validate every location and reject missing values.
+4. Cast `value` losslessly to the type of `x`.
+5. Broadcast the cast value to the indexing result dimensions.
+6. Copy `x`.
+7. Write in column-major indexing-result order.
+
+The operation cannot change the type, size, dimensions, or names of `x`.
+Broadcasting can repeat dimensions of one but cannot recycle an arbitrary
+size.
+
+Repeated source locations use deterministic last-write-wins behavior. The
+final value visited in column-major result order wins.
+
+An error must occur before `x` is copied or any writes happen. Casting and
+broadcasting `value` before copying also handles `value` equal to `x`.
+
+`NULL` is not an array and cannot be an assignment value. To assign `NULL` into
+a list array, use a list array containing `NULL`.
+
+### Assignment with repeated points
+
+```r
+x &lt;- matrix(
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80
+  ),
+  nrow = 2,
+  byrow = TRUE
+)
+
+rows &lt;- c(1L, 1L, 2L)
+columns &lt;- c(2L, 2L, 4L)
+
+out &lt;- rray_index_assign(
+  x,
+  locations = list(rows, columns),
+  value = c(100, 200, 300)
+)
+
+out
+#      [,1] [,2] [,3] [,4]
+# [1,]   10  200   30   40
+# [2,]   50   60   70  300
+```
+
+The point `(1, 2)` appears twice. The second value wins.
+
+## Connection to slicing
+
+Slicing accepts ordinary subscripts and forms a Cartesian product. Indexing
+accepts strict location arrays and reads them pointwise. They are separate
+public contracts, but positive slicing can be expressed through indexing after
+subscript normalization.
+
+### Orthogonal slicing
+
+After normalizing one subscript per source axis to positive locations, reshape
+each location vector onto its source axis:
+
+```text
+axis 1 locations: (I, 1, 1)
+axis 2 locations: (1, J, 1)
+axis 3 locations: (1, 1, K)
+```
+
+The arrays broadcast to `(I, J, K)`. Because every source axis is selected,
+`cross` has no effect:
+
+```r
+rray_slice(x, i, j, k)
+```
+
+has the same values and dimensions as:
+
+```r
+rray_index(
+  x,
+  locations = list(
+    array(normalize(i), c(I, 1L, 1L)),
+    array(normalize(j), c(1L, J, 1L)),
+    array(normalize(k), c(1L, 1L, K))
+  )
+)
+```
+
+`rray_slice()` remains separate because it accepts richer subscript forms,
+subsets source names, guarantees one result axis per source axis, and can use
+an affine strided fast path.
+
+### One-axis slicing
+
+After normalizing `i` to a one-dimensional location vector:
+
+```r
+rray_slice_axis(x, i, axis)
+```
+
+has the same values and dimensions as:
+
+```r
+rray_index_axis(
+  x,
+  locations = normalize(i),
+  axis = axis,
+  cross = TRUE
+)
+```
+
+The unspecified source axes cross with the shared one-dimensional locations.
+The slice wrapper owns ordinary subscript rules and selected-axis name
+subsetting.
+
+## Connection to extraction
+
+Extraction always returns a one-dimensional array. Point matrices and flat
+positions both lower to indexing every source axis.
+
+### Point matrices
+
+For a point matrix with one row per requested point and one column per source
+axis:
+
+```r
+points &lt;- rbind(
+  c(1L, 4L),
+  c(3L, 1L),
+  c(2L, 3L)
+)
+```
+
+this:
+
+```r
+rray_extract(x, points)
+```
+
+has the same values and dimensions as:
+
+```r
+rray_index(
+  x,
+  locations = list(points[, 1], points[, 2])
+)
+```
+
+Every source axis is selected and every location vector has dimensions `P`, so
+the result has dimensions `P`. Numeric and character point matrices are first
+normalized to integer locations.
+
+`rray_extract()` retains the matrix representation because it is the ordinary</pre><p class="cut">494 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Formulating rray_index function rewrite</strong></p>
+<p><strong>Planning comprehensive rray_index signature update</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Formulating rray_index function rewrite</strong></p>
+<p><strong>Planning comprehensive rray_index signature update</strong></p>
+</details>
+<p>The plans currently model general indexing as a <code>locations</code> list plus an <code>axes</code> vector. I’m replacing that model with positional dots: each supplied dot controls the matching source axis, a missing dot leaves that axis unspecified, and omitted trailing axes are also unspecified. The singular <code>*_axis()</code> helpers remain as conveniences; plural <code>*_axes()</code> helpers stay only as a possible future extension.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;locations = list|axes = NULL|locations, axes|`axes`|selected source axes|selected axes…</summary>
+<pre>$ rg -n &quot;locations = list|axes = NULL|locations, axes|`axes`|selected source axes|selected axes|location list|dynamic splicing|slice_axes|index_axes|rray_index\(|rray_index_assign\(&quot; plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+Warning: truncated output (original token count: 25593)
+Total output lines: 2011
+
+zsh:1: command not found: axes
+plans/slice.md:1:# Array slicing plan
+plans/slice.md:2:
+plans/slice.md:3:## Recommendation
+plans/slice.md:4:
+plans/slice.md:5:Use `slice` for dimension-preserving selection through ordinary R subscripts.
+plans/slice.md:6:Use `extract` for selection that returns a one-dimensional array. Flat
+plans/slice.md:7:positions and coordinate points are two input forms for `rray_extract()`.
+plans/slice.md:8:
+plans/slice.md:9:Keep ordinary subscripts separate from location arrays. A subscript describes
+plans/slice.md:10:a set of positions and can use ordinary R forms such as negative integers,
+plans/slice.md:11:logical masks, and names. A location array contains one positive, one-based
+plans/slice.md:12:integer location or a missing value for each output position. Its shape
+plans/slice.md:13:connects each location to the other axes of `x`.
+plans/slice.md:14:
+plans/slice.md:15:The proposed family is:
+plans/slice.md:16:
+plans/slice.md:17:| Operation | Read | Assign |
+plans/slice.md:18:|---|---|---|
+plans/slice.md:19:| Slice every axis | `rray_slice(x, ...)` | `rray_slice_assign(x, ..., value)` |
+plans/slice.md:20:| Slice one axis | `rray_slice_axis(x, i, axis)` | `rray_slice_assign_axis(x, i, axis, value)` |
+plans/slice.md:21:| Extract flat positions or points | `rray_extract(x, i)` | `rray_extract_assign(x, i, value)` |
+plans/slice.md:22:
+plans/slice.md:23:The two slice rows should be implemented first. Extraction forms the second
+plans/slice.md:24:layer.
+plans/slice.md:25:
+plans/slice.md:26:Do not add replacement functions such as `rray_slice&lt;-()`. The `_assign()`
+plans/slice.md:27:forms return a modified copy and match the rest of rray4's function API.
+plans/slice.md:28:There are no `[` or `[[` methods because rray4 provides functions rather than
+plans/slice.md:29:an array class.
+plans/slice.md:30:
+plans/slice.md:31:## The model
+plans/slice.md:32:
+plans/slice.md:33:There are four addressing modes in this plan. Orthogonal and one-axis slicing
+plans/slice.md:34:accept ordinary subscripts. Flat positions and coordinate points share
+plans/slice.md:35:`rray_extract()` because both return a one-dimensional array. Strict location
+plans/slice.md:36:arrays belong to `rray_index()` and `rray_index_axis()` in `plans/index.md`.
+plans/slice.md:37:
+plans/slice.md:38:The function name determines the input contract. The dimensionality or class
+plans/slice.md:39:of an input never changes a subscript into a location array.
+plans/slice.md:40:
+plans/slice.md:41:### Subscripts and location arrays
+plans/slice.md:42:
+plans/slice.md:43:| Property | Subscript | Location array |
+plans/slice.md:44:|---|---|---|
+plans/slice.md:45:| Used by | `rray_slice()`, `rray_slice_axis()` | `rray_index()`, `rray_index_axis()` |
+plans/slice.md:46:| Meaning | A set of positions on an axis | One position for each output point |
+plans/slice.md:47:| Accepted forms | Integer, double, logical, character, missing, `NULL` | Bare integer vector or array |
+plans/slice.md:48:| Negative values | Select the complement | Error |
+plans/slice.md:49:| Zero | Ignored | Error |
+plans/slice.md:50:| Shape | Does not connect positions to other axes | Connects locations to lanes and can broadcast |
+plans/slice.md:51:
+plans/slice.md:52:A subscript is normalized into a one-dimensional sequence of locations before
+plans/slice.md:53:slicing. Its original type expresses how to form that sequence. A location
+plans/slice.md:54:array is already normalized in meaning, but not in storage: its elements still
+plans/slice.md:55:need bounds and missing-value validation. This distinction lets
+plans/slice.md:56:`rray_slice_axis()` keep ordinary R subscript rules while the indexing family
+plans/slice.md:57:has one strict location contract.
+plans/slice.md:58:
+plans/slice.md:59:### Orthogonal slices
+plans/slice.md:60:
+plans/slice.md:61:Each subscript selects locations on one axis. Multiple subscripts form a
+plans/slice.md:62:Cartesian product.
+plans/slice.md:63:
+plans/slice.md:64:```r
+plans/slice.md:65:x &lt;- array(1:24, c(2, 3, 4))
+plans/slice.md:66:
+plans/slice.md:67:rray_slice(x, c(2, 1), c(3, 1), 2)
+plans/slice.md:68:# dimensions: c(2, 2, 1)
+plans/slice.md:69:
+plans/slice.md:70:rray_slice_axis(x, c(3, 1), axis = 2)
+plans/slice.md:71:# dimensions: c(2, 2, 4)
+plans/slice.md:72:```
+plans/slice.md:73:
+plans/slice.md:74:This is the ordinary array operation. It is close to base R's
+plans/slice.md:75:`x[..., drop = FALSE]` and NumPy's open-mesh indexing. It always preserves
+plans/slice.md:76:dimensionality.
+plans/slice.md:77:
+plans/slice.md:78:### Coordinate points
+plans/slice.md:79:
+plans/slice.md:80:Each row of `points` identifies one element. Rows are paired coordinates, not a
+plans/slice.md:81:Cartesian product.
+plans/slice.md:82:
+plans/slice.md:83:```r
+plans/slice.md:84:points &lt;- rbind(
+plans/slice.md:85:  c(1, 1, 1),
+plans/slice.md:86:  c(2, 3, 4),
+plans/slice.md:87:  c(1, 2, 3)
+plans/slice.md:88:)
+plans/slice.md:89:
+plans/slice.md:90:rray_extract(x, points)
+plans/slice.md:91:# dimensions: 3L
+plans/slice.md:92:# values: c(1L, 24L, 15L)
+plans/slice.md:93:```
+plans/slice.md:94:
+plans/slice.md:95:This is base R's matrix indexing and xtensor's `index_view()` model. The result
+plans/slice.md:96:is one dimensional because no source axis survives as an output axis.
+plans/slice.md:97:
+plans/slice.md:98:### Flat positions
+plans/slice.md:99:
+plans/slice.md:100:The array is treated as its column-major storage vector.
+plans/slice.md:101:
+plans/slice.md:102:```r
+plans/slice.md:103:rray_extract(x, c(1, 4, 24))
+plans/slice.md:104:rray_extract(x, x %% 5 == 0)
+plans/slice.md:105:```
+plans/slice.md:106:
+plans/slice.md:107:This covers base R's single-subscript array indexing and whole-array logical
+plans/slice.md:108:masks. The result is one dimensional.
+plans/slice.md:109:
+plans/slice.md:110:### Location indexing
+plans/slice.md:111:
+plans/slice.md:112:A location array can supply a different axis position for each lane through
+plans/slice.md:113:the array. A lane is the one-dimensional vector left after every coordinate
+plans/slice.md:114:except `axis` has been fixed.
+plans/slice.md:115:
+plans/slice.md:116:```r
+plans/slice.md:117:x &lt;- array(c(10, 60, 30, 40, 20, 50), c(2, 3))
+plans/slice.md:118:locations &lt;- array(c(2L, 1L), c(2L, 1L))
+plans/slice.md:119:
+plans/slice.md:120:rray_index_axis(x, locations, axis = 2)
+plans/slice.md:121:# dimensions: c(2, 1)
+plans/slice.md:122:# values: c(30, 60)
+plans/slice.md:123:```
+plans/slice.md:124:
+plans/slice.md:125:This operation belongs to the indexing family rather than the slicing family.
+plans/slice.md:126:It is the direct consumer of arrays returned by functions such as
+plans/slice.md:127:`rray_locate_min()` and `rray_locate_max()`. See `plans/index.md` for the full
+plans/slice.md:128:location model.
+plans/slice.md:129:
+plans/slice.md:130:## Why these divisions
+plans/slice.md:131:
+plans/slice.md:132:Base R gives `[` several unrelated meanings. A single subscript on an array is
+plans/slice.md:133:flat, one subscript per axis is orthogonal, and a matrix subscript is pointwise.
+plans/slice.md:134:It also drops dimensions by default. The behavior is powerful, but the same
+plans/slice.md:135:syntax can return unrelated shapes.
+plans/slice.md:136:
+plans/slice.md:137:NumPy distinguishes basic and advanced indexing, but multiple integer arrays
+plans/slice.md:138:switch to paired advanced indexing. `x[rows, columns]` selects paired points,
+plans/slice.md:139:while `x[np.ix_(rows, columns)]` selects the Cartesian product. This is one of
+plans/slice.md:140:the easiest indexing rules to misread.
+plans/slice.md:141:
+plans/slice.md:142:The original rray improved shape stability, but its names did not line up with
+plans/slice.md:143:the addressing modes:
+plans/slice.md:144:
+plans/slice.md:145:- `rray_subset()` performed dimension-preserving orthogonal slicing.
+plans/slice.md:146:- `rray_extract()` performed the same orthogonal selection and then flattened
+plans/slice.md:147:  it.
+plans/slice.md:148:- `rray_yank()` used flat positions.
+plans/slice.md:149:- `rray_slice()` was only the one-axis convenience wrapper.
+plans/slice.md:150:
+plans/slice.md:151:The proposed API makes the common orthogonal operation `rray_slice()`.
+plans/slice.md:152:`rray_extract()` uses the shape of `i` to distinguish flat positions from
+plans/slice.md:153:coordinate points. `rray_slice_axis()` always accepts one ordinary subscript.
+plans/slice.md:154:Location arrays have explicit indexing entry points.
+plans/slice.md:155:
+plans/slice.md:156:## `rray_slice()`
+plans/slice.md:157:
+plans/slice.md:158:```r
+plans/slice.md:159:rray_slice(x, ...)
+plans/slice.md:160:rray_slice_assign(x, ..., value)
+plans/slice.md:161:```
+plans/slice.md:162:
+plans/slice.md:163:`value` follows `...`, so it must be supplied by name.
+plans/slice.md:164:
+plans/slice.md:165:Each element of `...` applies to the matching axis. A missing argument selects
+plans/slice.md:166:the whole axis. Unspecified trailing axes also select the whole axis.
+plans/slice.md:167:
+plans/slice.md:168:```r
+plans/slice.md:169:rray_slice(x, 1)
+plans/slice.md:170:# dimensions: c(1, 3, 4)
+plans/slice.md:171:
+plans/slice.md:172:rray_slice(x, , 1)
+plans/slice.md:173:# dimensions: c(2, 1, 4)
+plans/slice.md:174:
+plans/slice.md:175:rray_slice(x)
+plans/slice.md:176:# dimensions: c(2, 3, 4)
+plans/slice.md:177:```
+plans/slice.md:178:
+plans/slice.md:179:Trailing missing arguments have no effect. More subscripts than the
+plans/slice.md:180:dimensionality of `x` are an error.
+plans/slice.md:181:
+plans/slice.md:182:The dots should support dynamic splicing. This gives a programmatic API without
+plans/slice.md:183:adding `rray_slice_axes()`.
+plans/slice.md:184:
+plans/slice.md:185:```r
+plans/slice.md:186:indices &lt;- list(1:2, c(3, 1))
+plans/slice.md:187:rray_slice(x, !!!indices)
+plans/slice.md:188:```
+plans/slice.md:189:
+plans/slice.md:190:Subscripts in `...` must be unnamed. This keeps selection positional and leaves
+plans/slice.md:191:named axes available as a future extension.
+plans/slice.md:192:</pre><p class="cut">543 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,180p' plans/index.md &amp;&amp; sed -n '180,380p' plans/index.md</summary>
+<pre>$ sed -n '1,180p' plans/index.md &amp;&amp; sed -n '180,380p' plans/index.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+# Location indexing plan
+
+## Recommendation
+
+Add one general location-indexing function and one single-axis convenience
+function:
+
+```r
+rray_index(x, locations = list(), axes = NULL, cross = FALSE)
+rray_index_assign(
+  x,
+  locations = list(),
+  axes = NULL,
+  value,
+  cross = FALSE
+)
+
+rray_index_axis(x, locations, axis, cross = FALSE)
+rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+```
+
+Each supplied location array controls one source axis. Supplied location arrays
+broadcast to common dimensions and are read pointwise. The `cross` argument
+controls only the source axes that do not have a supplied location array:
+
+- With `cross = FALSE`, unspecified axes receive implicit identity locations.
+  Their source positions pair with matching output positions.
+- With `cross = TRUE`, unspecified axes remain independent. They cross with
+  every point in the common supplied-location space.
+
+Supplied location arrays always pair through broadcasting. `cross` never
+changes them from paired to Cartesian indexing. Users request a Cartesian
+product among supplied arrays by shaping them as an open mesh.
+
+The full indexing family is:
+
+| Operation | Read | Assign |
+|---|---|---|
+| Orthogonal subscripts | `rray_slice()` | `rray_slice_assign()` |
+| One-axis subscript | `rray_slice_axis()` | `rray_slice_assign_axis()` |
+| Location arrays | `rray_index()` | `rray_index_assign()` |
+| One-axis location array | `rray_index_axis()` | `rray_index_assign_axis()` |
+| Flat positions or point matrix | `rray_extract()` | `rray_extract_assign()` |
+
+Do not add replacement functions. Every `_assign()` function returns a modified
+copy of `x`.
+
+## Subscripts and locations
+
+A subscript describes a set of positions on an axis. It can be negative,
+logical, character, missing, or `NULL`. Subscript normalization produces a
+one-dimensional sequence of positive or missing locations. Subscripts on
+different axes form a Cartesian product.
+
+A location array has a narrower meaning. Each non-missing element is one
+positive, one-based position on one source axis. Its dimensions connect that
+position to a point in the result. Zero and negative locations cannot mean
+complement because every element must identify one source position.
+
+This gives the public functions stable contracts:
+
+```r
+rray_slice_axis(x, -1L, axis = 2L)
+# Complement selection
+
+rray_index_axis(x, array(-1L, rray_dimensions(x)), axis = 2L)
+# Error: locations must be positive
+```
+
+The shape or class of an argument never changes an ordinary subscript into a
+location array. The function name determines the rules.
+
+## The location model
+
+Let:
+
+- `D` be the source dimensions.
+- `n` be the dimensionality of `x`.
+- `S` be the selected source axes named by `axes`.
+- `U` be the source axes not in `S`.
+- `L[j]` be the location array for `S[j]`.
+- `G` be the common dimensions of all supplied location arrays.
+
+Every supplied array gives one source coordinate at each point in `G`:
+
+```text
+source[S[j]] = broadcast(L[j])[g]
+```
+
+The selected coordinates are always paired at the same point `g`. Singleton
+dimensions and missing trailing dimensions follow rray's left-aligned
+broadcasting rules.
+
+### Location validation
+
+Each element of `locations` must be a bare integer vector or array. Bare
+vectors normalize to one-dimensional arrays. Factors and other classed integer
+objects are errors.
+
+Every non-missing location must be positive, one based, and no greater than the
+dimension of its source axis.
+
+- Positive integers identify one position.
+- Zero and negative integers are errors.
+- Missing locations produce missing output when reading.
+- Missing locations are errors when assigning.
+- Out-of-bounds locations are errors.
+
+Validation happens before allocating or copying the result. Every supplied
+location is validated even when another result axis has dimension zero.
+
+The first version should accept only integer locations. Logical values are
+masks, character values require name matching, and doubles weaken the contract
+without adding addressing power. Those inputs already belong to slicing or
+extraction.
+
+### Axis selection
+
+`locations` is a list and `axes` identifies the source axis controlled by each
+element.
+
+- `axes` must have the same size as `locations`.
+- Explicit axes must be valid, unique, and strictly increasing.
+- With a nonempty `locations` and `axes = NULL`, there must be one location
+  array per source axis. They map to all source axes in order.
+- With `locations = list()` and `axes = NULL`, no source axes are selected.
+  The result is `x`.
+- Selecting only some source axes requires explicit `axes`.
+
+Requiring increasing axes gives every call one canonical representation and
+makes crossed result placement deterministic.
+
+## `cross = FALSE`
+
+With `cross = FALSE`, every unspecified source axis receives an implicit
+identity location array. For an unselected axis `a`, its identity dimensions
+are:
+
+```text
+(1, ..., D[a], ..., 1)
+```
+
+and its values are:
+
+```text
+1, 2, ..., D[a]
+```
+
+The implementation represents identity locations in the plan. It does not
+allocate them as R arrays.
+
+The supplied location arrays and all implicit identity arrays broadcast to
+common dimensions `H`. Every source axis then has a coordinate at every point
+in `H`, so the result dimensions are exactly `H`:
+
+```text
+out_dimensions = H
+```
+
+For an output point `h`:
+
+```text
+if a is selected:
+  source[a] = broadcast(L[j])[h]
+else:
+  source[a] = identity[a][h]
+
+out[h] = x[source]
+```
+
+### Shape requirements
+
+When at least one but not every source axis is selected, every supplied
+location array must have the same dimensionality as `x`. Its axes then align
+unambiguously with the source axes that receive identities.
+
+On an unspecified source axis `a`, every supplied location dimension must be
+one or `D[a]`. The identity array forces the result dimension to `D[a]`.
+Therefore:
+
+
+- The result has the same dimensionality as `x`.
+- Every unspecified axis keeps its source dimension.
+- Selected-axis dimensions come from the common location dimensions.
+- A location array cannot enlarge an unspecified source axis, including an
+  axis of `x` whose dimension is one.
+
+When every source axis is selected, there are no identities to align. Supplied
+location arrays can have any dimensionality and the result dimensions are
+their common dimensions `G`.
+
+When no source axes are selected, every axis is an identity. The result has
+dimensions `D` and values identical to `x`.
+
+### Single-axis invariant
+</pre><p class="cut">185 more lines cut</p></details>
+<details class="tool"><summary>Edit plans/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+ ```r
+<span class="del">-rray_index(x, locations = list(), axes = NULL, cross = FALSE)</span>
+<span class="del">-rray_index_assign(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(),</span>
+<span class="del">-  axes = NULL,</span>
+<span class="del">-  value,</span>
+<span class="del">-  cross = FALSE</span>
+<span class="del">-)</span>
+<span class="ins">+rray_index(x, ..., cross = FALSE)</span>
+<span class="ins">+rray_index_assign(x, ..., value, cross = FALSE)</span>
+<span class="hunk">@@</span>
+<span class="del">-Each supplied location array controls one source axis. Supplied location arrays</span>
+<span class="del">-broadcast to common dimensions and are read pointwise. The `cross` argument</span>
+<span class="del">-controls only the source axes that do not have a supplied location array:</span>
+<span class="ins">+Each argument in `...` controls the matching source axis. A missing argument</span>
+<span class="ins">+leaves that axis unspecified, as does omitting a trailing argument. Supplied</span>
+<span class="ins">+location arrays broadcast to common dimensions and are read pointwise. The</span>
+<span class="ins">+`cross` argument controls only the unspecified source axes:</span>
+<span class="hunk">@@</span>
+<span class="del">-- `S` be the selected source axes named by `axes`.</span>
+<span class="ins">+- `S` be the selected source axes with supplied arguments in `...`.</span>
+<span class="hunk">@@</span>
+<span class="del">-Each element of `locations` must be a bare integer vector or array. Bare</span>
+<span class="del">-vectors normalize to one-dimensional arrays. Factors and other classed integer</span>
+<span class="del">-objects are errors.</span>
+<span class="ins">+Each supplied argument in `...` must be a bare integer vector or array. Bare</span>
+<span class="ins">+vectors normalize to one-dimensional arrays. Factors and other classed integer</span>
+<span class="ins">+objects are errors.</span>
+<span class="hunk">@@</span>
+<span class="del">-### Axis selection</span>
+<span class="del">-</span>
+<span class="del">-`locations` is a list and `axes` identifies the source axis controlled by each</span>
+<span class="del">-element.</span>
+<span class="del">-</span>
+<span class="del">-- `axes` must have the same size as `locations`.</span>
+<span class="del">-- Explicit axes must be valid, unique, and strictly increasing.</span>
+<span class="del">-- With a nonempty `locations` and `axes = NULL`, there must be one location</span>
+<span class="del">-  array per source axis. They map to all source axes in order.</span>
+<span class="del">-- With `locations = list()` and `axes = NULL`, no source axes are selected.</span>
+<span class="del">-  The result is `x`.</span>
+<span class="del">-- Selecting only some source axes requires explicit `axes`.</span>
+<span class="del">-</span>
+<span class="del">-Requiring increasing axes gives every call one canonical representation and</span>
+<span class="del">-makes crossed result placement deterministic.</span>
+<span class="ins">+### Axis selection</span>
+<span class="ins">+</span>
+<span class="ins">+The position of each argument in `...` identifies its source axis.</span>
+<span class="ins">+</span>
+<span class="ins">+- A supplied argument selects its matching source axis.</span>
+<span class="ins">+- A missing argument leaves its matching source axis unspecified.</span>
+<span class="ins">+- Omitted trailing arguments leave all remaining source axes unspecified.</span>
+<span class="ins">+- More arguments than the dimensionality of `x` are an error.</span>
+<span class="ins">+- Arguments in `...` must be unnamed.</span>
+<span class="ins">+- With no arguments in `...`, no source axes are selected and the result is</span>
+<span class="ins">+  `x`.</span>
+<span class="ins">+</span>
+<span class="ins">+This is the same positional call structure as `rray_slice()`. For example,</span>
+<span class="ins">+`rray_index(x, rows, , depths)` selects axes 1 and 3 and leaves axis 2</span>
+<span class="ins">+unspecified. `rray_index_axis()` remains the convenient form when the one</span>
+<span class="ins">+selected axis is held in a variable. If a future use case needs explicit</span>
+<span class="ins">+programmatic selection of several axes, it can be served by a separate</span>
+<span class="ins">+`rray_index_axes()` function without changing this contract.</span>
+<span class="hunk">@@</span>
+<span class="del">-The flag still belongs in these calls so a program can forward one indexing</span>
+<span class="del">-choice without inspecting `axes` first.</span>
+<span class="ins">+The flag still belongs in these calls so a program can forward one indexing</span>
+<span class="ins">+choice without inspecting the supplied arguments first.</span>
+<span class="hunk">@@</span>
+ ```r
+<span class="del">-rray_index(x, locations = list(), axes = NULL, cross = FALSE)</span>
+<span class="ins">+rray_index(x, ..., cross = FALSE)</span>
+ ```
+<span class="hunk">@@</span>
+ - `x` must be an array or bare vector supported by rray.
+ - Bare vectors normalize to one-dimensional arrays.
+<span class="del">-- `locations` must be a list.</span>
+<span class="del">-- Every location input must be a bare integer vector or array.</span>
+<span class="del">-- `axes` follows the selection rules above.</span>
+<span class="ins">+- Every supplied argument in `...` must be a bare integer vector or array.</span>
+<span class="ins">+- Arguments in `...` follow the positional selection rules above.</span>
+ - `cross` must be one non-missing logical value.
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: rg -n 'locations = list|axes =|locations, axes|location list|locations must be a list|explici…</summary>
+<pre>$ rg -n 'locations = list|axes =|locations, axes|location list|locations must be a list|explicit `axes`|`axes`|locations = normalize|locations = ' plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/slice.md:237:  locations = normalize(i),
+plans/index.md:381:  locations = list(locations),
+plans/index.md:382:  axes = axis,
+plans/index.md:407:  locations = list(rows, columns)
+plans/index.md:436:  locations = list(rows, columns)
+plans/index.md:611:### 8. Empty location list
+plans/index.md:650:  locations = list(),
+plans/index.md:651:  axes = NULL,
+plans/index.md:661:1. Normalize and validate `x`, `locations`, `axes`, and `cross`.
+plans/index.md:699:  locations = list(rows, columns),
+plans/index.md:741:  locations = list(
+plans/index.md:766:  locations = normalize(i),
+plans/index.md:805:  locations = list(points[, 1], points[, 2])
+plans/index.md:1003:- Nonempty `locations` with `axes = NULL` requires one array per source axis.
+plans/index.md:1004:- Empty `locations` with `axes = NULL` selects no axes.
+plans/index.md:1005:- Explicit `axes` must have one entry per location array.
+plans/index.md:1102:  locations = list(locations),
+plans/index.md:1103:  axes = axis,
+plans/index.md:1225:pointwise. This supplies the core model for the location list accepted by:
+plans/index.md:1228:rray_index(x, locations, axes, cross)</pre></details>
+<details class="tool"><summary>Bash: sed -n '345,830p' plans/index.md</summary>
+<pre>$ sed -n '345,830p' plans/index.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+| raw | `as.raw(0)` |
+| list | `NULL` |
+
+With `cross = TRUE`, a missing point in `G` produces missing values across all
+combinations of the independent source axes. With `cross = FALSE`, it affects
+only the matching identity-paired output point.
+
+### Zero dimensions
+
+Zero dimensions follow the existing common-dimension rules.
+
+- Equal zero dimensions are compatible.
+- Zero and one combine to zero.
+- Zero and a dimension greater than one are incompatible.
+- A crossed unselected zero dimension makes the result empty.
+- An identity zero dimension also makes the common result dimension zero.
+
+All coordinates are still validated before returning an empty result.
+
+## `rray_index_axis()`
+
+```r
+rray_index_axis(x, locations, axis, cross = FALSE)
+```
+
+The axis function is exactly the one-location-array form of `rray_index()`:
+
+```r
+rray_index_axis(x, locations, axis, cross = cross)
+```
+
+is equivalent to:
+
+```r
+rray_index(
+  x,
+  locations = list(locations),
+  axes = axis,
+  cross = cross
+)
+```
+
+It does not add another addressing mode or another set of validation rules.
+Errors should use the `locations` and `axis` argument names from the public
+axis call.
+
+The implementation can use a specialized iterator for the common
+`cross = FALSE` case. That optimization must preserve exact equivalence with
+the general function.
+
+## Worked examples
+
+### 1. Full pointwise indexing
+
+```r
+x &lt;- matrix(1:12, nrow = 3)
+
+rows &lt;- c(1L, 3L, 2L)
+columns &lt;- c(4L, 1L, 3L)
+
+out &lt;- rray_index(
+  x,
+  locations = list(rows, columns)
+)
+
+out
+# [1] 10 3 8
+
+dim(out)
+# [1] 3
+```
+
+Both source axes are selected, so `cross` has no effect. The calculation is:
+
+```text
+out[1] = x[rows[1], columns[1]] = x[1, 4] = 10
+out[2] = x[rows[2], columns[2]] = x[3, 1] = 3
+out[3] = x[rows[3], columns[3]] = x[2, 3] = 8
+```
+
+### 2. Cartesian indexing among supplied arrays
+
+Supplied arrays always pair through broadcasting. Shape them onto different
+axes to request a Cartesian product:
+
+```r
+rows &lt;- array(c(3L, 1L), c(2L, 1L))
+columns &lt;- array(c(4L, 2L, 1L), c(1L, 3L))
+
+out &lt;- rray_index(
+  x,
+  locations = list(rows, columns)
+)
+
+dim(out)
+# [1] 2 3
+```
+
+The common dimensions are `(2, 3)`. Every row location pairs with every column
+location because their singleton dimensions form an open mesh.
+
+Ordinary vectors of lengths two and three do not silently form a Cartesian
+product:
+
+```r
+rray_index(x, list(c(1L, 2L), c(1L, 2L, 3L)))
+# Error: dimensions 2 and 3 cannot broadcast
+```
+
+### 3. Identity-paired single-axis indexing
+
+```r
+x &lt;- matrix(
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80
+  ),
+  nrow = 2,
+  byrow = TRUE
+)
+
+locations &lt;- rbind(
+  c(4L, 1L),
+  c(2L, 3L)
+)
+
+out &lt;- rray_index_axis(
+  x,
+  locations,
+  axis = 2L,
+  cross = FALSE
+)
+
+out
+#      [,1] [,2]
+# [1,]   40   10
+# [2,]   60   70
+```
+
+The row axis receives identity locations:
+
+```text
+out[row, column] = x[row, locations[row, column]]
+```
+
+Only the selected column dimension changes.
+
+### 4. Crossed single-axis indexing
+
+Using the same `locations` with `cross = TRUE` gives:
+
+```r
+out &lt;- rray_index_axis(
+  x,
+  locations,
+  axis = 2L,
+  cross = TRUE
+)
+
+dim(out)
+# [1] 2 2 2
+```
+
+The first output axis is the independent source row. The next two axes are the
+location dimensions:
+
+```text
+out[a, j, k] = x[a, locations[j, k]]
+```
+
+For `k = 1`:
+
+```r
+out[, , 1]
+#      [,1] [,2]
+# [1,]   40   20
+# [2,]   80   60
+```
+
+For `k = 2`:
+
+```r
+out[, , 2]
+#      [,1] [,2]
+# [1,]   10   30
+# [2,]   50   70
+```
+
+The location row `j` is unrelated to the source row `a`. Equal dimensions do
+not establish a connection. Only `cross = FALSE` supplies that identity
+connection.
+
+### 5. Identity broadcasting
+
+```r
+x &lt;- matrix(</pre><p class="cut">290 more lines cut</p></details>
+<details class="tool"><summary>Edit plans/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+ is equivalent to:
+ 
+ ```r
+<span class="del">-rray_index(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(locations),</span>
+<span class="del">-  axes = axis,</span>
+<span class="del">-  cross = cross</span>
+<span class="del">-)</span>
+<span class="ins">+rray_index(x, , locations, cross = cross)</span>
+ ```
+<span class="ins">+</span>
+<span class="ins">+for `axis = 2`. The positional call is clearest when the axis is known in the</span>
+<span class="ins">+call. The axis function is clearest when `axis` is held in a variable.</span>
+<span class="hunk">@@</span>
+<span class="del">-out &lt;- rray_index(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(rows, columns)</span>
+<span class="del">-)</span>
+<span class="ins">+out &lt;- rray_index(x, rows, columns)</span>
+<span class="hunk">@@</span>
+<span class="del">-out &lt;- rray_index(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(rows, columns)</span>
+<span class="del">-)</span>
+<span class="ins">+out &lt;- rray_index(x, rows, columns)</span>
+<span class="hunk">@@</span>
+<span class="del">-rray_index(x, list(c(1L, 2L), c(1L, 2L, 3L)))</span>
+<span class="ins">+rray_index(x, c(1L, 2L), c(1L, 2L, 3L))</span>
+<span class="hunk">@@</span>
+ ### 6. Multiple selected axes with identities
+ 
+ Let `x` have dimensions `(A, B, C)` and select axes 1 and 3 with
+ `cross = FALSE`. Both supplied location arrays must have dimensionality three:
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+rray_index(x, row_locations, , depth_locations)</span>
+<span class="ins">+```</span>
+<span class="hunk">@@</span>
+<span class="del">-### 8. Empty location list</span>
+<span class="ins">+### 8. No location arguments</span>
+<span class="hunk">@@</span>
+ ```r
+<span class="del">-rray_index_assign(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(),</span>
+<span class="del">-  axes = NULL,</span>
+<span class="del">-  value,</span>
+<span class="del">-  cross = FALSE</span>
+<span class="del">-)</span>
+<span class="ins">+rray_index_assign(x, ..., value, cross = FALSE)</span>
+<span class="hunk">@@</span>
+<span class="del">-1. Normalize and validate `x`, `locations`, `axes`, and `cross`.</span>
+<span class="ins">+1. Normalize and validate `x`, `...`, and `cross`.</span>
+<span class="hunk">@@</span>
+ out &lt;- rray_index_assign(
+   x,
+<span class="del">-  locations = list(rows, columns),</span>
+<span class="ins">+  rows,</span>
+<span class="ins">+  columns,</span>
+   value = c(100, 200, 300)
+ )
+<span class="hunk">@@</span>
+ rray_index(
+   x,
+<span class="del">-  locations = list(</span>
+<span class="del">-    array(normalize(i), c(I, 1L, 1L)),</span>
+<span class="del">-    array(normalize(j), c(1L, J, 1L)),</span>
+<span class="del">-    array(normalize(k), c(1L, 1L, K))</span>
+<span class="del">-  )</span>
+<span class="ins">+  array(normalize(i), c(I, 1L, 1L)),</span>
+<span class="ins">+  array(normalize(j), c(1L, J, 1L)),</span>
+<span class="ins">+  array(normalize(k), c(1L, 1L, K))</span>
+ )
+<span class="hunk">@@</span>
+ rray_index_axis(
+   x,
+<span class="del">-  locations = normalize(i),</span>
+<span class="ins">+  normalize(i),</span>
+   axis = axis,
+   cross = TRUE
+ )
+<span class="hunk">@@</span>
+<span class="del">-rray_index(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(points[, 1], points[, 2])</span>
+<span class="del">-)</span>
+<span class="ins">+rray_index(x, points[, 1], points[, 2])</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Edit plans/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+ ### Validation
+ 
+<span class="del">-- `locations` must be a list for `rray_index()`.</span>
+ - Bare integer vectors and arrays work.
+ - Doubles, logicals, characters, factors, and other classed inputs error.
+<span class="del">-- Nonempty `locations` with `axes = NULL` requires one array per source axis.</span>
+<span class="del">-- Empty `locations` with `axes = NULL` selects no axes.</span>
+<span class="del">-- Explicit `axes` must have one entry per location array.</span>
+<span class="del">-- Axes must be valid, unique, and strictly increasing.</span>
+<span class="ins">+- Each supplied argument controls its positional source axis.</span>
+<span class="ins">+- Missing and omitted trailing arguments leave axes unspecified.</span>
+<span class="ins">+- No location arguments select no axes.</span>
+<span class="ins">+- More arguments than source axes error.</span>
+<span class="ins">+- Named arguments in `...` error.</span>
+ - `cross` must be one non-missing logical value.
+<span class="hunk">@@</span>
+ must equal:
+ 
+ ```r
+<span class="del">-rray_index(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations = list(locations),</span>
+<span class="del">-  axes = axis,</span>
+<span class="del">-  cross = cross</span>
+<span class="del">-)</span>
+<span class="ins">+rray_index(x, , locations, cross = cross)</span>
+ ```
+<span class="ins">+</span>
+<span class="ins">+for the representative case `axis = 2`. Repeat the property for every source</span>
+<span class="ins">+axis by constructing the corresponding positional call.</span>
+<span class="hunk">@@</span>
+<span class="del">-NumPy advanced indexing broadcasts multiple integer arrays and reads them</span>
+<span class="del">-pointwise. This supplies the core model for the location list accepted by:</span>
+<span class="ins">+NumPy advanced indexing broadcasts multiple integer arrays and reads them</span>
+<span class="ins">+pointwise. This supplies the core model for the location arguments accepted</span>
+<span class="ins">+by:</span>
+ 
+ ```r
+<span class="del">-rray_index(x, locations, axes, cross)</span>
+<span class="ins">+rray_index(x, ..., cross = FALSE)</span>
+ ```
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: rg -n 'locations = list|axes = NULL|locations, axes|location list|`axes`|locations must be a …</summary>
+<pre>$ rg -n 'locations = list|axes = NULL|locations, axes|location list|`axes`|locations must be a list|axes = axis|locations = normalize|locations = ' plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/slice.md:237:  locations = normalize(i),</pre></details>
+<details class="tool"><summary>Bash: rg -n 'rray_index\(' plans/index.md plans/slice.md &amp;&amp; rg -n 'rray_index_assign\(' plans/index…</summary>
+<pre>$ rg -n 'rray_index\(' plans/index.md plans/slice.md &amp;&amp; rg -n 'rray_index_assign\(' plans/index.md plans/slice.md &amp;&amp; rg -n 'dynamic splicing|rray_slice_axes|rray_index_axes|programmatic' plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/index.md:9:rray_index(x, ..., cross = FALSE)
+plans/index.md:36:| Location arrays | `rray_index()` | `rray_index_assign()` |
+plans/index.md:125:`rray_index(x, rows, , depths)` selects axes 1 and 3 and leaves axis 2
+plans/index.md:314:## `rray_index()`
+plans/index.md:317:rray_index(x, ..., cross = FALSE)
+plans/index.md:320:`rray_index()` implements the complete model above.
+plans/index.md:370:The axis function is exactly the one-location-array form of `rray_index()`:
+plans/index.md:379:rray_index(x, , locations, cross = cross)
+plans/index.md:403:out &lt;- rray_index(x, rows, columns)
+plans/index.md:429:out &lt;- rray_index(x, rows, columns)
+plans/index.md:442:rray_index(x, c(1L, 2L), c(1L, 2L, 3L))
+plans/index.md:569:rray_index(x, row_locations, , depth_locations)
+plans/index.md:610:rray_index(x)
+plans/index.md:730:rray_index(
+plans/index.md:792:rray_index(x, points[, 1], points[, 2])
+plans/index.md:811:  -&gt; rray_index() over every source axis
+plans/index.md:1086:rray_index(x, , locations, cross = cross)
+plans/index.md:1127:Implement `rray_index()` reads with integer locations, supplied-location
+plans/index.md:1168:| Advanced indexing | Multiple integer arrays broadcast and are read pointwise | Supplied arrays in `rray_index()` always broadcast and pair pointwise |
+plans/index.md:1169:| NEP 21 | Orthogonal and vectorized indexing should have explicit, separate contracts | `rray_slice()` owns Cartesian subscript selection and `rray_index()` owns paired location arrays |
+plans/index.md:1213:rray_index(x, ..., cross = FALSE)
+plans/index.md:1235:- `rray_index()` and `rray_index_axis()` accept strict location arrays and pair
+plans/index.md:1256:`rray_index()`. Base R does not expose arbitrary broadcast location dimensions
+plans/slice.md:36:arrays belong to `rray_index()` and `rray_index_axis()` in `plans/index.md`.
+plans/slice.md:45:| Used by | `rray_slice()`, `rray_slice_axis()` | `rray_index()`, `rray_index_axis()` |
+plans/slice.md:225:an error. Use `rray_index()` or `rray_index_axis()` for strict location arrays.
+plans/slice.md:458:  `rray_slice_by_lane()`: strict location arrays belong to `rray_index()` and
+plans/index.md:10:rray_index_assign(x, ..., value, cross = FALSE)
+plans/index.md:36:| Location arrays | `rray_index()` | `rray_index_assign()` |
+plans/index.md:644:rray_index_assign(x, ..., value, cross = FALSE)
+plans/index.md:687:out &lt;- rray_index_assign(
+plans/index.md:128:programmatic selection of several axes, it can be served by a separate
+plans/index.md:129:`rray_index_axes()` function without changing this contract.
+plans/slice.md:182:The dots should support dynamic splicing. This gives a programmatic API without
+plans/slice.md:183:adding `rray_slice_axes()`.
+plans/slice.md:454:- `pad()`: `rray_slice_axis()` handles late axes, and dynamic splicing handles
+plans/slice.md:455:  programmatic multi-axis slicing.</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Updating dynamic slicing plan and signatures</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '145,265p' plans/slice.md &amp;&amp; sed -n '435,470p' plans/slice.md &amp;&amp; sed -n '650,735p' pla…</summary>
+<pre>$ sed -n '145,265p' plans/slice.md &amp;&amp; sed -n '435,470p' plans/slice.md &amp;&amp; sed -n '650,735p' plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+- `rray_subset()` performed dimension-preserving orthogonal slicing.
+- `rray_extract()` performed the same orthogonal selection and then flattened
+  it.
+- `rray_yank()` used flat positions.
+- `rray_slice()` was only the one-axis convenience wrapper.
+
+The proposed API makes the common orthogonal operation `rray_slice()`.
+`rray_extract()` uses the shape of `i` to distinguish flat positions from
+coordinate points. `rray_slice_axis()` always accepts one ordinary subscript.
+Location arrays have explicit indexing entry points.
+
+## `rray_slice()`
+
+```r
+rray_slice(x, ...)
+rray_slice_assign(x, ..., value)
+```
+
+`value` follows `...`, so it must be supplied by name.
+
+Each element of `...` applies to the matching axis. A missing argument selects
+the whole axis. Unspecified trailing axes also select the whole axis.
+
+```r
+rray_slice(x, 1)
+# dimensions: c(1, 3, 4)
+
+rray_slice(x, , 1)
+# dimensions: c(2, 1, 4)
+
+rray_slice(x)
+# dimensions: c(2, 3, 4)
+```
+
+Trailing missing arguments have no effect. More subscripts than the
+dimensionality of `x` are an error.
+
+The dots should support dynamic splicing. This gives a programmatic API without
+adding `rray_slice_axes()`.
+
+```r
+indices &lt;- list(1:2, c(3, 1))
+rray_slice(x, !!!indices)
+```
+
+Subscripts in `...` must be unnamed. This keeps selection positional and leaves
+named axes available as a future extension.
+
+## `rray_slice_axis()`
+
+```r
+rray_slice_axis(x, i, axis)
+rray_slice_assign_axis(x, i, axis, value)
+```
+
+`rray_slice_axis()` has exactly the same subscript semantics as slicing one
+axis with `rray_slice()`. It uses one subscript for every lane and only changes
+the selected axis.
+
+```r
+x &lt;- matrix(
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80
+  ),
+  nrow = 2,
+  byrow = TRUE
+)
+
+rray_slice_axis(x, c(4, 1), axis = 2)
+#      [,1] [,2]
+# [1,]   40   10
+# [2,]   80   50
+```
+
+It replaces the need for a padding helper when the selected axis is late in a
+high-dimensional array.
+
+`i` is always an ordinary subscript. Its dimensions and class do not select a
+different behavior. A shaped object that is not a valid ordinary subscript is
+an error. Use `rray_index()` or `rray_index_axis()` for strict location arrays.
+
+## Connection to location indexing
+
+After `i` is normalized to a one-dimensional positive location vector,
+one-axis slicing has the same values and dimensions as crossed axis indexing:
+
+```r
+rray_slice_axis(x, i, axis)
+
+rray_index_axis(
+  x,
+  locations = normalize(i),
+  axis = axis,
+  cross = TRUE
+)
+```
+
+The source axes other than `axis` cross with the shared location vector.
+Slicing remains separate because it owns ordinary subscript normalization and
+selected-axis names.
+
+Identity-paired location arrays use `cross = FALSE`:
+
+```r
+locations &lt;- rray_locate_max(x, axis = 2L)
+rray_index_axis(x, locations, axis = 2L)
+```
+
+See `plans/index.md` for location broadcasting, identity coordinates, crossed
+axes, result dimensions, assignment, and the complete connections back to
+slicing and extraction.
+
+## Axis subscript rules
+
+`rray_slice()` and `rray_slice_axis()` use the same subscript rules as
+`vctrs::vec_as_location()`:
+
+- A missing argument selects every location.
+- `NULL`, `FALSE`, and `integer()` select no locations.
+- Positive integers select locations in the supplied order. Duplicates are
+
+For flat positions, the result dimension is the number of normalized
+locations. For points, it is `nrow(i)`. Names are dropped in both cases.
+`rray_extract_assign()` broadcasts `value` to this one-dimensional result.
+
+There is no separate `rray_filter()` function. A logical mask is already clear
+in `rray_extract()`, and a second name would not add a new addressing mode.
+
+## Functions not proposed
+
+Do not carry these parts of the original API forward:
+
+- `rray_subset()`: `rray_slice()` is the clearer name for its operation.
+- The original variadic `rray_extract(x, ...)`: flattening an orthogonal slice
+  is composition, not a new addressing mode. Use `rray_slice()` followed by
+  `rray_set_dimensions()` when it is genuinely needed. The proposed
+  `rray_extract(x, i)` has exactly one subscript, whose shape determines whether
+  it contains flat positions or coordinate points.
+- `rray_yank()`: `rray_extract()` is the clearer name for flat extraction.
+- `pad()`: `rray_slice_axis()` handles late axes, and dynamic splicing handles
+  programmatic multi-axis slicing.
+- `drop`: rray4 always returns arrays and never drops axes implicitly.
+- `rray_take()`, `rray_take_along_axis()`, `rray_slice_along_axis()`, and
+  `rray_slice_by_lane()`: strict location arrays belong to `rray_index()` and
+  `rray_index_axis()`.
+- `rray_filter()`: it would be an alias for logical flat extraction.
+
+Do not overload `rray_slice()` with point or flat modes based on the class or
+shape of one subscript. The function's output shape should be clear from its
+name and call structure.
+
+## Implementation design
+
+### Subscript normalization
+
+Add `src/subscript.c`, `src/subscript.h`, and
+produce missing output. Replacement promotes the left-hand type when needed,
+and repeated locations are assigned sequentially.
+
+Useful sources:
+
+- [Extract or Replace Parts of an Object](https://stat.ethz.ch/R-manual/R-patched/library/base/html/Extract.html)
+- [R source: `subset.c`](https://github.com/wch/r-source/blob/trunk/src/main/subset.c)
+- [R source: `subscript.c`](https://github.com/wch/r-source/blob/trunk/src/main/subscript.c)
+- [R source: `subassign.c`](https://github.com/wch/r-source/blob/trunk/src/main/subassign.c)
+
+The local R source confirms that point matrices are converted to flat
+column-major locations before ordinary vector extraction. Its array assignment
+loops also establish sequential last-write-wins behavior.
+
+### vctrs
+
+vctrs separates subscript normalization from slicing. `vec_as_location()`
+converts integer, logical, and character subscripts to positive locations. It
+uses strict logical sizes, inverts negative locations, removes zero, and offers
+an explicit missing policy. `vec_assign()` casts the right-hand side to the
+left-hand type and requires a scalar or target-sized value.
+
+Useful sources:
+
+- [`vec_as_location()`](https://vctrs.r-lib.org/reference/vec_as_location.html)
+- [`vec_slice()` and `vec_assign()`](https://vctrs.r-lib.org/reference/vec_slice.html)
+
+rray4 should use the same location language, but replace vector recycling with
+array broadcasting for assignment values.
+
+### NumPy
+
+NumPy distinguishes basic slicing, advanced integer or Boolean indexing, flat
+selection, `take()` along one axis, and `take_along_axis()` with indices that
+vary per lane. Basic integer indices drop an axis. Multiple advanced integer
+indices are broadcast and paired, rather than forming a Cartesian product.
+`ix_()` constructs an open mesh when a Cartesian product is wanted.
+
+Useful sources:</pre><p class="cut">45 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying dynamic splicing syntax and indexing</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/slice.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/slice.md</span>
+<span class="hunk">@@</span>
+ locations &lt;- array(c(2L, 1L), c(2L, 1L))
+ 
+<span class="del">-rray_index_axis(x, locations, axis = 2)</span>
+<span class="ins">+rray_index(x, , locations)</span>
+ # dimensions: c(2, 1)
+ # values: c(30, 60)
+<span class="hunk">@@</span>
+<span class="del">-The dots should support dynamic splicing. This gives a programmatic API without</span>
+<span class="del">-adding `rray_slice_axes()`.</span>
+<span class="ins">+The dots should support dynamic splicing for calls that already have one</span>
+<span class="ins">+subscript position per source axis.</span>
+<span class="hunk">@@</span>
+ Subscripts in `...` must be unnamed. This keeps selection positional and leaves
+<span class="del">-named axes available as a future extension.</span>
+<span class="ins">+named axes available as a future extension. Do not add `rray_slice_axes()` in</span>
+<span class="ins">+the first version. If explicit programmatic selection of several axes becomes</span>
+<span class="ins">+important, it can be added later without changing the positional API.</span>
+<span class="hunk">@@</span>
+ ```r
+ rray_slice_axis(x, i, axis)
+ 
+ rray_index_axis(
+   x,
+<span class="del">-  locations = normalize(i),</span>
+<span class="ins">+  normalize(i),</span>
+   axis = axis,
+   cross = TRUE
+ )
+ ```
+<span class="ins">+</span>
+<span class="ins">+When the axis is fixed in the call, the same relationship is visible directly</span>
+<span class="ins">+in the positional APIs:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+rray_slice(x, , i)</span>
+<span class="ins">+rray_index(x, , normalize(i), cross = TRUE)</span>
+<span class="ins">+```</span>
+<span class="hunk">@@</span>
+ ```r
+ locations &lt;- rray_locate_max(x, axis = 2L)
+<span class="del">-rray_index_axis(x, locations, axis = 2L)</span>
+<span class="ins">+rray_index(x, , locations)</span>
+ ```
+<span class="hunk">@@</span>
+<span class="del">-- `pad()`: `rray_slice_axis()` handles late axes, and dynamic splicing handles</span>
+<span class="del">-  programmatic multi-axis slicing.</span>
+<span class="ins">+- `pad()`: positional missing arguments handle fixed calls, and</span>
+<span class="ins">+  `rray_slice_axis()` handles an axis held in a variable.</span>
+<span class="hunk">@@</span>
+ Do not overload `rray_slice()` with point or flat modes based on the class or
+ shape of one subscript. The function's output shape should be clear from its
+ name and call structure.
+<span class="ins">+</span>
+<span class="ins">+Do not add `rray_slice_axes()` or `rray_index_axes()` in the first version.</span>
+<span class="ins">+Those names remain available if later use shows a need for explicit</span>
+<span class="ins">+programmatic selection of several axes.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: rg -n 'location(s)? list|list of location|list accepted|locations argument|locations` must|lo…</summary>
+<pre>$ rg -n 'location(s)? list|list of location|list accepted|locations argument|locations` must|locations,|axes argument|axes vector|explicit axes|axis selection|rray_index\([^\n]*list|locations =' plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/slice.md:661:a numeric or character matrix. Empty per-axis subscripts select all locations,
+plans/slice.md:682:uses strict logical sizes, inverts negative locations, removes zero, and offers
+plans/index.md:12:rray_index_axis(x, locations, axis, cross = FALSE)
+plans/index.md:13:rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+plans/index.md:194:For `rray_index_axis(x, locations, axis, cross = FALSE)`, `locations` must have
+plans/index.md:367:rray_index_axis(x, locations, axis, cross = FALSE)
+plans/index.md:373:rray_index_axis(x, locations, axis, cross = cross)
+plans/index.md:379:rray_index(x, , locations, cross = cross)
+plans/index.md:465:  locations,
+plans/index.md:491:  locations,
+plans/index.md:544:out &lt;- rray_index_axis(x, locations, axis = 2L)
+plans/index.md:569:rray_index(x, row_locations, , depth_locations)
+plans/index.md:599:rray_index_axis(x, locations, axis = 1L, cross = FALSE)
+plans/index.md:600:rray_index_axis(x, locations, axis = 1L, cross = TRUE)
+plans/index.md:646:rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+plans/index.md:711:After normalizing one subscript per source axis to positive locations, reshape
+plans/index.md:844:rray_index_axis(x, locations, axis = 2L)
+plans/index.md:856:  locations,
+plans/index.md:1080:rray_index_axis(x, locations, axis, cross = cross)
+plans/index.md:1086:rray_index(x, , locations, cross = cross)
+plans/index.md:1127:Implement `rray_index()` reads with integer locations, supplied-location
+plans/index.md:1128:broadcasting, both `cross` modes, result dimensions, names, missing locations,
+plans/index.md:1172:one-based locations, left-aligned broadcasting, stable output placement,
+plans/index.md:1182:rray_index_axis(x, locations, axis, cross = TRUE)
+plans/index.md:1195:rray_index_axis(x, locations, axis, cross = FALSE)
+plans/index.md:1203:rray_index_assign_axis(x, locations, axis, value, cross = FALSE)</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning removal of outdated index_axis functions</strong></p>
+<p><strong>Clarifying named arguments and updating examples</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '310,350p' plans/index.md &amp;&amp; sed -n '450,555p' plans/index.md &amp;&amp; sed -n '830,870p' pla…</summary>
+<pre>$ sed -n '310,350p' plans/index.md &amp;&amp; sed -n '450,555p' plans/index.md &amp;&amp; sed -n '830,870p' plans/index.md &amp;&amp; sed -n '975,1030p' plans/index.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+
+The flag still belongs in these calls so a program can forward one indexing
+choice without inspecting the supplied arguments first.
+
+## `rray_index()`
+
+```r
+rray_index(x, ..., cross = FALSE)
+```
+
+`rray_index()` implements the complete model above.
+
+### Argument rules
+
+- `x` must be an array or bare vector supported by rray.
+- Bare vectors normalize to one-dimensional arrays.
+- Every supplied argument in `...` must be a bare integer vector or array.
+- Arguments in `...` follow the positional selection rules above.
+- `cross` must be one non-missing logical value.
+- The resulting dimensionality must not exceed rray's supported maximum.
+
+The function returns the same storage type as `x`.
+
+### Missing locations
+
+If any selected coordinate at an output point is missing, that output value is
+missing. The storage-specific results are:
+
+| Type | Missing output |
+|---|---|
+| logical | `NA` |
+| integer | `NA_integer_` |
+| double | `NA_real_` |
+| complex | `NA_complex_` |
+| character | `NA_character_` |
+| raw | `as.raw(0)` |
+| list | `NULL` |
+
+With `cross = TRUE`, a missing point in `G` produces missing values across all
+combinations of the independent source axes. With `cross = FALSE`, it affects
+only the matching identity-paired output point.
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80
+  ),
+  nrow = 2,
+  byrow = TRUE
+)
+
+locations &lt;- rbind(
+  c(4L, 1L),
+  c(2L, 3L)
+)
+
+out &lt;- rray_index_axis(
+  x,
+  locations,
+  axis = 2L,
+  cross = FALSE
+)
+
+out
+#      [,1] [,2]
+# [1,]   40   10
+# [2,]   60   70
+```
+
+The row axis receives identity locations:
+
+```text
+out[row, column] = x[row, locations[row, column]]
+```
+
+Only the selected column dimension changes.
+
+### 4. Crossed single-axis indexing
+
+Using the same `locations` with `cross = TRUE` gives:
+
+```r
+out &lt;- rray_index_axis(
+  x,
+  locations,
+  axis = 2L,
+  cross = TRUE
+)
+
+dim(out)
+# [1] 2 2 2
+```
+
+The first output axis is the independent source row. The next two axes are the
+location dimensions:
+
+```text
+out[a, j, k] = x[a, locations[j, k]]
+```
+
+For `k = 1`:
+
+```r
+out[, , 1]
+#      [,1] [,2]
+# [1,]   40   20
+# [2,]   80   60
+```
+
+For `k = 2`:
+
+```r
+out[, , 2]
+#      [,1] [,2]
+# [1,]   10   30
+# [2,]   50   70
+```
+
+The location row `j` is unrelated to the source row `a`. Equal dimensions do
+not establish a connection. Only `cross = FALSE` supplies that identity
+connection.
+
+### 5. Identity broadcasting
+
+```r
+x &lt;- matrix(
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80,
+    90, 100, 110, 120
+  ),
+  nrow = 3,
+  byrow = TRUE
+)
+
+locations &lt;- matrix(c(4L, 1L), nrow = 1)
+
+out &lt;- rray_index_axis(x, locations, axis = 2L)
+```
+
+The one row of `locations` broadcasts across the identity row dimension:
+
+```r
+out
+#      [,1] [,2]
+# [1,]   40   10
+# [2,]   80   50
+# [3,]  120   90
+
+```text
+extract = full indexing with one-dimensional common locations
+```
+
+This is a semantic and testing relationship. It does not require extraction to
+allocate coordinate arrays internally.
+
+## Connection to location-producing functions
+
+Location-producing functions should return bare integer arrays shaped for
+`cross = FALSE` indexing.
+
+```r
+locations &lt;- rray_locate_max(x, axis = 2L)
+rray_index_axis(x, locations, axis = 2L)
+```
+
+If `x` has dimensions `(A, B, C)`, locating along axis 2 returns dimensions
+`(A, 1, C)`. Indexing those locations returns dimensions `(A, 1, C)` and one
+maximum per lane.
+
+Assignment through the same locations updates one position per lane:
+
+```r
+rray_index_assign_axis(
+  x,
+  locations,
+  axis = 2L,
+  value = 0
+)
+```
+
+If a lane has tied extrema, the locating function chooses according to its tie
+rule. Replacing every tied value uses a logical mask with
+`rray_extract_assign()` instead.
+
+## Implementation design
+
+### Location normalization
+
+Build location validation on the point-coordinate layer used by extraction,
+
+The index header declares internal entry points that the axis specialization
+can reuse. FFI declarations remain in `src/init.c`.
+
+Keep each `.c` file in top-down order. Include its declaration header last.
+Do not add comments to C or R source files.
+
+## Test plan</pre><p class="cut">48 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refactoring examples to positional arguments</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+ - Arguments in `...` follow the positional selection rules above.
+ - `cross` must be one non-missing logical value.
+ - The resulting dimensionality must not exceed rray's supported maximum.
+ 
+<span class="ins">+Because `cross` follows `...`, a nondefault value must be supplied by name.</span>
+<span class="ins">+The dots should support dynamic splicing. Spliced location arrays still map to</span>
+<span class="ins">+source axes by position.</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+locations &lt;- list(rows, columns)</span>
+<span class="ins">+rray_index(x, !!!locations)</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+ The function returns the same storage type as `x`.
+<span class="hunk">@@</span>
+<span class="del">-out &lt;- rray_index_axis(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations,</span>
+<span class="del">-  axis = 2L,</span>
+<span class="del">-  cross = FALSE</span>
+<span class="del">-)</span>
+<span class="ins">+out &lt;- rray_index(x, , locations, cross = FALSE)</span>
+<span class="hunk">@@</span>
+<span class="del">-out &lt;- rray_index_axis(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations,</span>
+<span class="del">-  axis = 2L,</span>
+<span class="del">-  cross = TRUE</span>
+<span class="del">-)</span>
+<span class="ins">+out &lt;- rray_index(x, , locations, cross = TRUE)</span>
+<span class="hunk">@@</span>
+<span class="del">-out &lt;- rray_index_axis(x, locations, axis = 2L)</span>
+<span class="ins">+out &lt;- rray_index(x, , locations)</span>
+<span class="hunk">@@</span>
+ Assignment follows the same indexing plan as reading:
+<span class="ins">+</span>
+<span class="ins">+`value` follows `...`, so it must be supplied by name. A nondefault `cross`</span>
+<span class="ins">+must also be supplied by name.</span>
+<span class="hunk">@@</span>
+ locations &lt;- rray_locate_max(x, axis = 2L)
+<span class="del">-rray_index_axis(x, locations, axis = 2L)</span>
+<span class="ins">+rray_index(x, , locations)</span>
+<span class="hunk">@@</span>
+<span class="del">-rray_index_assign_axis(</span>
+<span class="del">-  x,</span>
+<span class="del">-  locations,</span>
+<span class="del">-  axis = 2L,</span>
+<span class="del">-  value = 0</span>
+<span class="del">-)</span>
+<span class="ins">+rray_index_assign(x, , locations, value = 0)</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning dynamic splicing implementation</strong></p>
+</details>
+<p>The core rewrite is in place. I’m doing a consistency pass now, especially around missing positional arguments, assignment signatures, dynamic splicing, examples, tests, and the future-only status of <code>*_axes()</code> helpers.</p>
+
+<details class="tool"><summary>Bash: git diff -- plans/index.md plans/slice.md</summary>
+<pre>$ git diff -- plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+diff --git a/plans/index.md b/plans/index.md
+index 0906eda..19db5d6 100644
+--- a/plans/index.md
++++ b/plans/index.md
+@@ -6,22 +6,17 @@ Add one general location-indexing function and one single-axis convenience
+ function:
+ 
+ ```r
+-rray_index(x, locations = list(), axes = NULL, cross = FALSE)
+-rray_index_assign(
+-  x,
+-  locations = list(),
+-  axes = NULL,
+-  value,
+-  cross = FALSE
+-)
++rray_index(x, ..., cross = FALSE)
++rray_index_assign(x, ..., value, cross = FALSE)
+ 
+ rray_index_axis(x, locations, axis, cross = FALSE)
+ rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+ ```
+ 
+-Each supplied location array controls one source axis. Supplied location arrays
+-broadcast to common dimensions and are read pointwise. The `cross` argument
+-controls only the source axes that do not have a supplied location array:
++Each argument in `...` controls the matching source axis. A missing argument
++leaves that axis unspecified, as does omitting a trailing argument. Supplied
++location arrays broadcast to common dimensions and are read pointwise. The
++`cross` argument controls only the unspecified source axes:
+ 
+ - With `cross = FALSE`, unspecified axes receive implicit identity locations.
+   Their source positions pair with matching output positions.
+@@ -76,7 +71,7 @@ Let:
+ 
+ - `D` be the source dimensions.
+ - `n` be the dimensionality of `x`.
+-- `S` be the selected source axes named by `axes`.
++- `S` be the selected source axes with supplied arguments in `...`.
+ - `U` be the source axes not in `S`.
+ - `L[j]` be the location array for `S[j]`.
+ - `G` be the common dimensions of all supplied location arrays.
+@@ -93,7 +88,7 @@ broadcasting rules.
+ 
+ ### Location validation
+ 
+-Each element of `locations` must be a bare integer vector or array. Bare
++Each supplied argument in `...` must be a bare integer vector or array. Bare
+ vectors normalize to one-dimensional arrays. Factors and other classed integer
+ objects are errors.
+ 
+@@ -116,19 +111,22 @@ extraction.
+ 
+ ### Axis selection
+ 
+-`locations` is a list and `axes` identifies the source axis controlled by each
+-element.
++The position of each argument in `...` identifies its source axis.
+ 
+-- `axes` must have the same size as `locations`.
+-- Explicit axes must be valid, unique, and strictly increasing.
+-- With a nonempty `locations` and `axes = NULL`, there must be one location
+-  array per source axis. They map to all source axes in order.
+-- With `locations = list()` and `axes = NULL`, no source axes are selected.
+-  The result is `x`.
+-- Selecting only some source axes requires explicit `axes`.
++- A supplied argument selects its matching source axis.
++- A missing argument leaves its matching source axis unspecified.
++- Omitted trailing arguments leave all remaining source axes unspecified.
++- More arguments than the dimensionality of `x` are an error.
++- Arguments in `...` must be unnamed.
++- With no arguments in `...`, no source axes are selected and the result is
++  `x`.
+ 
+-Requiring increasing axes gives every call one canonical representation and
+-makes crossed result placement deterministic.
++This is the same positional call structure as `rray_slice()`. For example,
++`rray_index(x, rows, , depths)` selects axes 1 and 3 and leaves axis 2
++unspecified. `rray_index_axis()` remains the convenient form when the one
++selected axis is held in a variable. If a future use case needs explicit
++programmatic selection of several axes, it can be served by a separate
++`rray_index_axes()` function without changing this contract.
+ 
+ ## `cross = FALSE`
+ 
+@@ -311,12 +309,12 @@ When no source axis is selected, there is no supplied-location space to cross.
+ Both values return `x`.
+ 
+ The flag still belongs in these calls so a program can forward one indexing
+-choice without inspecting `axes` first.
++choice without inspecting the supplied arguments first.
+ 
+ ## `rray_index()`
+ 
+ ```r
+-rray_index(x, locations = list(), axes = NULL, cross = FALSE)
++rray_index(x, ..., cross = FALSE)
+ ```
+ 
+ `rray_index()` implements the complete model above.
+@@ -325,12 +323,20 @@ rray_index(x, locations = list(), axes = NULL, cross = FALSE)
+ 
+ - `x` must be an array or bare vector supported by rray.
+ - Bare vectors normalize to one-dimensional arrays.
+-- `locations` must be a list.
+-- Every location input must be a bare integer vector or array.
+-- `axes` follows the selection rules above.
++- Every supplied argument in `...` must be a bare integer vector or array.
++- Arguments in `...` follow the positional selection rules above.
+ - `cross` must be one non-missing logical value.
+ - The resulting dimensionality must not exceed rray's supported maximum.
+ 
++Because `cross` follows `...`, a nondefault value must be supplied by name.
++The dots should support dynamic splicing. Spliced location arrays still map to
++source axes by position.
++
++```r
++locations &lt;- list(rows, columns)
++rray_index(x, !!!locations)
++```
++
+ The function returns the same storage type as `x`.
+ 
+ ### Missing locations
+@@ -379,14 +385,12 @@ rray_index_axis(x, locations, axis, cross = cross)
+ is equivalent to:
+ 
+ ```r
+-rray_index(
+-  x,
+-  locations = list(locations),
+-  axes = axis,
+-  cross = cross
+-)
++rray_index(x, , locations, cross = cross)
+ ```
+ 
++for `axis = 2`. The positional call is clearest when the axis is known in the
++call. The axis function is clearest when `axis` is held in a variable.
++
+ It does not add another addressing mode or another set of validation rules.
+ Errors should use the `locations` and `axis` argument names from the public
+ axis call.
+@@ -405,10 +409,7 @@ x &lt;- matrix(1:12, nrow = 3)
+ rows &lt;- c(1L, 3L, 2L)
+ columns &lt;- c(4L, 1L, 3L)
+ 
+-out &lt;- rray_index(
+-  x,
+-  locations = list(rows, columns)
+-)
++out &lt;- rray_index(x, rows, columns)
+ 
+ out
+ # [1] 10 3 8
+@@ -434,10 +435,7 @@ axes to request a Cartesian product:
+ rows &lt;- array(c(3L, 1L), c(2L, 1L))
+ columns &lt;- array(c(4L, 2L, 1L), c(1L, 3L))
+ 
+-out &lt;- rray_index(
+-  x,
+-  locations = list(rows, columns)
+-)
++out &lt;- rray_index(x, rows, columns)
+ 
+ dim(out)
+ # [1] 2 3
+@@ -450,7 +448,7 @@ Ordinary vectors of lengths two and three do not silently form a Cartesian
+ product:
+ 
+ ```r
+-rray_index(x, list(c(1L, 2L), c(1L, 2L, 3L)))
++rray_index(x, c(1L, 2L), c(1L, 2L, 3L))
+ # Error: dimensions 2 and 3 cannot broadcast
+ ```
+ 
+@@ -471,12 +469,7 @@ locations &lt;- rbind(
+   c(2L, 3L)
+ )
+ 
+-out &lt;- rray_index_axis(
+-  x,
+-  locations,
+-  axis = 2L,
+-  cross = FALSE
+-)
++out &lt;- rray_index(x, , locations, cross = FALSE)
+ 
+ out
+ #      [,1] [,2]
+@@ -497,12 +490,7 @@ Only the selected column dimension changes.
+ Using the same `locations` with `cross = TRUE` gives:
+ 
+ ```r
+-out &lt;- rray_index_axis(
+-  x,</pre><p class="cut">272 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Updating calls to fixed positional indexing</strong></p>
+<p><strong>Planning dynamic splicing validation and argument normalization</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+<span class="del">-Assignment follows the same indexing plan as reading:</span>
+<span class="del">-</span>
+ `value` follows `...`, so it must be supplied by name. A nondefault `cross`
+ must also be supplied by name.
+<span class="ins">+</span>
+<span class="ins">+Assignment follows the same indexing plan as reading:</span>
+<span class="hunk">@@</span>
+ ## Implementation design
+ 
+<span class="ins">+### Positional argument capture</span>
+<span class="ins">+</span>
+<span class="ins">+The R wrapper must capture `...` without evaluating missing arguments away.</span>
+<span class="ins">+The captured representation has one entry per argument position and records</span>
+<span class="ins">+whether that position is supplied or missing.</span>
+<span class="ins">+</span>
+<span class="ins">+The wrapper must:</span>
+<span class="ins">+</span>
+<span class="ins">+- Expand dynamically spliced arguments in place.</span>
+<span class="ins">+- Reject named location arguments.</span>
+<span class="ins">+- Reject more argument positions than source axes.</span>
+<span class="ins">+- Distinguish a missing argument from a supplied `NULL`. A missing argument</span>
+<span class="ins">+  leaves an axis unspecified, while `NULL` is an invalid location array.</span>
+<span class="ins">+- Treat omitted trailing axes as unspecified without adding public arguments.</span>
+<span class="ins">+</span>
+<span class="ins">+The selected-axis mapping is derived only from these positions. No separate</span>
+<span class="ins">+axis vector enters the public or internal semantic model.</span>
+<span class="ins">+</span>
+ ### Location normalization
+<span class="hunk">@@</span>
+ - More arguments than source axes error.
+ - Named arguments in `...` error.
+<span class="ins">+- Dynamic splicing preserves positional axis mapping.</span>
+<span class="ins">+- Missing arguments and supplied `NULL` values remain distinct.</span>
+ - `cross` must be one non-missing logical value.
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Edit plans/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+<span class="del">-The selected-axis mapping is derived only from these positions. No separate</span>
+<span class="del">-axis vector enters the public or internal semantic model.</span>
+<span class="ins">+The selected-axis mapping is derived only from these positions. No separately</span>
+<span class="ins">+supplied axis vector enters the public or internal semantic model.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: awk '/^```/{n++} END {print FILENAME, n, (n % 2 == 0 ? &quot;balanced&quot; : &quot;unbalanced&quot;)}' plans/ind…</summary>
+<pre>$ awk '/^```/{n++} END {print FILENAME, n, (n % 2 == 0 ? &quot;balanced&quot; : &quot;unbalanced&quot;)}' plans/index.md plans/slice.md &amp;&amp; rg -n 'locations = list|axes = NULL|locations, axes|axes = axis|location list accepted|rray_index\(x, locations|rray_index_assign\([^\n]*locations' plans/index.md plans/slice.md &amp;&amp; git diff --check -- plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/slice.md 150 balanced
+plans/index.md:856:rray_index_assign(x, , locations, value = 0)</pre></details>
+<details class="tool"><summary>Bash: rg -n 'one array per source axis|all source axes in order|explicit axis|explicit `axis|select…</summary>
+<pre>$ rg -n 'one array per source axis|all source axes in order|explicit axis|explicit `axis|selecting only some|location list|empty location|same size as|strictly increasing|canonical representation|padding helper|without adding' plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/index.md:109:without adding addressing power. Those inputs already belong to slicing or
+plans/index.md:878:- Treat omitted trailing axes as unspecified without adding public arguments.
+plans/slice.md:222:It replaces the need for a padding helper when the selected axis is late in a</pre></details>
+<details class="tool"><summary>Bash: git diff --stat -- plans/index.md plans/slice.md &amp;&amp; git status --short &amp;&amp; git diff --check</summary>
+<pre>$ git diff --stat -- plans/index.md plans/slice.md &amp;&amp; git status --short &amp;&amp; git diff --check</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ plans/index.md | 193 ++++++++++++++++++++++++++++-----------------------------
+ plans/slice.md |  30 ++++++---
+ 2 files changed, 118 insertions(+), 105 deletions(-)
+ M plans/index.md
+ M plans/slice.md</pre></details>
+<details class="tool"><summary>Bash: sed -n '630,675p' plans/index.md &amp;&amp; sed -n '850,915p' plans/index.md &amp;&amp; sed -n '970,1015p' pl…</summary>
+<pre>$ sed -n '630,675p' plans/index.md &amp;&amp; sed -n '850,915p' plans/index.md &amp;&amp; sed -n '970,1015p' plans/index.md &amp;&amp; sed -n '1080,1110p' plans/index.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+- Unselected source axes keep their names and their relative order.
+- The inserted common location dimensions use names coalesced from the supplied
+  arrays.
+- Selected source axis names are dropped.
+
+When every source axis is selected, result names come only from the common
+supplied-location dimensions.
+
+Assignment always returns the original dimensions and names of `x` unchanged.
+
+## Assignment
+
+```r
+rray_index_assign(x, ..., value, cross = FALSE)
+
+rray_index_assign_axis(x, locations, axis, value, cross = FALSE)
+```
+
+`value` follows `...`, so it must be supplied by name. A nondefault `cross`
+must also be supplied by name.
+
+Assignment follows the same indexing plan as reading:
+
+1. Normalize and validate `x`, `...`, and `cross`.
+2. Compute the indexing result dimensions.
+3. Validate every location and reject missing values.
+4. Cast `value` losslessly to the type of `x`.
+5. Broadcast the cast value to the indexing result dimensions.
+6. Copy `x`.
+7. Write in column-major indexing-result order.
+
+The operation cannot change the type, size, dimensions, or names of `x`.
+Broadcasting can repeat dimensions of one but cannot recycle an arbitrary
+size.
+
+Repeated source locations use deterministic last-write-wins behavior. The
+final value visited in column-major result order wins.
+
+An error must occur before `x` is copied or any writes happen. Casting and
+broadcasting `value` before copying also handles `value` equal to `x`.
+
+`NULL` is not an array and cannot be an assignment value. To assign `NULL` into
+a list array, use a list array containing `NULL`.
+
+### Assignment with repeated points
+
+`(A, 1, C)`. Indexing those locations returns dimensions `(A, 1, C)` and one
+maximum per lane.
+
+Assignment through the same locations updates one position per lane:
+
+```r
+rray_index_assign(x, , locations, value = 0)
+```
+
+If a lane has tied extrema, the locating function chooses according to its tie
+rule. Replacing every tied value uses a logical mask with
+`rray_extract_assign()` instead.
+
+## Implementation design
+
+### Positional argument capture
+
+The R wrapper must capture `...` without evaluating missing arguments away.
+The captured representation has one entry per argument position and records
+whether that position is supplied or missing.
+
+The wrapper must:
+
+- Expand dynamically spliced arguments in place.
+- Reject named location arguments.
+- Reject more argument positions than source axes.
+- Distinguish a missing argument from a supplied `NULL`. A missing argument
+  leaves an axis unspecified, while `NULL` is an invalid location array.
+- Treat omitted trailing axes as unspecified without adding public arguments.
+
+The selected-axis mapping is derived only from these positions. No separately
+supplied axis vector enters the public or internal semantic model.
+
+### Location normalization
+
+Build location validation on the point-coordinate layer used by extraction,
+not on ordinary subscript normalization.
+
+The normalizer owns:
+
+- Bare integer vector and array validation.
+- One-based bounds checks against a specific source axis.
+- Missing detection.
+- Conversion to zero-based coordinate reads for the iterator.
+- Common dimension and broadcast-stride construction.
+- The conditional dimensionality rule for `cross = FALSE`.
+
+Do not send locations through ordinary subscript normalization. In particular,
+zero removal and negative complement have no meaning here.
+
+### Index plan
+
+Build one plan containing:
+
+- Source dimensions and column-major strides.
+- Selected and unselected source axes.
+- Normalized supplied location arrays.
+- Common supplied-location dimensions `G`.
+- Result dimensions.
+- Broadcast strides for every supplied location array.
+- A mapping from source axes to result axes.
+- Identity descriptors for unspecified axes when `cross = FALSE`.
+- Independent-axis descriptors when `cross = TRUE`.
+- Whether any supplied location is missing.
+
+The plan exposes one source offset for every result point. Read and assignment
+- Result dimensions and names across result allocation.
+- Cast assignment values across broadcasting and copying.
+
+Name the next function that receives each touched `r_obj*` and check whether
+that function allocates before it protects or consumes the value.
+
+### Files
+
+Add:
+
+- `R/index.R`
+- `src/index.c`
+- `src/index.h`
+- `src/decl/index-decl.h`
+- `R/index-axis.R`
+- `src/index-axis.c`
+- `src/index-axis.h`
+- `src/decl/index-axis-decl.h`
+- `tests/testthat/test-index.R`
+- `tests/testthat/test-index-axis.R`
+
+The index header declares internal entry points that the axis specialization
+can reuse. FFI declarations remain in `src/init.c`.
+
+Keep each `.c` file in top-down order. Include its declaration header last.
+Do not add comments to C or R source files.
+
+## Test plan
+
+### Validation
+
+- Bare integer vectors and arrays work.
+- Doubles, logicals, characters, factors, and other classed inputs error.
+- Each supplied argument controls its positional source axis.
+- Missing and omitted trailing arguments leave axes unspecified.
+- No location arguments select no axes.
+- More arguments than source axes error.
+- Named arguments in `...` error.
+- Dynamic splicing preserves positional axis mapping.
+- Missing arguments and supplied `NULL` values remain distinct.
+- `cross` must be one non-missing logical value.
+- Zero, negative, and out-of-bounds locations error.
+- Missing locations work for reads and error for assignment.
+- Validation still occurs for empty results.
+
+### Supplied-location broadcasting
+### Assignment
+
+- Lossless casts succeed and lossy casts fail.
+- Scalar and array broadcasting to indexing result dimensions.
+- Arbitrary recycling fails.
+- Repeated targets use last-write-wins order.
+- Missing targets fail before copying.
+- Empty targets validate and return a copy with unchanged contents.
+- `value` equal to `x` works.
+- Type, dimensions, and names of `x` are unchanged.
+- Reading selected targets agrees with assignment target order.
+
+### Axis equivalence
+
+For both values of `cross`:
+
+```r
+rray_index_axis(x, locations, axis, cross = cross)
+```
+
+must equal:
+
+```r
+rray_index(x, , locations, cross = cross)
+```
+
+for the representative case `axis = 2`. Repeat the property for every source
+axis by constructing the corresponding positional call.
+
+Compare values, dimensions, names, missing behavior, assignment results, and
+errors.</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining axis vector description</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/index.md (+1 more)</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/index.md</span>
+<span class="hunk">@@</span>
+<span class="del">-The selected-axis mapping is derived only from these positions. No separately</span>
+<span class="del">-supplied axis vector enters the public or internal semantic model.</span>
+<span class="ins">+The selected-axis mapping is derived only from these positions.</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/slice.md</span>
+<span class="hunk">@@</span>
+<span class="del">-Subscripts in `...` must be unnamed. This keeps selection positional and leaves</span>
+<span class="del">-named axes available as a future extension. Do not add `rray_slice_axes()` in</span>
+<span class="del">-the first version. If explicit programmatic selection of several axes becomes</span>
+<span class="del">-important, it can be added later without changing the positional API.</span>
+<span class="ins">+Subscripts in `...` must be unnamed because selection is positional. Do not add</span>
+<span class="ins">+`rray_slice_axes()` in the first version. If explicit programmatic selection</span>
+<span class="ins">+of several axes becomes important, it can be added later without changing the</span>
+<span class="ins">+positional API.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: rg -n 'axes = NULL|locations = list|locations, axes|rray_index\(x, locations|rray_index\([^\n…</summary>
+<pre>$ rg -n 'axes = NULL|locations = list|locations, axes|rray_index\(x, locations|rray_index\([^\n]*list\(|rray_index_assign\(x, locations|`axes` argument|axes vector' plans/index.md plans/slice.md || true
+for file in plans/index.md plans/slice.md; do count=$(rg -c '^```' &quot;$file&quot;); printf '%s %s\n' &quot;$file&quot; &quot;$count&quot;; done
+git diff --check -- plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/index.md 118
+plans/slice.md 32</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Refining index and slice plans</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/slice.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/slice.md</span>
+<span class="hunk">@@</span>
+ | Slice one axis | `rray_slice_axis(x, i, axis)` | `rray_slice_assign_axis(x, i, axis, value)` |
+ | Extract flat positions or points | `rray_extract(x, i)` | `rray_extract_assign(x, i, value)` |
+ 
+ The two slice rows should be implemented first. Extraction forms the second
+ layer.
+<span class="ins">+</span>
+<span class="ins">+The general slice and index forms intentionally share positional dots:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+rray_slice(x, ...)</span>
+<span class="ins">+rray_index(x, ..., cross = FALSE)</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+In both functions, each argument position maps to the matching source axis.</span>
+<span class="ins">+For slicing, a missing argument selects the whole axis. For indexing, it leaves</span>
+<span class="ins">+the axis unspecified, and `cross` controls how that axis joins the supplied</span>
+<span class="ins">+location arrays. The matching assignment functions use the same structure.</span>
+ 
+ Do not add replacement functions such as `rray_slice&lt;-()`. The `_assign()`
+ forms return a modified copy and match the rest of rray4's function API.
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: git diff --check -- plans/index.md plans/slice.md &amp;&amp; git diff --stat -- plans/index.md plans/…</summary>
+<pre>$ git diff --check -- plans/index.md plans/slice.md &amp;&amp; git diff --stat -- plans/index.md plans/slice.md &amp;&amp; rg -n 'axes = NULL|locations = list|locations, axes|rray_index\(x, locations|rray_index_assign\(x, locations' plans/index.md plans/slice.md || true</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ plans/index.md | 192 ++++++++++++++++++++++++++++-----------------------------
+ plans/slice.md |  44 ++++++++++---
+ 2 files changed, 130 insertions(+), 106 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: rg -n '^## Recommendation|^### Axis selection|^## `rray_index\(\)`|^### Positional argument c…</summary>
+<pre>$ rg -n '^## Recommendation|^### Axis selection|^## `rray_index\(\)`|^### Positional argument capture|^### Validation|general slice and index forms|Do not add `rray_slice_axes' plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/slice.md:3:## Recommendation
+plans/slice.md:26:The general slice and index forms intentionally share positional dots:
+plans/slice.md:488:Do not add `rray_slice_axes()` or `rray_index_axes()` in the first version.
+plans/index.md:3:## Recommendation
+plans/index.md:112:### Axis selection
+plans/index.md:314:## `rray_index()`
+plans/index.md:865:### Positional argument capture
+plans/index.md:998:### Validation</pre></details>
+<p>Rewrote both plans around <code>rray_index(x, ..., cross = FALSE)</code>:</p>
+<ul>
+<li>Location arguments now map to axes by position.</li>
+<li>Missing and omitted arguments mark unspecified axes.</li>
+<li>Removed the old <code>locations</code> list and <code>axes</code> argument throughout.</li>
+<li>Updated assignment signatures, examples, implementation notes, and tests.</li>
+<li>Kept singular <code>*_axis()</code> helpers.</li>
+<li>Reserved <code>rray_slice_axes()</code> and <code>rray_index_axes()</code> for possible future use.</li>
+<li>Added the shared positional model to the slice plan.</li>
+</ul>
+<p>Files: index.md and slice.md.</p>
+<p><code>git diff --check</code> passes. No tests were needed for plan-only changes.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll commit only the two updated plan files with a concise one-sentence message, then push the current branch to its configured upstream.</p>
+
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git branch --show-current &amp;&amp; git remote -v &amp;&amp; git diff --check</summary>
+<pre>$ git status --short &amp;&amp; git branch --show-current &amp;&amp; git remote -v &amp;&amp; git diff --check</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ M plans/index.md
+ M plans/slice.md
+feature/slice-plan
+origin	https://github.com/DavisVaughan/rray4.git (fetch)
+origin	https://github.com/DavisVaughan/rray4.git (push)</pre></details>
+<details class="tool"><summary>Bash: git add plans/index.md plans/slice.md</summary>
+<pre>$ git add plans/index.md plans/slice.md</pre><pre class="output">Script completed
+Wall time 5.8 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: git commit -m &quot;Adopt positional arguments in indexing plans&quot;</summary>
+<pre>$ git commit -m &quot;Adopt positional arguments in indexing plans&quot;</pre><pre class="output">Script completed
+Wall time 4.6 seconds
+Output:
+
+[feature/slice-plan cbab348] Adopt positional arguments in indexing plans
+ 2 files changed, 130 insertions(+), 106 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push</summary>
+<pre>$ git push</pre><pre class="output">Script completed
+Wall time 9.8 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   326d8aa..cbab348  feature/slice-plan -&gt; feature/slice-plan</pre></details>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git status --short &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+cbab348 Adopt positional arguments in indexing plans</pre></details>
+<p>Committed and pushed to <code>origin/feature/slice-plan</code>.</p>
+<p>Commit: <code>cbab348 Adopt positional arguments in indexing plans</code></p>
+<p>Working tree is clean.</p>
+
+</section>
+</main>
+</body>
+</html>

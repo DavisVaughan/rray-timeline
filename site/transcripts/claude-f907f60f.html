@@ -1,0 +1,1591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarking rray_combine() against rbind(), abind, and broadcast</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-76">rray timeline</a>
+<h1>Benchmarking <code>rray_combine()</code> against <code>rbind()</code>, abind, and broadcast</h1>
+<p class="facts">Claude · Sep 18, 2026 · 1 prompt · 6 replies · <a href="https://github.com/r-lib/rray/pull/76">#76</a></p>
+</header>
+<main>
+<p class="divider">Sep 18, 2026, 09:25 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Benchmark rray_combine against rbind, cbind, a bind::a bind, and broadcast:: bind_arrays</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll set up a benchmark comparing <code>rray_combine()</code> against the alternatives. Let me first check what <code>rray_combine()</code> looks like and what packages are available.</p>
+
+<details class="tool"><summary>Bash: ls R/ &amp;&amp; echo &quot;---&quot; &amp;&amp; cat R/combine.R 2&gt;/dev/null | head -100</summary>
+<pre>ls R/ &amp;&amp; echo &quot;---&quot; &amp;&amp; cat R/combine.R 2&gt;/dev/null | head -100</pre><pre class="output">arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+insert-axes.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rray4-package.R
+size.R
+split-names.R
+split.R
+zzz.R
+---
+#' Combine arrays along an existing axis
+#'
+#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+#' other axis are broadcast to common dimensions.
+#'
+#' @param ... Arrays to combine.
+#'
+#' @param .axis A single integer between 1 and the greatest input
+#'   dimensionality.
+#'
+#' @returns
+#' An array with the following dimensions:
+#' - Along `.axis`, the input dimensions are added together.
+#' - Along all other axes, the common dimensions are taken via broadcasting.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#' y &lt;- array(7:12, c(2, 3))
+#'
+#' rray_combine(x, y, .axis = 1)
+#' rray_combine(x, y, .axis = 2)
+#'
+#' # Missing trailing axes have an implicit dimension of 1
+#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+rray_combine &lt;- function(..., .axis) {
+  .Call(ffi_rray_combine, list2(...), .axis, environment())
+}</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'for (p in c(&quot;abind&quot;, &quot;broadcast&quot;, &quot;bench&quot;)) cat(p, requireNamespace(p, quietly = …</summary>
+<pre>Rscript -e 'for (p in c(&quot;abind&quot;, &quot;broadcast&quot;, &quot;bench&quot;)) cat(p, requireNamespace(p, quietly = TRUE), &quot;\n&quot;)'</pre><pre class="output">abind FALSE 
+broadcast TRUE 
+bench TRUE</pre></details>
+<p><code>abind</code> isn't installed. Let me install it and check <code>broadcast::bind_arrays()</code>.</p>
+
+<details class="tool"><summary>Bash: Rscript -e 'install.packages(&quot;abind&quot;, repos = &quot;https://cloud.r-project.org&quot;)' 2&gt;&amp;1 | tail -5</summary>
+<pre>Rscript -e 'install.packages(&quot;abind&quot;, repos = &quot;https://cloud.r-project.org&quot;)' 2&gt;&amp;1 | tail -5</pre><pre class="output">downloaded 63 KB
+
+
+The downloaded binary packages are in
+	/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T//RtmpySOms0/downloaded_packages</pre></details>
+<details class="tool tool-error"><summary>Bash: Rscript -e 'args(broadcast::bind_arrays); packageVersion(&quot;broadcast&quot;)'</summary>
+<pre>Rscript -e 'args(broadcast::bind_arrays); packageVersion(&quot;broadcast&quot;)'</pre><pre class="output">Exit code 1
+Error: 'bind_arrays' is not an exported object from 'namespace:broadcast'
+Execution halted</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'cat(grep(&quot;bind&quot;, getNamespaceExports(&quot;broadcast&quot;), value = TRUE), sep = &quot;\n&quot;); ca…</summary>
+<pre>Rscript -e 'cat(grep(&quot;bind&quot;, getNamespaceExports(&quot;broadcast&quot;), value = TRUE), sep = &quot;\n&quot;); cat(&quot;---\n&quot;); packageVersion(&quot;broadcast&quot;)'</pre><pre class="output">bind_array
+---
+[1] ‘0.1.9.6’</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'args(broadcast::bind_array)' &amp;&amp; Rscript -e 'args(abind::abind)'</summary>
+<pre>Rscript -e 'args(broadcast::bind_array)' &amp;&amp; Rscript -e 'args(abind::abind)'</pre><pre class="output">function (input, along, rev = FALSE, ndim2bc = 16L, name_along = TRUE, 
+    comnames_from = 1L) 
+NULL
+function (..., along = N, rev.along = NULL, new.names = NULL, 
+    force.array = TRUE, make.names = use.anon.names, use.anon.names = FALSE, 
+    use.first.dimnames = FALSE, hier.names = FALSE, use.dnns = FALSE) 
+NULL</pre></details>
+<details class="tool"><summary>Bash: ls -a ~/files/r/packages/rray4 &amp;&amp; echo &quot;--- .Rbuildignore ---&quot; &amp;&amp; cat .Rbuildignor…</summary>
+<pre>ls -a ~/files/r/packages/rray4 &amp;&amp; echo &quot;--- .Rbuildignore ---&quot; &amp;&amp; cat .Rbuildignore 2&gt;/dev/null</pre><pre class="output">_pkgdown.yml
+.
+..
+.cache
+.clang-format
+.claude
+.git
+.github
+.gitignore
+.Rbuildignore
+.vscode
+AGENTS.md
+air.toml
+bench
+CLAUDE.md
+compile_commands.json
+DESCRIPTION
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+plans
+R
+rray4.Rproj
+src
+tests
+--- .Rbuildignore ---
+^rray4\.Rproj$
+^\.Rproj\.user$
+^CLAUDE\.md$
+^LICENSE\.md$
+^compile_commands\.json$
+^\.cache$
+^[.]?air[.]toml$
+^plans$
+^_pkgdown\.yml$
+^\.clang-format$
+^\.vscode$
+\.clangd$
+^\.github$
+^\.claude$
+^bench$</pre></details>
+<details class="tool"><summary>Bash: ls bench &amp;&amp; echo &quot;===&quot; &amp;&amp; for f in bench/*; do echo &quot;--- $f ---&quot;; cat &quot;$f&quot;; done</summary>
+<pre>ls bench &amp;&amp; echo &quot;===&quot; &amp;&amp; for f in bench/*; do echo &quot;--- $f ---&quot;; cat &quot;$f&quot;; done</pre><pre class="output">broadcast.R
+extremum.R
+iterator.R
+matrix-stats.R
+mean.R
+reduce-logical.R
+stride-zero.R
+===
+--- bench/broadcast.R ---
+benchmark_library &lt;- Sys.getenv(&quot;RRAY_BENCH_LIBRARY&quot;, unset = NA_character_)
+
+if (!is.na(benchmark_library)) {
+  .libPaths(c(benchmark_library, .libPaths()))
+}
+
+devtools::load_all(quiet = TRUE)
+
+if (!requireNamespace(&quot;broadcast&quot;, quietly = TRUE)) {
+  stop(&quot;The broadcast package must be installed.&quot;, call. = FALSE)
+}
+
+iterations &lt;- 30L
+
+benchmark_pair &lt;- function(group, case, rray4, comparison, other) {
+  rray4()
+  other()
+  gc()
+
+  result &lt;- bench::mark(
+    rray4 = rray4(),
+    comparison = other(),
+    iterations = iterations,
+    check = TRUE,
+    memory = TRUE
+  )
+
+  data.frame(
+    group = group,
+    case = case,
+    implementation = c(&quot;rray4&quot;, comparison),
+    median_ms = as.numeric(result$median) * 1000,
+    mem_alloc_mb = as.numeric(result$mem_alloc) / 1024^2,
+    relative_time = as.numeric(result$median) / min(as.numeric(result$median)),
+    row.names = NULL
+  )
+}
+
+bind_results &lt;- function(...) {
+  do.call(rbind, list(...))
+}
+
+n &lt;- 1e6L
+x &lt;- array(seq(1, 2, length.out = n), c(1000L, 1000L))
+y &lt;- array(seq(2, 3, length.out = n), c(1000L, 1000L))
+scalar &lt;- array(2, c(1L, 1L))
+row &lt;- array(seq(2, 3, length.out = 1000L), c(1L, 1000L))
+column &lt;- array(seq(2, 3, length.out = 1000L), c(1000L, 1L))
+alternating_x &lt;- array(
+  seq(1, 2, length.out = 1000L),
+  c(1L, 10L, 1L, 10L, 1L, 10L)
+)
+alternating_y &lt;- array(
+  seq(2, 3, length.out = 1000L),
+  c(10L, 1L, 10L, 1L, 10L, 1L)
+)
+
+addition &lt;- bind_results(
+  benchmark_pair(
+    &quot;add&quot;,
+    &quot;same shape&quot;,
+    \() rray_add(x, y),
+    &quot;broadcast&quot;,
+    \() broadcast::bc.d(x, y, &quot;+&quot;)
+  ),
+  benchmark_pair(
+    &quot;add&quot;,
+    &quot;scalar&quot;,
+    \() rray_add(x, scalar),
+    &quot;broadcast&quot;,
+    \() broadcast::bc.d(x, scalar, &quot;+&quot;)
+  ),
+  benchmark_pair(
+    &quot;add&quot;,
+    &quot;row&quot;,
+    \() rray_add(x, row),
+    &quot;broadcast&quot;,
+    \() broadcast::bc.d(x, row, &quot;+&quot;)
+  ),
+  benchmark_pair(
+    &quot;add&quot;,
+    &quot;column&quot;,
+    \() rray_add(x, column),
+    &quot;broadcast&quot;,
+    \() broadcast::bc.d(x, column, &quot;+&quot;)
+  ),
+  benchmark_pair(
+    &quot;add&quot;,
+    &quot;alternating 6d&quot;,
+    \() rray_add(alternating_x, alternating_y),
+    &quot;broadcast&quot;,
+    \() broadcast::bc.d(alternating_x, alternating_y, &quot;+&quot;)
+  )
+)
+
+broadcasting &lt;- bind_results(
+  benchmark_pair(
+    &quot;broadcast&quot;,
+    &quot;scalar to matrix&quot;,
+    \() rray_broadcast(scalar, c(1000L, 1000L)),
+    &quot;broadcast&quot;,
+    \() broadcast::rep_dim(scalar, c(1000L, 1000L))
+  ),
+  benchmark_pair(
+    &quot;broadcast&quot;,
+    &quot;row to matrix&quot;,
+    \() rray_broadcast(row, c(1000L, 1000L)),
+    &quot;broadcast&quot;,
+    \() broadcast::rep_dim(row, c(1000L, 1000L))
+  ),
+  benchmark_pair(
+    &quot;broadcast&quot;,
+    &quot;column to matrix&quot;,
+    \() rray_broadcast(column, c(1000L, 1000L)),
+    &quot;broadcast&quot;,
+    \() broadcast::rep_dim(column, c(1000L, 1000L))
+  ),
+  benchmark_pair(
+    &quot;broadcast&quot;,
+    &quot;alternating 6d&quot;,
+    \() rray_broadcast(alternating_x, rep(10L, 6L)),
+    &quot;broadcast&quot;,
+    \() broadcast::rep_dim(alternating_x, rep(10L, 6L))
+  )
+)
+
+high_dimensional &lt;- array(seq(1, 2, length.out = n), rep(10L, 6L))
+
+reductions &lt;- bind_results(
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;matrix axis 1&quot;,
+    \() rray_sum_along(x, 1L),
+    &quot;base&quot;,
+    \() array(colSums(x), c(1L, 1000L))
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;matrix axis 2&quot;,
+    \() rray_sum_along(x, 2L),
+    &quot;base&quot;,
+    \() array(rowSums(x), c(1000L, 1L))
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;matrix both axes&quot;,
+    \() rray_sum_along(x, c(1L, 2L)),
+    &quot;base&quot;,
+    \() array(sum(x), c(1L, 1L))
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;6d odd axes&quot;,
+    \() rray_sum_along(high_dimensional, c(1L, 3L, 5L)),
+    &quot;base&quot;,
+    \() {
+      array(
+        apply(high_dimensional, c(2L, 4L, 6L), sum),
+        c(1L, 10L, 1L, 10L, 1L, 10L)
+      )
+    }
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;6d even axes&quot;,
+    \() rray_sum_along(high_dimensional, c(2L, 4L, 6L)),
+    &quot;base&quot;,
+    \() {
+      array(
+        apply(high_dimensional, c(1L, 3L, 5L), sum),
+        c(10L, 1L, 10L, 1L, 10L, 1L)
+      )
+    }
+  )
+)
+
+results &lt;- bind_results(addition, broadcasting, reductions)
+results$median_ms &lt;- round(results$median_ms, 3L)
+results$mem_alloc_mb &lt;- round(results$mem_alloc_mb, 3L)
+results$relative_time &lt;- round(results$relative_time, 2L)
+
+print(results, row.names = FALSE)
+cat(&quot;\nR:&quot;, as.character(getRversion()), &quot;\n&quot;)
+cat(&quot;rray4:&quot;, as.character(utils::packageVersion(&quot;rray4&quot;)), &quot;\n&quot;)
+cat(&quot;broadcast:&quot;, as.character(utils::packageVersion(&quot;broadcast&quot;)), &quot;\n&quot;)
+cat(&quot;platform:&quot;, R.version$platform, &quot;\n&quot;)
+--- bench/extremum.R ---
+devtools::load_all(quiet = TRUE)
+
+size &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_SIZE&quot;, &quot;1000000&quot;))
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;15&quot;))</pre><p class="cut">1,151 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat bench/mean.R</summary>
+<pre>cat bench/mean.R</pre><pre class="output">devtools::load_all(quiet = TRUE)
+
+size &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_SIZE&quot;, &quot;1000000&quot;))
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;15&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+side &lt;- as.integer(sqrt(size))
+if (side * side != size) {
+  stop(&quot;`RRAY_BENCH_SIZE` must be a perfect square.&quot;, call. = FALSE)
+}
+
+dimensions &lt;- c(side, side)
+
+cases &lt;- expand.grid(
+  implementation = c(&quot;mean&quot;, &quot;sum&quot;, &quot;base&quot;),
+  na_rm = c(FALSE, TRUE),
+  missing = c(&quot;none&quot;, &quot;sparse&quot;),
+  axes = c(&quot;axis1&quot;, &quot;axis2&quot;, &quot;both&quot;),
+  stringsAsFactors = FALSE
+)
+
+add_missing &lt;- function(x, missing) {
+  if (missing == &quot;none&quot;) {
+    return(x)
+  }
+
+  x[seq.int(1L, length(x), by = 101L)] &lt;- NA
+  x
+}
+
+make_input &lt;- function(missing) {
+  x &lt;- as.double(seq_len(size)) / 7
+  x &lt;- add_missing(x, missing)
+  array(x, dimensions)
+}
+
+base_fn &lt;- function(axes) {
+  switch(
+    axes,
+    axis1 = colMeans,
+    axis2 = rowMeans,
+    both = function(x, na.rm) mean(x, na.rm = na.rm)
+  )
+}
+
+results &lt;- vector(&quot;list&quot;, nrow(cases))
+
+for (i in seq_len(nrow(cases))) {
+  case &lt;- cases[i, ]
+  x &lt;- make_input(case$missing)
+  axes &lt;- switch(case$axes, axis1 = 1L, axis2 = 2L, both = c(1L, 2L))
+  base &lt;- base_fn(case$axes)
+
+  measurement &lt;- switch(
+    case$implementation,
+    mean = bench::mark(
+      rray_mean_along(x, axes, na_rm = case$na_rm),
+      iterations = iterations,
+      check = FALSE,
+      memory = FALSE,
+      filter_gc = FALSE
+    ),
+    sum = bench::mark(
+      rray_sum_along(x, axes, na_rm = case$na_rm),
+      iterations = iterations,
+      check = FALSE,
+      memory = FALSE,
+      filter_gc = FALSE
+    ),
+    base = bench::mark(
+      base(x, na.rm = case$na_rm),
+      iterations = iterations,
+      check = FALSE,
+      memory = FALSE,
+      filter_gc = FALSE
+    )
+  )
+
+  results[[i]] &lt;- cbind(
+    case,
+    median_ns = as.numeric(measurement$median) * 1e9,
+    itr_per_sec = as.numeric(measurement$`itr/sec`)
+  )
+}
+
+results &lt;- do.call(rbind, results)
+row.names(results) &lt;- NULL
+
+print(results, row.names = FALSE)
+
+if (nzchar(output)) {
+  saveRDS(
+    list(
+      results = results,
+      size = size,
+      iterations = iterations,
+      revision = system2(&quot;git&quot;, c(&quot;rev-parse&quot;, &quot;HEAD&quot;), stdout = TRUE)
+    ),
+    output
+  )
+}</pre></details>
+<details class="tool"><summary>Bash: tail -60 bench/broadcast.R</summary>
+<pre>tail -60 bench/broadcast.R</pre><pre class="output">high_dimensional &lt;- array(seq(1, 2, length.out = n), rep(10L, 6L))
+
+reductions &lt;- bind_results(
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;matrix axis 1&quot;,
+    \() rray_sum_along(x, 1L),
+    &quot;base&quot;,
+    \() array(colSums(x), c(1L, 1000L))
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;matrix axis 2&quot;,
+    \() rray_sum_along(x, 2L),
+    &quot;base&quot;,
+    \() array(rowSums(x), c(1000L, 1L))
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;matrix both axes&quot;,
+    \() rray_sum_along(x, c(1L, 2L)),
+    &quot;base&quot;,
+    \() array(sum(x), c(1L, 1L))
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;6d odd axes&quot;,
+    \() rray_sum_along(high_dimensional, c(1L, 3L, 5L)),
+    &quot;base&quot;,
+    \() {
+      array(
+        apply(high_dimensional, c(2L, 4L, 6L), sum),
+        c(1L, 10L, 1L, 10L, 1L, 10L)
+      )
+    }
+  ),
+  benchmark_pair(
+    &quot;sum&quot;,
+    &quot;6d even axes&quot;,
+    \() rray_sum_along(high_dimensional, c(2L, 4L, 6L)),
+    &quot;base&quot;,
+    \() {
+      array(
+        apply(high_dimensional, c(1L, 3L, 5L), sum),
+        c(10L, 1L, 10L, 1L, 10L, 1L)
+      )
+    }
+  )
+)
+
+results &lt;- bind_results(addition, broadcasting, reductions)
+results$median_ms &lt;- round(results$median_ms, 3L)
+results$mem_alloc_mb &lt;- round(results$mem_alloc_mb, 3L)
+results$relative_time &lt;- round(results$relative_time, 2L)
+
+print(results, row.names = FALSE)
+cat(&quot;\nR:&quot;, as.character(getRversion()), &quot;\n&quot;)
+cat(&quot;rray4:&quot;, as.character(utils::packageVersion(&quot;rray4&quot;)), &quot;\n&quot;)
+cat(&quot;broadcast:&quot;, as.character(utils::packageVersion(&quot;broadcast&quot;)), &quot;\n&quot;)
+cat(&quot;platform:&quot;, R.version$platform, &quot;\n&quot;)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1:6, c(2, 3)); y &lt;- array(7:12, c(2, 3))
+print(identical(rray_combine(x, y, .axis = 1), rbind(x, y)))
+print(rray_combine(x, y, .axis = 1))
+print(abind::abind(x, y, along = 1))
+print(broadcast::bind_array(list(x, y), 1L))
+print(identical(rray_combine(x, y, .axis = 2), cbind(x, y)))
+a &lt;- array(1:24, c(2,3,4)); b &lt;- array(25:48, c(2,3,4))
+print(dim(rray_combine(a, b, .axis = 3)))
+print(identical(as.vector(rray_combine(a,b,.axis=3)), as.vector(abind::abind(a,b,along=3))))
+print(identical(as.vector(rray_combine(a,b,.axis=3)), as.vector(broadcast::bind_array(list(a,b), 3L))))
+' 2&gt;&amp;1 | tail -40</pre><pre class="output">[1] TRUE
+     [,1] [,2] [,3]
+[1,]    1    3    5
+[2,]    2    4    6
+[3,]    7    9   11
+[4,]    8   10   12
+     [,1] [,2] [,3]
+[1,]    1    3    5
+[2,]    2    4    6
+[3,]    7    9   11
+[4,]    8   10   12
+     [,1] [,2] [,3]
+[1,]    1    3    5
+[2,]    2    4    6
+[3,]    7    9   11
+[4,]    8   10   12
+[1] TRUE
+[1] 2 3 8
+[1] TRUE
+[1] TRUE</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1:6, c(2, 3)); y &lt;- array(7:8, c(2, 1))
+r &lt;- rray_combine(x, y, .axis = 1)
+print(r)
+print(broadcast::bind_array(list(x, y), 1L))
+print(dim(rray_combine(x, y, .axis = 1)))
+' 2&gt;&amp;1 | tail -20</pre><pre class="output">     [,1] [,2] [,3]
+[1,]    1    3    5
+[2,]    2    4    6
+[3,]    7    7    7
+[4,]    8    8    8
+     [,1] [,2] [,3]
+[1,]    1    3    5
+[2,]    2    4    6
+[3,]    7    7    7
+[4,]    8    8    8
+[1] 4 3</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_combine&quot; R/ src/*.c src/*.h --include=* | grep -v &quot;^src/combine.c:[0-9]*: \*&quot; …</summary>
+<pre>grep -rn &quot;rray_combine&quot; R/ src/*.c src/*.h --include=* | grep -v &quot;^src/combine.c:[0-9]*: \*&quot; | head -30</pre><pre class="output">(eval):1: no matches found: --include=*</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_combine&quot; R/ src/ --include=&quot;*.R&quot; --include=&quot;*.c&quot; --include=&quot;*.h&quot; | head -30</summary>
+<pre>grep -rn &quot;rray_combine&quot; R/ src/ --include=&quot;*.R&quot; --include=&quot;*.c&quot; --include=&quot;*.h&quot; | head -30</pre><pre class="output">src/combine.h:8:r_obj* rray_combine(
+R/combine.R:3:#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+R/combine.R:21:#' rray_combine(x, y, .axis = 1)
+R/combine.R:22:#' rray_combine(x, y, .axis = 2)
+R/combine.R:25:#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+R/combine.R:26:rray_combine &lt;- function(..., .axis) {
+R/combine.R:27:  .Call(ffi_rray_combine, list2(...), .axis, environment())
+src/init.c:70:extern r_obj* ffi_rray_combine(
+src/init.c:212:  {&quot;ffi_rray_combine&quot;, (DL_FUNC) &amp;ffi_rray_combine, 3},
+src/combine.c:18:r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+src/combine.c:21:  return rray_combine(
+src/combine.c:31:r_obj* rray_combine(
+src/combine.c:133:    rray_combine_fill(x, out, out_start, &amp;plan);
+src/combine.c:140:    KEEP(rray_combine_names(xs, out_dimensions, axis, axis_dimension));
+src/combine.c:150:static r_obj* rray_combine_names(
+src/combine.c:160:  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis, axis_dimension));
+src/combine.c:174:static r_obj* rray_combine_axis_names(r_obj* xs, int axis, int axis_dimension) {
+src/combine.c:216:static void rray_combine_fill(
+src/combine.c:224:    rray_combine_fill_lgl(x, out, out_start, plan);
+src/combine.c:227:    rray_combine_fill_int(x, out, out_start, plan);
+src/combine.c:230:    rray_combine_fill_dbl(x, out, out_start, plan);
+src/combine.c:233:    rray_combine_fill_cpl(x, out, out_start, plan);
+src/combine.c:236:    rray_combine_fill_raw(x, out, out_start, plan);
+src/combine.c:239:    rray_combine_fill_chr(x, out, out_start, plan);
+src/combine.c:242:    rray_combine_fill_list(x, out, out_start, plan);
+src/combine.c:314:static void rray_combine_fill_lgl(
+src/combine.c:323:static void rray_combine_fill_int(
+src/combine.c:332:static void rray_combine_fill_dbl(
+src/combine.c:341:static void rray_combine_fill_cpl(
+src/combine.c:350:static void rray_combine_fill_raw(</pre></details>
+<p>Now let me write the benchmark.</p>
+
+<details class="tool"><summary>Write bench/combine.R</summary>
+<pre>benchmark_library &lt;- Sys.getenv(&quot;RRAY_BENCH_LIBRARY&quot;, unset = NA_character_)
+
+if (!is.na(benchmark_library)) {
+  .libPaths(c(benchmark_library, .libPaths()))
+}
+
+devtools::load_all(quiet = TRUE)
+
+if (!requireNamespace(&quot;abind&quot;, quietly = TRUE)) {
+  stop(&quot;The abind package must be installed.&quot;, call. = FALSE)
+}
+if (!requireNamespace(&quot;broadcast&quot;, quietly = TRUE)) {
+  stop(&quot;The broadcast package must be installed.&quot;, call. = FALSE)
+}
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))
+
+equivalent &lt;- function(x, y) {
+  identical(dim(x), dim(y)) &amp;&amp; identical(as.vector(x), as.vector(y))
+}
+
+benchmark_case &lt;- function(group, case, implementations) {
+  for (implementation in implementations) {
+    implementation()
+  }
+  gc()
+
+  result &lt;- bench::mark(
+    exprs = lapply(implementations, \(implementation) quote(implementation())),
+    iterations = iterations,
+    check = FALSE,
+    memory = TRUE,
+    filter_gc = FALSE,
+    env = environment()
+  )
+
+  median &lt;- as.numeric(result$median)
+
+  data.frame(
+    group = group,
+    case = case,
+    implementation = names(implementations),
+    median_ms = median * 1000,
+    mem_alloc_mb = as.numeric(result$mem_alloc) / 1024^2,
+    relative_time = median / min(median),
+    row.names = NULL
+  )
+}
+
+bind_results &lt;- function(...) {
+  do.call(rbind, list(...))
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/bench/combine.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write bench/combine.R</summary>
+<pre>benchmark_library &lt;- Sys.getenv(&quot;RRAY_BENCH_LIBRARY&quot;, unset = NA_character_)
+
+if (!is.na(benchmark_library)) {
+  .libPaths(c(benchmark_library, .libPaths()))
+}
+
+devtools::load_all(quiet = TRUE)
+
+if (!requireNamespace(&quot;abind&quot;, quietly = TRUE)) {
+  stop(&quot;The abind package must be installed.&quot;, call. = FALSE)
+}
+if (!requireNamespace(&quot;broadcast&quot;, quietly = TRUE)) {
+  stop(&quot;The broadcast package must be installed.&quot;, call. = FALSE)
+}
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))
+
+equivalent &lt;- function(x, y) {
+  identical(dim(x), dim(y)) &amp;&amp; identical(as.vector(x), as.vector(y))
+}
+
+benchmark_case &lt;- function(group, case, implementations) {
+  expected &lt;- implementations[[1L]]()
+
+  for (name in names(implementations)) {
+    if (!equivalent(expected, implementations[[name]]())) {
+      stop(
+        sprintf(&quot;`%s` disagrees for case `%s / %s`.&quot;, name, group, case),
+        call. = FALSE
+      )
+    }
+  }
+
+  gc()
+
+  results &lt;- lapply(implementations, function(implementation) {
+    bench::mark(
+      implementation(),
+      iterations = iterations,
+      check = FALSE,
+      memory = TRUE,
+      filter_gc = FALSE
+    )
+  })
+
+  median &lt;- vapply(results, \(result) as.numeric(result$median), double(1L))
+  memory &lt;- vapply(results, \(result) as.numeric(result$mem_alloc), double(1L))
+
+  data.frame(
+    group = group,
+    case = case,
+    implementation = names(implementations),
+    median_ms = median * 1000,
+    mem_alloc_mb = memory / 1024^2,
+    relative_time = median / min(median),
+    row.names = NULL
+  )
+}
+
+bind_results &lt;- function(...) {
+  do.call(rbind, list(...))
+}
+
+combine_list &lt;- function(xs, axis) {
+  do.call(rray_combine, c(xs, list(.axis = axis)))
+}
+
+abind_list &lt;- function(xs, axis) {
+  do.call(abind::abind, c(xs, list(along = axis)))
+}
+
+n &lt;- 1e6L
+x &lt;- array(seq(1, 2, length.out = n), c(1000L, 1000L))
+y &lt;- array(seq(2, 3, length.out = n), c(1000L, 1000L))
+
+pair &lt;- bind_results(
+  benchmark_case(
+    &quot;pair&quot;,
+    &quot;matrix axis 1&quot;,
+    list(
+      rray4 = \() rray_combine(x, y, .axis = 1L),
+      base = \() rbind(x, y),
+      abind = \() abind::abind(x, y, along = 1L),
+      broadcast = \() broadcast::bind_array(list(x, y), 1L)
+    )
+  ),
+  benchmark_case(
+    &quot;pair&quot;,
+    &quot;matrix axis 2&quot;,
+    list(
+      rray4 = \() rray_combine(x, y, .axis = 2L),
+      base = \() cbind(x, y),
+      abind = \() abind::abind(x, y, along = 2L),
+      broadcast = \() broadcast::bind_array(list(x, y), 2L)
+    )
+  )
+)
+
+cube_x &lt;- array(seq(1, 2, length.out = n), c(100L, 100L, 100L))
+cube_y &lt;- array(seq(2, 3, length.out = n), c(100L, 100L, 100L))
+
+cube &lt;- bind_results(
+  benchmark_case(
+    &quot;3d&quot;,
+    &quot;axis 1&quot;,
+    list(
+      rray4 = \() rray_combine(cube_x, cube_y, .axis = 1L),
+      abind = \() abind::abind(cube_x, cube_y, along = 1L),
+      broadcast = \() broadcast::bind_array(list(cube_x, cube_y), 1L)
+    )
+  ),
+  benchmark_case(
+    &quot;3d&quot;,
+    &quot;axis 2&quot;,
+    list(
+      rray4 = \() rray_combine(cube_x, cube_y, .axis = 2L),
+      abind = \() abind::abind(cube_x, cube_y, along = 2L),
+      broadcast = \() broadcast::bind_array(list(cube_x, cube_y), 2L)
+    )
+  ),
+  benchmark_case(
+    &quot;3d&quot;,
+    &quot;axis 3&quot;,
+    list(
+      rray4 = \() rray_combine(cube_x, cube_y, .axis = 3L),
+      abind = \() abind::abind(cube_x, cube_y, along = 3L),
+      broadcast = \() broadcast::bind_array(list(cube_x, cube_y), 3L)
+    )
+  )
+)
+
+high_x &lt;- array(seq(1, 2, length.out = n), rep(10L, 6L))
+high_y &lt;- array(seq(2, 3, length.out = n), rep(10L, 6L))
+
+high_dimensional &lt;- bind_results(
+  benchmark_case(
+    &quot;6d&quot;,
+    &quot;axis 1&quot;,
+    list(
+      rray4 = \() rray_combine(high_x, high_y, .axis = 1L),
+      abind = \() abind::abind(high_x, high_y, along = 1L),
+      broadcast = \() broadcast::bind_array(list(high_x, high_y), 1L)
+    )
+  ),
+  benchmark_case(
+    &quot;6d&quot;,
+    &quot;axis 6&quot;,
+    list(
+      rray4 = \() rray_combine(high_x, high_y, .axis = 6L),
+      abind = \() abind::abind(high_x, high_y, along = 6L),
+      broadcast = \() broadcast::bind_array(list(high_x, high_y), 6L)
+    )
+  )
+)
+
+chunks &lt;- lapply(
+  seq_len(100L),
+  \(i) array(seq(i, i + 1, length.out = 1e4L), c(100L, 100L))
+)
+tiny &lt;- lapply(seq_len(100L), \(i) array(as.double(i), c(1L, 1L)))
+
+many &lt;- bind_results(
+  benchmark_case(
+    &quot;many&quot;,
+    &quot;100 matrices axis 1&quot;,
+    list(
+      rray4 = \() combine_list(chunks, 1L),
+      base = \() do.call(rbind, chunks),
+      abind = \() abind_list(chunks, 1L),
+      broadcast = \() broadcast::bind_array(chunks, 1L)
+    )
+  ),
+  benchmark_case(
+    &quot;many&quot;,
+    &quot;100 matrices axis 2&quot;,
+    list(
+      rray4 = \() combine_list(chunks, 2L),
+      base = \() do.call(cbind, chunks),
+      abind = \() abind_list(chunks, 2L),
+      broadcast = \() broadcast::bind_array(chunks, 2L)
+    )
+  ),
+  benchmark_case(
+    &quot;many&quot;,
+    &quot;100 scalars axis 1&quot;,
+    list(
+      rray4 = \() combine_list(tiny, 1L),
+      base = \() do.call(rbind, tiny),
+      abind = \() abind_list(tiny, 1L),
+      broadcast = \() broadcast::bind_array(tiny, 1L)
+    )
+  )
+)
+
+row &lt;- array(seq(2, 3, length.out = 1000L), c(1L, 1000L))
+column &lt;- array(seq(2, 3, length.out = 1000L), c(1000L, 1L))
+
+broadcasting &lt;- bind_results(
+  benchmark_case(
+    &quot;broadcast&quot;,</pre><p class="cut">56 more lines cut</p><pre class="output">The file ~/files/r/packages/rray4/bench/combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format bench/combine.R &amp;&amp; Rscript bench/combine.R 2&gt;&amp;1 | tail -60</summary>
+<pre>air format bench/combine.R &amp;&amp; Rscript bench/combine.R 2&gt;&amp;1 | tail -60</pre><pre class="output">      many       100 scalars axis 1          abind     0.673        0.077
+      many       100 scalars axis 1      broadcast     0.458        0.017
+ broadcast matrix and column axis 1          rray4     1.641       15.259
+ broadcast matrix and column axis 1      broadcast     1.575       15.266
+ broadcast    matrix and row axis 2          rray4     1.311       15.259
+ broadcast    matrix and row axis 2      broadcast     1.218       15.266
+     named            matrix axis 1          rray4     1.582       15.274
+     named            matrix axis 1           base     3.377       15.279
+     named            matrix axis 1          abind    23.124       61.064
+     named            matrix axis 1      broadcast     1.807       15.289
+ relative_time
+          1.01
+          2.03
+         10.41
+          1.00
+          1.05
+          1.00
+          3.86
+          1.13
+          1.08
+          9.32
+          1.00
+          1.00
+         14.86
+          1.06
+          1.03
+          3.56
+          1.00
+          1.06
+         11.97
+          1.00
+          1.00
+          3.38
+          1.09
+          1.00
+          1.41
+         11.22
+          1.24
+          1.16
+          1.00
+          6.30
+          1.12
+          5.17
+          1.00
+         53.43
+         36.39
+          1.04
+          1.00
+          1.08
+          1.00
+          1.00
+          2.13
+         14.61
+          1.14
+
+R: 4.6.0 
+rray4: 0.0.0.9000 
+abind: 1.4.8 
+broadcast: 0.1.9.6 
+platform: aarch64-apple-darwin23</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -i '' 's/^iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))$/iterations…</summary>
+<pre>sed -i '' 's/^iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))$/iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))\n\noptions(width = 120L)/' bench/combine.R &amp;&amp; sed -n '15,22p' bench/combine.R</pre><pre class="output">Blocked: this is a sed in-place edit. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Edit bench/combine.R</summary>
+<pre class="diff"><span class="del">-iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))</span>
+<span class="ins">+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;30&quot;))</span>
+<span class="ins">+</span>
+<span class="ins">+options(width = 120L)</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format bench/combine.R &amp;&amp; Rscript bench/combine.R 2&gt;&amp;1</summary>
+<pre>air format bench/combine.R &amp;&amp; Rscript bench/combine.R 2&gt;&amp;1</pre><pre class="output">     group                     case implementation median_ms mem_alloc_mb relative_time
+      pair            matrix axis 1          rray4     1.665       15.259          1.00
+      pair            matrix axis 1           base     3.361       15.264          2.02
+      pair            matrix axis 1          abind    17.711       61.079         10.64
+      pair            matrix axis 1      broadcast     1.809       15.266          1.09
+      pair            matrix axis 2          rray4     1.335       15.259          1.08
+      pair            matrix axis 2           base     1.279       15.264          1.03
+      pair            matrix axis 2          abind     4.229       30.561          3.41
+      pair            matrix axis 2      broadcast     1.239       15.266          1.00
+        3d                   axis 1          rray4     2.173       15.259          1.00
+        3d                   axis 1          abind    19.334       61.045          8.90
+        3d                   axis 1      broadcast     2.182       15.266          1.00
+        3d                   axis 2          rray4     1.344       15.259          1.05
+        3d                   axis 2          abind    17.149       61.045         13.37
+        3d                   axis 2      broadcast     1.282       15.266          1.00
+        3d                   axis 3          rray4     1.177       15.259          1.00
+        3d                   axis 3          abind     4.415       30.527          3.75
+        3d                   axis 3      broadcast     1.286       15.266          1.09
+        6d                   axis 1          rray4     1.807       15.259          1.11
+        6d                   axis 1          abind    18.281       61.041         11.19
+        6d                   axis 1      broadcast     1.633       15.266          1.00
+        6d                   axis 6          rray4     1.241       15.259          1.00
+        6d                   axis 6          abind     4.073       30.523          3.28
+        6d                   axis 6      broadcast     1.428       15.266          1.15
+      many      100 matrices axis 1          rray4     0.882        7.633          1.00
+      many      100 matrices axis 1           base     1.415        7.635          1.61
+      many      100 matrices axis 1          abind    11.044       34.505         12.52
+      many      100 matrices axis 1      broadcast     1.148        7.645          1.30
+      many      100 matrices axis 2          rray4     0.727        7.633          1.16
+      many      100 matrices axis 2           base     0.629        7.635          1.00
+      many      100 matrices axis 2          abind     4.195       19.231          6.67
+      many      100 matrices axis 2      broadcast     0.975        7.645          1.55
+      many       100 scalars axis 1          rray4     0.065        0.004          5.29
+      many       100 scalars axis 1           base     0.012        0.006          1.00
+      many       100 scalars axis 1          abind     0.678        0.077         55.05
+      many       100 scalars axis 1      broadcast     0.459        0.017         37.23
+ broadcast matrix and column axis 1          rray4     1.517       15.259          1.00
+ broadcast matrix and column axis 1      broadcast     1.548       15.266          1.02
+ broadcast    matrix and row axis 2          rray4     1.363       15.259          1.10
+ broadcast    matrix and row axis 2      broadcast     1.244       15.266          1.00
+     named            matrix axis 1          rray4     1.729       15.274          1.00
+     named            matrix axis 1           base     3.452       15.279          2.00
+     named            matrix axis 1          abind    23.481       61.064         13.58
+     named            matrix axis 1      broadcast     1.826       15.289          1.06
+
+R: 4.6.0 
+rray4: 0.0.0.9000 
+abind: 1.4.8 
+broadcast: 0.1.9.6 
+platform: aarch64-apple-darwin23</pre></details>
+<p>Results are in. Let me dig into the one case where <code>rray_combine()</code> lags.</p>
+
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+options(width = 120)
+devtools::load_all(quiet = TRUE)
+for (k in c(1L, 2L, 10L, 100L, 1000L)) {
+  tiny &lt;- lapply(seq_len(k), \(i) array(as.double(i), c(1L, 1L)))
+  b &lt;- bench::mark(
+    rray4 = do.call(rray_combine, c(tiny, list(.axis = 1L))),
+    base = do.call(rbind, tiny),
+    check = FALSE, iterations = 200, memory = FALSE, filter_gc = FALSE
+  )
+  cat(sprintf(&quot;n=%4d  rray4=%8.1fus  base=%8.1fus\n&quot;, k,
+              as.numeric(b$median[1]) * 1e6, as.numeric(b$median[2]) * 1e6))
+}
+' 2&gt;&amp;1 | tail -10</pre><pre class="output">n=   1  rray4=     4.0us  base=     1.3us
+n=   2  rray4=     3.9us  base=     1.4us
+n=  10  rray4=     7.6us  base=     2.6us
+n= 100  rray4=    78.9us  base=    13.2us
+n=1000  rray4=  4091.7us  base=   120.0us</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,150p' src/combine.c</summary>
+<pre>sed -n '1,150p' src/combine.c</pre><pre class="output">#include &quot;combine.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;axes.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast-common.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;ptype-common.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/combine-decl.h&quot;
+
+r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+  return rray_combine(
+    ffi_xs,
+    axis,
+    r_null,
+    rray_args.empty,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+) {
+  if (r_length(xs) == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+
+  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  const int out_dimensionality = list_max_dimensionality(xs, arg, error_call);
+  check_max_dimensionality(out_dimensionality);
+
+  check_axis(axis, out_dimensionality, rray_args.dot_axis, error_call);
+
+  r_obj* out_dimensions =
+    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+
+  int axis_dimension = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+    r_obj* x_dimensions = r_dim(x);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? r_int_get(x_dimensions, axis - 1) : 1;
+
+    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;The combined dimension on `.axis` is too large.&quot;
+      );
+    }
+
+    axis_dimension += x_axis_dimension;
+  }
+
+  v_out_dimensions[axis - 1] = axis_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    out_dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    out_dimensionality,
+    v_out_strides
+  );
+
+  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_memcpy(
+    v_x_broadcast_dimensions,
+    v_out_dimensions,
+    sizeof(int) * out_dimensionality
+  );
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+
+  r_ssize axis_offset = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+    r_obj* x_dimensions = r_dim(x);
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+
+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+
+    rray_fill_broadcast_strides_from_dimensions(
+      v_x_dimensions,
+      x_dimensionality,
+      out_dimensionality,
+      v_x_strides
+    );
+
+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+      v_x_broadcast_dimensions,
+      out_dimensionality,
+      v_out_strides,
+      v_x_strides
+    );
+
+    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+    rray_combine_fill(x, out, out_start, &amp;plan);
+    axis_offset += x_axis_dimension;
+  }
+
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names =
+    KEEP(rray_combine_names(xs, out_dimensions, axis, axis_dimension));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_combine_names(</pre></details>
+<details class="tool"><summary>Bash: sed -n '150,220p' src/combine.c</summary>
+<pre>sed -n '150,220p' src/combine.c</pre><pre class="output">static r_obj* rray_combine_names(
+  r_obj* xs,
+  r_obj* dimensions,
+  int axis,
+  int axis_dimension
+) {
+  r_obj* out = rray_broadcast_names_common_opts(xs, dimensions, &amp;axis, 1);
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis, axis_dimension));
+
+  if (axis_names != r_null) {
+    if (out == r_null) {
+      out = r_alloc_list(r_length(dimensions));
+      KEEP_AT(out, out_loc);
+    }
+    r_list_poke(out, axis - 1, axis_names);
+  }
+
+  FREE(2);
+  return out;
+}
+
+static r_obj* rray_combine_axis_names(r_obj* xs, int axis, int axis_dimension) {
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* out = r_null;
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  r_ssize out_i = 0;
+
+  for (r_ssize i = 0; i &lt; n; ++i) {
+    r_obj* x = v_xs[i];
+    r_obj* dimensions = r_dim(x);
+    const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+    const int dimension =
+      (axis &lt;= dimensionality) ? r_int_get(dimensions, axis - 1) : 1;
+
+    r_obj* names = r_dim_names(x);
+    r_obj* axis_names = (names != r_null &amp;&amp; axis &lt;= dimensionality)
+      ? r_list_get(names, axis - 1)
+      : r_null;
+
+    if (axis_names != r_null) {
+      if (out == r_null) {
+        out = r_alloc_character(axis_dimension);
+        KEEP_AT(out, out_loc);
+      }
+
+      r_obj* const* v_axis_names = r_chr_cbegin(axis_names);
+
+      for (int j = 0; j &lt; dimension; ++j) {
+        r_chr_poke(out, out_i + j, v_axis_names[j]);
+      }
+    }
+
+    out_i += dimension;
+  }
+
+  FREE(1);
+  return out;
+}
+
+static void rray_combine_fill(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+options(width = 120)
+devtools::load_all(quiet = TRUE)
+cat(grep(&quot;common|broadcast&quot;, getNamespaceExports(&quot;rray4&quot;), value = TRUE), sep = &quot;\n&quot;)
+'</pre><pre class="output">rray_broadcast
+rray_dimensions_common
+rray_broadcast_common</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+options(width = 120)
+devtools::load_all(quiet = TRUE)
+for (k in c(100L, 1000L)) {
+  tiny &lt;- lapply(seq_len(k), \(i) array(as.double(i), c(1L, 1L)))
+  b &lt;- bench::mark(
+    combine = do.call(rray_combine, c(tiny, list(.axis = 1L))),
+    dims_common = do.call(rray_dimensions_common, tiny),
+    bc_common = do.call(rray_broadcast_common, tiny),
+    list2 = do.call(list, tiny),
+    check = FALSE, iterations = 100, memory = FALSE, filter_gc = FALSE
+  )
+  cat(sprintf(&quot;n=%d\n&quot;, k))
+  print(data.frame(expr = as.character(b$expression), us = round(as.numeric(b$median) * 1e6, 1)))
+}
+' 2&gt;&amp;1 | tail -20</pre><pre class="output">n=100
+         expr   us
+1     combine 91.7
+2 dims_common 67.2
+3   bc_common 66.0
+4       list2  3.7
+n=1000
+         expr     us
+1     combine 4106.0
+2 dims_common 3983.0
+3   bc_common 4024.0
+4       list2   26.4</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;rray_dimensions_common_opts&quot; -A 80 src/dimensions.c | head -110</summary>
+<pre>grep -n &quot;rray_dimensions_common_opts&quot; -A 80 src/dimensions.c | head -110</pre><pre class="output">149:  return rray_dimensions_common_opts(xs, NULL, 0, arg, error_call);
+150-}
+151-
+152:r_obj* rray_dimensions_common_opts(
+153-  r_obj* xs,
+154-  const int* v_ignore,
+155-  r_ssize ignore_size,
+156-  struct rray_arg* arg,
+157-  struct r_lazy error_call
+158-) {
+159-  const r_ssize n = r_length(xs);
+160-
+161-  if (n == 0) {
+162-    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+163-  }
+164-
+165-  r_obj* const* v_xs = r_list_cbegin(xs);
+166-  r_obj* xs_names = KEEP(r_names(xs));
+167-
+168-  r_ssize x_i = 0;
+169-  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;x_i);
+170-  KEEP(x_arg-&gt;shelter);
+171-
+172-  r_ssize out_i = 0;
+173-  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, n, &amp;out_i);
+174-  KEEP(out_arg-&gt;shelter);
+175-
+176-  int out_dimensionality = 1;
+177-
+178-  // Stack allocated array of known max size that we accumulate the common
+179-  // dimensions in. Initialized to 1, which works very nicely with broadcasting.
+180-  int v_out_dimensions[RRAY_MAX_DIMENSIONALITY];
+181-
+182-  // Index of the input that set each axis of `v_out_dimensions`, always
+183-  // populated by the time that axis can conflict
+184-  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+185-
+186-  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+187-    v_out_dimensions[i] = 1;
+188-    v_out_args[i] = 0;
+189-  }
+190-
+191-  bool v_ignored[RRAY_MAX_DIMENSIONALITY];
+192-  r_memset(v_ignored, 0, sizeof(bool) * RRAY_MAX_DIMENSIONALITY);
+193-
+194-  for (r_ssize i = 0; i &lt; ignore_size; ++i) {
+195-    v_ignored[v_ignore[i] - 1] = true;
+196-  }
+197-
+198-  for (; x_i &lt; n; ++x_i) {
+199-    r_obj* x = v_xs[x_i];
+200-
+201-    r_obj* x_dimensions = KEEP(rray_dimensions(x, x_arg, error_call));
+202-    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+203-    const int x_dimensionality =
+204-      rray_dimensionality_from_dimensions(x_dimensions);
+205-    check_max_dimensionality(x_dimensionality);
+206-
+207-    // Update `v_out_dimensions` and `out_dimensionality` in place
+208-    // with common dimensions
+209-    rray_dimensions_merge(
+210-      v_out_dimensions,
+211-      v_out_args,
+212-      v_ignored,
+213-      &amp;out_dimensionality,
+214-      &amp;out_i,
+215-      v_x_dimensions,
+216-      x_dimensionality,
+217-      x_i,
+218-      out_arg,
+219-      x_arg,
+220-      error_call
+221-    );
+222-
+223-    FREE(1);
+224-  }
+225-
+226-  r_obj* out = KEEP(r_alloc_integer(out_dimensionality));
+227-  int* v_out = r_int_begin(out);
+228-  r_memcpy(v_out, v_out_dimensions, sizeof(int) * out_dimensionality);
+229-
+230-  FREE(4);
+231-  return out;
+232-}</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+options(width = 120)
+devtools::load_all(quiet = TRUE)
+print(rray_dimensions_common)
+f &lt;- function(...) rlang::list2(...)
+g &lt;- function(...) environment()
+for (k in c(100L, 1000L)) {
+  tiny &lt;- lapply(seq_len(k), \(i) array(as.double(i), c(1L, 1L)))
+  b &lt;- bench::mark(
+    dims_common = do.call(rray_dimensions_common, tiny),
+    list2 = do.call(f, tiny),
+    env = do.call(g, tiny),
+    check = FALSE, iterations = 100, memory = FALSE, filter_gc = FALSE
+  )
+  cat(sprintf(&quot;n=%d\n&quot;, k))
+  print(data.frame(expr = as.character(b$expression), us = round(as.numeric(b$median) * 1e6, 1)))
+}
+' 2&gt;&amp;1 | tail -20</pre><pre class="output">function(..., .dimensions = NULL) {
+  .Call(ffi_rray_dimensions_common, list2(...), .dimensions, environment())
+}
+&lt;environment: namespace:rray4&gt;
+n=100
+         expr   us
+1 dims_common 75.5
+2       list2 62.2
+n=1000
+         expr     us
+1 dims_common 4004.0
+2       list2 3958.1</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+options(width = 120)
+library(rlang)
+base_dots &lt;- function(...) list(...)
+rlang_dots &lt;- function(...) list2(...)
+for (k in c(100L, 1000L, 2000L)) {
+  tiny &lt;- lapply(seq_len(k), \(i) array(as.double(i), c(1L, 1L)))
+  b &lt;- bench::mark(
+    base = do.call(base_dots, tiny),
+    rlang = do.call(rlang_dots, tiny),
+    check = FALSE, iterations = 50, memory = FALSE, filter_gc = FALSE
+  )
+  cat(sprintf(&quot;n=%5d  list=%8.1fus  list2=%8.1fus\n&quot;, k,
+              as.numeric(b$median[1]) * 1e6, as.numeric(b$median[2]) * 1e6))
+}
+cat(&quot;rlang:&quot;, as.character(packageVersion(&quot;rlang&quot;)), &quot;\n&quot;)
+' 2&gt;&amp;1 | tail -10</pre><pre class="output">Warning message:
+package ‘rlang’ was built under R version 4.6.1 
+n=  100  list=     7.6us  list2=    55.7us
+n= 1000  list=    80.2us  list2=  3980.8us
+n= 2000  list=   156.9us  list2= 34056.1us
+rlang: 1.3.0</pre></details>
+<p>Found the cause of the one bad case. Let me add a larger input-count case to the benchmark so it stays visible.</p>
+
+<details class="tool"><summary>Edit bench/combine.R</summary>
+<pre class="diff"><span class="del">-tiny &lt;- lapply(seq_len(100L), \(i) array(as.double(i), c(1L, 1L)))</span>
+<span class="ins">+tiny &lt;- lapply(seq_len(100L), \(i) array(as.double(i), c(1L, 1L)))</span>
+<span class="ins">+tinier &lt;- lapply(seq_len(1000L), \(i) array(as.double(i), c(1L, 1L)))</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit bench/combine.R</summary>
+<pre class="diff"><span class="del">-      broadcast = \() broadcast::bind_array(tiny, 1L)</span>
+<span class="del">-    )</span>
+<span class="del">-  )</span>
+<span class="del">-)</span>
+<span class="ins">+      broadcast = \() broadcast::bind_array(tiny, 1L)</span>
+<span class="ins">+    )</span>
+<span class="ins">+  ),</span>
+<span class="ins">+  benchmark_case(</span>
+<span class="ins">+    &quot;many&quot;,</span>
+<span class="ins">+    &quot;1000 scalars axis 1&quot;,</span>
+<span class="ins">+    list(</span>
+<span class="ins">+      rray4 = \() combine_list(tinier, 1L),</span>
+<span class="ins">+      base = \() do.call(rbind, tinier),</span>
+<span class="ins">+      abind = \() abind_list(tinier, 1L),</span>
+<span class="ins">+      broadcast = \() broadcast::bind_array(tinier, 1L)</span>
+<span class="ins">+    )</span>
+<span class="ins">+  )</span>
+<span class="ins">+)</span></pre><pre class="output">The file ~/files/r/packages/rray4/bench/combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format bench/combine.R &amp;&amp; Rscript bench/combine.R 2&gt;&amp;1</summary>
+<pre>air format bench/combine.R &amp;&amp; Rscript bench/combine.R 2&gt;&amp;1</pre><pre class="output">     group                     case implementation median_ms mem_alloc_mb relative_time
+      pair            matrix axis 1          rray4     1.578       15.259          1.00
+      pair            matrix axis 1           base     3.299       15.264          2.09
+      pair            matrix axis 1          abind    18.059       61.079         11.45
+      pair            matrix axis 1      broadcast     1.808       15.266          1.15
+      pair            matrix axis 2          rray4     1.233       15.259          1.03
+      pair            matrix axis 2           base     1.198       15.264          1.00
+      pair            matrix axis 2          abind     4.182       30.561          3.49
+      pair            matrix axis 2      broadcast     1.217       15.266          1.02
+        3d                   axis 1          rray4     2.170       15.259          1.05
+        3d                   axis 1          abind    19.571       61.045          9.50
+        3d                   axis 1      broadcast     2.060       15.266          1.00
+        3d                   axis 2          rray4     1.292       15.259          1.00
+        3d                   axis 2          abind    17.233       61.045         13.34
+        3d                   axis 2      broadcast     1.312       15.266          1.02
+        3d                   axis 3          rray4     1.334       15.259          1.01
+        3d                   axis 3          abind     4.483       30.527          3.41
+        3d                   axis 3      broadcast     1.316       15.266          1.00
+        6d                   axis 1          rray4     1.746       15.259          1.13
+        6d                   axis 1          abind    18.648       61.041         12.02
+        6d                   axis 1      broadcast     1.552       15.266          1.00
+        6d                   axis 6          rray4     1.333       15.259          1.00
+        6d                   axis 6          abind     4.457       30.523          3.34
+        6d                   axis 6      broadcast     1.438       15.266          1.08
+      many      100 matrices axis 1          rray4     0.915        7.633          1.00
+      many      100 matrices axis 1           base     1.419        7.635          1.55
+      many      100 matrices axis 1          abind    10.756       34.505         11.75
+      many      100 matrices axis 1      broadcast     1.185        7.645          1.29
+      many      100 matrices axis 2          rray4     0.716        7.633          1.16
+      many      100 matrices axis 2           base     0.615        7.635          1.00
+      many      100 matrices axis 2          abind     3.994       19.231          6.49
+      many      100 matrices axis 2      broadcast     0.937        7.645          1.52
+      many       100 scalars axis 1          rray4     0.066        0.004          5.14
+      many       100 scalars axis 1           base     0.013        0.006          1.00
+      many       100 scalars axis 1          abind     0.674        0.077         52.36
+      many       100 scalars axis 1      broadcast     0.460        0.017         35.77
+      many      1000 scalars axis 1          rray4     4.098        0.038         30.53
+      many      1000 scalars axis 1           base     0.134        0.013          1.00
+      many      1000 scalars axis 1          abind     7.427        4.156         55.35
+      many      1000 scalars axis 1      broadcast     4.083        0.110         30.43
+ broadcast matrix and column axis 1          rray4     1.656       15.259          1.03
+ broadcast matrix and column axis 1      broadcast     1.604       15.266          1.00
+ broadcast    matrix and row axis 2          rray4     1.326       15.259          1.03
+ broadcast    matrix and row axis 2      broadcast     1.291       15.266          1.00
+     named            matrix axis 1          rray4     1.676       15.274          1.00
+     named            matrix axis 1           base     3.303       15.279          1.97
+     named            matrix axis 1          abind    23.435       61.064         13.98
+     named            matrix axis 1      broadcast     1.805       15.289          1.08
+
+R: 4.6.0 
+rray4: 0.0.0.9000 
+abind: 1.4.8 
+broadcast: 0.1.9.6 
+platform: aarch64-apple-darwin23</pre></details>
+<p>Benchmark is at <code>bench/combine.R:1</code>, in the same style as <code>bench/broadcast.R</code>. Every case verifies all implementations agree (dims + values) before timing.</p>
+<h2>Results</h2>
+<p>1000×1000 doubles unless noted, medians over 30 iterations, M-series mac, R 4.6.0.</p>
+<table>
+<thead>
+<tr>
+<th>case</th>
+<th>rray4</th>
+<th>base</th>
+<th>abind</th>
+<th>broadcast</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>matrix axis 1</td>
+<td><strong>1.58 ms</strong></td>
+<td>3.30 (rbind)</td>
+<td>18.06</td>
+<td>1.81</td>
+</tr>
+<tr>
+<td>matrix axis 2</td>
+<td>1.23</td>
+<td><strong>1.20</strong> (cbind)</td>
+<td>4.18</td>
+<td>1.22</td>
+</tr>
+<tr>
+<td>3d axis 1</td>
+<td>2.17</td>
+<td>—</td>
+<td>19.57</td>
+<td><strong>2.06</strong></td>
+</tr>
+<tr>
+<td>3d axis 2</td>
+<td><strong>1.29</strong></td>
+<td>—</td>
+<td>17.23</td>
+<td>1.31</td>
+</tr>
+<tr>
+<td>3d axis 3</td>
+<td>1.33</td>
+<td>—</td>
+<td>4.48</td>
+<td><strong>1.32</strong></td>
+</tr>
+<tr>
+<td>6d axis 1</td>
+<td>1.75</td>
+<td>—</td>
+<td>18.65</td>
+<td><strong>1.55</strong></td>
+</tr>
+<tr>
+<td>6d axis 6</td>
+<td><strong>1.33</strong></td>
+<td>—</td>
+<td>4.46</td>
+<td>1.44</td>
+</tr>
+<tr>
+<td>100 matrices axis 1</td>
+<td><strong>0.92</strong></td>
+<td>1.42</td>
+<td>10.76</td>
+<td>1.19</td>
+</tr>
+<tr>
+<td>100 matrices axis 2</td>
+<td>0.72</td>
+<td><strong>0.62</strong></td>
+<td>3.99</td>
+<td>0.94</td>
+</tr>
+<tr>
+<td>named matrix axis 1</td>
+<td><strong>1.68</strong></td>
+<td>3.30</td>
+<td>23.44</td>
+<td>1.81</td>
+</tr>
+<tr>
+<td>broadcast: matrix + column, axis 1</td>
+<td>1.66</td>
+<td>n/a</td>
+<td>n/a</td>
+<td><strong>1.60</strong></td>
+</tr>
+<tr>
+<td>1000 scalars axis 1</td>
+<td>4.10</td>
+<td><strong>0.13</strong></td>
+<td>7.43</td>
+<td>4.08</td>
+</tr>
+</tbody>
+</table>
+<h2>What it says</h2>
+<p><code>rray_combine()</code> and <code>broadcast::bind_array()</code> are effectively tied everywhere, within noise. Both allocate exactly one result (15.26 MB); <code>abind</code> allocates 4x that on axis 1 and is 3-14x slower across the board. <code>abind</code> never wins a case.</p>
+<p>Against base, <code>rray_combine()</code> is 2x faster than <code>rbind()</code> and ties <code>cbind()</code>. That gap is the expected one: <code>cbind()</code> on axis 2 is a straight memcpy, <code>rbind()</code> has to stride.</p>
+<p>Dimnames are nearly free for <code>rray_combine()</code> (1.58 → 1.68 ms) and expensive for <code>abind</code> (18.06 → 23.44 ms).</p>
+<h2>The one bad case</h2>
+<p>At 1000 one-element inputs, <code>rray_combine()</code> takes 4.1 ms against <code>rbind()</code>'s 0.13 ms. None of that is your C code. It is <code>rlang::list2()</code>, which is quadratic in the number of dots:</p>
+<pre><code>n=  100  list()=  7.6us  list2()=    55.7us
+n= 1000  list()= 80.2us  list2()=  3980.8us
+n= 2000  list()=156.9us  list2()= 34056.1us
+</code></pre>
+<p>At n=1000 the whole <code>rray_combine()</code> call is 4.10 ms and <code>function(...) list2(...)</code> alone is 3.98 ms, so ~97% of the time is dots collection. rlang 1.3.0. <code>rray_dimensions_common()</code> and <code>rray_broadcast_common()</code> have the same ceiling since they collect dots the same way.</p>
+<p>Two notes: I installed <code>abind</code> (it wasn't present). <code>broadcast::bind_array()</code> is also 4.08 ms on that case despite taking a plain list, so it has a separate per-input cost of its own.</p>
+
+</section>
+</main>
+</body>
+</html>

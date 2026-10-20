@@ -1,0 +1,2206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Measuring and dropping the unit_run stride-1 path in rray_index()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-86">rray timeline</a>
+<h1>Measuring and dropping the <code>unit_run</code> stride-1 path in <code>rray_index()</code></h1>
+<p class="facts">Claude · Sep 24, 2026 · 3 prompts · 13 replies · <a href="https://github.com/r-lib/rray/pull/86">#86</a></p>
+</header>
+<main>
+<p class="divider">Sep 24, 2026, 17:09 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>How often does “unit_run” really kick in in this PR?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git log --oneline main..HEAD &amp;&amp; git diff main --stat &amp;&amp; grep -rn &quot;unit_run&quot; src/ R/ plans/ 2&gt;…</summary>
+<pre>git log --oneline main..HEAD &amp;&amp; git diff main --stat &amp;&amp; grep -rn &quot;unit_run&quot; src/ R/ plans/ 2&gt;/dev/null | head -50</pre><pre class="output">d9af662 Record findings comparing rray_index() optimization approaches
+2cba798 Specialize, run, coalesce, and skip missing checks in rray_index()
+ee4bd8d Test index coordinate counts, coordinate shapes, and storage types
+ plans/index-optimize-2.md        | 253 +++++++++++++++++++++++++++++++++++++++
+ src/decl/index-decl.h            |  15 +--
+ src/decl/strided-iterator-decl.h |   7 ++
+ src/index.c                      | 249 +++++++++++++++++++++++++++++---------
+ src/index.h                      |   1 +
+ src/strided-iterator.h           |  69 +++++++++--
+ tests/testthat/test-index.R      |  82 +++++++++++++
+ 7 files changed, 602 insertions(+), 74 deletions(-)
+src/index.c:322:    if (unit_run) {                                                            \
+src/index.c:373:  bool unit_run = true;                                                        \
+src/index.c:376:    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \
+plans/index-optimize.md:347:  plan.unit_run = true;
+plans/index-optimize.md:351:      plan.unit_run = false;</pre></details>
+<details class="tool"><summary>Bash: cat src/index.c &amp;&amp; cat src/strided-iterator.h</summary>
+<pre>cat src/index.c &amp;&amp; cat src/strided-iterator.h</pre><pre class="output">#include &quot;index.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/index-decl.h&quot;
+
+r_obj* ffi_rray_index(r_obj* ffi_x, r_obj* ffi_indices, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_index(
+    ffi_x,
+    ffi_indices,
+    rray_args.x,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_index(
+  r_obj* x,
+  r_obj* indices,
+  struct rray_arg* x_arg,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+
+  r_obj* x_dimensions = KEEP(r_dim(x));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(x_dimensionality);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    x_dimensionality,
+    v_x_strides
+  );
+
+  bool any_missing;
+  indices = KEEP(rray_as_index_arrays(
+    indices,
+    v_x_dimensions,
+    x_dimensionality,
+    &amp;any_missing,
+    indices_arg,
+    error_call
+  ));
+  r_obj* const* v_indices = r_list_cbegin(indices);
+  const r_ssize indices_size = r_length(indices);
+
+  r_obj* dimensions =
+    KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  // `...` can take up to `RRAY_MAX_DIMENSIONALITY` inputs, bounded by the
+  // dimensionality of `x`. Each input can have dimensionality up to
+  // `RRAY_MAX_DIMENSIONALITY`, so the maximum size is known.
+  r_ssize v_indices_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_arrays(
+    v_indices,
+    indices_size,
+    dimensionality,
+    v_indices_strides
+  );
+
+  // `...` can have up to `RRAY_MAX_DIMENSIONALITY` inputs, bounded by the
+  // dimensionality of `x`.
+  const int* v_v_index[RRAY_MAX_DIMENSIONALITY];
+  for (r_ssize i = 0; i &lt; indices_size; ++i) {
+    v_v_index[i] = r_int_cbegin(v_indices[i]);
+  }
+
+  const struct rray_strided_iterator_n_plan plan = rray_strided_iterator_n_plan(
+    v_dimensions,
+    dimensionality,
+    v_indices_strides,
+    indices_size
+  );
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_index_lgl(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_integer:
+    out = rray_index_int(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_double:
+    out = rray_index_dbl(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_complex:
+    out = rray_index_cpl(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_raw:
+    out = rray_index_raw(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_character:
+    out = rray_index_chr(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_list:
+    out = rray_index_list(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP(out);
+  r_attrib_poke_dim(out, dimensions);
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_as_index_arrays(
+  r_obj* indices,
+  const int* v_dimensions,
+  int dimensionality,
+  bool* p_any_missing,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  r_obj* const* v_indices = r_list_cbegin(indices);
+  const r_ssize indices_size = r_length(indices);
+
+  if (indices_size != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Must supply exactly %d coordinate array%s to `...`, not %&quot; R_PRI_SSIZE
+      &quot;.&quot;,
+      dimensionality,
+      dimensionality == 1 ? &quot;&quot; : &quot;s&quot;,
+      indices_size
+    );
+  }
+
+  if (r_names(indices) != r_null) {
+    r_abort_lazy_call(error_call, &quot;All elements of `...` must be unnamed.&quot;);
+  }
+
+  r_obj* out = KEEP(r_alloc_list(indices_size));
+
+  r_ssize i = 0;
+  struct rray_arg* index_arg =</pre><p class="cut">990 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 60,460p src/index.c</summary>
+<pre>sed -n 60,460p src/index.c</pre><pre class="output">  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  // `...` can take up to `RRAY_MAX_DIMENSIONALITY` inputs, bounded by the
+  // dimensionality of `x`. Each input can have dimensionality up to
+  // `RRAY_MAX_DIMENSIONALITY`, so the maximum size is known.
+  r_ssize v_indices_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_arrays(
+    v_indices,
+    indices_size,
+    dimensionality,
+    v_indices_strides
+  );
+
+  // `...` can have up to `RRAY_MAX_DIMENSIONALITY` inputs, bounded by the
+  // dimensionality of `x`.
+  const int* v_v_index[RRAY_MAX_DIMENSIONALITY];
+  for (r_ssize i = 0; i &lt; indices_size; ++i) {
+    v_v_index[i] = r_int_cbegin(v_indices[i]);
+  }
+
+  const struct rray_strided_iterator_n_plan plan = rray_strided_iterator_n_plan(
+    v_dimensions,
+    dimensionality,
+    v_indices_strides,
+    indices_size
+  );
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_index_lgl(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_integer:
+    out = rray_index_int(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_double:
+    out = rray_index_dbl(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_complex:
+    out = rray_index_cpl(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_raw:
+    out = rray_index_raw(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_character:
+    out = rray_index_chr(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  case R_TYPE_list:
+    out = rray_index_list(
+      x,
+      v_x_strides,
+      v_v_index,
+      indices_size,
+      any_missing,
+      &amp;plan
+    );
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP(out);
+  r_attrib_poke_dim(out, dimensions);
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_as_index_arrays(
+  r_obj* indices,
+  const int* v_dimensions,
+  int dimensionality,
+  bool* p_any_missing,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  r_obj* const* v_indices = r_list_cbegin(indices);
+  const r_ssize indices_size = r_length(indices);
+
+  if (indices_size != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Must supply exactly %d coordinate array%s to `...`, not %&quot; R_PRI_SSIZE
+      &quot;.&quot;,
+      dimensionality,
+      dimensionality == 1 ? &quot;&quot; : &quot;s&quot;,
+      indices_size
+    );
+  }
+
+  if (r_names(indices) != r_null) {
+    r_abort_lazy_call(error_call, &quot;All elements of `...` must be unnamed.&quot;);
+  }
+
+  r_obj* out = KEEP(r_alloc_list(indices_size));
+
+  r_ssize i = 0;
+  struct rray_arg* index_arg =
+    new_subscript_arg(indices_arg, r_null, indices_size, &amp;i);
+  KEEP(index_arg-&gt;shelter);
+
+  bool any_missing = false;
+
+  for (; i &lt; indices_size; ++i) {
+    bool index_any_missing;
+    r_obj* index = rray_as_index_array(
+      v_indices[i],
+      v_dimensions[i],
+      &amp;index_any_missing,
+      index_arg,
+      error_call
+    );
+    r_list_poke(out, i, index);
+    any_missing = any_missing || index_any_missing;
+  }
+
+  *p_any_missing = any_missing;
+
+  FREE(2);
+  return out;
+}
+
+r_obj* ffi_rray_as_index_array(
+  r_obj* ffi_x,
+  r_obj* ffi_dimension,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int dimension =
+    arg_as_int(ffi_dimension, rray_args.dimension, error_call);
+  bool any_missing;
+  return rray_as_index_array(
+    ffi_x,
+    dimension,
+    &amp;any_missing,
+    rray_args.x,
+    error_call
+  );
+}
+
+r_obj* rray_as_index_array(
+  r_obj* x,
+  int dimension,
+  bool* p_any_missing,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+
+  if (r_typeof(x) != R_TYPE_integer) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be an integer array, not %s.&quot;,
+      rray_arg_format_input(arg),
+      r_obj_type_friendly(x)
+    );
+  }</pre><p class="cut">201 more lines cut</p></details>
+<p>Now the plan logic: how run size and run strides are computed.</p>
+
+<details class="tool tool-error"><summary>Bash: cat src/strided-iterator.h; ls src/strided-iterator.c &amp;&amp; grep -n &quot;run\|coalesc&quot; src/strided-i…</summary>
+<pre>cat src/strided-iterator.h; ls src/strided-iterator.c &amp;&amp; grep -n &quot;run\|coalesc&quot; src/strided-iterator.c | head -80</pre><pre class="output">Exit code 1
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+/
+
+... [12674 characters truncated] ...
+
+                                                         \
+    for (r_ssize i = 0; i &lt; N; ++i) {                                          \
+      V_STARTS[i] -= (dimension - 1) * v_strides[i];                           \
+    }                                                                          \
+  }
+
+// --------------------------------------------------------------------------
+
+static inline int rray__strided_iterator_axes_coalesce(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides,
+  int dimensionality
+) {
+  int out_axis = 0;
+
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize left_dimension = v_dimensions[out_axis];
+    const r_ssize left_stride = v_strides[out_axis];
+    const r_ssize right_dimension = v_dimensions[axis];
+    const r_ssize right_stride = v_strides[axis];
+
+    const bool coalescible = rray__strided_iterator_axes_coalescible(
+      left_dimension,
+      left_stride,
+      right_dimension,
+      right_stride
+    );
+
+    if (coalescible) {
+      if (left_dimension == 1) {
+        v_strides[out_axis] = right_stride;
+      }
+      v_dimensions[out_axis] = left_dimension * right_dimension;
+    } else {
+      ++out_axis;
+      v_dimensions[out_axis] = right_dimension;
+      v_strides[out_axis] = right_stride;
+    }
+  }
+
+  return out_axis + 1;
+}
+
+static inline int rray__strided_iterator_axes_coalesce2(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides1,
+  r_ssize* v_strides2,
+  int dimensionality
+) {
+  int out_axis = 0;
+
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize left_dimension = v_dimensions[out_axis];
+    const r_ssize left_stride1 = v_strides1[out_axis];
+    const r_ssize left_stride2 = v_strides2[out_axis];
+    const r_ssize right_dimension = v_dimensions[axis];
+    const r_ssize right_stride1 = v_strides1[axis];
+    const r_ssize right_stride2 = v_strides2[axis];
+
+    const bool coalescible1 = rray__strided_iterator_axes_coalescible(
+      left_dimension,
+      left_stride1,
+      right_dimension,
+      right_stride1
+    );
+    const bool coalescible2 = rray__strided_iterator_axes_coalescible(
+      left_dimension,
+      left_stride2,
+      right_dimension,
+      right_stride2
+    );
+
+    if (coalescible1 &amp;&amp; coalescible2) {
+      if (left_dimension == 1) {
+        v_strides1[out_axis] = right_stride1;
+        v_strides2[out_axis] = right_stride2;
+      }
+      v_dimensions[out_axis] = left_dimension * right_dimension;
+    } else {
+      ++out_axis;
+      v_dimensions[out_axis] = right_dimension;
+      v_strides1[out_axis] = right_stride1;
+      v_strides2[out_axis] = right_stride2;
+    }
+  }
+
+  return out_axis + 1;
+}
+
+static inline int rray__strided_iterator_axes_coalescen(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides,
+  int dimensionality,
+  r_ssize n</pre><p class="cut">85 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat plans/index-optimize-2.md; grep -n &quot;rray_fill_broadcast_strides_from_arrays&quot; -A40 src/str…</summary>
+<pre>cat plans/index-optimize-2.md; grep -n &quot;rray_fill_broadcast_strides_from_arrays&quot; -A40 src/strides.c | head -70; grep -n &quot;run_stride\|run_size\|n_plan(&quot; -A12 src/strided-iterator.h | head -120</pre><pre class="output"># Optimizing `rray_index()`, part 2
+
+## Summary
+
+This branch implements steps 1 through 4 of `plans/index-optimize.md`:
+
+1. Specialize the loop on 1, 2, 3 and 4 coordinate arrays.
+
+2. Walk the first axis as a run, with a literal stride 1 path.
+
+3. Merge (coalesce) adjacent axes across all coordinate arrays.
+
+4. Skip the missing value check when validation saw no `NA`.
+
+It is 50% to 78% faster than `feature/index` on every large case except character arrays, which are 30% faster. Results are bit identical on every case measured.
+
+We also built and measured a different algorithm, one pass per coordinate array. It lost to steps 1-4 on every case with two or more coordinate arrays, and it needs a scratch buffer as large as the result or larger. We recommend steps 1-4.
+
+## The two algorithms
+
+Both algorithms compute, for every point of the result, a flat location into `x`:
+
+```c
+location = (i1 - 1) * x_stride1 + (i2 - 1) * x_stride2 + ...
+```
+
+Steps 1-4 walk all K coordinate arrays together. Each output element reads one value from each array, sums the location, and reads `x` once. The only state is one position per coordinate array, which lives on the stack.
+
+The per-array idea walks one coordinate array at a time with the 1 operand strided iterator. Each pass adds that array's part of the location into an `r_ssize` buffer the size of the result:
+
+```c
+// first array
+v_locations[i] = (v_index[loc] - 1) * x_stride;
+
+// middle arrays
+v_locations[i] += (v_index[loc] - 1) * x_stride;
+
+// last array, also reading from `x`
+v_out[i] = v_x[v_locations[i] + (v_index[loc] - 1) * x_stride];
+```
+
+It looked attractive for three reasons. Each array gets its own coalescing, so crossed strides no longer block a merge. It reuses the existing 1 operand fast paths. And it needs no per-count specialization, so it is much less code. With one coordinate array there is no buffer at all.
+
+Missing values were handled the way we planned for this branch. Validation records whether each array holds an `NA`. Arrays without one are visited first with no check. Arrays with one are visited last, and mark a missing location with `-1`.
+
+## How it was measured
+
+Five builds, all installed with `R CMD INSTALL` at `-O2`. `devtools::load_all()` compiles at `-O0`, so it is not usable for timing.
+
+| Column | Build |
+|---|---|
+| base | `feature/index` at `ab6fd54` |
+| plan 1-3 | steps 1-3 rebuilt from the sketches in `plans/index-optimize.md` |
+| plan 1-4 | the same, plus step 4 |
+| per-array | the per-array algorithm described above |
+| this branch | the cleaned up steps 1-4 committed here |
+
+The plan 1-3 and plan 1-4 builds were throwaway prototypes. The original steps 1-3 proof of concept was discarded before this work, so it was rebuilt from the plan to get numbers from the same session.
+
+Every build ran the full harness twice, interleaved as base, plan 1-3, plan 1-4, per-array, this branch, then again. Each cell below is the faster of the two runs. The largest run to run difference for any build on any row was 5.4%. All five builds returned identical results on all 23 cases.
+
+Every large case produces 1048576 output elements. &quot;Small src&quot; means `x` is tiny (10 elements per axis) so that it stays in cache and the loop cost is visible. The harness is at the end of this document.
+
+## Results
+
+All values are ns per output element, except the two small call rows, which are us per call.
+
+| Case | base | plan 1-3 | plan 1-4 | per-array | this branch |
+|---|---|---|---|---|---|
+| 1d/1 small src | 2.79 | 1.27 | 1.09 | 1.09 | 1.08 |
+| 1d/1 large src | 2.97 | 1.37 | 1.37 | 1.36 | 1.37 |
+| 2d/2 small src | 4.02 | 1.97 | 1.85 | 2.37 | 1.85 |
+| 2d/2 large src | 4.30 | 2.03 | 1.98 | 2.66 | 1.96 |
+| 2d/2 flat coords | 4.00 | 1.95 | 1.84 | 2.46 | 1.84 |
+| 2d/2 cartesian | 2.87 | 0.82 | 0.72 | 1.15 | 0.71 |
+| 3d/3 small src | 5.83 | 2.76 | 2.66 | 3.41 | 2.66 |
+| 4d/4 small src | 6.94 | 3.68 | 3.46 | 4.38 | 3.45 |
+| 2d/2 coords 10 axes | 4.65 | 1.95 | 1.86 | 2.46 | 1.85 |
+| 2d/2 coords 20 axes | 6.21 | 1.96 | 1.84 | 2.45 | 1.86 |
+| 2d/2 `[1, N]` | 6.00 | 1.97 | 1.87 | 2.43 | 1.86 |
+| 2d/2 `[1, 1, N]` | 8.66 | 1.97 | 1.86 | 2.41 | 1.87 |
+| 2d/2 `[1, 1024, 1024]` | 5.99 | 1.96 | 1.86 | 2.41 | 1.86 |
+| 2d/2 `[2, N/2]` | 4.88 | 1.96 | 1.85 | 2.37 | 1.86 |
+| 2d/2 mixed `[2, N/2]` `[1, N/2]` | 4.58 | 2.39 | 1.96 | 2.48 | 1.99 |
+| take first axis, J = 2 | 4.09 | 1.84 | 1.45 | 2.72 | 1.45 |
+| take first axis, J = 8 | 3.14 | 1.12 | 0.93 | 1.40 | 0.89 |
+| take 3d axis 2 | 4.76 | 1.67 | 1.55 | 2.04 | 1.54 |
+| 2d/2 small src, NA in one array | 4.15 | 1.99 | 2.02 | 2.60 | 2.01 |
+| 2d/2 small src, double | 4.29 | 2.24 | 2.05 | 2.53 | 2.05 |
+| 2d/2 small src, character | 6.38 | 4.74 | 4.50 | 5.08 | 4.49 |
+| small call | 1.97 | 1.97 | 1.93 | 1.97 | 1.97 |
+| small call 2d | 2.21 | 2.21 | 2.21 | 2.25 | 2.21 |
+
+Relative to base, this branch is:
+
+| Case | change |
+|---|---|
+| 1d/1 small src | -61% |
+| 2d/2 small src | -54% |
+| 4d/4 small src | -50% |
+| 2d/2 cartesian | -75% |
+| 2d/2 coords 20 axes | -70% |
+| 2d/2 `[1, 1, N]` | -78% |
+| take first axis, J = 8 | -72% |
+| take 3d axis 2 | -68% |
+| 2d/2 small src, character | -30% |
+
+## Why we recommend steps 1-4
+
+### It is faster
+
+Steps 1-4 beat the per-array algorithm by 19% to 47% on every case with two or more coordinate arrays, and by 12% on character arrays, likely because writing into a character vector costs more than the rest of the loop in both. With one coordinate array they tie, because both reduce to the same loop: walk one array, read `x`, no buffer.
+
+The reason is the buffer. Walking all arrays together reads each coordinate once and writes each output once. The per-array algorithm also writes an 8 byte location per element on every pass but the last, and reads it back on the next pass.
+
+Each extra coordinate array cost the per-array build about 0.95 ns/elt. Two measurements split that cost:
+
+- **Validation is about 0.57 ns/elt of it.** `rray_as_index_array()` alone on a 1-d array measured 0.59 ns/elt at 16384 elements and 0.56 ns/elt at 1048576 elements. Every build pays this, once per coordinate array.
+
+- **The build pass is the other 0.36 ns/elt or so.**
+
+The per-array cost did not depend on whether the buffer fit in cache. Timing each coordinate count across output sizes, with one coordinate array per axis of a small `x`, in an earlier run of the same session:
+
+| Output size | base, K = 1 to 4 | per-array, K = 1 to 4 |
+|---|---|---|
+| 4096 | 3.33, 4.53, 6.47, 7.67 | 1.67, 3.20, 4.21, 5.19 |
+| 16384 | 2.93, 4.12, 6.04, 7.11 | 1.29, 2.66, 3.56, 4.47 |
+| 65536 | 2.82, 3.99, 5.82, 6.93 | 1.16, 2.37, 3.28, 4.17 |
+| 262144 | 2.77, 3.96, 5.82, 6.90 | 1.09, 2.33, 3.27, 4.18 |
+| 1048576 | 2.79, 3.96, 5.77, 6.93 | 1.10, 2.06, 2.99, 4.11 |
+| 4194304 | 2.68, 4.01, 5.80, 6.93 | 1.09, 2.38, 3.32, 4.29 |
+
+The step from K to K + 1 is roughly constant from 16384 elements (a 128 KB buffer) up to 4194304 elements (a 32 MB buffer). Memory traffic is not the limit, so processing the result in cache sized chunks would not have rescued it.
+
+### It needs no scratch memory
+
+Steps 1-4 allocate nothing beyond the result. The per-array algorithm allocates 8 bytes per result element whenever there are two or more coordinate arrays, and that buffer is alive at the same time as the result:
+
+| Storage type | Buffer size relative to the result |
+|---|---|
+| raw | 8x |
+| logical, integer | 2x |
+| double, character, list | 1x |
+| complex | 0.5x |
+
+A 1e8 element result would need 800 MB of scratch on top of the result. That can fail where steps 1-4 would succeed.
+
+### What the per-array algorithm did better
+
+Only code size. It needs no per-count specialization, and only the final pass depends on the storage type. That is not worth a 20% to 45% slowdown and a scratch buffer.
+
+## Findings that change `plans/index-optimize.md`
+
+- **Take shapes do benefit.** The earlier plan said the take-along-axis shapes would not gain from step 3. That is true of coalescing, but the run loop from step 2 still cuts them by 55% to 65%, and step 4 takes a further 7% to 21% off.
+
+- **Step 4 is measured now.** It is worth 5% to 8% on most cases, and 12% to 21% on the Cartesian, mixed and take first axis shapes. With one coordinate array it is worth 15%, bringing that case to 1.08 ns/elt. It does nothing when an `NA` is present, as expected. The earlier plan quoted numpy at 0.94 ns/elt for this case, but that number is from a different session, so treat the gap as approximate.
+
+- **Coalescing still does exactly what the earlier plan said.** `[1, N]`, `[1, 1, N]`, `[1, 1024, 1024]`, 10 axes and 20 axes all cost the same as flat coordinates.
+
+- **Short runs are sensitive to how run strides are read.** Reading each run stride through `rray_strided_iterator_n_plan_run_stride()` on every element was 6% to 7% slower on the mixed and J = 2 take shapes, where every run is 2 elements long. Copying the run strides into a local array before the loop removed the difference.
+
+- **A literal stride 1 path did little for the per-array algorithm.** It was worth about 3%, close to noise. Steps 1-4 keep theirs, as the earlier plan describes, but its share of the step 2 gain was not measured separately.
+
+## What changed in this branch
+
+- **`src/strided-iterator.h`**: `rray_strided_iterator_n_plan()` now merges adjacent axes through a new `rray__strided_iterator_axes_coalescen()`, the N operand sibling of `rray__strided_iterator_axes_coalesce2()`. The plan still points at caller owned strides, so N stays unbounded. The builder takes `r_ssize* v_strides` and merges the axes in place. `RRAY_STRIDED_ITERATOR_NEXT_N()` now starts at axis 1 like the other iterators, since the caller owns the first axis run, and takes the array count as a parameter so it can be a literal.
+
+- **`src/index.c`**: the loop walks the first axis as a run, with a literal stride 1 path. It is specialized on 1 to 4 coordinate arrays, with a general fallback. When validation saw no `NA`, it runs a copy with no missing value check.
+
+- **`rray_as_index_array()`**: takes a `bool* p_any_missing` and reports whether it saw an `NA`, at no extra cost since it already visits every value.
+
+- **Tests**: every coordinate count from 1 to 5, with and without `NA`, against `index_base()`. Coordinates reshaped as `[1, n]`, `[1, 1, n]`, `[2, n/2]` and `[2, 3, 4]` giving the same values. Character and list results from one and two coordinate arrays, with and without `NA`. A missing value in an early coordinate array surviving later arrays.
+
+## Next
+
+- **Validation is now the largest cost per coordinate array.** At 0.57 ns/elt it is over half of the one array case. The loop has two data dependent branches per element that each lead to an error. Checking the range without branching, and only finding the bad value once we know there is one, is the obvious next step.
+
+- **Small call overhead is unchanged** at about 2 us per call. The earlier plan's analysis still applies. The loop is not involved.
+
+## Harness
+
+```r
+args &lt;- commandArgs(trailingOnly = TRUE)
+lib &lt;- args[[1]]
+label &lt;- args[[2]]
+library(rray4, lib.loc = lib)
+
+set.seed(1)
+n &lt;- 1048576L
+N &lt;- n
+s10 &lt;- function(size) sample(10L, size, replace = TRUE)
+
+x1_small &lt;- array(1:10, 10L)
+x1_large &lt;- array(seq_len(n), n)
+x2_small &lt;- array(1:100, c(10L, 10L))
+x2_large &lt;- array(seq_len(n), c(1024L, 1024L))
+x3_small &lt;- array(1:1000, c(10L, 10L, 10L))
+x4_small &lt;- array(1:10000, c(10L, 10L, 10L, 10L))
+x2_dbl &lt;- array(as.double(1:100), c(10L, 10L))
+x2_chr &lt;- array(as.character(1:100), c(10L, 10L))</pre><p class="cut">149 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: rm -rf /tmp/rray4-probe &amp;&amp; cp -R ~/files/r/packages/rray4 /tmp/rray4-probe &amp;&amp; cd /…</summary>
+<pre>rm -rf /tmp/rray4-probe &amp;&amp; cp -R ~/files/r/packages/rray4 /tmp/rray4-probe &amp;&amp; cd /tmp/rray4-probe &amp;&amp; rm -f src/*.o src/*.so &amp;&amp; perl -0pi -e 's/(unit_run = unit_run &amp;&amp; v_index_run_strides\[i\] == 1;\s*\\\n  \}\s*\\\n)/$1  Rprintf(&quot;unit_run=%d run_size=%d\\n&quot;, unit_run, (int) run_size); \\\n/' src/index.c &amp;&amp; grep -n &quot;Rprintf&quot; src/index.c &amp;&amp; cat &gt; probe.R &lt;&lt;'EOF'
+suppressMessages(devtools::load_all(quiet = TRUE))
+n &lt;- 64L; N &lt;- n
+s10 &lt;- function(size) sample(10L, size, replace = TRUE)
+x2 &lt;- array(1:100, c(10L, 10L))
+sq &lt;- c(8L, 8L)
+cases &lt;- list(
+  &quot;1d/1&quot; = list(array(1:10, 10L), array(s10(n), n)),
+  &quot;2d/2 same shape&quot; = list(x2, array(s10(n), sq), array(s10(n), sq)),
+  &quot;2d/2 [1, N]&quot; = list(x2, array(s10(n), c(1L, N)), array(s10(n), c(1L, N))),
+  &quot;2d/2 [2, N/2]&quot; = list(x2, array(s10(n), c(2L, N / 2L)), array(s10(n), c(2L, N / 2L))),
+  &quot;2d/2 cartesian&quot; = list(x2, array(s10(8L), c(8L, 1L)), array(s10(8L), c(1L, 8L))),
+  &quot;2d/2 mixed&quot; = list(x2, array(s10(n), c(2L, N / 2L)), array(s10(N / 2L), c(1L, N / 2L))),
+  &quot;take first axis&quot; = list(array(1:(10L * 32L), c(10L, 32L)), array(s10(2L), c(2L, 1L)), array(1:32, c(1L, 32L))),
+  &quot;take 3d axis 2&quot; = list(array(1:(4L * 10L * 4L), c(4L, 10L, 4L)), array(1:4, c(4L, 1L, 1L)), array(s10(64L), c(4L, 4L, 4L)), array(1:4, c(1L, 1L, 4L))),
+  &quot;vector + scalar&quot; = list(x2, array(1:10, 10L), array(2L, 1L)),
+  &quot;scalar + vector&quot; = list(x2, array(2L, 1L), array(1:10, 10L))
+)
+for (name in names(cases)) { cat(format(name, width = 18)); invisible(do.call(rray_index, cases[[name]])) }
+EOF
+Rscript probe.R 2&gt;&amp;1 | tail -15</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Bash: rm -rf /tmp/rray4-probe &amp;&amp; cp -R ~/files/r/packages/rray4 /tmp/rray4-probe &amp;&amp; rm -…</summary>
+<pre>rm -rf /tmp/rray4-probe &amp;&amp; cp -R ~/files/r/packages/rray4 /tmp/rray4-probe &amp;&amp; rm -f /tmp/rray4-probe/src/*.o /tmp/rray4-probe/src/*.so &amp;&amp; echo ok</pre><pre class="output">ok</pre></details>
+<details class="tool"><summary>Read /tmp/rray4-probe/src/index.c</summary>
+<pre class="output">370	  const r_ssize run_size = rray_strided_iterator_n_plan_run_size(plan);        \
+371	                                                                               \
+372	  r_ssize v_index_run_strides[RRAY_MAX_DIMENSIONALITY];                        \
+373	  bool unit_run = true;                                                        \
+374	  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \
+375	    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \
+376	    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \
+377	  }                                                                            \
+378	                                                                               \
+379	  r_ssize v_index_locations[RRAY_MAX_DIMENSIONALITY] = {0};                    \</pre></details>
+<details class="tool"><summary>Write /tmp/rray4-probe/probe.R</summary>
+<pre>suppressMessages(devtools::load_all(&quot;/tmp/rray4-probe&quot;, quiet = TRUE))
+set.seed(1)
+n &lt;- 64L
+N &lt;- n
+s10 &lt;- function(size) sample(10L, size, replace = TRUE)
+x2 &lt;- array(1:100, c(10L, 10L))
+sq &lt;- c(8L, 8L)
+cases &lt;- list(
+  &quot;1d/1&quot; = list(array(1:10, 10L), array(s10(n), n)),
+  &quot;2d/2 same shape&quot; = list(x2, array(s10(n), sq), array(s10(n), sq)),
+  &quot;2d/2 [1, N]&quot; = list(x2, array(s10(n), c(1L, N)), array(s10(n), c(1L, N))),
+  &quot;2d/2 [2, N/2]&quot; = list(x2, array(s10(n), c(2L, N / 2L)), array(s10(n), c(2L, N / 2L))),
+  &quot;2d/2 cartesian&quot; = list(x2, array(s10(8L), c(8L, 1L)), array(s10(8L), c(1L, 8L))),
+  &quot;2d/2 mixed&quot; = list(x2, array(s10(n), c(2L, N / 2L)), array(s10(N / 2L), c(1L, N / 2L))),
+  &quot;take first axis&quot; = list(array(1:320, c(10L, 32L)), array(s10(2L), c(2L, 1L)), array(1:32, c(1L, 32L))),
+  &quot;take 3d axis 2&quot; = list(array(1:160, c(4L, 10L, 4L)), array(1:4, c(4L, 1L, 1L)), array(s10(64L), c(4L, 4L, 4L)), array(1:4, c(1L, 1L, 4L))),
+  &quot;vector + scalar&quot; = list(x2, array(1:10, 10L), array(2L, 1L)),
+  &quot;scalar + vector&quot; = list(x2, array(2L, 1L), array(1:10, 10L))
+)
+for (name in names(cases)) {
+  cat(format(name, width = 18))
+  invisible(do.call(rray_index, cases[[name]]))
+}</pre><pre class="output">File created successfully at: /tmp/rray4-probe/probe.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /tmp/rray4-probe/src/index.c</summary>
+<pre class="diff"><span class="del">-    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="ins">+    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \</span>
+<span class="ins">+  }                                                                            \</span>
+<span class="ins">+  Rprintf(&quot;unit_run=%d run_size=%d\n&quot;, unit_run, (int) run_size);              \</span></pre><pre class="output">The file /tmp/rray4-probe/src/index.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; Rscript /tmp/rray4-probe/probe.R 2&gt;&amp;1 | tail -12</summary>
+<pre>cd /tmp &amp;&amp; Rscript /tmp/rray4-probe/probe.R 2&gt;&amp;1 | tail -12</pre><pre class="output">1d/1              unit_run=1 run_size=64
+2d/2 same shape   unit_run=1 run_size=64
+2d/2 [1, N]       unit_run=1 run_size=64
+2d/2 [2, N/2]     unit_run=1 run_size=64
+2d/2 cartesian    unit_run=0 run_size=8
+2d/2 mixed        unit_run=0 run_size=2
+take first axis   unit_run=0 run_size=2
+take 3d axis 2    unit_run=0 run_size=4
+vector + scalar   unit_run=0 run_size=10
+scalar + vector   unit_run=0 run_size=10
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: rm -rf /tmp/rray4-probe &amp;&amp; echo done</summary>
+<pre>rm -rf /tmp/rray4-probe &amp;&amp; echo done</pre><pre class="output">done</pre></details>
+<p><code>unit_run</code> is true only when no coordinate array is broadcast along the first axis of the result. In practice that means one coordinate array, or several that all have the same shape. Any broadcasting sends the loop to the runtime stride path, including the most common case: a scalar mixed with a vector.</p>
+<p>The rule in code: <code>unit_run</code> needs every coordinate array to have run stride 1 on the first merged axis. A broadcast axis has stride 0, so a single broadcast array turns it off.</p>
+<p>I checked this by adding an <code>Rprintf()</code> to a throwaway copy of the package (since deleted, your tree is untouched):</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th><code>unit_run</code></th>
+<th>run size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1 coordinate array</td>
+<td>yes</td>
+<td>64 (whole result)</td>
+</tr>
+<tr>
+<td>2 arrays, same shape <code>[8, 8]</code></td>
+<td>yes</td>
+<td>64</td>
+</tr>
+<tr>
+<td>2 arrays, <code>[1, N]</code></td>
+<td>yes</td>
+<td>64</td>
+</tr>
+<tr>
+<td>2 arrays, <code>[2, N/2]</code></td>
+<td>yes</td>
+<td>64</td>
+</tr>
+<tr>
+<td>cartesian <code>[8, 1]</code> + <code>[1, 8]</code></td>
+<td>no</td>
+<td>8</td>
+</tr>
+<tr>
+<td>mixed <code>[2, N/2]</code> + <code>[1, N/2]</code></td>
+<td>no</td>
+<td>2</td>
+</tr>
+<tr>
+<td>take first axis <code>[2, 1]</code> + <code>[1, 32]</code></td>
+<td>no</td>
+<td>2</td>
+</tr>
+<tr>
+<td>take 3d axis 2</td>
+<td>no</td>
+<td>4</td>
+</tr>
+<tr>
+<td>vector + scalar, <code>rray_index(x, 1:10, 2L)</code></td>
+<td>no</td>
+<td>10</td>
+</tr>
+<tr>
+<td>scalar + vector, <code>rray_index(x, 2L, 1:10)</code></td>
+<td>no</td>
+<td>10</td>
+</tr>
+</tbody>
+</table>
+<p>Two things follow from this:</p>
+<ul>
+<li>
+<p><strong>When it is on, it runs once per call.</strong> Same-shape arrays merge all the way down to one axis, so the whole result is a single run. The literal stride only helps inside that one loop, by giving the compiler contiguous reads of the coordinate arrays.</p>
+</li>
+<li>
+<p><strong>Its payoff was never measured on its own.</strong> <code>plans/index-optimize-2.md</code> says so. The only related number is from the per-array prototype, where a stride 1 path was worth about 3%, close to noise. In the benchmark, 16 of 23 cases take this path (every same-shape case), but all the gains quoted for those cases come bundled with the run loop, merging and the skipped <code>NA</code> check.</p>
+</li>
+</ul>
+<p>If you want to know whether it is worth the extra code (it doubles every specialized loop), the test is a build with the <code>unit_run</code> branch removed, run through the same harness on the 16 same-shape cases. I can do that if you like.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Measure just that</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Building two <code>-O2</code> installs (this branch, and a copy with the <code>unit_run</code> branch removed) to benchmark side by side.</p>
+
+<details class="tool"><summary>Bash: cat ~/.R/Makevars 2&gt;/dev/null; R CMD config CFLAGS; rm -rf /tmp/unitrun &amp;&amp; mkdir -p /tmp/unit…</summary>
+<pre>cat ~/.R/Makevars 2&gt;/dev/null; R CMD config CFLAGS; rm -rf /tmp/unitrun &amp;&amp; mkdir -p /tmp/unitrun/lib-with /tmp/unitrun/lib-without &amp;&amp; cp -R ~/files/r/packages/rray4 /tmp/unitrun/src-with &amp;&amp; cp -R ~/files/r/packages/rray4 /tmp/unitrun/src-without &amp;&amp; rm -f /tmp/unitrun/src-*/src/*.o /tmp/unitrun/src-*/src/*.so &amp;&amp; sysctl -n machdep.cpu.brand_string</pre><pre class="output"># -02 for normal compilation optimization
+# -g for debugging symbols (with Instruments)
+# -fno-common to ensure that on gcc10 we avoid multiple definition warnings
+#  by forgetting to add `extern` declarations
+# -Wstrict-prototypes to ensure functions with 0 arguments use `(void)` signatures
+# -fno-omit-frame-pointer possibly makes debugging easier?
+# -ftime-trace for tracing information in chrome://tracing/. See https://aras-p.info/blog/2019/01/16/time-trace-timeline-flame-chart-profiler-for-Clang/
+CFLAGS=-O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always
+CXXFLAGS=-O2 -g -Wall -pedantic -fdiagnostics-color=always
+-O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always
+Apple M2 Pro</pre></details>
+<details class="tool tool-error"><summary>Edit /tmp/unitrun/src-without/src/index.c</summary>
+<pre class="diff"><span class="del">-    if (unit_run) {                                                            \</span>
+<span class="del">-      RRAY_INDEX_RUN(                                                          \</span>
+<span class="del">-        POKE,                                                                  \</span>
+<span class="del">-        MISSING,                                                               \</span>
+<span class="del">-        INDICES_SIZE,                                                          \</span>
+<span class="del">-        RRAY_INDEX_STRIDE_ONE,                                                 \</span>
+<span class="del">-        CHECK_MISSING                                                          \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      RRAY_INDEX_RUN(                                                          \</span>
+<span class="del">-        POKE,                                                                  \</span>
+<span class="del">-        MISSING,                                                               \</span>
+<span class="del">-        INDICES_SIZE,                                                          \</span>
+<span class="del">-        RRAY_INDEX_STRIDE_RUNTIME,                                             \</span>
+<span class="del">-        CHECK_MISSING                                                          \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="ins">+    RRAY_INDEX_RUN(                                                            \</span>
+<span class="ins">+      POKE,                                                                    \</span>
+<span class="ins">+      MISSING,                                                                 \</span>
+<span class="ins">+      INDICES_SIZE,                                                            \</span>
+<span class="ins">+      RRAY_INDEX_STRIDE_RUNTIME,                                               \</span>
+<span class="ins">+      CHECK_MISSING                                                            \</span>
+<span class="ins">+    );                                                                         \</span></pre><pre class="output">&lt;tool_use_error&gt;File has not been read yet. Read it first before writing to it.&lt;/tool_use_error&gt;</pre></details>
+<details class="tool tool-error"><summary>Edit /tmp/unitrun/src-without/src/index.c</summary>
+<pre class="diff"><span class="del">-  bool unit_run = true;                                                        \</span>
+<span class="del">-  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \</span>
+<span class="del">-    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \</span>
+<span class="del">-    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \</span>
+<span class="ins">+    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \</span>
+<span class="ins">+  }                                                                            \</span></pre><pre class="output">&lt;tool_use_error&gt;File has not been read yet. Read it first before writing to it.&lt;/tool_use_error&gt;</pre></details>
+<details class="tool"><summary>Read /tmp/unitrun/src-without/src/index.c</summary>
+<pre class="output">318	  }
+319	
+320	#define RRAY_INDEX_LOOP(POKE, MISSING, INDICES_SIZE, CHECK_MISSING)            \
+321	  while (run_start != size) {                                                  \
+322	    if (unit_run) {                                                            \
+323	      RRAY_INDEX_RUN(                                                          \
+324	        POKE,                                                                  \
+325	        MISSING,                                                               \
+326	        INDICES_SIZE,                                                          \
+327	        RRAY_INDEX_STRIDE_ONE,                                                 \
+328	        CHECK_MISSING                                                          \
+329	      );                                                                       \
+330	    } else {                                                                   \
+331	      RRAY_INDEX_RUN(                                                          \
+332	        POKE,                                                                  \
+333	        MISSING,                                                               \
+334	        INDICES_SIZE,                                                          \
+335	        RRAY_INDEX_STRIDE_RUNTIME,                                             \
+336	        CHECK_MISSING                                                          \
+337	      );                                                                       \
+338	    }                                                                          \
+339	                                                                               \
+340	    run_start += run_size;                                                     \
+341	    RRAY_STRIDED_ITERATOR_NEXT_N(                                              \
+342	      v_index_locations,                                                       \
+343	      v_point,                                                                 \
+344	      plan,                                                                    \
+345	      INDICES_SIZE                                                             \
+346	    );                                                                         \
+347	  }
+348	
+349	#define RRAY_INDEX_LOOPS(POKE, MISSING, CHECK_MISSING)                         \
+350	  switch (indices_size) {                                                      \
+351	  case 1:                                                                      \
+352	    RRAY_INDEX_LOOP(POKE, MISSING, 1, CHECK_MISSING);                          \
+353	    break;                                                                     \
+354	  case 2:                                                                      \
+355	    RRAY_INDEX_LOOP(POKE, MISSING, 2, CHECK_MISSING);                          \
+356	    break;                                                                     \
+357	  case 3:                                                                      \
+358	    RRAY_INDEX_LOOP(POKE, MISSING, 3, CHECK_MISSING);                          \
+359	    break;                                                                     \
+360	  case 4:                                                                      \
+361	    RRAY_INDEX_LOOP(POKE, MISSING, 4, CHECK_MISSING);                          \
+362	    break;                                                                     \
+363	  default:                                                                     \
+364	    RRAY_INDEX_LOOP(POKE, MISSING, indices_size, CHECK_MISSING);               \
+365	    break;                                                                     \
+366	  }
+367	
+368	#define RRAY_INDEX_ITERATE(POKE, MISSING)                                      \
+369	  r_ssize run_start = 0;                                                       \
+370	  const r_ssize run_size = rray_strided_iterator_n_plan_run_size(plan);        \
+371	                                                                               \
+372	  r_ssize v_index_run_strides[RRAY_MAX_DIMENSIONALITY];                        \
+373	  bool unit_run = true;                                                        \
+374	  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \
+375	    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \
+376	    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \
+377	  }                                                                            \
+378	                                                                               \
+379	  r_ssize v_index_locations[RRAY_MAX_DIMENSIONALITY] = {0};                    \</pre></details>
+<details class="tool"><summary>Edit /tmp/unitrun/src-without/src/index.c</summary>
+<pre class="diff"><span class="del">-    if (unit_run) {                                                            \</span>
+<span class="del">-      RRAY_INDEX_RUN(                                                          \</span>
+<span class="del">-        POKE,                                                                  \</span>
+<span class="del">-        MISSING,                                                               \</span>
+<span class="del">-        INDICES_SIZE,                                                          \</span>
+<span class="del">-        RRAY_INDEX_STRIDE_ONE,                                                 \</span>
+<span class="del">-        CHECK_MISSING                                                          \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      RRAY_INDEX_RUN(                                                          \</span>
+<span class="del">-        POKE,                                                                  \</span>
+<span class="del">-        MISSING,                                                               \</span>
+<span class="del">-        INDICES_SIZE,                                                          \</span>
+<span class="del">-        RRAY_INDEX_STRIDE_RUNTIME,                                             \</span>
+<span class="del">-        CHECK_MISSING                                                          \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="ins">+    RRAY_INDEX_RUN(                                                            \</span>
+<span class="ins">+      POKE,                                                                    \</span>
+<span class="ins">+      MISSING,                                                                 \</span>
+<span class="ins">+      INDICES_SIZE,                                                            \</span>
+<span class="ins">+      RRAY_INDEX_STRIDE_RUNTIME,                                               \</span>
+<span class="ins">+      CHECK_MISSING                                                            \</span>
+<span class="ins">+    );                                                                         \</span></pre><pre class="output">The file /tmp/unitrun/src-without/src/index.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit /tmp/unitrun/src-without/src/index.c</summary>
+<pre class="diff"><span class="del">-  bool unit_run = true;                                                        \</span>
+<span class="del">-  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \</span>
+<span class="del">-    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \</span>
+<span class="del">-    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \</span>
+<span class="ins">+    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \</span>
+<span class="ins">+  }                                                                            \</span></pre><pre class="output">The file /tmp/unitrun/src-without/src/index.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/unitrun &amp;&amp; grep -n &quot;STRIDE_ONE&quot; src-without/src/index.c; R CMD INSTALL --no-test-load…</summary>
+<pre>cd /tmp/unitrun &amp;&amp; grep -n &quot;STRIDE_ONE&quot; src-without/src/index.c; R CMD INSTALL --no-test-load -l lib-with src-with 2&gt;&amp;1 | grep -E &quot;warning|error|DONE&quot; ; R CMD INSTALL --no-test-load -l lib-without src-without 2&gt;&amp;1 | grep -E &quot;warning|error|DONE&quot;; cd ~/files/r/packages/rray4</pre><pre class="output">298:#define RRAY_INDEX_STRIDE_ONE(I) 1
+511:#undef RRAY_INDEX_STRIDE_ONE
+[1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1m./missing.h:16:10: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1m./missing.h:16:10: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[0m[1mequal.c:558:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:558:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:564:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:564:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:570:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:570:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:576:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:576:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:583:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:583:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:589:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:589:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+1 warning generated.
+7 warnings generated.
+* DONE (rray4)
+[1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1m./missing.h:16:10: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1m./missing.h:16:10: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[0m[1mequal.c:558:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:558:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:564:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:564:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:570:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:570:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:576:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:576:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:583:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:583:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:589:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:589:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+1 warning generated.
+7 warnings generated.
+* DONE (rray4)</pre></details>
+<p>Both builds installed. Now the benchmark harness from <code>plans/index-optimize-2.md</code>, with a results dump so I can confirm both builds agree.</p>
+
+<details class="tool"><summary>Write /tmp/unitrun/bench.R</summary>
+<pre>args &lt;- commandArgs(trailingOnly = TRUE)
+lib &lt;- args[[1]]
+label &lt;- args[[2]]
+round &lt;- args[[3]]
+library(rray4, lib.loc = lib)
+
+set.seed(1)
+n &lt;- 1048576L
+N &lt;- n
+s10 &lt;- function(size) sample(10L, size, replace = TRUE)
+
+x1_small &lt;- array(1:10, 10L)
+x1_large &lt;- array(seq_len(n), n)
+x2_small &lt;- array(1:100, c(10L, 10L))
+x2_large &lt;- array(seq_len(n), c(1024L, 1024L))
+x3_small &lt;- array(1:1000, c(10L, 10L, 10L))
+x4_small &lt;- array(1:10000, c(10L, 10L, 10L, 10L))
+x2_dbl &lt;- array(as.double(1:100), c(10L, 10L))
+x2_chr &lt;- array(as.character(1:100), c(10L, 10L))
+
+sq &lt;- c(1024L, 1024L)
+a &lt;- s10(n)
+b &lt;- s10(n)
+c3 &lt;- s10(n)
+d4 &lt;- s10(n)
+a_na &lt;- a
+a_na[seq(1L, n, by = 100L)] &lt;- NA_integer_
+
+take3_x &lt;- array(seq_len(64L * 10L * 64L), c(64L, 10L, 64L))
+
+cases &lt;- list(
+  &quot;1d/1 small src&quot; = list(x1_small, array(a, n)),
+  &quot;1d/1 large src&quot; = list(x1_large, array(sample(n), n)),
+  &quot;2d/2 small src&quot; = list(x2_small, array(a, sq), array(b, sq)),
+  &quot;2d/2 large src&quot; = list(x2_large, array(sample(1024L, n, TRUE), sq), array(sample(1024L, n, TRUE), sq)),
+  &quot;2d/2 flat coords&quot; = list(x2_small, array(a, n), array(b, n)),
+  &quot;2d/2 cartesian&quot; = list(x2_small, array(s10(1024L), c(1024L, 1L)), array(s10(1024L), c(1L, 1024L))),
+  &quot;3d/3 small src&quot; = list(x3_small, array(a, sq), array(b, sq), array(c3, sq)),
+  &quot;4d/4 small src&quot; = list(x4_small, array(a, sq), array(b, sq), array(c3, sq), array(d4, sq)),
+  &quot;2d/2 coords 10 axes&quot; = list(x2_small, array(a, rep(4L, 10L)), array(b, rep(4L, 10L))),
+  &quot;2d/2 coords 20 axes&quot; = list(x2_small, array(a, rep(2L, 20L)), array(b, rep(2L, 20L))),
+  &quot;2d/2 [1, N]&quot; = list(x2_small, array(a, c(1L, N)), array(b, c(1L, N))),
+  &quot;2d/2 [1, 1, N]&quot; = list(x2_small, array(a, c(1L, 1L, N)), array(b, c(1L, 1L, N))),
+  &quot;2d/2 [1, 1024, 1024]&quot; = list(x2_small, array(a, c(1L, sq)), array(b, c(1L, sq))),
+  &quot;2d/2 [2, N/2]&quot; = list(x2_small, array(a, c(2L, N / 2L)), array(b, c(2L, N / 2L))),
+  &quot;2d/2 mixed [2, N/2] [1, N/2]&quot; = list(x2_small, array(a, c(2L, N / 2L)), array(b[seq_len(N / 2L)], c(1L, N / 2L))),
+  &quot;take first axis J = 2&quot; = list(array(1:(10L * (N / 2L)), c(10L, N / 2L)), array(s10(2L), c(2L, 1L)), array(seq_len(N / 2L), c(1L, N / 2L))),
+  &quot;take first axis J = 8&quot; = list(array(1:(10L * (N / 8L)), c(10L, N / 8L)), array(s10(8L), c(8L, 1L)), array(seq_len(N / 8L), c(1L, N / 8L))),
+  &quot;take 3d axis 2&quot; = list(take3_x, array(seq_len(64L), c(64L, 1L, 1L)), array(s10(n), c(64L, 256L, 64L)), array(seq_len(64L), c(1L, 1L, 64L))),
+  &quot;2d/2 small src, NA in 1&quot; = list(x2_small, array(a_na, sq), array(b, sq)),
+  &quot;2d/2 small src, double&quot; = list(x2_dbl, array(a, sq), array(b, sq)),
+  &quot;2d/2 small src, character&quot; = list(x2_chr, array(a, sq), array(b, sq)),
+  &quot;small call&quot; = list(x1_small, array(s10(10L), 10L)),
+  &quot;small call 2d&quot; = list(x2_small, array(s10(10L), 10L), array(s10(10L), 10L))
+)
+
+results &lt;- lapply(cases, function(case) do.call(rray_index, case))
+saveRDS(results, file.path(&quot;/tmp/unitrun&quot;, paste0(&quot;results-&quot;, label, &quot;.rds&quot;)))
+
+rows &lt;- lapply(names(cases), function(name) {
+  case &lt;- cases[[name]]
+  f &lt;- function() do.call(rray_index, case)
+  size &lt;- length(f())
+  bm &lt;- bench::mark(f(), min_iterations = 30, max_iterations = 2000, min_time = 1, check = FALSE, filter_gc = FALSE)
+  med &lt;- as.numeric(bm$median)
+  data.frame(
+    build = label,
+    round = round,
+    case = name,
+    value = if (size &lt; 100) med * 1e6 else med * 1e9 / size,
+    unit = if (size &lt; 100) &quot;us/call&quot; else &quot;ns/elt&quot;
+  )
+})
+out &lt;- do.call(rbind, rows)
+write.csv(out, file.path(&quot;/tmp/unitrun&quot;, paste0(&quot;bench-&quot;, label, &quot;-&quot;, round, &quot;.csv&quot;)), row.names = FALSE)</pre><pre class="output">File created successfully at: /tmp/unitrun/bench.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/unitrun &amp;&amp; for r in 1 2 3; do Rscript bench.R lib-with with $r &amp;&amp; Rscript bench.R lib…</summary>
+<pre>cd /tmp/unitrun &amp;&amp; for r in 1 2 3; do Rscript bench.R lib-with with $r &amp;&amp; Rscript bench.R lib-without without $r; done; ls; cd ~/files/r/packages/rray4</pre><pre class="output">Command running in background with ID: bzsm3cmyi. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/01cee254-cde1-47c8-9fa1-20f5b1947469/tasks/bzsm3cmyi.output. You will be notified when it completes. To check interim output, use Read on that file path.
+Session cwd remains ~/files/r/packages/rray4; directory changes made by the backgrounded command do not apply to subsequent commands.</pre></details>
+<p>Benchmarks are running, 3 interleaved rounds per build (a few minutes). Meanwhile I'm writing the summary script.</p>
+
+<details class="tool"><summary>Write /tmp/unitrun/summarize.R</summary>
+<pre>setwd(&quot;/tmp/unitrun&quot;)
+
+with &lt;- readRDS(&quot;results-with.rds&quot;)
+without &lt;- readRDS(&quot;results-without.rds&quot;)
+cat(&quot;identical results:&quot;, identical(with, without), &quot;\n\n&quot;)
+
+files &lt;- list.files(pattern = &quot;^bench-.*\\.csv$&quot;)
+all &lt;- do.call(rbind, lapply(files, read.csv))
+
+best &lt;- aggregate(value ~ build + case + unit, all, min)
+spread &lt;- aggregate(value ~ build + case, all, function(x) (max(x) - min(x)) / min(x))
+cat(&quot;largest run to run spread:&quot;, sprintf(&quot;%.1f%%&quot;, 100 * max(spread$value)), &quot;\n\n&quot;)
+
+unit_cases &lt;- c(
+  &quot;1d/1 small src&quot;, &quot;1d/1 large src&quot;, &quot;2d/2 small src&quot;, &quot;2d/2 large src&quot;,
+  &quot;2d/2 flat coords&quot;, &quot;3d/3 small src&quot;, &quot;4d/4 small src&quot;,
+  &quot;2d/2 coords 10 axes&quot;, &quot;2d/2 coords 20 axes&quot;, &quot;2d/2 [1, N]&quot;,
+  &quot;2d/2 [1, 1, N]&quot;, &quot;2d/2 [1, 1024, 1024]&quot;, &quot;2d/2 [2, N/2]&quot;,
+  &quot;2d/2 small src, NA in 1&quot;, &quot;2d/2 small src, double&quot;,
+  &quot;2d/2 small src, character&quot;, &quot;small call&quot;, &quot;small call 2d&quot;
+)
+
+w &lt;- best[best$build == &quot;with&quot;, c(&quot;case&quot;, &quot;unit&quot;, &quot;value&quot;)]
+wo &lt;- best[best$build == &quot;without&quot;, c(&quot;case&quot;, &quot;value&quot;)]
+names(w)[3] &lt;- &quot;with&quot;
+names(wo)[2] &lt;- &quot;without&quot;
+tbl &lt;- merge(w, wo)
+tbl$change &lt;- sprintf(&quot;%+.1f%%&quot;, 100 * (tbl$without - tbl$with) / tbl$with)
+tbl$unit_run &lt;- tbl$case %in% unit_cases
+tbl &lt;- tbl[order(!tbl$unit_run, match(tbl$case, unit_cases)), ]
+print(tbl, digits = 3, row.names = FALSE)</pre><pre class="output">File created successfully at: /tmp/unitrun/summarize.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cat /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/01cee254-cde1-47c8-9fa1-20f5b…</summary>
+<pre>cat /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/01cee254-cde1-47c8-9fa1-20f5b1947469/tasks/bzsm3cmyi.output; ls /tmp/unitrun</pre><pre class="output">bench.R
+lib-with
+lib-without
+results-with.rds
+src-with
+src-without
+summarize.R</pre></details>
+<details class="tool"><summary>ToolSearch: select:Monitor</summary>
+<pre>{
+  &quot;query&quot;: &quot;select:Monitor&quot;,
+  &quot;max_results&quot;: 1
+}</pre><pre class="output">Monitor</pre></details>
+<p>The benchmark is still running. It does 6 harness runs of about 40 seconds each, and I'll be notified when it finishes. No monitor needed.</p>
+
+<details class="tool"><summary>Bash: Rscript /tmp/unitrun/summarize.R</summary>
+<pre>Rscript /tmp/unitrun/summarize.R</pre><pre class="output">identical results: TRUE 
+
+largest run to run spread: 7.0% 
+
+                         case    unit  with without change unit_run
+               1d/1 small src  ns/elt 1.077   1.084  +0.7%     TRUE
+               1d/1 large src  ns/elt 1.375   1.376  +0.1%     TRUE
+               2d/2 small src  ns/elt 1.850   1.894  +2.4%     TRUE
+               2d/2 large src  ns/elt 2.002   2.006  +0.2%     TRUE
+             2d/2 flat coords  ns/elt 1.850   1.891  +2.2%     TRUE
+               3d/3 small src  ns/elt 2.658   2.713  +2.1%     TRUE
+               4d/4 small src  ns/elt 3.442   3.533  +2.6%     TRUE
+          2d/2 coords 10 axes  ns/elt 1.857   1.895  +2.0%     TRUE
+          2d/2 coords 20 axes  ns/elt 1.850   1.895  +2.4%     TRUE
+                  2d/2 [1, N]  ns/elt 1.847   1.898  +2.8%     TRUE
+               2d/2 [1, 1, N]  ns/elt 1.848   1.890  +2.3%     TRUE
+         2d/2 [1, 1024, 1024]  ns/elt 1.849   1.891  +2.3%     TRUE
+                2d/2 [2, N/2]  ns/elt 1.849   1.891  +2.3%     TRUE
+      2d/2 small src, NA in 1  ns/elt 2.002   2.028  +1.3%     TRUE
+       2d/2 small src, double  ns/elt 2.007   2.049  +2.1%     TRUE
+    2d/2 small src, character  ns/elt 4.450   4.461  +0.2%     TRUE
+                   small call us/call 1.968   1.968  +0.0%     TRUE
+                small call 2d us/call 2.214   2.214  +0.0%     TRUE
+               2d/2 cartesian  ns/elt 0.711   0.713  +0.2%    FALSE
+ 2d/2 mixed [2, N/2] [1, N/2]  ns/elt 1.992   2.007  +0.7%    FALSE
+               take 3d axis 2  ns/elt 1.520   1.516  -0.2%    FALSE
+        take first axis J = 2  ns/elt 1.452   1.467  +1.0%    FALSE
+        take first axis J = 8  ns/elt 0.885   0.907  +2.5%    FALSE</pre></details>
+<p>The unit-run cases show a steady +2%, but one control case (take J = 8) also moved +2.5%, so I'm checking whether the gap holds round by round.</p>
+
+<details class="tool"><summary>Bash: cd /tmp/unitrun &amp;&amp; Rscript -e '</summary>
+<pre>cd /tmp/unitrun &amp;&amp; Rscript -e '
+all &lt;- do.call(rbind, lapply(list.files(pattern = &quot;^bench-.*csv$&quot;), read.csv))
+all &lt;- all[all$unit == &quot;ns/elt&quot;, ]
+w &lt;- reshape(all[, c(&quot;build&quot;,&quot;round&quot;,&quot;case&quot;,&quot;value&quot;)], idvar = c(&quot;case&quot;,&quot;round&quot;), timevar = &quot;build&quot;, direction = &quot;wide&quot;)
+w$pct &lt;- round(100 * (w$value.without - w$value.with) / w$value.with, 1)
+print(reshape(w[, c(&quot;case&quot;,&quot;round&quot;,&quot;pct&quot;)], idvar = &quot;case&quot;, timevar = &quot;round&quot;, direction = &quot;wide&quot;), row.names = FALSE)
+'</pre><pre class="output">                         case pct.1 pct.2 pct.3
+               1d/1 small src  -1.7   1.7   0.7
+               1d/1 large src  -1.9   0.1   2.2
+               2d/2 small src  -0.2   0.6   4.4
+               2d/2 large src  -1.4  -0.4   2.3
+             2d/2 flat coords   0.1   1.9   3.0
+               2d/2 cartesian  -4.0  -2.9   1.3
+               3d/3 small src   0.8   2.1   2.2
+               4d/4 small src   1.6   2.3   2.9
+          2d/2 coords 10 axes  -0.3   3.1   2.1
+          2d/2 coords 20 axes  -0.1   3.2   2.5
+                  2d/2 [1, N]   1.0   4.4   3.4
+               2d/2 [1, 1, N]  -0.2   3.9   3.3
+         2d/2 [1, 1024, 1024]  -0.1   2.3   2.3
+                2d/2 [2, N/2]   2.6   2.6   1.8
+ 2d/2 mixed [2, N/2] [1, N/2]   0.7   0.7   1.2
+        take first axis J = 2   1.6   1.1   0.7
+        take first axis J = 8   4.4   3.1   1.8
+               take 3d axis 2   0.8  -1.2  -1.8
+      2d/2 small src, NA in 1   0.7   1.4   1.0
+       2d/2 small src, double   2.1   0.6   2.5
+    2d/2 small src, character   0.2  -1.6   0.3
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>The stride 1 path is worth about 2% at best, which is the same size as the noise. I can't tell it apart from zero.</p>
+<p><strong>How I measured.</strong> I made two <code>-O2</code> builds with <code>R CMD INSTALL</code>, using the harness from <code>plans/index-optimize-2.md</code>. One build is this branch. The other is the same code with the <code>unit_run</code> check and the <code>RRAY_INDEX_STRIDE_ONE</code> branch removed, so every run uses the runtime stride. I ran 3 rounds per build, alternating between the two, and took the fastest of the 3 for each case. Both builds returned identical results on all 23 cases.</p>
+<p>A correction to my last answer: 18 of the 23 cases take the <code>unit_run</code> path, not 16. The other 5 don't use it at all, so they act as a control.</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>with</th>
+<th>without</th>
+<th>change</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1d/1 small src</td>
+<td>1.077</td>
+<td>1.084</td>
+<td>+0.7%</td>
+</tr>
+<tr>
+<td>1d/1 large src</td>
+<td>1.375</td>
+<td>1.376</td>
+<td>+0.1%</td>
+</tr>
+<tr>
+<td>2d/2 small src</td>
+<td>1.850</td>
+<td>1.894</td>
+<td>+2.4%</td>
+</tr>
+<tr>
+<td>2d/2 large src</td>
+<td>2.002</td>
+<td>2.006</td>
+<td>+0.2%</td>
+</tr>
+<tr>
+<td>2d/2 flat coords</td>
+<td>1.850</td>
+<td>1.891</td>
+<td>+2.2%</td>
+</tr>
+<tr>
+<td>3d/3 small src</td>
+<td>2.658</td>
+<td>2.713</td>
+<td>+2.1%</td>
+</tr>
+<tr>
+<td>4d/4 small src</td>
+<td>3.442</td>
+<td>3.533</td>
+<td>+2.6%</td>
+</tr>
+<tr>
+<td>2d/2 <code>[1, N]</code></td>
+<td>1.847</td>
+<td>1.898</td>
+<td>+2.8%</td>
+</tr>
+<tr>
+<td>2d/2 <code>[2, N/2]</code></td>
+<td>1.849</td>
+<td>1.891</td>
+<td>+2.3%</td>
+</tr>
+<tr>
+<td>2d/2 small src, double</td>
+<td>2.007</td>
+<td>2.049</td>
+<td>+2.1%</td>
+</tr>
+<tr>
+<td>2d/2 small src, character</td>
+<td>4.450</td>
+<td>4.461</td>
+<td>+0.2%</td>
+</tr>
+<tr>
+<td>small call (us/call)</td>
+<td>1.968</td>
+<td>1.968</td>
+<td>+0.0%</td>
+</tr>
+<tr>
+<td>control: take first axis, J = 8</td>
+<td>0.885</td>
+<td>0.907</td>
+<td>+2.5%</td>
+</tr>
+<tr>
+<td>control: 2d/2 mixed</td>
+<td>1.992</td>
+<td>2.007</td>
+<td>+0.7%</td>
+</tr>
+<tr>
+<td>control: 2d/2 cartesian</td>
+<td>0.711</td>
+<td>0.713</td>
+<td>+0.2%</td>
+</tr>
+</tbody>
+</table>
+<p>Values are ns per output element except the small call row. &quot;+&quot; means removing <code>unit_run</code> made it slower. The 10 axes, 20 axes, <code>[1, 1, N]</code> and <code>[1, 1024, 1024]</code> rows match <code>[1, N]</code> at +2.0% to +2.4%.</p>
+<p><strong>Why I call it noise:</strong></p>
+<ul>
+<li>
+<p><strong>The control moved as much.</strong> Take first axis J = 8 never uses the <code>unit_run</code> path, yet it slowed by 2.5%, as much as any <code>unit_run</code> case. So removing the branch shifts timings by about 2% even where the branch never runs. That is most likely a side effect of the compiled code changing layout, not of the stride 1 path.</p>
+</li>
+<li>
+<p><strong>Round by round it is not consistent.</strong> In round 1 most <code>unit_run</code> cases were within ±1%, and some were faster without the path. Only rounds 2 and 3 show the +2% to +4%. The largest spread between runs of the same build on the same case was 7%.</p>
+</li>
+<li>
+<p><strong>With one coordinate array there is no gain at all</strong> (+0.1% to +0.7%). That case should benefit most, since with a single array the path is the only thing that differs. The compiler likely already does as well with a runtime stride.</p>
+</li>
+</ul>
+<p><strong>Recommendation:</strong> drop <code>unit_run</code>. It doubles every specialized loop, 5 array counts × 2 missing modes × 7 storage types, for a gain I can't separate from noise. The plan's finding that copying run strides into a local array matters still holds, and removing <code>unit_run</code> keeps that.</p>
+<p>Your tree is untouched. The two builds, the harness, and the raw CSVs are in <code>/tmp/unitrun</code> if you want to rerun anything. Should I make the change on this branch and update the findings in <code>plans/index-optimize-2.md</code>?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Drop it! And further collapse macros where possible</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/index.c</summary>
+<pre class="output">290	  }
+291	
+292	  *p_any_missing = any_missing;
+293	
+294	  FREE(1);
+295	  return x;
+296	}
+297	
+298	#define RRAY_INDEX_STRIDE_ONE(I) 1
+299	#define RRAY_INDEX_STRIDE_RUNTIME(I) v_index_run_strides[I]
+300	
+301	#define RRAY_INDEX_RUN(POKE, MISSING, INDICES_SIZE, STRIDE, CHECK_MISSING)     \
+302	  for (r_ssize j = 0; j &lt; run_size; ++j) {                                     \
+303	    r_ssize location = 0;                                                      \
+304	    bool missing = false;                                                      \
+305	                                                                               \
+306	    for (r_ssize i = 0; i &lt; INDICES_SIZE; ++i) {                               \
+307	      const int index = v_v_index[i][v_index_locations[i] + j * STRIDE(i)];    \
+308	                                                                               \
+309	      if (CHECK_MISSING &amp;&amp; index == r_globals.na_int) {                        \
+310	        missing = true;                                                        \
+311	        break;                                                                 \
+312	      }                                                                        \
+313	                                                                               \
+314	      location += (r_ssize) (index - 1) * v_x_strides[i];                      \
+315	    }                                                                          \
+316	                                                                               \
+317	    POKE(out, run_start + j, missing ? (MISSING) : v_x[location]);             \
+318	  }
+319	
+320	#define RRAY_INDEX_LOOP(POKE, MISSING, INDICES_SIZE, CHECK_MISSING)            \
+321	  while (run_start != size) {                                                  \
+322	    if (unit_run) {                                                            \
+323	      RRAY_INDEX_RUN(                                                          \
+324	        POKE,                                                                  \
+325	        MISSING,                                                               \
+326	        INDICES_SIZE,                                                          \
+327	        RRAY_INDEX_STRIDE_ONE,                                                 \
+328	        CHECK_MISSING                                                          \
+329	      );                                                                       \
+330	    } else {                                                                   \
+331	      RRAY_INDEX_RUN(                                                          \
+332	        POKE,                                                                  \
+333	        MISSING,                                                               \
+334	        INDICES_SIZE,                                                          \
+335	        RRAY_INDEX_STRIDE_RUNTIME,                                             \
+336	        CHECK_MISSING                                                          \
+337	      );                                                                       \
+338	    }                                                                          \
+339	                                                                               \
+340	    run_start += run_size;                                                     \
+341	    RRAY_STRIDED_ITERATOR_NEXT_N(                                              \
+342	      v_index_locations,                                                       \
+343	      v_point,                                                                 \
+344	      plan,                                                                    \
+345	      INDICES_SIZE                                                             \
+346	    );                                                                         \
+347	  }
+348	
+349	#define RRAY_INDEX_LOOPS(POKE, MISSING, CHECK_MISSING)                         \
+350	  switch (indices_size) {                                                      \
+351	  case 1:                                                                      \
+352	    RRAY_INDEX_LOOP(POKE, MISSING, 1, CHECK_MISSING);                          \
+353	    break;                                                                     \
+354	  case 2:                                                                      \
+355	    RRAY_INDEX_LOOP(POKE, MISSING, 2, CHECK_MISSING);                          \
+356	    break;                                                                     \
+357	  case 3:                                                                      \
+358	    RRAY_INDEX_LOOP(POKE, MISSING, 3, CHECK_MISSING);                          \
+359	    break;                                                                     \
+360	  case 4:                                                                      \
+361	    RRAY_INDEX_LOOP(POKE, MISSING, 4, CHECK_MISSING);                          \
+362	    break;                                                                     \
+363	  default:                                                                     \
+364	    RRAY_INDEX_LOOP(POKE, MISSING, indices_size, CHECK_MISSING);               \
+365	    break;                                                                     \
+366	  }
+367	
+368	#define RRAY_INDEX_ITERATE(POKE, MISSING)                                      \
+369	  r_ssize run_start = 0;                                                       \
+370	  const r_ssize run_size = rray_strided_iterator_n_plan_run_size(plan);        \
+371	                                                                               \
+372	  r_ssize v_index_run_strides[RRAY_MAX_DIMENSIONALITY];                        \
+373	  bool unit_run = true;                                                        \
+374	  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \
+375	    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \
+376	    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \
+377	  }                                                                            \
+378	                                                                               \
+379	  r_ssize v_index_locations[RRAY_MAX_DIMENSIONALITY] = {0};                    \
+380	                                                                               \
+381	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+382	  rray_strided_iterator_n_plan_point_init(plan, v_point);                      \
+383	                                                                               \
+384	  if (any_missing) {                                                           \
+385	    RRAY_INDEX_LOOPS(POKE, MISSING, true);                                     \
+386	  } else {                                                                     \
+387	    RRAY_INDEX_LOOPS(POKE, MISSING, false);                                    \
+388	  }
+389	
+390	#define RRAY_INDEX_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+391	
+392	#define RRAY_INDEX_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF, MISSING)           \
+393	  const r_ssize size = rray_strided_iterator_n_plan_size(plan);                \
+394	                                                                               \
+395	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+396	  CTYPE* v_out = DEREF(out);                                                   \
+397	                                                                               \
+398	  const CTYPE* v_x = CONST_DEREF(x);                                           \
+399	                                                                               \
+400	  RRAY_INDEX_ITERATE(RRAY_INDEX_ATOMIC_POKE, MISSING);                         \
+401	                                                                               \
+402	  FREE(1);                                                                     \
+403	  return out;
+404	
+405	#define RRAY_INDEX_BARRIER(RTYPE, CONST_DEREF, POKE, MISSING)                  \
+406	  const r_ssize size = rray_strided_iterator_n_plan_size(plan);                \
+407	                                                                               \
+408	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+409	                                                                               \
+410	  r_obj* const* v_x = CONST_DEREF(x);                                          \
+411	                                                                               \
+412	  RRAY_INDEX_ITERATE(POKE, MISSING);                                           \
+413	                                                                               \
+414	  FREE(1);                                                                     \
+415	  return out;
+416	
+417	static r_obj* rray_index_lgl(
+418	  r_obj* x,
+419	  const r_ssize* v_x_strides,
+420	  const int* const* v_v_index,
+421	  r_ssize indices_size,
+422	  bool any_missing,
+423	  const struct rray_strided_iterator_n_plan* plan
+424	) {
+425	  RRAY_INDEX_ATOMIC(
+426	    R_TYPE_logical,
+427	    int,
+428	    r_lgl_cbegin,
+429	    r_lgl_begin,
+430	    r_globals.na_lgl
+431	  );
+432	}
+433	
+434	static r_obj* rray_index_int(
+435	  r_obj* x,
+436	  const r_ssize* v_x_strides,
+437	  const int* const* v_v_index,
+438	  r_ssize indices_size,
+439	  bool any_missing,
+440	  const struct rray_strided_iterator_n_plan* plan
+441	) {
+442	  RRAY_INDEX_ATOMIC(
+443	    R_TYPE_integer,
+444	    int,
+445	    r_int_cbegin,
+446	    r_int_begin,
+447	    r_globals.na_int
+448	  );
+449	}
+450	
+451	static r_obj* rray_index_dbl(
+452	  r_obj* x,
+453	  const r_ssize* v_x_strides,
+454	  const int* const* v_v_index,
+455	  r_ssize indices_size,
+456	  bool any_missing,
+457	  const struct rray_strided_iterator_n_plan* plan
+458	) {
+459	  RRAY_INDEX_ATOMIC(
+460	    R_TYPE_double,
+461	    double,
+462	    r_dbl_cbegin,
+463	    r_dbl_begin,
+464	    r_globals.na_dbl
+465	  );
+466	}
+467	
+468	static r_obj* rray_index_cpl(
+469	  r_obj* x,
+470	  const r_ssize* v_x_strides,
+471	  const int* const* v_v_index,
+472	  r_ssize indices_size,
+473	  bool any_missing,
+474	  const struct rray_strided_iterator_n_plan* plan
+475	) {
+476	  RRAY_INDEX_ATOMIC(
+477	    R_TYPE_complex,
+478	    r_complex,
+479	    r_cpl_cbegin,
+480	    r_cpl_begin,
+481	    r_globals.na_cpl
+482	  );
+483	}
+484	
+485	static r_obj* rray_index_raw(
+486	  r_obj* x,
+487	  const r_ssize* v_x_strides,
+488	  const int* const* v_v_index,
+489	  r_ssize indices_size,</pre><p class="cut">43 more lines cut</p></details>
+<p>Before collapsing, I'm checking how the other strided-loop files in the repo lay out their macros, so <code>index.c</code> matches them.</p>
+
+<details class="tool"><summary>Bash: grep -n &quot;^#define\|^#undef&quot; src/*.c | grep -v &quot;src/rlang&quot; ; git show main:src/index.c | sed -…</summary>
+<pre>grep -n &quot;^#define\|^#undef&quot; src/*.c | grep -v &quot;src/rlang&quot; ; git show main:src/index.c | sed -n '/^#define/,$p' | head -120</pre><pre class="output">src/arg.c:10:#define RRAY_ARG_BUFFER_SIZE 100
+src/arg.c:206:#define INIT_ARG(ARG)                                                          \
+src/arg.c:211:#define INIT_ARG2(ARG, STR)                                                    \
+src/cast.c:123:#define RRAY_CAST(FROM_CTYPE, FROM_CBEGIN, TO_RTYPE, TO_CTYPE, TO_BEGIN, ONE)  \
+src/cast.c:147:#define RRAY_CAST_LOSSY(                                                       \
+src/cast.c:313:#undef RRAY_CAST
+src/cast.c:314:#undef RRAY_CAST_LOSSY
+src/broadcast.c:110:#define RRAY_BROADCAST_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)                \
+src/broadcast.c:150:#define RRAY_BROADCAST_BARRIER(RTYPE, CONST_DEREF, POKE)                       \
+src/broadcast.c:238:#undef RRAY_BROADCAST_ATOMIC
+src/broadcast.c:239:#undef RRAY_BROADCAST_BARRIER
+src/combine.c:249:#define RRAY_COMBINE_FILL_ATOMIC(CTYPE, CONST_DEREF, DEREF)                    \
+src/combine.c:282:#define RRAY_COMBINE_FILL_BARRIER(CONST_DEREF, POKE)                           \
+src/combine.c:377:#undef RRAY_COMBINE_FILL_ATOMIC
+src/combine.c:378:#undef RRAY_COMBINE_FILL_BARRIER
+src/index.c:298:#define RRAY_INDEX_STRIDE_ONE(I) 1
+src/index.c:299:#define RRAY_INDEX_STRIDE_RUNTIME(I) v_index_run_strides[I]
+src/index.c:301:#define RRAY_INDEX_RUN(POKE, MISSING, INDICES_SIZE, STRIDE, CHECK_MISSING)     \
+src/index.c:320:#define RRAY_INDEX_LOOP(POKE, MISSING, INDICES_SIZE, CHECK_MISSING)            \
+src/index.c:349:#define RRAY_INDEX_LOOPS(POKE, MISSING, CHECK_MISSING)                         \
+src/index.c:368:#define RRAY_INDEX_ITERATE(POKE, MISSING)                                      \
+src/index.c:390:#define RRAY_INDEX_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+src/index.c:392:#define RRAY_INDEX_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF, MISSING)           \
+src/index.c:405:#define RRAY_INDEX_BARRIER(RTYPE, CONST_DEREF, POKE, MISSING)                  \
+src/index.c:523:#undef RRAY_INDEX_STRIDE_ONE
+src/index.c:524:#undef RRAY_INDEX_STRIDE_RUNTIME
+src/index.c:525:#undef RRAY_INDEX_RUN
+src/index.c:526:#undef RRAY_INDEX_LOOP
+src/index.c:527:#undef RRAY_INDEX_LOOPS
+src/index.c:528:#undef RRAY_INDEX_ITERATE
+src/index.c:529:#undef RRAY_INDEX_ATOMIC_POKE
+src/index.c:530:#undef RRAY_INDEX_ATOMIC
+src/index.c:531:#undef RRAY_INDEX_BARRIER
+src/equal.c:227:#define RRAY_EQUALITY(                                                         \
+src/equal.c:555:#undef RRAY_EQUALITY
+src/compare.c:297:#define RRAY_COMPARE(                                                          \
+src/compare.c:554:#undef RRAY_COMPARE
+src/compare.c:556:#define RRAY_COMPARE_ONE(X_IS_MISSING, Y_IS_MISSING, OPERATOR)                 \
+src/compare.c:613:#undef RRAY_COMPARE_ONE
+src/permute-axes.c:99:#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \
+src/permute-axes.c:139:#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \
+src/permute-axes.c:232:#undef RRAY_PERMUTE_AXES_ATOMIC
+src/permute-axes.c:233:#undef RRAY_PERMUTE_AXES_BARRIER
+src/extremum.c:291:#define RRAY_EXTREMUM(                                                         \
+src/extremum.c:730:#undef RRAY_EXTREMUM
+src/split.c:258:#define RRAY_SPLIT_FILL_ATOMIC(CTYPE, CONST_DEREF, DEREF)                      \
+src/split.c:285:#define RRAY_SPLIT_FILL_BARRIER(CONST_DEREF, POKE)                             \
+src/split.c:373:#undef RRAY_SPLIT_FILL_ATOMIC
+src/split.c:374:#undef RRAY_SPLIT_FILL_BARRIER
+src/rep.c:262:#define RRAY_REP_FILL_UNIFORM_ATOMIC(CTYPE, CONST_DEREF, DEREF)                \
+src/rep.c:279:#define RRAY_REP_FILL_UNIFORM_BARRIER(CONST_DEREF, POKE)                       \
+src/rep.c:365:#undef RRAY_REP_FILL_UNIFORM_ATOMIC
+src/rep.c:366:#undef RRAY_REP_FILL_UNIFORM_BARRIER
+src/rep.c:452:#define RRAY_REP_FILL_VARYING_ATOMIC(CTYPE, CONST_DEREF, DEREF)                \
+src/rep.c:474:#define RRAY_REP_FILL_VARYING_BARRIER(CONST_DEREF, POKE)                       \
+src/rep.c:572:#undef RRAY_REP_FILL_VARYING_ATOMIC
+src/rep.c:573:#undef RRAY_REP_FILL_VARYING_BARRIER
+#define RRAY_INDEX_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF, MISSING)           \
+  const r_ssize size = rray_strided_iterator_n_plan_size(plan);                \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+  CTYPE* v_out = DEREF(out);                                                   \
+                                                                               \
+  const CTYPE* v_x = CONST_DEREF(x);                                           \
+                                                                               \
+  r_ssize v_index_locations[RRAY_MAX_DIMENSIONALITY] = {0};                    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_n_plan_point_init(plan, v_point);                      \
+                                                                               \
+  for (r_ssize i = 0; i &lt; size; ++i) {                                         \
+    const r_ssize location = rray_index_location(                              \
+      v_x_strides,                                                             \
+      v_v_index,                                                               \
+      v_index_locations,                                                       \
+      indices_size                                                             \
+    );                                                                         \
+    v_out[i] = location == -1 ? MISSING : v_x[location];                       \
+    RRAY_STRIDED_ITERATOR_NEXT_N(v_index_locations, v_point, plan);            \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#define RRAY_INDEX_BARRIER(RTYPE, CONST_DEREF, POKE, MISSING)                  \
+  const r_ssize size = rray_strided_iterator_n_plan_size(plan);                \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \
+                                                                               \
+  r_ssize v_index_locations[RRAY_MAX_DIMENSIONALITY] = {0};                    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_n_plan_point_init(plan, v_point);                      \
+                                                                               \
+  for (r_ssize i = 0; i &lt; size; ++i) {                                         \
+    const r_ssize location = rray_index_location(                              \
+      v_x_strides,                                                             \
+      v_v_index,                                                               \
+      v_index_locations,                                                       \
+      indices_size                                                             \
+    );                                                                         \
+    POKE(out, i, location == -1 ? MISSING : v_x[location]);                    \
+    RRAY_STRIDED_ITERATOR_NEXT_N(v_index_locations, v_point, plan);            \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+static r_obj* rray_index_lgl(
+  r_obj* x,
+  const r_ssize* v_x_strides,
+  const int* const* v_v_index,
+  r_ssize indices_size,
+  const struct rray_strided_iterator_n_plan* plan
+) {
+  RRAY_INDEX_ATOMIC(
+    R_TYPE_logical,
+    int,
+    r_lgl_cbegin,
+    r_lgl_begin,
+    r_globals.na_lgl
+  );
+}
+
+static r_obj* rray_index_int(
+  r_obj* x,
+  const r_ssize* v_x_strides,
+  const int* const* v_v_index,
+  r_ssize indices_size,
+  const struct rray_strided_iterator_n_plan* plan
+) {
+  RRAY_INDEX_ATOMIC(
+    R_TYPE_integer,
+    int,
+    r_int_cbegin,
+    r_int_begin,
+    r_globals.na_int
+  );
+}
+
+static r_obj* rray_index_dbl(
+  r_obj* x,
+  const r_ssize* v_x_strides,
+  const int* const* v_v_index,
+  r_ssize indices_size,
+  const struct rray_strided_iterator_n_plan* plan
+) {
+  RRAY_INDEX_ATOMIC(
+    R_TYPE_double,
+    double,
+    r_dbl_cbegin,
+    r_dbl_begin,
+    r_globals.na_dbl
+  );
+}
+
+static r_obj* rray_index_cpl(
+  r_obj* x,
+  const r_ssize* v_x_strides,
+  const int* const* v_v_index,
+  r_ssize indices_size,
+  const struct rray_strided_iterator_n_plan* plan
+) {
+  RRAY_INDEX_ATOMIC(
+    R_TYPE_complex,
+    r_complex,
+    r_cpl_cbegin,
+    r_cpl_begin,
+    r_globals.na_cpl
+  );
+}
+
+static r_obj* rray_index_raw(
+  r_obj* x,
+  const r_ssize* v_x_strides,</pre></details>
+<details class="tool"><summary>Bash: sed -n 105,175p src/broadcast.c</summary>
+<pre>sed -n 105,175p src/broadcast.c</pre><pre class="output">  FREE(5);
+  return out;
+}
+
+#define RRAY_BROADCAST_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)                \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+  CTYPE* v_out = DEREF(out);                                                   \
+                                                                               \
+  const CTYPE* v_x = CONST_DEREF(x);                                           \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    if (x_run_stride == 0) {                                                   \
+      const CTYPE x_elt = v_x[x_loc];                                          \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[i] = x_elt;                                                      \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[i] = v_x[x_loc];                                                 \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#define RRAY_BROADCAST_BARRIER(RTYPE, CONST_DEREF, POKE)                       \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    if (x_run_stride == 0) {                                                   \
+      r_obj* const x_elt = v_x[x_loc];                                         \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        POKE(out, i, x_elt);                                                   \
+      }                                                                        \
+    } else {                                                                   \</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Merging the run body into <code>RRAY_INDEX_LOOP()</code> and dropping the stride macros, cutting the macro count from 9 to 6 — this matches the &quot;without&quot; build I already benchmarked, so those numbers still hold.</p>
+</details>
+<details class="tool"><summary>Edit src/index.c</summary>
+<pre class="diff"><span class="del">-#define RRAY_INDEX_STRIDE_ONE(I) 1</span>
+<span class="del">-#define RRAY_INDEX_STRIDE_RUNTIME(I) v_index_run_strides[I]</span>
+<span class="del">-</span>
+<span class="del">-#define RRAY_INDEX_RUN(POKE, MISSING, INDICES_SIZE, STRIDE, CHECK_MISSING)     \</span>
+<span class="del">-  for (r_ssize j = 0; j &lt; run_size; ++j) {                                     \</span>
+<span class="del">-    r_ssize location = 0;                                                      \</span>
+<span class="del">-    bool missing = false;                                                      \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    for (r_ssize i = 0; i &lt; INDICES_SIZE; ++i) {                               \</span>
+<span class="del">-      const int index = v_v_index[i][v_index_locations[i] + j * STRIDE(i)];    \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-      if (CHECK_MISSING &amp;&amp; index == r_globals.na_int) {                        \</span>
+<span class="del">-        missing = true;                                                        \</span>
+<span class="del">-        break;                                                                 \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-      location += (r_ssize) (index - 1) * v_x_strides[i];                      \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    POKE(out, run_start + j, missing ? (MISSING) : v_x[location]);             \</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-#define RRAY_INDEX_LOOP(POKE, MISSING, INDICES_SIZE, CHECK_MISSING)            \</span>
+<span class="del">-  while (run_start != size) {                                                  \</span>
+<span class="del">-    if (unit_run) {                                                            \</span>
+<span class="del">-      RRAY_INDEX_RUN(                                                          \</span>
+<span class="del">-        POKE,                                                                  \</span>
+<span class="del">-        MISSING,                                                               \</span>
+<span class="del">-        INDICES_SIZE,                                                          \</span>
+<span class="del">-        RRAY_INDEX_STRIDE_ONE,                                                 \</span>
+<span class="del">-        CHECK_MISSING                                                          \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      RRAY_INDEX_RUN(                                                          \</span>
+<span class="del">-        POKE,                                                                  \</span>
+<span class="del">-        MISSING,                                                               \</span>
+<span class="del">-        INDICES_SIZE,                                                          \</span>
+<span class="del">-        RRAY_INDEX_STRIDE_RUNTIME,                                             \</span>
+<span class="del">-        CHECK_MISSING                                                          \</span>
+<span class="del">-      );                                                                       \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    run_start += run_size;                                                     \</span>
+<span class="ins">+#define RRAY_INDEX_LOOP(POKE, MISSING, INDICES_SIZE, CHECK_MISSING)            \</span>
+<span class="ins">+  while (run_start != size) {                                                  \</span>
+<span class="ins">+    for (r_ssize j = 0; j &lt; run_size; ++j) {                                   \</span>
+<span class="ins">+      r_ssize location = 0;                                                    \</span>
+<span class="ins">+      bool missing = false;                                                    \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = 0; i &lt; INDICES_SIZE; ++i) {                             \</span>
+<span class="ins">+        const int index =                                                      \</span>
+<span class="ins">+          v_v_index[i][v_index_locations[i] + j * v_index_run_strides[i]];     \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+        if (CHECK_MISSING &amp;&amp; index == r_globals.na_int) {                      \</span>
+<span class="ins">+          missing = true;                                                      \</span>
+<span class="ins">+          break;                                                               \</span>
+<span class="ins">+        }                                                                      \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+        location += (r_ssize) (index - 1) * v_x_strides[i];                    \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      POKE(out, run_start + j, missing ? (MISSING) : v_x[location]);           \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    run_start += run_size;                                                     \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/index.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/index.c</summary>
+<pre class="diff"><span class="del">-  bool unit_run = true;                                                        \</span>
+<span class="del">-  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \</span>
+<span class="del">-    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \</span>
+<span class="del">-    unit_run = unit_run &amp;&amp; v_index_run_strides[i] == 1;                        \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; indices_size; ++i) {                                 \</span>
+<span class="ins">+    v_index_run_strides[i] = rray_strided_iterator_n_plan_run_stride(plan, i); \</span>
+<span class="ins">+  }                                                                            \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/index.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/index.c</summary>
+<pre class="diff"><span class="del">-#undef RRAY_INDEX_STRIDE_ONE</span>
+<span class="del">-#undef RRAY_INDEX_STRIDE_RUNTIME</span>
+<span class="del">-#undef RRAY_INDEX_RUN</span>
+<span class="del">-#undef RRAY_INDEX_LOOP</span>
+<span class="ins">+#undef RRAY_INDEX_LOOP</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/index.c has been updated successfully.</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>This is as far as the code collapses—folding these further would either duplicate loops or add unnecessary per-element calls. Now I'll format the code and check for any leftover references to the stride-1 path.</p>
+</details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; grep -rn -i &quot;unit_run\|stride 1\|str…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; grep -rn -i &quot;unit_run\|stride 1\|stride_one\|literal stride&quot; src/ plans/index-optimize-2.md R/ tests/ | grep -v &quot;src/rlang&quot;</pre><pre class="output"> M src/index.c
+src/strided-iterator.h:99://   dimension 3 second axis, adopting stride 1, after which the dimension 4
+src/strided-iterator.h:121:// loop and vectorize the remaining stride 1 work.
+plans/index-optimize-2.md:9:2. Walk the first axis as a run, with a literal stride 1 path.
+plans/index-optimize-2.md:162:- **A literal stride 1 path did little for the per-array algorithm.** It was worth about 3%, close to noise. Steps 1-4 keep theirs, as the earlier plan describes, but its share of the step 2 gain was not measured separately.
+plans/index-optimize-2.md:168:- **`src/index.c`**: the loop walks the first axis as a run, with a literal stride 1 path. It is specialized on 1 to 4 coordinate arrays, with a general fallback. When validation saw no `NA`, it runs a copy with no missing value check.</pre></details>
+<p>The two <code>strided-iterator.h</code> hits are your comments about coalescing in general, so I'm leaving them. Next I'm updating the three stale spots in the findings doc and adding the new measurement.</p>
+
+<details class="tool"><summary>Read plans/index-optimize-2.md</summary>
+<pre class="output">1	# Optimizing `rray_index()`, part 2
+2	
+3	## Summary
+4	
+5	This branch implements steps 1 through 4 of `plans/index-optimize.md`:
+6	
+7	1. Specialize the loop on 1, 2, 3 and 4 coordinate arrays.
+8	
+9	2. Walk the first axis as a run, with a literal stride 1 path.
+10	
+11	3. Merge (coalesce) adjacent axes across all coordinate arrays.
+12	
+13	4. Skip the missing value check when validation saw no `NA`.
+14	
+15	It is 50% to 78% faster than `feature/index` on every large case except character arrays, which are 30% faster. Results are bit identical on every case measured.
+16	
+17	We also built and measured a different algorithm, one pass per coordinate array. It lost to steps 1-4 on every case with two or more coordinate arrays, and it needs a scratch buffer as large as the result or larger. We recommend steps 1-4.
+18	
+19	## The two algorithms
+20	</pre></details>
+<details class="tool"><summary>Read plans/index-optimize-2.md</summary>
+<pre class="output">150	Only code size. It needs no per-count specialization, and only the final pass depends on the storage type. That is not worth a 20% to 45% slowdown and a scratch buffer.
+151	
+152	## Findings that change `plans/index-optimize.md`
+153	
+154	- **Take shapes do benefit.** The earlier plan said the take-along-axis shapes would not gain from step 3. That is true of coalescing, but the run loop from step 2 still cuts them by 55% to 65%, and step 4 takes a further 7% to 21% off.
+155	
+156	- **Step 4 is measured now.** It is worth 5% to 8% on most cases, and 12% to 21% on the Cartesian, mixed and take first axis shapes. With one coordinate array it is worth 15%, bringing that case to 1.08 ns/elt. It does nothing when an `NA` is present, as expected. The earlier plan quoted numpy at 0.94 ns/elt for this case, but that number is from a different session, so treat the gap as approximate.
+157	
+158	- **Coalescing still does exactly what the earlier plan said.** `[1, N]`, `[1, 1, N]`, `[1, 1024, 1024]`, 10 axes and 20 axes all cost the same as flat coordinates.
+159	
+160	- **Short runs are sensitive to how run strides are read.** Reading each run stride through `rray_strided_iterator_n_plan_run_stride()` on every element was 6% to 7% slower on the mixed and J = 2 take shapes, where every run is 2 elements long. Copying the run strides into a local array before the loop removed the difference.
+161	
+162	- **A literal stride 1 path did little for the per-array algorithm.** It was worth about 3%, close to noise. Steps 1-4 keep theirs, as the earlier plan describes, but its share of the step 2 gain was not measured separately.
+163	
+164	## What changed in this branch
+165	
+166	- **`src/strided-iterator.h`**: `rray_strided_iterator_n_plan()` now merges adjacent axes through a new `rray__strided_iterator_axes_coalescen()`, the N operand sibling of `rray__strided_iterator_axes_coalesce2()`. The plan still points at caller owned strides, so N stays unbounded. The builder takes `r_ssize* v_strides` and merges the axes in place. `RRAY_STRIDED_ITERATOR_NEXT_N()` now starts at axis 1 like the other iterators, since the caller owns the first axis run, and takes the array count as a parameter so it can be a literal.
+167	
+168	- **`src/index.c`**: the loop walks the first axis as a run, with a literal stride 1 path. It is specialized on 1 to 4 coordinate arrays, with a general fallback. When validation saw no `NA`, it runs a copy with no missing value check.
+169	
+170	- **`rray_as_index_array()`**: takes a `bool* p_any_missing` and reports whether it saw an `NA`, at no extra cost since it already visits every value.
+171	
+172	- **Tests**: every coordinate count from 1 to 5, with and without `NA`, against `index_base()`. Coordinates reshaped as `[1, n]`, `[1, 1, n]`, `[2, n/2]` and `[2, 3, 4]` giving the same values. Character and list results from one and two coordinate arrays, with and without `NA`. A missing value in an early coordinate array surviving later arrays.
+173	
+174	## Next
+175	
+176	- **Validation is now the largest cost per coordinate array.** At 0.57 ns/elt it is over half of the one array case. The loop has two data dependent branches per element that each lead to an error. Checking the range without branching, and only finding the bad value once we know there is one, is the obvious next step.
+177	
+178	- **Small call overhead is unchanged** at about 2 us per call. The earlier plan's analysis still applies. The loop is not involved.
+179	</pre></details>
+<details class="tool"><summary>Edit plans/index-optimize-2.md</summary>
+<pre class="diff"><span class="del">-2. Walk the first axis as a run, with a literal stride 1 path.</span>
+<span class="ins">+2. Walk the first axis as a run.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/index-optimize-2.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/index-optimize-2.md</summary>
+<pre class="diff"><span class="del">-- **A literal stride 1 path did little for the per-array algorithm.** It was worth about 3%, close to noise. Steps 1-4 keep theirs, as the earlier plan describes, but its share of the step 2 gain was not measured separately.</span>
+<span class="ins">+- **A literal stride 1 path is not worth it.** The earlier plan called for a copy of the run loop with every run stride fixed at 1. It only applies when no coordinate array is broadcast along the first merged axis, and it measured within noise for both algorithms. See below.</span>
+<span class="ins">+</span>
+<span class="ins">+## Dropping the literal stride 1 path</span>
+<span class="ins">+</span>
+<span class="ins">+The &quot;this branch&quot; column above was measured with a copy of the run loop where every run stride was the literal `1`. It was taken when every coordinate array had run stride 1, that is, when none was broadcast along the first merged axis. That is 18 of the 23 cases. The other 5 (Cartesian, mixed, both take first axis cases, take 3d axis 2) never take it.</span>
+<span class="ins">+</span>
+<span class="ins">+We compared that build against the same code with the copy removed, 3 interleaved rounds each, keeping the faster run. Results were identical on all 23 cases.</span>
+<span class="ins">+</span>
+<span class="ins">+| Case | with | without | change |</span>
+<span class="ins">+|---|---|---|---|</span>
+<span class="ins">+| 1d/1 small src | 1.077 | 1.084 | +0.7% |</span>
+<span class="ins">+| 1d/1 large src | 1.375 | 1.376 | +0.1% |</span>
+<span class="ins">+| 2d/2 small src | 1.850 | 1.894 | +2.4% |</span>
+<span class="ins">+| 2d/2 large src | 2.002 | 2.006 | +0.2% |</span>
+<span class="ins">+| 4d/4 small src | 3.442 | 3.533 | +2.6% |</span>
+<span class="ins">+| 2d/2 `[1, N]` | 1.847 | 1.898 | +2.8% |</span>
+<span class="ins">+| 2d/2 small src, character | 4.450 | 4.461 | +0.2% |</span>
+<span class="ins">+| take first axis, J = 8 (never takes it) | 0.885 | 0.907 | +2.5% |</span>
+<span class="ins">+</span>
+<span class="ins">+The other same shape cases sat at +2.0% to +2.4%. It is noise, not a gain:</span>
+<span class="ins">+</span>
+<span class="ins">+- **The control moved as much.** Take first axis J = 8 never takes the path and still moved 2.5%, likely from code layout.</span>
+<span class="ins">+</span>
+<span class="ins">+- **It was not consistent.** In the first round most cases were within 1% either way. The largest run to run spread was 7%.</span>
+<span class="ins">+</span>
+<span class="ins">+- **One coordinate array gained nothing**, where the path should matter most.</span>
+<span class="ins">+</span>
+<span class="ins">+It doubled every specialized loop, so it was removed.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/index-optimize-2.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/index-optimize-2.md</summary>
+<pre class="diff"><span class="del">-the loop walks the first axis as a run, with a literal stride 1 path. It is</span>
+<span class="ins">+the loop walks the first axis as a run. It is</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/index-optimize-2.md has been updated successfully.</pre></details>
+<p>Docs updated. No <code>r_obj*</code> values were touched, so there is nothing new to protect. Running the index tests.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^index')&quot; 2&gt;&amp;1 | tail -8 &amp;&amp; git diff --stat</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^index')&quot; 2&gt;&amp;1 | tail -8 &amp;&amp; git diff --stat</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 64 ]
+ plans/index-optimize-2.md | 33 +++++++++++++++++++++++++---
+ src/index.c               | 56 +++++++++++++----------------------------------
+ 2 files changed, 45 insertions(+), 44 deletions(-)</pre></details>
+<p>All 64 index tests pass. Committing and pushing.</p>
+
+<details class="tool"><summary>Bash: git add src/index.c plans/index-optimize-2.md &amp;&amp; git commit -q -m &quot;Drop the literal stride 1 …</summary>
+<pre>git add src/index.c plans/index-optimize-2.md &amp;&amp; git commit -q -m &quot;Drop the literal stride 1 path from rray_index() and collapse its macros&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/index-optimize 2&gt;&amp;1 | tail -3 &amp;&amp; rm -rf /tmp/unitrun</pre><pre class="output">08afcb9 Drop the literal stride 1 path from rray_index() and collapse its macros
+To https://github.com/DavisVaughan/rray4.git
+   d9af662..08afcb9  feature/index-optimize -&gt; feature/index-optimize
+branch 'feature/index-optimize' set up to track 'origin/feature/index-optimize'.</pre></details>
+<p>I removed the stride 1 path and its macros, then committed and pushed as <code>08afcb9</code> to <code>feature/index-optimize</code>. All 64 index tests pass.</p>
+<p><strong><code>src/index.c</code></strong></p>
+<ul>
+<li>
+<p>Removed <code>unit_run</code> and the stride 1 copy of the loop. Every run now reads its stride from the local <code>v_index_run_strides</code> array. That is exactly the &quot;without&quot; build I benchmarked, so those numbers describe the code as committed.</p>
+</li>
+<li>
+<p>Collapsed the macros from 9 to 6. <code>RRAY_INDEX_STRIDE_ONE()</code> and <code>RRAY_INDEX_STRIDE_RUNTIME()</code> are gone, and <code>RRAY_INDEX_RUN()</code> is now part of <code>RRAY_INDEX_LOOP()</code>.</p>
+</li>
+</ul>
+<p>The remaining macros each still do a job, so I stopped there:</p>
+<ul>
+<li>
+<p><strong><code>RRAY_INDEX_LOOPS()</code></strong> picks the loop version for 1 to 4 coordinate arrays. It is expanded twice, with and without the missing check. Folding it away would mean writing out 10 loop copies by hand.</p>
+</li>
+<li>
+<p><strong><code>RRAY_INDEX_ATOMIC_POKE()</code></strong> writes straight into <code>v_out</code>. The alternative calls <code>r_*_begin()</code> on every element, which would cost speed.</p>
+</li>
+<li>
+<p><strong><code>RRAY_INDEX_ATOMIC()</code> and <code>RRAY_INDEX_BARRIER()</code></strong> are the same pair every other strided file uses, like <code>src/broadcast.c</code> and <code>src/permute-axes.c</code>.</p>
+</li>
+</ul>
+<p><strong><code>plans/index-optimize-2.md</code></strong></p>
+<ul>
+<li>
+<p>Step 2 no longer mentions a stride 1 path.</p>
+</li>
+<li>
+<p>There is a new &quot;Dropping the literal stride 1 path&quot; section with the with/without table and why it counts as noise.</p>
+</li>
+<li>
+<p>One thing to keep in mind: the main &quot;this branch&quot; results column was measured with the stride 1 path still in. The new section says so. Based on the comparison, current code sits within 0% to 3% of those numbers.</p>
+</li>
+</ul>
+<p>I deleted the scratch builds in <code>/tmp/unitrun</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

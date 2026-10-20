@@ -1,0 +1,1458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tidying src/extract-subscript.c switches, protection, and strides</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-87">rray timeline</a>
+<h1>Tidying <code>src/extract-subscript.c</code> switches, protection, and strides</h1>
+<p class="facts">Claude · Sep 25, 2026 · 7 prompts · 9 replies · <a href="https://github.com/r-lib/rray/pull/87">#87</a></p>
+</header>
+<main>
+<p class="divider">Sep 25, 2026, 00:35 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In rray as extract subscript don’t break on integer and double cases. Inline all of that code and the extra switch so the whole body is one big switch</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -rn &quot;as_extract_subscript&quot; src R | head -30</summary>
+<pre>grep -rn &quot;as_extract_subscript&quot; src R | head -30</pre><pre class="output">src/extract.c:32:  const struct rray_extract_subscript subscript = rray_as_extract_subscript(
+src/init.c:27:extern r_obj* ffi_rray_as_extract_subscript(
+src/init.c:229:  {&quot;ffi_rray_as_extract_subscript&quot;,
+src/init.c:230:   (DL_FUNC) &amp;ffi_rray_as_extract_subscript,
+src/extract-subscript.h:22:struct rray_extract_subscript rray_as_extract_subscript(
+src/extract-subscript.c:19:r_obj* ffi_rray_as_extract_subscript(
+src/extract-subscript.c:29:  const struct rray_extract_subscript subscript = rray_as_extract_subscript(
+src/extract-subscript.c:52:struct rray_extract_subscript rray_as_extract_subscript(
+R/extract-subscript.R:1:rray_as_extract_subscript &lt;- function(i, dimensions) {
+R/extract-subscript.R:2:  .Call(ffi_rray_as_extract_subscript, i, dimensions, environment())</pre></details>
+<details class="tool"><summary>Bash: cat -n src/extract-subscript.c &amp;&amp; cat src/decl/extract-subscript-decl.h &amp;&amp; cat src/extract-su…</summary>
+<pre>cat -n src/extract-subscript.c &amp;&amp; cat src/decl/extract-subscript-decl.h &amp;&amp; cat src/extract-subscript.h</pre><pre class="output">     1	#include &quot;extract-subscript.h&quot;
+     2	
+     3	#include &lt;math.h&gt;
+     4	
+     5	#include &quot;dimensions.h&quot;
+     6	#include &quot;size.h&quot;
+     7	#include &quot;utils.h&quot;
+     8	
+     9	struct rray_subscript_summary {
+    10	  double min;
+    11	  double max;
+    12	  r_ssize zeros;
+    13	  bool any_missing;
+    14	  bool any_fractional;
+    15	};
+    16	
+    17	#include &quot;decl/extract-subscript-decl.h&quot;
+    18	
+    19	r_obj* ffi_rray_as_extract_subscript(
+    20	  r_obj* ffi_i,
+    21	  r_obj* ffi_dimensions,
+    22	  r_obj* ffi_frame
+    23	) {
+    24	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+    25	
+    26	  r_obj* dimensions =
+    27	    KEEP(arg_as_dimensions(ffi_dimensions, rray_args.dimensions, error_call));
+    28	
+    29	  const struct rray_extract_subscript subscript = rray_as_extract_subscript(
+    30	    ffi_i,
+    31	    r_int_cbegin(dimensions),
+    32	    (int) r_length(dimensions),
+    33	    rray_args.i,
+    34	    error_call
+    35	  );
+    36	  KEEP(subscript.i);
+    37	
+    38	  const char* v_names[] = {&quot;i&quot;, &quot;kind&quot;, &quot;size&quot;};
+    39	  r_obj* names = KEEP(r_chr_n(v_names, 3));
+    40	
+    41	  r_obj* out = KEEP(r_alloc_list(3));
+    42	  r_attrib_poke_names(out, names);
+    43	
+    44	  r_list_poke(out, 0, subscript.i);
+    45	  r_list_poke(out, 1, r_chr(rray_extract_subscript_kind_name(subscript.kind)));
+    46	  r_list_poke(out, 2, r_int(r_ssize_as_integer(subscript.size)));
+    47	
+    48	  FREE(4);
+    49	  return out;
+    50	}
+    51	
+    52	struct rray_extract_subscript rray_as_extract_subscript(
+    53	  r_obj* i,
+    54	  const int* v_dimensions,
+    55	  int dimensionality,
+    56	  struct rray_arg* i_arg,
+    57	  struct r_lazy error_call
+    58	) {
+    59	  check_unclassed(i, i_arg, error_call);
+    60	
+    61	  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+    62	
+    63	  switch (r_typeof(i)) {
+    64	  case R_TYPE_logical:
+    65	    return rray_as_extract_mask(
+    66	      i,
+    67	      v_dimensions,
+    68	      dimensionality,
+    69	      size,
+    70	      i_arg,
+    71	      error_call
+    72	    );
+    73	  case R_TYPE_integer:
+    74	  case R_TYPE_double:
+    75	    break;
+    76	  default:
+    77	    r_abort_lazy_call(
+    78	      error_call,
+    79	      &quot;%s must be logical, integer, or double, not %s.&quot;,
+    80	      rray_arg_format(i_arg),
+    81	      r_obj_type_friendly(i)
+    82	    );
+    83	  }
+    84	
+    85	  r_obj* i_dimensions = r_dim(i);
+    86	  const r_ssize i_dimensionality =
+    87	    i_dimensions == r_null ? 1 : r_length(i_dimensions);
+    88	
+    89	  switch (i_dimensionality) {
+    90	  case 1:
+    91	    return rray_as_extract_positions(i, size, i_arg, error_call);
+    92	  case 2:
+    93	    return rray_as_extract_points(
+    94	      i,
+    95	      v_dimensions,
+    96	      dimensionality,
+    97	      i_arg,
+    98	      error_call
+    99	    );
+   100	  default:
+   101	    r_abort_lazy_call(
+   102	      error_call,
+   103	      &quot;Numeric %s must be a vector or a matrix, not an array with &quot;
+   104	      &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,
+   105	      rray_arg_format(i_arg),
+   106	      i_dimensionality
+   107	    );
+   108	  }
+   109	}
+   110	
+   111	static struct rray_extract_subscript rray_as_extract_mask(
+   112	  r_obj* i,
+   113	  const int* v_dimensions,
+   114	  int dimensionality,
+   115	  r_ssize size,
+   116	  struct rray_arg* i_arg,
+   117	  struct r_lazy error_call
+   118	) {
+   119	  r_obj* i_dimensions = r_dim(i);
+   120	
+   121	  if (i_dimensions != r_null &amp;&amp; r_length(i_dimensions) != 1) {
+   122	    const bool equal = rray_dimensions_are_equal(
+   123	      r_int_cbegin(i_dimensions),
+   124	      (int) r_length(i_dimensions),
+   125	      v_dimensions,
+   126	      dimensionality
+   127	    );
+   128	
+   129	    if (!equal) {
+   130	      r_abort_lazy_call(
+   131	        error_call,
+   132	        &quot;Logical %s must be a vector or have the same dimensions as `x`.&quot;,
+   133	        rray_arg_format(i_arg)
+   134	      );
+   135	    }
+   136	  }
+   137	
+   138	  const r_ssize i_size = r_length(i);
+   139	
+   140	  if (i_size != 1 &amp;&amp; i_size != size) {
+   141	    r_abort_lazy_call(
+   142	      error_call,
+   143	      &quot;Logical %s must be size 1 or %&quot; R_PRI_SSIZE &quot;, not %&quot; R_PRI_SSIZE &quot;.&quot;,
+   144	      rray_arg_format(i_arg),
+   145	      size,
+   146	      i_size
+   147	    );
+   148	  }
+   149	
+   150	  return (struct rray_extract_subscript){
+   151	    .i = i,
+   152	    .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_mask,
+   153	    .size = rray_mask_size(i, size)
+   154	  };
+   155	}
+   156	
+   157	static struct rray_extract_subscript rray_as_extract_positions(
+   158	  r_obj* i,
+   159	  r_ssize size,
+   160	  struct rray_arg* i_arg,
+   161	  struct r_lazy error_call
+   162	) {
+   163	  const r_ssize i_size = r_length(i);
+   164	  const struct rray_subscript_summary summary =
+   165	    rray_subscript_summarise(i, 0, i_size);
+   166	
+   167	  if (summary.any_fractional) {
+   168	    stop_subscript_fractional(i_arg, error_call);
+   169	  }
+   170	  if (summary.max &gt; size) {
+   171	    r_abort_lazy_call(
+   172	      error_call,
+   173	      &quot;%s must not contain values greater than %&quot; R_PRI_SSIZE &quot;.&quot;,
+   174	      rray_arg_format(i_arg),
+   175	      size
+   176	    );
+   177	  }
+   178	  if (summary.min &lt; -size) {
+   179	    r_abort_lazy_call(
+   180	      error_call,
+   181	      &quot;%s must not contain values less than -%&quot; R_PRI_SSIZE &quot;.&quot;,
+   182	      rray_arg_format(i_arg),
+   183	      size
+   184	    );
+   185	  }
+   186	
+   187	  const bool any_negative = summary.min &lt; 0;
+   188	
+   189	  if (any_negative &amp;&amp; summary.max &gt; 0) {
+   190	    r_abort_lazy_call(
+   191	      error_call,
+   192	      &quot;%s can't mix positive and negative values.&quot;,
+   193	      rray_arg_format(i_arg)
+   194	    );
+   195	  }
+   196	  if (any_negative &amp;&amp; summary.any_missing) {
+   197	    r_abort_lazy_call(
+   198	      error_call,
+   199	      &quot;%s can't mix negative and missing values.&quot;,
+   200	      rray_arg_format(i_arg)</pre><p class="cut">392 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+p = &quot;src/extract-subscript.c&quot;
+s = open(p).read()
+old = s[s.index(&quot;  case R_TYPE_integer:\n  case R_TYPE_double:\n    break;&quot;):s.index(&quot;static struct rray_extract_subscript rray_as_extract_mask(&quot;)]
+new = '''  case R_TYPE_integer:
+  case R_TYPE_double: {
+    r_obj* i_dimensions = r_dim(i);
+    const r_ssize i_dimensionality =
+      i_dimensions == r_null ? 1 : r_length(i_dimensions);
+
+    switch (i_dimensionality) {
+    case 1:
+      return rray_as_extract_positions(i, size, i_arg, error_call);
+    case 2:
+      return rray_as_extract_points(
+        i,
+        v_dimensions,
+        dimensionality,
+        i_arg,
+        error_call
+      );
+    default:
+      r_abort_lazy_call(
+        error_call,
+        &quot;Numeric %s must be a vector or a matrix, not an array with &quot;
+        &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,
+        rray_arg_format(i_arg),
+        i_dimensionality
+      );
+    }
+  }
+  default:
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be logical, integer, or double, not %s.&quot;,
+      rray_arg_format(i_arg),
+      r_obj_type_friendly(i)
+    );
+  }
+}
+
+'''
+s = s.replace(old, new)
+open(p, &quot;w&quot;).write(s)
+EOF
+clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; sed -n 52,110p src/extract-subscript.c</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/extract-subscript.c</summary>
+<pre class="output">60	
+61	  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+62	
+63	  switch (r_typeof(i)) {
+64	  case R_TYPE_logical:
+65	    return rray_as_extract_mask(
+66	      i,
+67	      v_dimensions,
+68	      dimensionality,
+69	      size,
+70	      i_arg,
+71	      error_call
+72	    );
+73	  case R_TYPE_integer:
+74	  case R_TYPE_double:
+75	    break;
+76	  default:
+77	    r_abort_lazy_call(
+78	      error_call,
+79	      &quot;%s must be logical, integer, or double, not %s.&quot;,
+80	      rray_arg_format(i_arg),
+81	      r_obj_type_friendly(i)
+82	    );
+83	  }
+84	
+85	  r_obj* i_dimensions = r_dim(i);
+86	  const r_ssize i_dimensionality =
+87	    i_dimensions == r_null ? 1 : r_length(i_dimensions);
+88	
+89	  switch (i_dimensionality) {
+90	  case 1:
+91	    return rray_as_extract_positions(i, size, i_arg, error_call);
+92	  case 2:
+93	    return rray_as_extract_points(
+94	      i,
+95	      v_dimensions,
+96	      dimensionality,
+97	      i_arg,
+98	      error_call
+99	    );
+100	  default:
+101	    r_abort_lazy_call(
+102	      error_call,
+103	      &quot;Numeric %s must be a vector or a matrix, not an array with &quot;
+104	      &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,
+105	      rray_arg_format(i_arg),
+106	      i_dimensionality
+107	    );
+108	  }
+109	}</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-  case R_TYPE_integer:</span>
+<span class="del">-  case R_TYPE_double:</span>
+<span class="del">-    break;</span>
+<span class="del">-  default:</span>
+<span class="del">-    r_abort_lazy_call(</span>
+<span class="del">-      error_call,</span>
+<span class="del">-      &quot;%s must be logical, integer, or double, not %s.&quot;,</span>
+<span class="del">-      rray_arg_format(i_arg),</span>
+<span class="del">-      r_obj_type_friendly(i)</span>
+<span class="del">-    );</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* i_dimensions = r_dim(i);</span>
+<span class="del">-  const r_ssize i_dimensionality =</span>
+<span class="del">-    i_dimensions == r_null ? 1 : r_length(i_dimensions);</span>
+<span class="del">-</span>
+<span class="del">-  switch (i_dimensionality) {</span>
+<span class="del">-  case 1:</span>
+<span class="del">-    return rray_as_extract_positions(i, size, i_arg, error_call);</span>
+<span class="del">-  case 2:</span>
+<span class="del">-    return rray_as_extract_points(</span>
+<span class="del">-      i,</span>
+<span class="del">-      v_dimensions,</span>
+<span class="del">-      dimensionality,</span>
+<span class="del">-      i_arg,</span>
+<span class="del">-      error_call</span>
+<span class="del">-    );</span>
+<span class="del">-  default:</span>
+<span class="del">-    r_abort_lazy_call(</span>
+<span class="del">-      error_call,</span>
+<span class="del">-      &quot;Numeric %s must be a vector or a matrix, not an array with &quot;</span>
+<span class="del">-      &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,</span>
+<span class="del">-      rray_arg_format(i_arg),</span>
+<span class="del">-      i_dimensionality</span>
+<span class="del">-    );</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="ins">+  case R_TYPE_integer:</span>
+<span class="ins">+  case R_TYPE_double: {</span>
+<span class="ins">+    r_obj* i_dimensions = r_dim(i);</span>
+<span class="ins">+    const r_ssize i_dimensionality =</span>
+<span class="ins">+      i_dimensions == r_null ? 1 : r_length(i_dimensions);</span>
+<span class="ins">+</span>
+<span class="ins">+    switch (i_dimensionality) {</span>
+<span class="ins">+    case 1:</span>
+<span class="ins">+      return rray_as_extract_positions(i, size, i_arg, error_call);</span>
+<span class="ins">+    case 2:</span>
+<span class="ins">+      return rray_as_extract_points(</span>
+<span class="ins">+        i,</span>
+<span class="ins">+        v_dimensions,</span>
+<span class="ins">+        dimensionality,</span>
+<span class="ins">+        i_arg,</span>
+<span class="ins">+        error_call</span>
+<span class="ins">+      );</span>
+<span class="ins">+    default:</span>
+<span class="ins">+      r_abort_lazy_call(</span>
+<span class="ins">+        error_call,</span>
+<span class="ins">+        &quot;Numeric %s must be a vector or a matrix, not an array with &quot;</span>
+<span class="ins">+        &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,</span>
+<span class="ins">+        rray_arg_format(i_arg),</span>
+<span class="ins">+        i_dimensionality</span>
+<span class="ins">+      );</span>
+<span class="ins">+    }</span>
+<span class="ins">+  }</span>
+<span class="ins">+  default:</span>
+<span class="ins">+    r_abort_lazy_call(</span>
+<span class="ins">+      error_call,</span>
+<span class="ins">+      &quot;%s must be logical, integer, or double, not %s.&quot;,</span>
+<span class="ins">+      rray_arg_format(i_arg),</span>
+<span class="ins">+      r_obj_type_friendly(i)</span>
+<span class="ins">+    );</span>
+<span class="ins">+  }</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^e…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^extract')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output"> src/extract-subscript.c | 53 ++++++++++++++++++++++++-------------------------
+ 1 file changed, 26 insertions(+), 27 deletions(-)
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 102 ]</pre></details>
+<p><code>rray_as_extract_subscript()</code> in <code>src/extract-subscript.c</code> is now one big switch. The integer and double case no longer breaks. It holds its own block with the dimensions lookup and the vector/matrix switch, and the &quot;must be logical, integer, or double&quot; default comes last.</p>
+<p>I ran <code>clang-format</code> over all the files. The extract tests pass (102 passed, 0 failed). Nothing is committed.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push after</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add src/extract-subscript.c &amp;&amp; git commit -q -m &quot;Fold numeric extract subscript handling …</summary>
+<pre>git add src/extract-subscript.c &amp;&amp; git commit -q -m &quot;Fold numeric extract subscript handling into a single type switch&quot; &amp;&amp; git push -u origin feature/extract 2&gt;&amp;1 | tail -3 &amp;&amp; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   49e7ae2..e1b002d  feature/extract -&gt; feature/extract
+branch 'feature/extract' set up to track 'origin/feature/extract'.
+e1b002d Fold numeric extract subscript handling into a single type switch</pre></details>
+<p>I committed the change as <code>e1b002d</code> (&quot;Fold numeric extract subscript handling into a single type switch&quot;) and pushed it to <code>origin/feature/extract</code>. Following your project rules, the message is one sentence with no attribution line.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Use rray dimensionality from dimensions instead of things like (int) r_length(i_dimensions)</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -rn &quot;dimensionality_from_dimensions&quot; src/*.h src/*.c | head; grep -rn &quot;r_length(.*dimens…</summary>
+<pre>grep -rn &quot;dimensionality_from_dimensions&quot; src/*.h src/*.c | head; grep -rn &quot;r_length(.*dimensions)&quot; src/*.c</pre><pre class="output">src/dimensionality.h:15:int rray_dimensionality_from_dimensions(r_obj* dimensions);
+src/broadcast-names.c:93:    rray_dimensionality_from_dimensions(x_dimensions);
+src/broadcast-names.c:96:  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+src/arithmetic.c:33:    rray_dimensionality_from_dimensions(x_dimensions);
+src/arithmetic.c:35:    rray_dimensionality_from_dimensions(y_dimensions);
+src/arithmetic.c:47:  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+src/combine.c:65:      rray_dimensionality_from_dimensions(x_dimensions);
+src/combine.c:112:      rray_dimensionality_from_dimensions(x_dimensions);
+src/combine.c:187:    const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+src/equal.c:75:    rray_dimensionality_from_dimensions(x_dimensions);
+src/dimensionality.c:22:  return (int) r_length(dimensions);
+src/combine.c:164:      out = r_alloc_list(r_length(dimensions));
+src/extract-subscript.c:32:    (int) r_length(dimensions),
+src/extract-subscript.c:77:      i_dimensions == r_null ? 1 : r_length(i_dimensions);
+src/extract-subscript.c:120:  if (i_dimensions != r_null &amp;&amp; r_length(i_dimensions) != 1) {
+src/extract-subscript.c:123:      (int) r_length(i_dimensions),
+src/split.c:55:  const bool uniform = r_length(dimensions) == 1;
+src/split.c:58:    uniform ? axis_dimension / v_dimensions[0] : r_length(dimensions);
+src/split.c:157:  const r_ssize size = r_length(dimensions);
+src/strides.c:41:    const int from_dimensionality = r_length(from_dimensions);</pre></details>
+<details class="tool"><summary>Bash: cat src/dimensionality.c src/dimensionality.h; grep -rn &quot;(int) r_length\|int) r_length&quot; src/*…</summary>
+<pre>cat src/dimensionality.c src/dimensionality.h; grep -rn &quot;(int) r_length\|int) r_length&quot; src/*.c; sed -n 150,170p src/combine.c; sed -n 30,65p src/strides.c; sed -n 45,60p src/split.c; sed -n 150,160p src/split.c; git grep -n &quot;include&quot; src/extract-subscript.c src/extract.c</pre><pre class="output">#include &quot;dimensionality.h&quot;
+
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+}
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return rray_dimensionality_from_dimensions(dimensions);
+}
+
+int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+  return (int) r_length(dimensions);
+}
+
+r_obj* rray_expand_dimensionality(
+  r_obj* x,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+
+  if (dimensionality &lt;= x_dimensionality) {
+    r_stop_internal(
+      &quot;`dimensionality` (%d) must be greater than the dimensionality of %s &quot;
+      &quot;(%d).&quot;,
+      dimensionality,
+      rray_arg_format(arg),
+      x_dimensionality
+    );
+  }
+
+  check_dimensionality(dimensionality);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * x_dimensionality);
+
+  for (int i = x_dimensionality; i &lt; dimensionality; ++i) {
+    v_out_dimensions[i] = 1;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* x_names = r_dim_names(x);
+
+  if (x_names != r_null) {
+    r_obj* out_names = KEEP(r_alloc_list(dimensionality));
+    r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+    for (int i = 0; i &lt; x_dimensionality; ++i) {
+      r_list_poke(out_names, i, v_x_names[i]);
+    }
+
+    r_attrib_poke_dim_names(out, out_names);
+    FREE(1);
+  }
+
+  FREE(4);
+  return out;
+}
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  int out = 1;
+
+  for (; x_i &lt; xs_size; ++x_i) {
+    const int x_dimensionality =
+      rray_dimensionality(v_xs[x_i], x_arg, error_call);
+
+    if (x_dimensionality &gt; out) {
+      out = x_dimensionality;
+    }
+  }
+
+  FREE(2);
+  return out;
+}
+
+void check_dimensionality(int dimensionality) {
+  if (dimensionality &lt; 1) {
+    r_stop_internal(
+      &quot;`dimensionality` (%d) must be at least 1.&quot;,
+      dimensionality
+    );
+  }
+
+  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+    r_abort(
+      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+      &quot;A dimensionality of %d was requested.&quot;,
+      RRAY_MAX_DIMENSIONALITY,
+      dimensionality
+    );
+  }
+}
+#ifndef RRAY_DIMENSIONALITY_H
+#define RRAY_DIMENSIONALITY_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+#define RRAY_MAX_DIMENSIONALITY 64
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+int rray_dimensionality_from_dimensions(r_obj* dimensions);
+
+r_obj* rray_expand_dimensionality(
+  r_obj* x,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_dimensionality(int dimensionality);
+
+#endif
+src/dimensionality.c:22:  return (int) r_length(dimensions);
+src/extract-subscript.c:32:    (int) r_length(dimensions),
+src/extract-subscript.c:123:      (int) r_length(i_dimensions),
+static r_obj* rray_combine_names(
+  r_obj* xs,
+  r_obj* dimensions,
+  int axis,
+  int axis_dimension
+) {
+  r_obj* out = rray_broadcast_names_common_opts(xs, dimensions, &amp;axis, 1);
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis, axis_dimension));
+
+  if (axis_names != r_null) {
+    if (out == r_null) {
+      out = r_alloc_list(r_length(dimensions));
+      KEEP_AT(out, out_loc);
+    }
+    r_list_poke(out, axis - 1, axis_names);
+  }
+
+  FREE(2);
+
+// For use with strided iterator n plan
+void rray_fill_broadcast_strides_from_arrays(
+  r_obj* const* v_froms,
+  r_ssize froms_size,
+  int to_dimensionality,
+  r_ssize* v_out
+) {
+  for (r_ssize i = 0; i &lt; froms_size; ++i) {
+    r_obj* from_dimensions = r_dim(v_froms[i]);
+    const int* v_from_dimensions = r_int_cbegin(from_dimensions);
+    const int from_dimensionality = r_length(from_dimensions);
+
+    r_ssize stride = 1;
+
+    for (int axis = 0; axis &lt; to_dimensionality; ++axis) {
+      const int dimension =
+        axis &lt; from_dimensionality ? v_from_dimensions[axis] : 1;
+      v_out[(r_ssize) axis * froms_size + i] = dimension == 1 ? 0 : stride;</pre><p class="cut">44 more lines cut</p></details>
+<details class="tool"><summary>Read src/extract-subscript.c</summary>
+<pre class="output">1	#include &quot;extract-subscript.h&quot;
+2	
+3	#include &lt;math.h&gt;
+4	
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;size.h&quot;
+7	#include &quot;utils.h&quot;
+8	
+9	struct rray_subscript_summary {
+10	  double min;
+11	  double max;
+12	  r_ssize zeros;
+13	  bool any_missing;
+14	  bool any_fractional;
+15	};
+16	
+17	#include &quot;decl/extract-subscript-decl.h&quot;
+18	
+19	r_obj* ffi_rray_as_extract_subscript(
+20	  r_obj* ffi_i,
+21	  r_obj* ffi_dimensions,
+22	  r_obj* ffi_frame
+23	) {
+24	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+25	
+26	  r_obj* dimensions =
+27	    KEEP(arg_as_dimensions(ffi_dimensions, rray_args.dimensions, error_call));
+28	
+29	  const struct rray_extract_subscript subscript = rray_as_extract_subscript(
+30	    ffi_i,
+31	    r_int_cbegin(dimensions),
+32	    (int) r_length(dimensions),
+33	    rray_args.i,
+34	    error_call
+35	  );
+36	  KEEP(subscript.i);
+37	
+38	  const char* v_names[] = {&quot;i&quot;, &quot;kind&quot;, &quot;size&quot;};
+39	  r_obj* names = KEEP(r_chr_n(v_names, 3));
+40	
+41	  r_obj* out = KEEP(r_alloc_list(3));
+42	  r_attrib_poke_names(out, names);
+43	
+44	  r_list_poke(out, 0, subscript.i);
+45	  r_list_poke(out, 1, r_chr(rray_extract_subscript_kind_name(subscript.kind)));
+46	  r_list_poke(out, 2, r_int(r_ssize_as_integer(subscript.size)));
+47	
+48	  FREE(4);
+49	  return out;
+50	}
+51	
+52	struct rray_extract_subscript rray_as_extract_subscript(
+53	  r_obj* i,
+54	  const int* v_dimensions,
+55	  int dimensionality,
+56	  struct rray_arg* i_arg,
+57	  struct r_lazy error_call
+58	) {
+59	  check_unclassed(i, i_arg, error_call);
+60	
+61	  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+62	
+63	  switch (r_typeof(i)) {
+64	  case R_TYPE_logical:
+65	    return rray_as_extract_mask(
+66	      i,
+67	      v_dimensions,
+68	      dimensionality,
+69	      size,
+70	      i_arg,
+71	      error_call
+72	    );
+73	  case R_TYPE_integer:
+74	  case R_TYPE_double: {
+75	    r_obj* i_dimensions = r_dim(i);
+76	    const r_ssize i_dimensionality =
+77	      i_dimensions == r_null ? 1 : r_length(i_dimensions);
+78	
+79	    switch (i_dimensionality) {
+80	    case 1:
+81	      return rray_as_extract_positions(i, size, i_arg, error_call);
+82	    case 2:
+83	      return rray_as_extract_points(
+84	        i,
+85	        v_dimensions,
+86	        dimensionality,
+87	        i_arg,
+88	        error_call
+89	      );
+90	    default:
+91	      r_abort_lazy_call(
+92	        error_call,
+93	        &quot;Numeric %s must be a vector or a matrix, not an array with &quot;
+94	        &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,
+95	        rray_arg_format(i_arg),
+96	        i_dimensionality
+97	      );
+98	    }
+99	  }
+100	  default:
+101	    r_abort_lazy_call(
+102	      error_call,
+103	      &quot;%s must be logical, integer, or double, not %s.&quot;,
+104	      rray_arg_format(i_arg),
+105	      r_obj_type_friendly(i)
+106	    );
+107	  }
+108	}
+109	
+110	static struct rray_extract_subscript rray_as_extract_mask(
+111	  r_obj* i,
+112	  const int* v_dimensions,
+113	  int dimensionality,
+114	  r_ssize size,
+115	  struct rray_arg* i_arg,
+116	  struct r_lazy error_call
+117	) {
+118	  r_obj* i_dimensions = r_dim(i);
+119	
+120	  if (i_dimensions != r_null &amp;&amp; r_length(i_dimensions) != 1) {
+121	    const bool equal = rray_dimensions_are_equal(
+122	      r_int_cbegin(i_dimensions),
+123	      (int) r_length(i_dimensions),
+124	      v_dimensions,
+125	      dimensionality
+126	    );
+127	
+128	    if (!equal) {
+129	      r_abort_lazy_call(
+130	        error_call,</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-  r_obj* i_dimensions = r_dim(i);</span>
+<span class="del">-</span>
+<span class="del">-  if (i_dimensions != r_null &amp;&amp; r_length(i_dimensions) != 1) {</span>
+<span class="del">-    const bool equal = rray_dimensions_are_equal(</span>
+<span class="del">-      r_int_cbegin(i_dimensions),</span>
+<span class="del">-      (int) r_length(i_dimensions),</span>
+<span class="ins">+  r_obj* i_dimensions = r_dim(i);</span>
+<span class="ins">+  const int i_dimensionality = i_dimensions == r_null</span>
+<span class="ins">+    ? 1</span>
+<span class="ins">+    : rray_dimensionality_from_dimensions(i_dimensions);</span>
+<span class="ins">+</span>
+<span class="ins">+  if (i_dimensionality != 1) {</span>
+<span class="ins">+    const bool equal = rray_dimensions_are_equal(</span>
+<span class="ins">+      r_int_cbegin(i_dimensions),</span>
+<span class="ins">+      i_dimensionality,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-    const r_ssize i_dimensionality =</span>
+<span class="del">-      i_dimensions == r_null ? 1 : r_length(i_dimensions);</span>
+<span class="ins">+    const int i_dimensionality = i_dimensions == r_null</span>
+<span class="ins">+      ? 1</span>
+<span class="ins">+      : rray_dimensionality_from_dimensions(i_dimensions);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-        &quot;Numeric %s must be a vector or a matrix, not an array with &quot;</span>
+<span class="del">-        &quot;%&quot; R_PRI_SSIZE &quot; dimensions.&quot;,</span>
+<span class="ins">+        &quot;Numeric %s must be a vector or a matrix, not an array with &quot;</span>
+<span class="ins">+        &quot;%d dimensions.&quot;,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-    r_int_cbegin(dimensions),</span>
+<span class="del">-    (int) r_length(dimensions),</span>
+<span class="ins">+    r_int_cbegin(dimensions),</span>
+<span class="ins">+    rray_dimensionality_from_dimensions(dimensions),</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-#include &quot;dimensions.h&quot;</span>
+<span class="del">-#include &quot;size.h&quot;</span>
+<span class="ins">+#include &quot;dimensionality.h&quot;</span>
+<span class="ins">+#include &quot;dimensions.h&quot;</span>
+<span class="ins">+#include &quot;size.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<p>Now the other array-dimensions spots in <code>strides.c</code> and <code>combine.c</code>.</p>
+
+<details class="tool"><summary>Bash: grep -n &quot;#include&quot; src/strides.c src/combine.c</summary>
+<pre>grep -n &quot;#include&quot; src/strides.c src/combine.c</pre><pre class="output">src/strides.c:1:#include &quot;strides.h&quot;
+src/combine.c:1:#include &quot;combine.h&quot;
+src/combine.c:3:#include &lt;limits.h&gt;
+src/combine.c:5:#include &quot;axes.h&quot;
+src/combine.c:6:#include &quot;broadcast-names.h&quot;
+src/combine.c:7:#include &quot;cast-common.h&quot;
+src/combine.c:8:#include &quot;dimensionality.h&quot;
+src/combine.c:9:#include &quot;dimensions.h&quot;
+src/combine.c:10:#include &quot;ptype-common.h&quot;
+src/combine.c:11:#include &quot;size.h&quot;
+src/combine.c:12:#include &quot;strided-iterator.h&quot;
+src/combine.c:13:#include &quot;strides.h&quot;
+src/combine.c:14:#include &quot;utils.h&quot;
+src/combine.c:16:#include &quot;decl/combine-decl.h&quot;</pre></details>
+<details class="tool"><summary>Read src/strides.c</summary>
+<pre class="output">1	#include &quot;strides.h&quot;
+2	
+3	void rray_fill_strides_from_dimensions(
+4	  const int* v_dimensions,
+5	  int dimensionality,</pre></details>
+<details class="tool"><summary>Read src/combine.c</summary>
+<pre class="output">160	  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis, axis_dimension));
+161	
+162	  if (axis_names != r_null) {
+163	    if (out == r_null) {
+164	      out = r_alloc_list(r_length(dimensions));
+165	      KEEP_AT(out, out_loc);
+166	    }
+167	    r_list_poke(out, axis - 1, axis_names);</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-      out = r_alloc_list(r_length(dimensions));</span>
+<span class="ins">+      out = r_alloc_list(rray_dimensionality_from_dimensions(dimensions));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/strides.c</summary>
+<pre class="diff"><span class="del">-    const int from_dimensionality = r_length(from_dimensions);</span>
+<span class="ins">+    const int from_dimensionality =</span>
+<span class="ins">+      rray_dimensionality_from_dimensions(from_dimensions);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strides.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/strides.c</summary>
+<pre class="diff"><span class="del">-#include &quot;strides.h&quot;</span>
+<span class="ins">+#include &quot;strides.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &quot;dimensionality.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strides.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;length(r_dim\|length(.*_dim)&quot; src/*.c; clang-format -i src/*.c src/*.h &amp;&amp; git diff -…</summary>
+<pre>grep -n &quot;length(r_dim\|length(.*_dim)&quot; src/*.c; clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -6</pre><pre class="output"> src/combine.c           |  2 +-
+ src/extract-subscript.c | 17 +++++++++++------
+ src/strides.c           |  5 ++++-
+ 3 files changed, 16 insertions(+), 8 deletions(-)
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2506 ]</pre></details>
+<p>Every place that read an array's dimensionality with <code>r_length()</code> now calls <code>rray_dimensionality_from_dimensions()</code> instead. All tests pass (2506 passed, 0 failed), and I ran <code>clang-format</code> over all the files.</p>
+<p><strong><code>src/extract-subscript.c</code></strong></p>
+<ul>
+<li>
+<p><strong><code>ffi_rray_as_extract_subscript()</code>:</strong> <code>(int) r_length(dimensions)</code> is replaced.</p>
+</li>
+<li>
+<p><strong>Numeric case:</strong> <code>i_dimensionality</code> is now an <code>int</code> built the same way, so the &quot;must be a vector or a matrix&quot; error uses <code>%d</code> instead of <code>R_PRI_SSIZE</code>.</p>
+</li>
+<li>
+<p><strong><code>rray_as_extract_mask()</code>:</strong> it now computes <code>i_dimensionality</code> the same way as the numeric case (1 when there is no <code>dim</code>) and checks <code>i_dimensionality != 1</code>. That replaces the two separate <code>r_length(i_dimensions)</code> calls.</p>
+</li>
+<li>
+<p><strong>Include:</strong> added <code>dimensionality.h</code>.</p>
+</li>
+</ul>
+<p><strong>Other files</strong></p>
+<ul>
+<li>
+<p><strong><code>src/strides.c</code>:</strong> <code>rray_fill_broadcast_strides_from_arrays()</code> now uses the helper, and the file includes <code>dimensionality.h</code>.</p>
+</li>
+<li>
+<p><strong><code>src/combine.c</code>:</strong> <code>rray_combine_names()</code> now uses the helper when it allocates the names list.</p>
+</li>
+</ul>
+<p>I left <code>src/split.c</code> alone. Its <code>dimensions</code> argument holds the sizes of the split pieces, not the dimensions of an array, so <code>r_length()</code> is the right call there.</p>
+<p>None of the changed lines create a new <code>r_obj*</code>, and the helper doesn't allocate, so there is nothing new to protect.</p>
+<p>This isn't committed yet. Your earlier &quot;commit and push&quot; covered the previous change, so tell me if you want this one pushed too.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add src/combine.c src/extract-subscript.c src/strides.c &amp;&amp; git commit -q -m &quot;Use rray_dim…</summary>
+<pre>git add src/combine.c src/extract-subscript.c src/strides.c &amp;&amp; git commit -q -m &quot;Use rray_dimensionality_from_dimensions() instead of measuring dimensions directly&quot; &amp;&amp; git push -u origin feature/extract 2&gt;&amp;1 | tail -2 &amp;&amp; git log --oneline -1</pre><pre class="output">   e1b002d..8b97b93  feature/extract -&gt; feature/extract
+branch 'feature/extract' set up to track 'origin/feature/extract'.
+8b97b93 Use rray_dimensionality_from_dimensions() instead of measuring dimensions directly</pre></details>
+<p>I committed this change as <code>8b97b93</code> and pushed it to <code>origin/feature/extract</code>. The message is &quot;Use rray_dimensionality_from_dimensions() instead of measuring dimensions directly&quot;. It's 83 characters, a little over your 80 target.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I’m weirded out by the bare out = r_Alloc calls in extract subscript, we should KEEP those even if nothing currently allocates in there</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/extract-subscript.c</summary>
+<pre class="output">283	
+284	static struct rray_extract_subscript rray_as_extract_complement(
+285	  r_obj* i,
+286	  r_ssize size
+287	) {
+288	  const r_ssize i_size = r_length(i);
+289	
+290	  r_obj* out = r_alloc_logical(size);
+291	  int* v_out = r_lgl_begin(out);
+292	
+293	  for (r_ssize j = 0; j &lt; size; ++j) {
+294	    v_out[j] = 1;
+295	  }
+296	
+297	  switch (r_typeof(i)) {
+298	  case R_TYPE_integer: {
+299	    const int* v_i = r_int_cbegin(i);
+300	
+301	    for (r_ssize j = 0; j &lt; i_size; ++j) {
+302	      const int elt = v_i[j];
+303	
+304	      if (elt != 0) {
+305	        v_out[-(r_ssize) elt - 1] = 0;
+306	      }
+307	    }
+308	
+309	    break;
+310	  }
+311	  case R_TYPE_double: {
+312	    const double* v_i = r_dbl_cbegin(i);
+313	
+314	    for (r_ssize j = 0; j &lt; i_size; ++j) {
+315	      const double elt = v_i[j];
+316	
+317	      if (elt != 0) {
+318	        v_out[-(r_ssize) elt - 1] = 0;
+319	      }
+320	    }
+321	
+322	    break;
+323	  }
+324	  default:
+325	    r_stop_unreachable();
+326	  }
+327	
+328	  return (struct rray_extract_subscript){
+329	    .i = out,
+330	    .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_mask,
+331	    .size = rray_mask_size(out, size)
+332	  };
+333	}
+334	
+335	static struct rray_extract_subscript rray_as_extract_nonzero(
+336	  r_obj* i,
+337	  r_ssize size
+338	) {
+339	  const r_ssize i_size = r_length(i);
+340	
+341	  switch (r_typeof(i)) {
+342	  case R_TYPE_integer: {
+343	    const int* v_i = r_int_cbegin(i);
+344	
+345	    r_obj* out = r_alloc_integer(size);
+346	    int* v_out = r_int_begin(out);
+347	
+348	    r_ssize k = 0;
+349	
+350	    for (r_ssize j = 0; j &lt; i_size; ++j) {
+351	      const int elt = v_i[j];
+352	
+353	      if (elt != 0) {
+354	        v_out[k] = elt;
+355	        ++k;
+356	      }
+357	    }
+358	
+359	    return (struct rray_extract_subscript){
+360	      .i = out,
+361	      .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_positions_int,
+362	      .size = size
+363	    };
+364	  }
+365	  case R_TYPE_double: {
+366	    const double* v_i = r_dbl_cbegin(i);
+367	
+368	    r_obj* out = r_alloc_double(size);
+369	    double* v_out = r_dbl_begin(out);
+370	
+371	    r_ssize k = 0;
+372	
+373	    for (r_ssize j = 0; j &lt; i_size; ++j) {
+374	      const double elt = v_i[j];
+375	
+376	      if (elt != 0) {
+377	        v_out[k] = elt;
+378	        ++k;
+379	      }
+380	    }
+381	
+382	    return (struct rray_extract_subscript){
+383	      .i = out,
+384	      .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_positions_dbl,
+385	      .size = size
+386	    };
+387	  }
+388	  default:
+389	    r_stop_unreachable();
+390	  }
+391	}
+392	</pre></details>
+<details class="tool"><summary>Bash: grep -n -B2 -A2 &quot;FREE(.*);&quot; src/*.c | grep -B4 &quot;return (struct\|return subscript\|return info…</summary>
+<pre>grep -n -B2 -A2 &quot;FREE(.*);&quot; src/*.c | grep -B4 &quot;return (struct\|return subscript\|return info&quot; | head -30; grep -rn &quot;r_stop_unreachable&quot; src/*.c | head -3</pre><pre class="output">--
+src/arg.c-147-  p_data-&gt;p_i = p_i;
+src/arg.c-148-
+src/arg.c:149:  FREE(1);
+src/arg.c-150-  return (struct rray_arg*) p_data;
+src/arithmetic-add.c:105:  r_stop_unreachable();
+src/arithmetic-multiply.c:111:  r_stop_unreachable();
+src/arithmetic-subtract.c:111:  r_stop_unreachable();</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = r_alloc_logical(size);</span>
+<span class="del">-  int* v_out = r_lgl_begin(out);</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_logical(size));</span>
+<span class="ins">+  int* v_out = r_lgl_begin(out);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-  return (struct rray_extract_subscript){</span>
+<span class="del">-    .i = out,</span>
+<span class="del">-    .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_mask,</span>
+<span class="del">-    .size = rray_mask_size(out, size)</span>
+<span class="del">-  };</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static struct rray_extract_subscript rray_as_extract_nonzero(</span>
+<span class="ins">+  const struct rray_extract_subscript subscript = {</span>
+<span class="ins">+    .i = out,</span>
+<span class="ins">+    .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_mask,</span>
+<span class="ins">+    .size = rray_mask_size(out, size)</span>
+<span class="ins">+  };</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(1);</span>
+<span class="ins">+  return subscript;</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+static struct rray_extract_subscript rray_as_extract_nonzero(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-    r_obj* out = r_alloc_integer(size);</span>
+<span class="del">-    int* v_out = r_int_begin(out);</span>
+<span class="ins">+    r_obj* out = KEEP(r_alloc_integer(size));</span>
+<span class="ins">+    int* v_out = r_int_begin(out);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-    return (struct rray_extract_subscript){</span>
+<span class="del">-      .i = out,</span>
+<span class="del">-      .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_positions_int,</span>
+<span class="del">-      .size = size</span>
+<span class="del">-    };</span>
+<span class="ins">+    const struct rray_extract_subscript subscript = {</span>
+<span class="ins">+      .i = out,</span>
+<span class="ins">+      .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_positions_int,</span>
+<span class="ins">+      .size = size</span>
+<span class="ins">+    };</span>
+<span class="ins">+</span>
+<span class="ins">+    FREE(1);</span>
+<span class="ins">+    return subscript;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-    r_obj* out = r_alloc_double(size);</span>
+<span class="del">-    double* v_out = r_dbl_begin(out);</span>
+<span class="ins">+    r_obj* out = KEEP(r_alloc_double(size));</span>
+<span class="ins">+    double* v_out = r_dbl_begin(out);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extract-subscript.c</summary>
+<pre class="diff"><span class="del">-    return (struct rray_extract_subscript){</span>
+<span class="del">-      .i = out,</span>
+<span class="del">-      .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_positions_dbl,</span>
+<span class="del">-      .size = size</span>
+<span class="del">-    };</span>
+<span class="ins">+    const struct rray_extract_subscript subscript = {</span>
+<span class="ins">+      .i = out,</span>
+<span class="ins">+      .kind = RRAY_EXTRACT_SUBSCRIPT_KIND_positions_dbl,</span>
+<span class="ins">+      .size = size</span>
+<span class="ins">+    };</span>
+<span class="ins">+</span>
+<span class="ins">+    FREE(1);</span>
+<span class="ins">+    return subscript;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract-subscript.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;r_alloc&quot; src/extract-subscript.c; clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat…</summary>
+<pre>grep -n &quot;r_alloc&quot; src/extract-subscript.c; clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^extract')&quot; 2&gt;&amp;1 | tail -3</pre><pre class="output">42:  r_obj* out = KEEP(r_alloc_list(3));
+290:  r_obj* out = KEEP(r_alloc_logical(size));
+348:    r_obj* out = KEEP(r_alloc_integer(size));
+374:    r_obj* out = KEEP(r_alloc_double(size));
+ src/extract-subscript.c | 21 +++++++++++++++------
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 102 ]</pre></details>
+<p>Every <code>r_alloc_*()</code> call in <code>src/extract-subscript.c</code> is now wrapped in <code>KEEP()</code>. The extract tests pass (102 passed, 0 failed), and I ran <code>clang-format</code> over all the files.</p>
+<ul>
+<li>
+<p><strong><code>rray_as_extract_complement()</code>:</strong> keeps the logical mask it allocates.</p>
+</li>
+<li>
+<p><strong><code>rray_as_extract_nonzero()</code>:</strong> keeps its integer or double output in each case.</p>
+</li>
+</ul>
+<p>A function can't call <code>FREE(1)</code> after <code>return</code>, so each one now builds the result struct in a <code>const</code> local named <code>subscript</code>, calls <code>FREE(1)</code>, and then returns it. That naming matches how <code>ffi_rray_as_extract_subscript()</code> holds the result.</p>
+<p>This isn't committed yet.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add src/extract-subscript.c &amp;&amp; git commit -q -m &quot;Protect freshly allocated extract subscr…</summary>
+<pre>git add src/extract-subscript.c &amp;&amp; git commit -q -m &quot;Protect freshly allocated extract subscripts before returning them&quot; &amp;&amp; git push -u origin feature/extract 2&gt;&amp;1 | tail -2 &amp;&amp; git log --oneline -1</pre><pre class="output">   8b97b93..e54241c  feature/extract -&gt; feature/extract
+branch 'feature/extract' set up to track 'origin/feature/extract'.
+e54241c Protect freshly allocated extract subscripts before returning them</pre></details>
+<p>I committed the change as <code>e54241c</code> (&quot;Protect freshly allocated extract subscripts before returning them&quot;) and pushed it to <code>origin/feature/extract</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Only build v_strides in the point loop. So i think you need to pass v dimensions through instead . And push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat -n src/extract.c &amp;&amp; cat src/decl/extract-decl.h &amp;&amp; cat src/strides.h</summary>
+<pre>cat -n src/extract.c &amp;&amp; cat src/decl/extract-decl.h &amp;&amp; cat src/strides.h</pre><pre class="output">     1	#include &quot;extract.h&quot;
+     2	
+     3	#include &lt;math.h&gt;
+     4	
+     5	#include &quot;dimensionality.h&quot;
+     6	#include &quot;extract-subscript.h&quot;
+     7	#include &quot;strides.h&quot;
+     8	#include &quot;utils.h&quot;
+     9	
+    10	#include &quot;decl/extract-decl.h&quot;
+    11	
+    12	r_obj* ffi_rray_extract(r_obj* ffi_x, r_obj* ffi_i, r_obj* ffi_frame) {
+    13	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+    14	  return rray_extract(ffi_x, ffi_i, rray_args.x, rray_args.i, error_call);
+    15	}
+    16	
+    17	r_obj* rray_extract(
+    18	  r_obj* x,
+    19	  r_obj* i,
+    20	  struct rray_arg* x_arg,
+    21	  struct rray_arg* i_arg,
+    22	  struct r_lazy error_call
+    23	) {
+    24	  check_unclassed(x, x_arg, error_call);
+    25	  x = KEEP(arg_as_array(x, x_arg, error_call));
+    26	
+    27	  r_obj* dimensions = r_dim(x);
+    28	  const int* v_dimensions = r_int_cbegin(dimensions);
+    29	  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+    30	  check_dimensionality(dimensionality);
+    31	
+    32	  const struct rray_extract_subscript subscript = rray_as_extract_subscript(
+    33	    i,
+    34	    v_dimensions,
+    35	    dimensionality,
+    36	    i_arg,
+    37	    error_call
+    38	  );
+    39	  KEEP(subscript.i);
+    40	
+    41	  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+    42	  rray_fill_strides_from_dimensions(v_dimensions, dimensionality, v_strides);
+    43	
+    44	  r_obj* out;
+    45	
+    46	  switch (r_typeof(x)) {
+    47	  case R_TYPE_logical:
+    48	    out = rray_extract_lgl(x, subscript, v_strides, dimensionality);
+    49	    break;
+    50	  case R_TYPE_integer:
+    51	    out = rray_extract_int(x, subscript, v_strides, dimensionality);
+    52	    break;
+    53	  case R_TYPE_double:
+    54	    out = rray_extract_dbl(x, subscript, v_strides, dimensionality);
+    55	    break;
+    56	  case R_TYPE_complex:
+    57	    out = rray_extract_cpl(x, subscript, v_strides, dimensionality);
+    58	    break;
+    59	  case R_TYPE_raw:
+    60	    out = rray_extract_raw(x, subscript, v_strides, dimensionality);
+    61	    break;
+    62	  case R_TYPE_character:
+    63	    out = rray_extract_chr(x, subscript, v_strides, dimensionality);
+    64	    break;
+    65	  case R_TYPE_list:
+    66	    out = rray_extract_list(x, subscript, v_strides, dimensionality);
+    67	    break;
+    68	  default:
+    69	    r_stop_unreachable();
+    70	  }
+    71	
+    72	  KEEP(out);
+    73	  r_attrib_poke_dim(out, r_int(r_ssize_as_integer(subscript.size)));
+    74	
+    75	  FREE(3);
+    76	  return out;
+    77	}
+    78	
+    79	static inline r_ssize rray_position_offset_int(int position) {
+    80	  return position == r_globals.na_int ? -1 : (r_ssize) position - 1;
+    81	}
+    82	
+    83	static inline r_ssize rray_position_offset_dbl(double position) {
+    84	  return isnan(position) ? -1 : (r_ssize) position - 1;
+    85	}
+    86	
+    87	static inline r_ssize rray_point_offset_int(
+    88	  const int* v_point,
+    89	  r_ssize size,
+    90	  const r_ssize* v_strides,
+    91	  int dimensionality
+    92	) {
+    93	  r_ssize out = 0;
+    94	
+    95	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    96	    const int coordinate = v_point[axis * size];
+    97	
+    98	    if (coordinate == r_globals.na_int) {
+    99	      return -1;
+   100	    }
+   101	
+   102	    out += (r_ssize) (coordinate - 1) * v_strides[axis];
+   103	  }
+   104	
+   105	  return out;
+   106	}
+   107	
+   108	static inline r_ssize rray_point_offset_dbl(
+   109	  const double* v_point,
+   110	  r_ssize size,
+   111	  const r_ssize* v_strides,
+   112	  int dimensionality
+   113	) {
+   114	  r_ssize out = 0;
+   115	
+   116	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+   117	    const double coordinate = v_point[axis * size];
+   118	
+   119	    if (isnan(coordinate)) {
+   120	      return -1;
+   121	    }
+   122	
+   123	    out += ((r_ssize) coordinate - 1) * v_strides[axis];
+   124	  }
+   125	
+   126	  return out;
+   127	}
+   128	
+   129	#define RRAY_EXTRACT_POSITIONS_LOOP(                                           \
+   130	  POKE,                                                                        \
+   131	  MISSING,                                                                     \
+   132	  I_CTYPE,                                                                     \
+   133	  I_CONST_DEREF,                                                               \
+   134	  OFFSET                                                                       \
+   135	)                                                                              \
+   136	  do {                                                                         \
+   137	    const I_CTYPE* v_i = I_CONST_DEREF(subscript.i);                           \
+   138	                                                                               \
+   139	    for (r_ssize j = 0; j &lt; subscript.size; ++j) {                             \
+   140	      const r_ssize offset = OFFSET(v_i[j]);                                   \
+   141	      POKE(out, j, offset == -1 ? MISSING : v_x[offset]);                      \
+   142	    }                                                                          \
+   143	  } while (0)
+   144	
+   145	#define RRAY_EXTRACT_ATOMIC_MASK_LOOP(POKE, MISSING)                           \
+   146	  do {                                                                         \
+   147	    const int* v_i = r_lgl_cbegin(subscript.i);                                \
+   148	    const r_ssize i_step = r_length(subscript.i) == 1 ? 0 : 1;                 \
+   149	                                                                               \
+   150	    r_ssize j = 0;                                                             \
+   151	                                                                               \
+   152	    for (r_ssize offset = 0; j &lt; subscript.size; ++offset) {                   \
+   153	      const int elt = v_i[offset * i_step];                                    \
+   154	      POKE(out, j, elt == r_globals.na_lgl ? MISSING : v_x[offset]);           \
+   155	      j += elt != 0;                                                           \
+   156	    }                                                                          \
+   157	  } while (0)
+   158	
+   159	#define RRAY_EXTRACT_BARRIER_MASK_LOOP(POKE, MISSING)                          \
+   160	  do {                                                                         \
+   161	    const int* v_i = r_lgl_cbegin(subscript.i);                                \
+   162	    const r_ssize i_step = r_length(subscript.i) == 1 ? 0 : 1;                 \
+   163	    const r_ssize x_size = r_length(x);                                        \
+   164	                                                                               \
+   165	    r_ssize j = 0;                                                             \
+   166	                                                                               \
+   167	    for (r_ssize offset = 0; offset &lt; x_size; ++offset) {                      \
+   168	      const int elt = v_i[offset * i_step];                                    \
+   169	                                                                               \
+   170	      if (elt == 0) {                                                          \
+   171	        continue;                                                              \
+   172	      }                                                                        \
+   173	                                                                               \
+   174	      POKE(out, j, elt == r_globals.na_lgl ? MISSING : v_x[offset]);           \
+   175	      ++j;                                                                     \
+   176	    }                                                                          \
+   177	  } while (0)
+   178	
+   179	#define RRAY_EXTRACT_POINTS_LOOP(                                              \
+   180	  POKE,                                                                        \
+   181	  MISSING,                                                                     \
+   182	  I_CTYPE,                                                                     \
+   183	  I_CONST_DEREF,                                                               \
+   184	  OFFSET                                                                       \
+   185	)                                                                              \
+   186	  do {                                                                         \
+   187	    const I_CTYPE* v_i = I_CONST_DEREF(subscript.i);                           \
+   188	                                                                               \
+   189	    for (r_ssize j = 0; j &lt; subscript.size; ++j) {                             \
+   190	      const r_ssize offset =                                                   \
+   191	        OFFSET(v_i + j, subscript.size, v_strides, dimensionality);            \
+   192	      POKE(out, j, offset == -1 ? MISSING : v_x[offset]);                      \
+   193	    }                                                                          \
+   194	  } while (0)
+   195	
+   196	#define RRAY_EXTRACT_ITERATE(POKE, MISSING, MASK_LOOP)                         \
+   197	  switch (subscript.kind) {                                                    \
+   198	  case RRAY_EXTRACT_SUBSCRIPT_KIND_positions_int:                              \
+   199	    RRAY_EXTRACT_POSITIONS_LOOP(                                               \
+   200	      POKE,                                                                    \</pre><p class="cut">249 more lines cut</p></details>
+<details class="tool"><summary>Edit src/extract.c</summary>
+<pre class="diff"><span class="del">-  struct rray_extract_subscript subscript,</span>
+<span class="del">-  const r_ssize* v_strides,</span>
+<span class="ins">+  struct rray_extract_subscript subscript,</span>
+<span class="ins">+  const int* v_dimensions,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract.c has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/extract.c</summary>
+<pre class="diff"><span class="del">-(x, subscript, v_strides, dimensionality)</span>
+<span class="ins">+(x, subscript, v_dimensions, dimensionality)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract.c has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/extract.c</summary>
+<pre class="diff"><span class="del">-  KEEP(subscript.i);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-  rray_fill_strides_from_dimensions(v_dimensions, dimensionality, v_strides);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out;</span>
+<span class="ins">+  KEEP(subscript.i);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/extract.c</summary>
+<pre class="diff"><span class="del">-    const I_CTYPE* v_i = I_CONST_DEREF(subscript.i);                           \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    for (r_ssize j = 0; j &lt; subscript.size; ++j) {                             \</span>
+<span class="del">-      const r_ssize offset =                                                   \</span>
+<span class="ins">+    const I_CTYPE* v_i = I_CONST_DEREF(subscript.i);                           \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];                                \</span>
+<span class="ins">+    rray_fill_strides_from_dimensions(v_dimensions, dimensionality, v_strides); \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    for (r_ssize j = 0; j &lt; subscript.size; ++j) {                             \</span>
+<span class="ins">+      const r_ssize offset =                                                   \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extract.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/decl/extract-decl.h</summary>
+<pre class="diff"><span class="del">-  struct rray_extract_subscript subscript,</span>
+<span class="del">-  const r_ssize* v_strides,</span>
+<span class="ins">+  struct rray_extract_subscript subscript,</span>
+<span class="ins">+  const int* v_dimensions,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/extract-decl.h has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Those diagnostics came from before the decl header edit. Formatting and running the tests:</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; grep -n &quot;v_strides&quot; src/extract.c src/decl/extract-decl.h …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; grep -n &quot;v_strides&quot; src/extract.c src/decl/extract-decl.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^extract')&quot; 2&gt;&amp;1 | grep -i &quot;warning\|error\|FAIL&quot; | tail -5</pre><pre class="output">src/decl/extract-decl.h:50:  const r_ssize* v_strides,
+src/decl/extract-decl.h:56:  const r_ssize* v_strides,
+src/extract.c:87:  const r_ssize* v_strides,
+src/extract.c:99:    out += (r_ssize) (coordinate - 1) * v_strides[axis];
+src/extract.c:108:  const r_ssize* v_strides,
+src/extract.c:120:    out += ((r_ssize) coordinate - 1) * v_strides[axis];
+src/extract.c:186:    r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];                                \
+src/extract.c:190:      v_strides                                                                \
+src/extract.c:195:        OFFSET(v_i + j, subscript.size, v_strides, dimensionality);            \
+ src/decl/extract-decl.h | 14 +++++++-------
+ src/extract.c           | 38 +++++++++++++++++++++-----------------
+ 2 files changed, 28 insertions(+), 24 deletions(-)
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 102 ]</pre></details>
+<details class="tool"><summary>Read src/extract.c</summary>
+<pre class="output">174	  } while (0)
+175	
+176	#define RRAY_EXTRACT_POINTS_LOOP(                                              \
+177	  POKE,                                                                        \
+178	  MISSING,                                                                     \
+179	  I_CTYPE,                                                                     \
+180	  I_CONST_DEREF,                                                               \
+181	  OFFSET                                                                       \
+182	)                                                                              \
+183	  do {                                                                         \
+184	    const I_CTYPE* v_i = I_CONST_DEREF(subscript.i);                           \
+185	                                                                               \
+186	    r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];                                \
+187	    rray_fill_strides_from_dimensions(                                         \
+188	      v_dimensions,                                                            \
+189	      dimensionality,                                                          \
+190	      v_strides                                                                \
+191	    );                                                                         \
+192	                                                                               \
+193	    for (r_ssize j = 0; j &lt; subscript.size; ++j) {                             \
+194	      const r_ssize offset =                                                   \
+195	        OFFSET(v_i + j, subscript.size, v_strides, dimensionality);            \
+196	      POKE(out, j, offset == -1 ? MISSING : v_x[offset]);                      \
+197	    }                                                                          \
+198	  } while (0)
+199	
+200	#define RRAY_EXTRACT_ITERATE(POKE, MISSING, MASK_LOOP)                         \
+201	  switch (subscript.kind) {                                                    \</pre></details>
+<details class="tool"><summary>Bash: git add src/extract.c src/decl/extract-decl.h &amp;&amp; git commit -q -m &quot;Build point strides inside…</summary>
+<pre>git add src/extract.c src/decl/extract-decl.h &amp;&amp; git commit -q -m &quot;Build point strides inside the point loop from the dimensions of x&quot; &amp;&amp; git push -u origin feature/extract 2&gt;&amp;1 | tail -2 &amp;&amp; git log --oneline -1</pre><pre class="output">   e54241c..620ce2b  feature/extract -&gt; feature/extract
+branch 'feature/extract' set up to track 'origin/feature/extract'.
+620ce2b Build point strides inside the point loop from the dimensions of x</pre></details>
+<p><code>v_strides</code> is now built only inside the point loop. I committed this as <code>620ce2b</code> and pushed it to <code>origin/feature/extract</code>.</p>
+<ul>
+<li>
+<p><strong><code>rray_extract()</code>:</strong> it no longer builds strides. It passes <code>v_dimensions</code> and <code>dimensionality</code> to the <code>rray_extract_*()</code> family, whose signatures in <code>extract.c</code> and <code>decl/extract-decl.h</code> now take <code>const int* v_dimensions</code> instead of <code>v_strides</code>.</p>
+</li>
+<li>
+<p><strong><code>RRAY_EXTRACT_POINTS_LOOP</code>:</strong> it declares <code>r_ssize v_strides[RRAY_MAX_DIMENSIONALITY]</code> and fills it with <code>rray_fill_strides_from_dimensions()</code> before looping. Positions and masks never compute strides now.</p>
+</li>
+</ul>
+<p>The extract tests pass (102 passed, 0 failed), and I ran <code>clang-format</code> over all the files.</p>
+
+</section>
+</main>
+</body>
+</html>

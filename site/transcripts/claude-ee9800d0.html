@@ -1,0 +1,2229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Polishing strided-iterator2.h docs and hoisting next() fields</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-112">rray timeline</a>
+<h1>Polishing <code>strided-iterator2.h</code> docs and hoisting <code>next()</code> fields</h1>
+<p class="facts">Claude · Oct 2, 2026 · 9 prompts · 25 replies · <a href="https://github.com/r-lib/rray/pull/112">#112</a></p>
+</header>
+<main>
+<p class="divider">Oct 2, 2026, 21:34 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Read this PR and plans/iterator</p>
+<p>Does it make any difference if the next() helpers pull dimensionality, v_strides, and v_dimensions out into locals before the loop?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls plans/ | grep -i iter; git diff main --stat; ls src | grep -i iter</summary>
+<pre>ls plans/ | grep -i iter; git diff main --stat; ls src | grep -i iter</pre><pre class="output">iterators.md
+ src/arithmetic-add.c              | 116 +++++++----
+ src/arithmetic.c                  |  79 ++++++++
+ src/arithmetic.h                  |  27 +++
+ src/binary.h                      |  71 +++++++
+ src/broadcast.c                   | 179 +++++++++--------
+ src/decl/arithmetic-add-decl.h    |  82 ++++++--
+ src/decl/broadcast-decl.h         |  28 ++-
+ src/decl/reduce-sum-decl.h        |  34 +++-
+ src/decl/strided-iterator2-decl.h |  13 ++
+ src/dimensionality.h              |   1 +
+ src/reduce-sum.c                  |  52 +++--
+ src/reduce.c                      |  61 ++++++
+ src/reduce.h                      |  70 +++++++
+ src/strided-iterator2.h           | 407 ++++++++++++++++++++++++++++++++++++++
+ 14 files changed, 1058 insertions(+), 162 deletions(-)
+point-iterator.h
+slice-iterator.h
+strided-iterator.h
+strided-iterator2.h</pre></details>
+<details class="tool"><summary>Bash: cat plans/iterators.md; cat src/strided-iterator2.h; cat src/decl/strided-iterator2-decl.h</summary>
+<pre>cat plans/iterators.md; cat src/strided-iterator2.h; cat src/decl/strided-iterator2-decl.h</pre><pre class="output"># Run iterators: loops in each function instead of loop macros
+
+Today the loops that walk arrays live in macros: `RRAY_BROADCAST_ATOMIC()`, `RRAY_BINARY()` and `RRAY_REDUCE()`. Each operation passes in a one-element kernel (`ONE`). Anything an operation needs beyond that one-element kernel, like a 64-bit total or a pairwise sum, has to become a new macro parameter or a new macro. `plans/accuracy.md` shows how quickly that grows.
+
+This plan looks at the alternative: an iterator that the operation drives itself, with the loops written in each function. We built three iterator designs into a variant of rray4 and benchmarked them against the current macros on broadcasting, addition and sums.
+
+---
+
+# Summary
+
+- A per-element iterator (a `next()` that hands back `x` and `out` locations for every element) is simplest to use, but too slow. It's up to 7x slower on sums, 2x to 2.7x slower on double addition, and 1.1x to 1.5x slower on broadcasting.
+
+- An iterator that hands back one run at a time, used with a single loop over the run, matches the macros when every operand moves along the run. When one operand stays fixed, it's 1.3x to 1.5x slower on broadcasting and addition, and 4x to 7x slower on sums.
+
+- The same run iterator, with each function writing one loop per stride case (an operand fixed or moving), matches the macros in nearly every case we measured. The exception is very short runs: adding `[10, 1e6] + [10, 1]` (a million runs of 10 elements) is 4% to 6% slower, in every one of six runs. It's faster in one case: summing `[10, 1e6]` over axis 1 takes 2.75 ms against 3.53 ms, because the total stays in a local variable.
+
+- That design is what NumPy does. It is also what the macros already do. The loops are the same, so the speed is the same. What changes is where the loops live: in each function, where they can be read and changed, instead of inside a macro.
+
+- One run iterator can serve any number of inputs, replacing today's separate one-input and two-input plans. It's as fast as the specialized ones, as long as each function passes the number of inputs as a literal (`1`, `2`) and the call is inlined. With the count known only at runtime, short runs get 25% to 75% slower.
+
+- The short-run gap goes away when the iterator does less per run: keep one location array that the iterator advances directly (no per-run copy for the caller), and advance at the end of each run instead of checking for the first run at the start, like the macros do. That version is within 2.5% of the macro on every short-run case.
+
+- Keep the plan and the iterator as separate structs. A merged struct is just as fast when it's built inside the kernel. But when the driver builds it and the kernel uses it through a pointer, raw broadcasting gets up to 5x slower and a strided mean 11% slower. With a small `const` plan passed in and the iterator built locally in the kernel, the fast version is the default, with no rule to remember.
+
+- The cost is repetition. rray4 has 84 `RRAY_BINARY()` calls, 32 `RRAY_REDUCE()` calls and 5 `RRAY_BROADCAST_ATOMIC()` calls. Writing every stride case out by hand in each of them is a lot of code. How to handle the per-type repetition is the main open question.
+
+Recommendation: adopt one run iterator for any number of inputs, in the &quot;advance at the end&quot; shape, with per-stride-case loops written in each function. Decide separately how to avoid writing every type out by hand.
+
+---
+
+# How it works today
+
+`src/strided-iterator.h` builds a plan from a point space (the dimensions being walked) and a subspace (the strides of the array being read or written). After merging axes that can be walked as one (&quot;coalescing&quot;), the first axis is walked as one run, and later axes advance between runs with `RRAY_STRIDED_ITERATOR_NEXT()`.
+
+The header documents three things that matter here:
+
+- &quot;For performance and flexibility, the user is responsible for managing the run loop along the first axis. We've tried many alternative approaches but they tend to tank performance quickly as you increase the level of abstractions.&quot;
+
+- The plan holds only fixed state. The positions that change are kept by the caller, so the compiler can keep them in registers.
+
+- When a stride along the run is 0, the macros take a separate path where the compiler can see the location doesn't change. It then loads the fixed value once and vectorizes the rest.
+
+Each macro owns the full walk: allocate the output, set up the plan, loop over runs, branch on the stride cases, call `ONE` per element, and advance between runs. A few functions (`combine.c`, `index.c`, `permute-axes.c`, `split.c`) already write their own loops against the plan directly, without a macro.
+
+---
+
+# What NumPy does
+
+This section is from knowledge of NumPy's source, not checked against it. NumPy isn't installed on the benchmark machine.
+
+- One iterator, `nditer`, for everything. It reorders axes so the inner loop follows memory order, merges axes that can be walked as one, and hands out one run at a time: a pointer, a length, and a stride for each operand. For reductions, it walks the input in memory order no matter which axis is reduced.
+
+- Reductions reuse the elementwise kernel. `np.add.reduce` calls the same inner loop as `np.add`, with operands `(out, in, out)`. When a whole run feeds one output, the output's stride is 0.
+
+- Each typed inner loop checks its strides and picks a path. The `float64` add loop first checks `IS_BINARY_REDUCE` (output stride 0, output is also the first input). If so, it runs a pairwise sum over the run into one local total. Otherwise it picks a fast path for contiguous operands, a fixed scalar operand, and so on, and uses SIMD there.
+
+- SIMD is written by hand with NumPy's own layer (and Highway for newer kernels), compiled for several CPU levels and picked when NumPy loads. rray4 can only rely on the compiler vectorizing at R's default `-O2`, since CRAN doesn't allow `-march=native`.
+
+- When data needs a type conversion or is misaligned, `nditer` copies it in chunks (8192 elements by default) into a contiguous buffer, and the inner loop runs on that.
+
+- The typed inner loops are generated, not written by hand: once from `.c.src` templates expanded by a Python script, now mostly C++ templates. There is one loop body per operation, expanded across types. The iterator never knows what operation it's running, and the inner loop never knows how many dimensions the array has.
+
+So NumPy uses the &quot;run iterator, per-stride-case loops&quot; design, and avoids writing every type out by generating the per-type loops.
+
+---
+
+# The iterators
+
+Both iterators wrap an existing `rray_strided_iterator_plan` (one subspace) or `rray_strided_iterator2_plan` (two subspaces). They hold the changing positions in a struct on the caller's stack. Because `next()` is `static inline` and the struct never leaves the function, the compiler keeps its fields in registers, so the header's concern about positions in registers doesn't apply. That held for every case below, with Apple clang 17. GCC is not checked.
+
+## Run iterator
+
+`next()` advances one run. The caller gets the run's range in the point space (`start` to `end`) and, for each subspace, where the run starts (`loc`) and how far to move per element (`stride`).
+
+```c
+struct rray_run_iterator {
+  r_ssize start;
+  r_ssize end;
+  r_ssize loc;
+  r_ssize stride;
+
+  r_ssize size;
+  r_ssize run_size;
+  r_ssize loc_start;
+  const struct rray_strided_iterator_plan* plan;
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_run_iterator rray_run_iterator(
+  const struct rray_strided_iterator_plan* plan
+) {
+  struct rray_run_iterator it;
+
+  it.plan = plan;
+  it.size = rray_strided_iterator_plan_size(plan);
+  it.run_size = rray_strided_iterator_plan_run_size(plan);
+  it.stride = rray_strided_iterator_plan_run_stride(plan);
+
+  it.start = 0;
+  it.end = 0;
+  it.loc = 0;
+  it.loc_start = 0;
+
+  rray_strided_iterator_plan_point_init(plan, it.v_point);
+
+  return it;
+}
+
+static inline bool rray_run_iterator_next(struct rray_run_iterator* it) {
+  if (it-&gt;end == it-&gt;size) {
+    return false;
+  }
+
+  if (it-&gt;end != 0) {
+    const struct rray_strided_iterator_plan* plan = it-&gt;plan;
+    RRAY_STRIDED_ITERATOR_NEXT(it-&gt;loc_start, it-&gt;v_point, plan);
+  }
+
+  it-&gt;start = it-&gt;end;
+  it-&gt;end = it-&gt;start + it-&gt;run_size;
+  it-&gt;loc = it-&gt;loc_start;
+
+  return true;
+}
+```
+
+`rray_run_iterator2` is the same, with `loc1`, `loc2`, `stride1` and `stride2`, built on `rray_strided_iterator2_plan` and `RRAY_STRIDED_ITERATOR_NEXT2()`. The full code is in the appendix.
+
+The meaning of the two spaces depends on the operation, as it does for the plan today:
+
+- Broadcasting and binary operations walk the output. `start` to `end` indexes the output, and `loc` indexes the input.
+
+- Reductions walk the input. `start` to `end` indexes the input, and `loc` indexes the output.
+
+## Element iterator
+
+`next()` advances one element and hands back `index` (in the point space) and `loc` (in the subspace). It starts at `loc = -stride` and `run_i = -1`, so the first call goes through the same &quot;next element in this run&quot; path as every other call, without a special first branch. The full code is in the appendix. It is here as the baseline that was ruled out.
+
+---
+
+# Worked examples
+
+All three use the run iterator with a loop per stride case. These are the `run_split` variants from the benchmarks, exactly as they were compiled.
+
+## Broadcast
+
+One input, walking the output. When the input's stride is 0, the run repeats one value.
+
+```c
+static r_obj* rray_broadcast_dbl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* plan
+) {
+  const r_ssize size = rray_strided_iterator_plan_size(plan);
+
+  r_obj* out = KEEP(r_alloc_double(size));
+  double* v_out = r_dbl_begin(out);
+
+  const double* v_x = r_dbl_cbegin(x);
+
+  struct rray_run_iterator it = rray_run_iterator(plan);
+
+  while (rray_run_iterator_next(&amp;it)) {
+    if (it.stride == 0) {
+      const double x_elt = v_x[it.loc];
+
+      for (r_ssize i = it.start; i &lt; it.end; ++i) {
+        v_out[i] = x_elt;
+      }
+    } else {
+      r_ssize x_loc = it.loc;
+
+      for (r_ssize i = it.start; i &lt; it.end; ++i) {
+        v_out[i] = v_x[x_loc];
+        x_loc += it.stride;
+      }
+    }
+  }
+
+  FREE(1);
+  return out;
+}
+```
+
+For example, broadcasting `[1, 4000]` to `[4000, 4000]` gives 4000 runs of 4000 elements, each with input stride 0. Every run takes the first branch and fills with one value. Broadcasting `[4000, 1]` to `[4000, 4000]` gives 4000 runs with input stride 1, each copying the same 4000 contiguous values.
+
+## Add
+
+Two inputs, walking the output. Each input is either fixed or moving along the run, so there are four cases. The integer version passes `error_call` to its one-element kernel directly, with no `RRAY_BINARY_ARGS()` needed.
+
+```c
+static r_obj* rray_add_int_int(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+) {
+  const r_ssize size = rray_strided_iterator2_plan_size(plan);
+
+  r_obj* out = KEEP(r_alloc_integer(size));</pre><p class="cut">1,677 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/strided-iterator2.h; cat src/decl/strided-iterator2-decl.h; grep -n -i &quot;local\|hoist\…</summary>
+<pre>cat src/strided-iterator2.h; cat src/decl/strided-iterator2-decl.h; grep -n -i &quot;local\|hoist\|next()&quot; plans/iterators.md | head -60</pre><pre class="output">#ifndef RRAY_STRIDED_ITERATOR2_H
+#define RRAY_STRIDED_ITERATOR2_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator2-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// For iterator2, note that both sets of location strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// When the inner loop receives the stride as a runtime value, the compiler
+// can't prove that the location is fixed and falls back to a scalar loop. The
+// public iteration macros check for a zero stride and pass a literal 0 to a
+// specialized path. This lets the compiler see that the location does not
+// change. For binary operations, it can then hoist the fixed load out of the
+// loop and vectorize the remaining stride 1 work.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_run_iterator {
+  r_ssize start;
+  r_ssize end;
+  r_ssize v_loc[RRAY_MAX_INPUTS];
+
+  r_ssize size;
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  // Strides for all `n` arrays, laid out axis-major in a flat array as
+  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+};
+
+static inline struct rray_run_iterator rray_run_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* const* v_v_strides,
+  r_ssize n
+) {
+  check_dimensionality(dimensionality);
+
+  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+    r_stop_internal(
+      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+      n,
+      RRAY_MAX_INPUTS
+    );
+  }
+
+  struct rray_run_iterator it;
+
+  it.size = rray_size_from_dimensions_checked(
+    v_dimensions,
+    dimensionality,
+    r_lazy_null
+  );
+
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+  }
+
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    r_ssize* v_strides = it.v_strides + axis * n;
+    for (r_ssize i = 0; i &lt; n; ++i) {
+      v_strides[i] = v_v_strides[i][axis];
+    }
+  }
+</pre><p class="cut">276 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;run_iterator&quot; src/*.c src/*.h | grep -v &quot;strided-iterator2.h&quot; | head -40; sed -n 1,2…</summary>
+<pre>grep -n &quot;run_iterator&quot; src/*.c src/*.h | grep -v &quot;strided-iterator2.h&quot; | head -40; sed -n 1,200p src/arithmetic-add.c | grep -n &quot;it\b\|it\.\|&amp;it&quot; | head -40</pre><pre class="output">src/broadcast.c:149:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+src/broadcast.c:150:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/broadcast.c:151:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/broadcast.c:153:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+src/broadcast.c:154:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+src/broadcast.c:172:  struct rray_run_iterator it =                                                \
+src/broadcast.c:173:    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+src/broadcast.c:175:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/broadcast.c:186:  struct rray_run_iterator it =                                                \
+src/broadcast.c:187:    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+src/broadcast.c:189:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/binary.h:101:  struct rray_run_iterator it = rray_run_iterator2(                            \
+src/binary.h:108:  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, rray_run_iterator_size(&amp;it)));   \
+src/binary.h:114:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next2(&amp;it)) {         \
+src/binary.h:115:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/binary.h:116:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/binary.h:118:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+src/binary.h:119:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+src/binary.h:121:    r_ssize y_loc = rray_run_iterator_loc(&amp;it, 1);                             \
+src/binary.h:122:    const r_ssize y_stride = rray_run_iterator_stride(&amp;it, 1);                 \
+src/reduce.h:132:  struct rray_run_iterator it =                                                \
+src/reduce.h:133:    rray_run_iterator1(v_dimensions, dimensionality, v_out_broadcast_strides); \
+src/reduce.h:144:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+src/reduce.h:145:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/reduce.h:146:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/reduce.h:148:    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);                           \
+src/reduce.h:149:    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \</pre></details>
+<p>The iterator is always a local in the calling function, so the compiler sees everything. Let me check the generated code directly rather than guess.</p>
+
+<details class="tool"><summary>Bash: R CMD config CC; R CMD config CFLAGS; R CMD config CPPFLAGS; Rscript -e 'cat(R.home(&quot;include&quot;…</summary>
+<pre>R CMD config CC; R CMD config CFLAGS; R CMD config CPPFLAGS; Rscript -e 'cat(R.home(&quot;include&quot;))'; cat src/Makevars 2&gt;/dev/null</pre><pre class="output">clang -arch arm64
+-O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always
+-I/opt/R/arm64/include
+/Library/Frameworks/R.framework/Versions/4.6/Resources/includePKG_CPPFLAGS = -I./rlang</pre></details>
+<p>Now a copy with hoisted locals in <code>next1()</code> / <code>next2()</code> / <code>next()</code>, and compare assembly.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad &amp;&amp; rm -rf $S/a $S/b &amp;&amp; mkdir -p $S/a $S/b &amp;&amp; cp -R src/. $S/a/ &amp;&amp; cp -R src/. $S/b/ &amp;&amp; python3 - &quot;$S/b/strided-iterator2.h&quot; &lt;&lt;'EOF'
+import sys,re
+p=sys.argv[1]; s=open(p).read()
+s=s.replace(&quot;&quot;&quot;  r_ssize n
+) {
+  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+    const r_ssize* v_strides = it-&gt;v_strides + axis * n;
+    const r_ssize dimension = it-&gt;v_dimensions[axis];&quot;&quot;&quot;,&quot;&quot;&quot;  r_ssize n
+) {
+  const int dimensionality = it-&gt;dimensionality;
+  const r_ssize* v_all_strides = it-&gt;v_strides;
+  const r_ssize* v_dimensions = it-&gt;v_dimensions;
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize* v_strides = v_all_strides + axis * n;
+    const r_ssize dimension = v_dimensions[axis];&quot;&quot;&quot;)
+s=s.replace(&quot;&quot;&quot;static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {
+  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+    const r_ssize stride = it-&gt;v_strides[axis];
+    const r_ssize dimension = it-&gt;v_dimensions[axis];&quot;&quot;&quot;,&quot;&quot;&quot;static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {
+  const int dimensionality = it-&gt;dimensionality;
+  const r_ssize* v_strides = it-&gt;v_strides;
+  const r_ssize* v_dimensions = it-&gt;v_dimensions;
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize stride = v_strides[axis];
+    const r_ssize dimension = v_dimensions[axis];&quot;&quot;&quot;)
+s=s.replace(&quot;&quot;&quot;static inline void rray_run_iterator_next2(struct rray_run_iterator* it) {
+  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+    const r_ssize* v_strides = it-&gt;v_strides + axis * 2;&quot;&quot;&quot;,&quot;&quot;&quot;static inline void rray_run_iterator_next2(struct rray_run_iterator* it) {
+  const int dimensionality = it-&gt;dimensionality;
+  const r_ssize* v_all_strides = it-&gt;v_strides;
+  const r_ssize* v_dimensions = it-&gt;v_dimensions;
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize* v_strides = v_all_strides + axis * 2;&quot;&quot;&quot;)
+s=s.replace(&quot;&quot;&quot;    const r_ssize stride2 = v_strides[1];
+    const r_ssize dimension = it-&gt;v_dimensions[axis];&quot;&quot;&quot;,&quot;&quot;&quot;    const r_ssize stride2 = v_strides[1];
+    const r_ssize dimension = v_dimensions[axis];&quot;&quot;&quot;)
+s=s.replace(&quot;&quot;&quot;  it-&gt;start = it-&gt;end;
+  it-&gt;end += it-&gt;v_dimensions[0];&quot;&quot;&quot;,&quot;&quot;&quot;  it-&gt;start = it-&gt;end;
+  it-&gt;end += v_dimensions[0];&quot;&quot;&quot;)
+open(p,'w').write(s)
+EOF
+diff $S/a/strided-iterator2.h $S/b/strided-iterator2.h | head -60
+INC=&quot;-I$(Rscript -e 'cat(R.home(&quot;include&quot;))') -I/opt/R/arm64/include&quot;
+for v in a b; do for f in broadcast arithmetic-add reduce-sum; do (cd $S/$v &amp;&amp; clang -arch arm64 -O2 -fno-common $INC -I./rlang -S $f.c -o $f.s); done; done
+for f in broadcast arithmetic-add reduce-sum; do echo &quot;== $f&quot;; diff $S/a/$f.s $S/b/$f.s | wc -l; done</pre><pre class="output">279,281c279,284
+&lt;   for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+&lt;     const r_ssize* v_strides = it-&gt;v_strides + axis * n;
+&lt;     const r_ssize dimension = it-&gt;v_dimensions[axis];
+---
+&gt;   const int dimensionality = it-&gt;dimensionality;
+&gt;   const r_ssize* v_all_strides = it-&gt;v_strides;
+&gt;   const r_ssize* v_dimensions = it-&gt;v_dimensions;
+&gt;   for (int axis = 1; axis &lt; dimensionality; ++axis) {
+&gt;     const r_ssize* v_strides = v_all_strides + axis * n;
+&gt;     const r_ssize dimension = v_dimensions[axis];
+300c303
+&lt;   it-&gt;end += it-&gt;v_dimensions[0];
+---
+&gt;   it-&gt;end += v_dimensions[0];
+304,306c307,312
+&lt;   for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+&lt;     const r_ssize stride = it-&gt;v_strides[axis];
+&lt;     const r_ssize dimension = it-&gt;v_dimensions[axis];
+---
+&gt;   const int dimensionality = it-&gt;dimensionality;
+&gt;   const r_ssize* v_strides = it-&gt;v_strides;
+&gt;   const r_ssize* v_dimensions = it-&gt;v_dimensions;
+&gt;   for (int axis = 1; axis &lt; dimensionality; ++axis) {
+&gt;     const r_ssize stride = v_strides[axis];
+&gt;     const r_ssize dimension = v_dimensions[axis];
+321c327
+&lt;   it-&gt;end += it-&gt;v_dimensions[0];
+---
+&gt;   it-&gt;end += v_dimensions[0];
+325,326c331,335
+&lt;   for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+&lt;     const r_ssize* v_strides = it-&gt;v_strides + axis * 2;
+---
+&gt;   const int dimensionality = it-&gt;dimensionality;
+&gt;   const r_ssize* v_all_strides = it-&gt;v_strides;
+&gt;   const r_ssize* v_dimensions = it-&gt;v_dimensions;
+&gt;   for (int axis = 1; axis &lt; dimensionality; ++axis) {
+&gt;     const r_ssize* v_strides = v_all_strides + axis * 2;
+329c338
+&lt;     const r_ssize dimension = it-&gt;v_dimensions[axis];
+---
+&gt;     const r_ssize dimension = v_dimensions[axis];
+346c355
+&lt;   it-&gt;end += it-&gt;v_dimensions[0];
+---
+&gt;   it-&gt;end += v_dimensions[0];
+In file included from broadcast.c:1:
+In file included from ./broadcast.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+In file included from arithmetic-add.c:1:
+In file included from ./arithmetic-add.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+In file included from reduce-sum.c:1:
+In file included from ./reduce-sum.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+In file included from broadcast.c:1:
+In file included from ./broadcast.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+In file included from arithmetic-add.c:1:
+In file included from ./arithmetic-add.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+In file included from reduce-sum.c:1:
+In file included from ./reduce-sum.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+== broadcast
+diff: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/a/broadcast.s: No such file or directory
+       0
+== arithmetic-add
+diff: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/a/arithmetic-add.s: No such file or directory
+       0
+== reduce-sum
+diff: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/a/reduce-sum.s: No such file or directory
+       0</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad; ls /Library/Frameworks/R.framework/Versions/4.6/Resources/include/Rinternals.h /Library/Frameworks/R.framework/Headers/Rinternals.h 2&gt;&amp;1; INC=&quot;-I/Library/Frameworks/R.framework/Headers -I/opt/R/arm64/include&quot;
+for v in a b; do for f in broadcast arithmetic-add reduce-sum; do (cd $S/$v &amp;&amp; clang -arch arm64 -O2 -fno-common $INC -I./rlang -S $f.c -o $f.s) || echo FAIL; done; done
+for f in broadcast arithmetic-add reduce-sum; do echo &quot;== $f&quot;; diff $S/a/$f.s $S/b/$f.s | wc -l; done</pre><pre class="output">/Library/Frameworks/R.framework/Headers/Rinternals.h
+/Library/Frameworks/R.framework/Versions/4.6/Resources/include/Rinternals.h
+In file included from broadcast.c:1:
+In file included from ./broadcast.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+FAIL
+In file included from arithmetic-add.c:1:
+In file included from ./arithmetic-add.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+FAIL
+In file included from reduce-sum.c:1:
+In file included from ./reduce-sum.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+FAIL
+In file included from broadcast.c:1:
+In file included from ./broadcast.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+FAIL
+In file included from arithmetic-add.c:1:
+In file included from ./arithmetic-add.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+FAIL
+In file included from reduce-sum.c:1:
+In file included from ./reduce-sum.h:4:
+./rlang/rlang.h:25:10: fatal error: 'Rinternals.h' file not found
+   25 | #include &lt;Rinternals.h&gt;  // IWYU pragma: export
+      |          ^~~~~~~~~~~~~~
+1 error generated.
+FAIL
+== broadcast
+diff: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/a/broadcast.s: No such file or directory
+       0
+== arithmetic-add
+diff: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/a/arithmetic-add.s: No such file or directory
+       0
+== reduce-sum
+diff: /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/a/reduce-sum.s: No such file or directory
+       0</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad
+for v in a b; do for f in broadcast arithmetic-add reduce-sum; do (cd $S/$v &amp;&amp; clang -arch arm64 -O2 -fno-common -I/Library/Frameworks/R.framework/Headers -I/opt/R/arm64/include -I./rlang -S $f.c -o $f.s) || echo FAIL; done; done
+for f in broadcast arithmetic-add reduce-sum; do echo &quot;== $f&quot;; diff $S/a/$f.s $S/b/$f.s | wc -l; done</pre><pre class="output">== broadcast
+       0
+== arithmetic-add
+       0
+== reduce-sum
+       0</pre></details>
+<p>No. With Apple clang at R's <code>-O2</code>, the hoisted version compiles to byte-for-byte identical assembly.</p>
+<p><strong>What I tested:</strong> I copied <code>src/</code> twice. In one copy I changed <code>next()</code>, <code>next1()</code> and <code>next2()</code> to read <code>dimensionality</code>, <code>v_strides</code> and <code>v_dimensions</code> into locals before the loop. That includes <code>it-&gt;end += v_dimensions[0]</code>. Then I compiled <code>broadcast.c</code>, <code>arithmetic-add.c</code> and <code>reduce-sum.c</code> to assembly from both copies. <code>diff</code> found 0 lines of difference in all three. Those three files use <code>next1()</code> (broadcast and reduce) and <code>next2()</code> (binary).</p>
+<p><strong>Why it makes no difference:</strong></p>
+<ul>
+<li>
+<p><strong>The arrays:</strong> <code>v_strides</code> and <code>v_dimensions</code> are arrays stored inside the struct, not pointers. So <code>it-&gt;v_strides</code> is just the struct's address plus a fixed offset, with no memory read. A local copy of it is the same address under a new name.</p>
+</li>
+<li>
+<p><strong><code>dimensionality</code>:</strong> this is the only field that is really read from memory. The loop only writes to <code>v_point[]</code> and <code>v_loc[]</code>. Those are <code>r_ssize</code>, so under C's type rules they can't change an <code>int</code>. Also, every caller declares <code>it</code> as a local and passes <code>&amp;it</code> only to <code>static inline</code> functions. After inlining, the compiler can see exactly which fields each write touches, so it knows <code>dimensionality</code> doesn't change.</p>
+</li>
+<li>
+<p><strong>How often it runs:</strong> the loop almost always exits on the first axis. So even a re-read of <code>dimensionality</code> would happen about once per run, not once per element.</p>
+</li>
+</ul>
+<p><strong>Caveats:</strong></p>
+<ul>
+<li>
+<p><code>rray_run_iterator_next()</code> (the version that takes any <code>n</code>) has no caller yet, so I couldn't check its assembly. The same reasoning applies to it.</p>
+</li>
+<li>
+<p>Hoisting would start to matter if the iterator were passed through a pointer into a function that isn't inlined, and that function wrote through a <code>char*</code>, which is allowed to alias anything. That is the raw broadcast slowdown in the &quot;separate or merged&quot; section of <code>plans/iterators.md</code>. But that slowdown was in the caller's run loop, not in <code>next()</code>. Keeping the iterator a local, as the current design does, avoids it.</p>
+</li>
+<li>
+<p>I only checked Apple clang 17, not GCC.</p>
+</li>
+</ul>
+<p>So whether to hoist is purely a style choice. The current version reads fine.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Address all GitHub PR comments one by one.<br />
+Carefully analyze the line number the comment is left on, it is relevant to the context you need to perform the adjustment.<br />
+If a GitHub comment touches a code comment, reflow that comment.<br />
+After each comment, commit and push. Resolve each comment on GitHub with a link to the commit that resolved it.</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>ToolSearch: +github pull request review comments</summary>
+<pre>{
+  &quot;query&quot;: &quot;+github pull request review comments&quot;,
+  &quot;max_results&quot;: 15
+}</pre><pre class="output">Monitor
+WebFetch
+RemoteTrigger</pre></details>
+<details class="tool"><summary>ToolSearch: mcp__github</summary>
+<pre>{
+  &quot;query&quot;: &quot;mcp__github&quot;,
+  &quot;max_results&quot;: 30
+}</pre><pre class="output">No matching deferred tools found</pre></details>
+<details class="tool"><summary>Bash: which gh &amp;&amp; gh pr view --json number,url,headRefName 2&gt;&amp;1 | head</summary>
+<pre>which gh &amp;&amp; gh pr view --json number,url,headRefName 2&gt;&amp;1 | head</pre><pre class="output">/opt/homebrew/bin/gh
+{&quot;headRefName&quot;:&quot;feature/iterator&quot;,&quot;number&quot;:112,&quot;url&quot;:&quot;https://github.com/DavisVaughan/rray4/pull/112&quot;}</pre></details>
+<details class="tool"><summary>Bash: gh api graphql -f query='</summary>
+<pre>gh api graphql -f query='
+query { repository(owner:&quot;DavisVaughan&quot;, name:&quot;rray4&quot;) { pullRequest(number:112) {
+  reviewThreads(first:100) { nodes { id isResolved isOutdated path line originalLine diffSide
+    comments(first:20) { nodes { author{login} body diffHunk createdAt } } } } } } }' | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for t in d[&quot;data&quot;][&quot;repository&quot;][&quot;pullRequest&quot;][&quot;reviewThreads&quot;][&quot;nodes&quot;]:
+  if t[&quot;isResolved&quot;]: continue
+  print(&quot;=====&quot;, t[&quot;id&quot;], t[&quot;path&quot;], &quot;line&quot;, t[&quot;line&quot;], &quot;orig&quot;, t[&quot;originalLine&quot;], &quot;outdated&quot;, t[&quot;isOutdated&quot;])
+  for c in t[&quot;comments&quot;][&quot;nodes&quot;]:
+    print(&quot;--&quot;, c[&quot;author&quot;][&quot;login&quot;], c[&quot;createdAt&quot;]); print(c[&quot;body&quot;]); print(&quot;HUNK:&quot;, c[&quot;diffHunk&quot;][-600:])
+'; gh pr view 112 --comments | tail -40</pre><pre class="output">===== PRRT_kwDOUHAoJs6odOxL src/strided-iterator2.h line 10 orig 10 outdated False
+-- DavisVaughan 2026-10-02T19:03:33Z
+```suggestion
+// Strided iterator
+```
+
+HUNK: @@ -0,0 +1,342 @@
++#ifndef RRAY_STRIDED_ITERATOR2_H
++#define RRAY_STRIDED_ITERATOR2_H
++
++#include &quot;dimensionality.h&quot;
++#include &quot;rlang.h&quot;
++#include &quot;size.h&quot;
++
++#include &quot;decl/strided-iterator2-decl.h&quot;
++
++// Strided iterator plan
+===== PRRT_kwDOUHAoJs6odQyj src/strided-iterator2.h line 14 orig 14 outdated False
+-- DavisVaughan 2026-10-02T19:05:20Z
+```suggestion
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates the current `loc`ations in one or more
+// alternate subspaces defined by `v_v_strides`.
+```
+
+HUNK: @@ -0,0 +1,342 @@
++#ifndef RRAY_STRIDED_ITERATOR2_H
++#define RRAY_STRIDED_ITERATOR2_H
++
++#include &quot;dimensionality.h&quot;
++#include &quot;rlang.h&quot;
++#include &quot;size.h&quot;
++
++#include &quot;decl/strided-iterator2-decl.h&quot;
++
++// Strided iterator plan
++//
++// Optimizes and assists in walking a multidimensional point space defined by
++// `v_dimensions`. As it walks, it updates a user provided `start` in an
++// alternate subspace defined by `v_strides`.
+===== PRRT_kwDOUHAoJs6odRUM src/strided-iterator2.h line 22 orig 22 outdated False
+-- DavisVaughan 2026-10-02T19:05:48Z
+Remove paragraph
+HUNK: efined by
++// `v_dimensions`. As it walks, it updates a user provided `start` in an
++// alternate subspace defined by `v_strides`.
++//
++// For performance and flexibility, the user is responsible for managing the run
++// loop along the first axis. We've tried many alternative approaches but they
++// tend to tank performance quickly as you increase the level of abstractions.
++//
++// The plan holds only immutable state. The positions that change as it walks
++// are managed by the caller. This lets the compiler keep these positions in
++// registers, which has significant performance implications.
+===== PRRT_kwDOUHAoJs6odUt3 src/strided-iterator2.h line 18 orig 18 outdated False
+-- DavisVaughan 2026-10-02T19:08:46Z
+Change to:
+
+We've carefully tuned this iterator for both performance and flexibility. The caller MUST create the iterator INSIDE the function that utilizes it. If a pointer to the iterator is passed around, it can destroy performance due to the way the result is compiled. 
+
+
+HUNK: RATOR2_H
++
++#include &quot;dimensionality.h&quot;
++#include &quot;rlang.h&quot;
++#include &quot;size.h&quot;
++
++#include &quot;decl/strided-iterator2-decl.h&quot;
++
++// Strided iterator plan
++//
++// Optimizes and assists in walking a multidimensional point space defined by
++// `v_dimensions`. As it walks, it updates a user provided `start` in an
++// alternate subspace defined by `v_strides`.
++//
++// For performance and flexibility, the user is responsible for managing the run
++// loop along the first axis. We've tried many alternative approaches but they
++// tend to tank performance quickly as you increase the level of abstractions.
+===== PRRT_kwDOUHAoJs6odWDO src/strided-iterator2.h line 49 orig 49 outdated False
+-- DavisVaughan 2026-10-02T19:09:55Z
+```suggestion
+// advance by fixed strides, making it much easier to optimize and vectorize. This loop is typically what the caller writes.
+```
+
+HUNK: point space you can create `location`s back into your original
++// array to pull from.
++//
++// --------------------------------------------------------------------------
++// Optimization - First axis runs
++//
++// After coalescing, the iterator walks the entire first axis in one inner run
++// while holding all later axes fixed. It only updates the later point
++// coordinates between runs, rather than checking and carrying them after every
++// element. This gives the compiler a small loop where the index and locations
++// advance by fixed strides, making it much easier to optimize and vectorize.
+===== PRRT_kwDOUHAoJs6odXFq src/strided-iterator2.h line 104 orig 104 outdated False
+-- DavisVaughan 2026-10-02T19:10:51Z
+```suggestion
+// Note that all sets of strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+```
+
+HUNK: sions of size 1. Output point dimensions of [1, 3, 4] can
++//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
++//   dimension 3 second axis, adopting stride 1, after which the dimension 4
++//   third axis also coalesces. The result is one dimension [12] with stride
++//   [1]. Note that this isn't broadcasting. This is when both input and output
++//   have an axis that stays dimension 1, which is somewhat rare.
++//
++// For iterator2, note that both sets of location strides must be coalescible,
++// as coalescing changes the output dimensionality, so it's all or nothing.
+===== PRRT_kwDOUHAoJs6odYnu src/strided-iterator2.h line 120 orig 120 outdated False
+-- DavisVaughan 2026-10-02T19:12:08Z
+Remove this paragraph
+HUNK: // it to accumulate into the same output location. A zero stride on a later axis
++// does not use this path because later axes advance between inner runs.
++//
++// When the inner loop receives the stride as a runtime value, the compiler
++// can't prove that the location is fixed and falls back to a scalar loop. The
++// public iteration macros check for a zero stride and pass a literal 0 to a
++// specialized path. This lets the compiler see that the location does not
++// change. For binary operations, it can then hoist the fixed load out of the
++// loop and vectorize the remaining stride 1 work.
+===== PRRT_kwDOUHAoJs6oeKXO src/strided-iterator2.h line 194 orig 194 outdated False
+-- DavisVaughan 2026-10-02T19:54:16Z
+```suggestion
+  // Reorder strides to be contiguous during next() calls
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+```
+
+HUNK: sionality,
++  const r_ssize* const* v_v_strides,
++  r_ssize n
++) {
++  check_dimensionality(dimensionality);
++
++  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
++    r_stop_internal(
++      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
++      n,
++      RRAY_MAX_INPUTS
++    );
++  }
++
++  struct rray_run_iterator it;
++
++  it.size = rray_size_from_dimensions_checked(
++    v_dimensions,
++    dimensionality,
++    r_lazy_null
++  );
++
++  for (int axis = 0; axis &lt; dimensionality; ++axis) {
++    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
++  }
++
++  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+===== PRRT_kwDOUHAoJs6oeLlB src/strided-iterator2.h line 215 orig 215 outdated False
+-- DavisVaughan 2026-10-02T19:55:15Z
+Just use a plain loop for this too
+HUNK: xis) {
++    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
++  }
++
++  for (int axis = 0; axis &lt; dimensionality; ++axis) {
++    r_ssize* v_strides = it.v_strides + axis * n;
++    for (r_ssize i = 0; i &lt; n; ++i) {
++      v_strides[i] = v_v_strides[i][axis];
++    }
++  }
++
++  it.dimensionality = rray__run_iterator_axes_coalesce(
++    it.v_dimensions,
++    it.v_strides,
++    n,
++    dimensionality
++  );
++
++  it.start = 0;
++  it.end = it.v_dimensions[0];
++
++  for (r_ssize i = 0; i &lt; n; ++i) {
++    it.v_loc[i] = 0;
++  }
++
++  r_memset(it.v_point, 0, sizeof(r_ssize) * (size_t) it.dimensionality);
+===== PRRT_kwDOUHAoJs6of1_n src/strided-iterator2.h line 163 orig 163 outdated False
+-- DavisVaughan 2026-10-02T21:29:11Z
+Put in this order:
+
+- size
+
+
+Then
+- v_point
+- v_dimensions
+- dimensionality
+
+Then
+- start</pre><p class="cut">19 more lines cut</p></details>
+<details class="tool"><summary>Read src/strided-iterator2.h</summary>
+<pre class="output">1	#ifndef RRAY_STRIDED_ITERATOR2_H
+2	#define RRAY_STRIDED_ITERATOR2_H
+3	
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;rlang.h&quot;
+6	#include &quot;size.h&quot;
+7	
+8	#include &quot;decl/strided-iterator2-decl.h&quot;
+9	
+10	// Strided iterator plan
+11	//
+12	// Optimizes and assists in walking a multidimensional point space defined by
+13	// `v_dimensions`. As it walks, it updates a user provided `start` in an
+14	// alternate subspace defined by `v_strides`.
+15	//
+16	// For performance and flexibility, the user is responsible for managing the run
+17	// loop along the first axis. We've tried many alternative approaches but they
+18	// tend to tank performance quickly as you increase the level of abstractions.
+19	//
+20	// The plan holds only immutable state. The positions that change as it walks
+21	// are managed by the caller. This lets the compiler keep these positions in
+22	// registers, which has significant performance implications.
+23	//
+24	// --------------------------------------------------------------------------
+25	// Examples
+26	//
+27	// For broadcasting, the dimensions you broadcast to make up the larger point
+28	// space. This is walked in order. The original dimensions of the array make
+29	// up the subspace. So as you walk the output's point space you can create
+30	// `location`s back into your original array to pull from.
+31	//
+32	// For reducing, it's actually a special form of broadcasting. The original
+33	// dimensions of the array are the point space. The reduced dimensions are the
+34	// subspace. So as you walk the original array, you can create `location`s into
+35	// the output to accumulate the reduced result at.
+36	//
+37	// For permuting axes, the permuted dimensions make up the point space. The
+38	// original dimensions of the array make up the subspace. So as you walk the
+39	// output's point space you can create `location`s back into your original
+40	// array to pull from.
+41	//
+42	// --------------------------------------------------------------------------
+43	// Optimization - First axis runs
+44	//
+45	// After coalescing, the iterator walks the entire first axis in one inner run
+46	// while holding all later axes fixed. It only updates the later point
+47	// coordinates between runs, rather than checking and carrying them after every
+48	// element. This gives the compiler a small loop where the index and locations
+49	// advance by fixed strides, making it much easier to optimize and vectorize.
+50	//
+51	// Practical examples of when this is useful:
+52	//
+53	// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+54	//   coalesces to dimensions [40], so the entire operation is one first axis run
+55	//   where both input locations advance contiguously.
+56	//
+57	// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+58	//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+59	//   performs four first axis runs of size 6, copying six contiguous values
+60	//   before updating the later axis.
+61	//
+62	// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+63	//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+64	//   axis run accumulates one contiguous slice into six output locations before
+65	//   advancing along the reduced axis.
+66	//
+67	// --------------------------------------------------------------------------
+68	// Optimization - Coalescing
+69	//
+70	// Coalescing axes is an important optimization used to reduce the number of
+71	// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+72	// improve performance by 3-5x on its own in some cases.
+73	//
+74	// Practical examples of when this is useful:
+75	//
+76	// - Identically shaped binary array operations. Adding two arrays with
+77	//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+78	//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+79	//   resulting in one flat vectorizable loop.
+80	//
+81	// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+82	//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+83	//   Both coalesce completely, producing a [40] loop with array stride [1] and
+84	//   scalar stride [0].
+85	//
+86	// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+87	//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+88	//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+89	//   leaving dimensions [6, 4] and strides [1, 0].
+90	//
+91	// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+92	//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+93	//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+94	//   example above.
+95	//
+96	// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+97	//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+98	//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+99	//   third axis also coalesces. The result is one dimension [12] with stride
+100	//   [1]. Note that this isn't broadcasting. This is when both input and output
+101	//   have an axis that stays dimension 1, which is somewhat rare.
+102	//
+103	// For iterator2, note that both sets of location strides must be coalescible,
+104	// as coalescing changes the output dimensionality, so it's all or nothing.
+105	//
+106	// --------------------------------------------------------------------------
+107	// Optimization - Fixed zero stride paths
+108	//
+109	// After coalescing, the first axis is walked by the inner loop. A stride of 0
+110	// on this axis means that a subspace location stays fixed while the point space
+111	// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+112	// it to accumulate into the same output location. A zero stride on a later axis
+113	// does not use this path because later axes advance between inner runs.
+114	//
+115	// When the inner loop receives the stride as a runtime value, the compiler
+116	// can't prove that the location is fixed and falls back to a scalar loop. The
+117	// public iteration macros check for a zero stride and pass a literal 0 to a
+118	// specialized path. This lets the compiler see that the location does not
+119	// change. For binary operations, it can then hoist the fixed load out of the
+120	// loop and vectorize the remaining stride 1 work.
+121	//
+122	// Practical examples of when this is useful:
+123	//
+124	// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+125	//   array coalesces to point dimensions [40], with array strides [1] and scalar
+126	//   strides [0]. The scalar location stays fixed while the array and output
+127	//   advance contiguously. The same path is used by arithmetic, comparison,
+128	//   equality, and extrema operations.
+129	//
+130	// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+131	//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+132	//   therefore reuses one row value while the array and output advance
+133	//   contiguously.
+134	//
+135	// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+136	//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+137	//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+138	//   path.
+139	//
+140	// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+141	//   absorbs the shared first axis and produces dimensions [3, 4], with first
+142	//   input strides [0, 1] and second input strides [1, 3].
+143	//
+144	// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+145	//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+146	//   with output strides [0, 1]. Each inner run accumulates into one fixed
+147	//   output location.
+148	struct rray_run_iterator {
+149	  r_ssize start;
+150	  r_ssize end;
+151	  r_ssize v_loc[RRAY_MAX_INPUTS];
+152	
+153	  r_ssize size;
+154	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+155	
+156	  // Since coalescing can multiply two axes' dimensions together, we use an
+157	  // `r_ssize` here even though an individual dimension can't be above an `int`.
+158	  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+159	  int dimensionality;
+160	
+161	  // Strides for all `n` arrays, laid out axis-major in a flat array as
+162	  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+163	  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+164	};
+165	
+166	static inline struct rray_run_iterator rray_run_iterator(
+167	  const int* v_dimensions,
+168	  int dimensionality,
+169	  const r_ssize* const* v_v_strides,
+170	  r_ssize n
+171	) {
+172	  check_dimensionality(dimensionality);
+173	
+174	  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+175	    r_stop_internal(
+176	      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+177	      n,
+178	      RRAY_MAX_INPUTS
+179	    );
+180	  }
+181	
+182	  struct rray_run_iterator it;
+183	
+184	  it.size = rray_size_from_dimensions_checked(
+185	    v_dimensions,
+186	    dimensionality,
+187	    r_lazy_null
+188	  );
+189	
+190	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+191	    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+192	  }
+193	
+194	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+195	    r_ssize* v_strides = it.v_strides + axis * n;
+196	    for (r_ssize i = 0; i &lt; n; ++i) {
+197	      v_strides[i] = v_v_strides[i][axis];
+198	    }
+199	  }
+200	</pre><p class="cut">30 more lines cut</p></details>
+<p>Found 10 open review threads on PR #112, all in <code>src/strided-iterator2.h</code>. I'm working through them in order, with one commit and push per thread, then a reply and resolve on each.</p>
+
+<details class="tool"><summary>Bash: cat .clang-format; git status --short; git log origin/feature/iterator -1 --oneline; cat &gt; /p…</summary>
+<pre>cat .clang-format; git status --short; git log origin/feature/iterator -1 --oneline; cat &gt; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh &lt;&lt;'EOF'
+#!/bin/zsh
+# usage: resolve.sh THREAD_ID
+set -e
+cd ~/files/r/packages/rray4
+sha=$(git rev-parse HEAD)
+url=&quot;https://github.com/DavisVaughan/rray4/commit/$sha&quot;
+body=&quot;Resolved in $url
+
+---
+_Generated by [Claude Code](https://claude.ai/code)_&quot;
+gh api graphql -f query='mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$t, body:$b}){comment{url}}}' -f t=&quot;$1&quot; -f b=&quot;$body&quot; --jq .data.addPullRequestReviewThreadReply.comment.url
+gh api graphql -f query='mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}' -f t=&quot;$1&quot; --jq .data.resolveReviewThread.thread.isResolved
+EOF
+chmod +x /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh</pre><pre class="output">IndentWidth: 2
+ContinuationIndentWidth: 2
+SortIncludes: Never
+BinPackArguments: false
+BinPackParameters: false
+InsertBraces: true
+PointerAlignment: Left
+SpaceAfterCStyleCast: true
+Cpp11BracedListStyle: true
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AlignAfterOpenBracket: BlockIndent
+AlignOperands: DontAlign
+BreakBeforeTernaryOperators: true
+BreakAfterReturnType: Automatic
+PenaltyReturnTypeOnItsOwnLine: 10000
+0c42a07 Add one and two input run iterators with hand unrolled next functions</pre></details>
+<p>Thread 1: title.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// Strided iterator plan</span>
+<span class="del">-//</span>
+<span class="ins">+// Strided iterator</span>
+<span class="ins">+//</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; git commit -qam &quot;Rename the strided …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; git commit -qam &quot;Rename the strided iterator header comment title to Strided iterator&quot; &amp;&amp; git push -q -u origin feature/iterator &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odOxL</pre><pre class="output"> M src/strided-iterator2.h
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170032794
+true</pre></details>
+<p>Thread 2: description, reflowed to 80 columns.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// `v_dimensions`. As it walks, it updates a user provided `start` in an</span>
+<span class="del">-// alternate subspace defined by `v_strides`.</span>
+<span class="ins">+// `v_dimensions`. As it walks, it updates the current `loc`ations in one or</span>
+<span class="ins">+// more alternate subspaces defined by `v_v_strides`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Describe the strided i…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Describe the strided iterator as updating locations in one or more subspaces&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odQyj</pre><pre class="output"> src/strided-iterator2.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170033913
+true</pre></details>
+<p>Thread 3: remove the &quot;plan holds only immutable state&quot; paragraph.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// tend to tank performance quickly as you increase the level of abstractions.</span>
+<span class="del">-//</span>
+<span class="del">-// The plan holds only immutable state. The positions that change as it walks</span>
+<span class="del">-// are managed by the caller. This lets the compiler keep these positions in</span>
+<span class="del">-// registers, which has significant performance implications.</span>
+<span class="del">-//</span>
+<span class="ins">+// tend to tank performance quickly as you increase the level of abstractions.</span>
+<span class="ins">+//</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Remove the outdated im…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Remove the outdated immutable plan paragraph from the strided iterator comment&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odRUM</pre><pre class="output"> src/strided-iterator2.h | 4 ----
+ 1 file changed, 4 deletions(-)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170035196
+true</pre></details>
+<p>Thread 4: replace the performance paragraph with the requested text.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// For performance and flexibility, the user is responsible for managing the run</span>
+<span class="del">-// loop along the first axis. We've tried many alternative approaches but they</span>
+<span class="del">-// tend to tank performance quickly as you increase the level of abstractions.</span>
+<span class="ins">+// We've carefully tuned this iterator for both performance and flexibility. The</span>
+<span class="ins">+// caller MUST create the iterator INSIDE the function that utilizes it. If a</span>
+<span class="ins">+// pointer to the iterator is passed around, it can destroy performance due to</span>
+<span class="ins">+// the way the result is compiled.</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Require callers to cre…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Require callers to create the strided iterator inside the function using it&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odUt3</pre><pre class="output"> src/strided-iterator2.h | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170036240
+true</pre></details>
+<p>Thread 5: first axis runs sentence, reflowed.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// element. This gives the compiler a small loop where the index and locations</span>
+<span class="del">-// advance by fixed strides, making it much easier to optimize and vectorize.</span>
+<span class="ins">+// element. This gives the compiler a small loop where the index and locations</span>
+<span class="ins">+// advance by fixed strides, making it much easier to optimize and vectorize.</span>
+<span class="ins">+// This loop is typically what the caller writes.</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Note that the caller t…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Note that the caller typically writes the first axis run loop&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odWDO</pre><pre class="output"> src/strided-iterator2.h | 1 +
+ 1 file changed, 1 insertion(+)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170037051
+true</pre></details>
+<p>Thread 6: coalescing note, reflowed.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// For iterator2, note that both sets of location strides must be coalescible,</span>
+<span class="del">-// as coalescing changes the output dimensionality, so it's all or nothing.</span>
+<span class="ins">+// Note that all sets of strides must be coalescible, as coalescing changes the</span>
+<span class="ins">+// output dimensionality, so it's all or nothing.</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Say that all sets of s…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Say that all sets of strides must be coalescible together&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odXFq</pre><pre class="output"> src/strided-iterator2.h | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170037934
+true</pre></details>
+<p>Thread 7: remove the runtime stride paragraph.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-// does not use this path because later axes advance between inner runs.</span>
+<span class="del">-//</span>
+<span class="del">-// When the inner loop receives the stride as a runtime value, the compiler</span>
+<span class="del">-// can't prove that the location is fixed and falls back to a scalar loop. The</span>
+<span class="del">-// public iteration macros check for a zero stride and pass a literal 0 to a</span>
+<span class="del">-// specialized path. This lets the compiler see that the location does not</span>
+<span class="del">-// change. For binary operations, it can then hoist the fixed load out of the</span>
+<span class="del">-// loop and vectorize the remaining stride 1 work.</span>
+<span class="del">-//</span>
+<span class="ins">+// does not use this path because later axes advance between inner runs.</span>
+<span class="ins">+//</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Remove the runtime str…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Remove the runtime stride paragraph from the fixed zero stride section&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6odYnu</pre><pre class="output"> src/strided-iterator2.h | 7 -------
+ 1 file changed, 7 deletions(-)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170039094
+true</pre></details>
+<p>Thread 8: the user's suggested comment on the stride reorder loop.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  for (int axis = 0; axis &lt; dimensionality; ++axis) {</span>
+<span class="del">-    r_ssize* v_strides = it.v_strides + axis * n;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  // Reorder strides to be contiguous during next() calls</span>
+<span class="ins">+  for (int axis = 0; axis &lt; dimensionality; ++axis) {</span>
+<span class="ins">+    r_ssize* v_strides = it.v_strides + axis * n;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Note why the run itera…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Note why the run iterator reorders strides axis-major&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6oeKXO</pre><pre class="output"> src/strided-iterator2.h | 1 +
+ 1 file changed, 1 insertion(+)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170040344
+true</pre></details>
+<p>Thread 9: plain loop instead of <code>r_memset()</code> for <code>v_point</code>.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-  r_memset(it.v_point, 0, sizeof(r_ssize) * (size_t) it.dimensionality);</span>
+<span class="ins">+  for (int axis = 0; axis &lt; it.dimensionality; ++axis) {</span>
+<span class="ins">+    it.v_point[axis] = 0;</span>
+<span class="ins">+  }</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e 'devtools::load_all(quiet=TR…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e 'devtools::load_all(quiet=TRUE)' 2&gt;&amp;1 | tail -3 &amp;&amp; git commit -qam &quot;Zero the run iterator point with a plain loop instead of r_memset()&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6oeLlB</pre><pre class="output"> src/strided-iterator2.h | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170042465
+true</pre></details>
+<p>Thread 10: reorder the struct fields.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-struct rray_run_iterator {</span>
+<span class="del">-  r_ssize start;</span>
+<span class="del">-  r_ssize end;</span>
+<span class="del">-  r_ssize v_loc[RRAY_MAX_INPUTS];</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize size;</span>
+<span class="del">-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-</span>
+<span class="del">-  // Since coalescing can multiply two axes' dimensions together, we use an</span>
+<span class="del">-  // `r_ssize` here even though an individual dimension can't be above an `int`.</span>
+<span class="del">-  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-  int dimensionality;</span>
+<span class="del">-</span>
+<span class="del">-  // Strides</span>
+<span class="ins">+struct rray_run_iterator {</span>
+<span class="ins">+  r_ssize size;</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+  // Since coalescing can multiply two axes' dimensions together, we use an</span>
+<span class="ins">+  // `r_ssize` here even though an individual dimension can't be above an `int`.</span>
+<span class="ins">+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+  int dimensionality;</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize start;</span>
+<span class="ins">+  r_ssize end;</span>
+<span class="ins">+  r_ssize v_loc[RRAY_MAX_INPUTS];</span>
+<span class="ins">+  // Strides</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff &amp;&amp; Rscript -e 'devtools::test(reporter = &quot;summary…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff &amp;&amp; Rscript -e 'devtools::test(reporter = &quot;summary&quot;)' 2&gt;&amp;1 | tail -6</pre><pre class="output">diff --git a/src/strided-iterator2.h b/src/strided-iterator2.h
+index 5d07f62..9364a45 100644
+--- a/src/strided-iterator2.h
++++ b/src/strided-iterator2.h
+@@ -137,18 +137,17 @@
+ //   with output strides [0, 1]. Each inner run accumulates into one fixed
+ //   output location.
+ struct rray_run_iterator {
+-  r_ssize start;
+-  r_ssize end;
+-  r_ssize v_loc[RRAY_MAX_INPUTS];
+-
+   r_ssize size;
+-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+ 
++  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+   // Since coalescing can multiply two axes' dimensions together, we use an
+   // `r_ssize` here even though an individual dimension can't be above an `int`.
+   r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   int dimensionality;
+ 
++  r_ssize start;
++  r_ssize end;
++  r_ssize v_loc[RRAY_MAX_INPUTS];
+   // Strides for all `n` arrays, laid out axis-major in a flat array as
+   // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+   r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+split: ....................................................................................................................................................................................................................................................
+stack: .....................................................................................
+unstack: ................................................................
+wrapper: ................................................................................................................................
+
+══ DONE ════════════════════════════════════════════════════════════════════════</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::test(reporter = &quot;summary&quot;)' 2&gt;&amp;1 | grep -iE &quot;fail|error|warn|skip&quot; | he…</summary>
+<pre>Rscript -e 'devtools::test(reporter = &quot;summary&quot;)' 2&gt;&amp;1 | grep -iE &quot;fail|error|warn|skip&quot; | head; git commit -qam &quot;Group run iterator fields into size, point space, and run state&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6of1_n &amp;&amp; git log --oneline -11 &amp;&amp; git status --short</pre><pre class="output">https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170049675
+true
+4d0806e Group run iterator fields into size, point space, and run state
+adb10bd Zero the run iterator point with a plain loop instead of r_memset()
+e58f000 Note why the run iterator reorders strides axis-major
+2d380e3 Remove the runtime stride paragraph from the fixed zero stride section
+a111999 Say that all sets of strides must be coalescible together
+834b538 Note that the caller typically writes the first axis run loop
+42291e4 Require callers to create the strided iterator inside the function using it
+de06716 Remove the outdated immutable plan paragraph from the strided iterator comment
+249a09c Describe the strided iterator as updating locations in one or more subspaces
+47f908c Rename the strided iterator header comment title to Strided iterator
+0c42a07 Add one and two input run iterators with hand unrolled next functions</pre></details>
+<p>I addressed all 10 review threads on PR #112. Each one has its own commit on <code>feature/iterator</code>, is pushed, and is resolved on GitHub with a reply linking its commit. All 10 were in <code>src/strided-iterator2.h</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Line</th>
+<th>Change</th>
+<th>Commit</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>10</td>
+<td>Title is now <code>// Strided iterator</code></td>
+<td><code>47f908c</code></td>
+</tr>
+<tr>
+<td>14</td>
+<td>Applied your suggestion, reflowed to 80 columns</td>
+<td><code>249a09c</code></td>
+</tr>
+<tr>
+<td>22</td>
+<td>Removed the &quot;plan holds only immutable state&quot; paragraph</td>
+<td><code>de06716</code></td>
+</tr>
+<tr>
+<td>18</td>
+<td>Replaced the performance paragraph with your text (callers MUST create the iterator INSIDE the function using it), reflowed</td>
+<td><code>42291e4</code></td>
+</tr>
+<tr>
+<td>49</td>
+<td>Added &quot;This loop is typically what the caller writes.&quot;, reflowed</td>
+<td><code>834b538</code></td>
+</tr>
+<tr>
+<td>104</td>
+<td>Now &quot;Note that all sets of strides must be coalescible...&quot;, reflowed</td>
+<td><code>a111999</code></td>
+</tr>
+<tr>
+<td>120</td>
+<td>Removed the paragraph about the stride being a runtime value</td>
+<td><code>2d380e3</code></td>
+</tr>
+<tr>
+<td>194</td>
+<td>Added your <code>// Reorder strides to be contiguous during next() calls</code> line above the stride loop</td>
+<td><code>e58f000</code></td>
+</tr>
+<tr>
+<td>215</td>
+<td><code>v_point</code> is now zeroed with a plain <code>for</code> loop instead of <code>r_memset()</code></td>
+<td><code>adb10bd</code></td>
+</tr>
+<tr>
+<td>163</td>
+<td>Struct fields reordered into your three groups: <code>size</code>; then <code>v_point</code>, <code>v_dimensions</code>, <code>dimensionality</code>; then <code>start</code>, <code>end</code>, <code>v_loc</code>, <code>v_strides</code></td>
+<td><code>4d0806e</code></td>
+</tr>
+</tbody>
+</table>
+<p>Two things to check:</p>
+<ul>
+<li>
+<p><strong>Struct layout (line 163):</strong> I kept a blank line between your three groups. The existing comments on <code>v_dimensions</code> and <code>v_strides</code> now sit directly under the field before them, with no blank line in between. Say if you want the blank lines back above those comments.</p>
+</li>
+<li>
+<p><strong>Testing:</strong> I ran <code>clang-format</code> over all files before every commit. The full test suite passed after the final commit. For the <code>r_memset()</code> commit I only checked that the package compiled and loaded; I didn't run the tests until the struct reorder that followed.</p>
+</li>
+</ul>
+<p>Your global rules say never to commit for you. I did here because this request asked for a commit and push after each comment.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Now that we have specialized next1/2, I think we should go ahead and store n as a field under v_strides so next() doesn’t need n as an input, it will be runtime provided anyways whenever that is called so it wont be a candidate for loop unrolling, do you agree?</p>
+<p>Also add a newline before the v_strides docs</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Yes, I agree. Once <code>next1()</code> and <code>next2()</code> exist, the generic <code>next()</code> only runs when <code>n</code> is 3 or more, and in those cases <code>n</code> comes from data at runtime. Storing <code>n</code> in the struct also loses nothing if a caller ever passes a fixed <code>n</code>. The iterator is a local and the constructor is inlined, so the compiler can still see that <code>it.n</code> is that fixed value.</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;rray_run_iterator_next(&quot; src/ plans/ | grep -v &quot;^src/strided-iterator2.h&quot;; grep -n …</summary>
+<pre>grep -rn &quot;rray_run_iterator_next(&quot; src/ plans/ | grep -v &quot;^src/strided-iterator2.h&quot;; grep -n &quot;r_ssize n\b\|it-&gt;n\|, n)\|\* n&quot; src/strided-iterator2.h</pre><pre class="output">plans/iterators.md:109:static inline bool rray_run_iterator_next(struct rray_run_iterator* it) {
+plans/iterators.md:163:  while (rray_run_iterator_next(&amp;it)) {
+plans/iterators.md:269:  while (rray_run_iterator_next(&amp;it)) {
+plans/iterators.md:990:while (rray_run_iterator_next(&amp;it)) {
+plans/iterators.md:1003:while (rray_run_iterator_next(&amp;it)) {
+160:  r_ssize n
+186:    r_ssize* v_strides = it.v_strides + axis * n;
+270:  r_ssize n
+273:    const r_ssize* v_strides = it-&gt;v_strides + axis * n;
+345:  r_ssize n,
+352:    r_ssize* v_left_strides = v_strides + out_axis * n;
+354:    const r_ssize* v_right_strides = v_strides + axis * n;
+380:      r_ssize* v_out_strides = v_strides + out_axis * n;</pre></details>
+<details class="tool"><summary>Read src/strided-iterator2.h</summary>
+<pre class="output">139	struct rray_run_iterator {
+140	  r_ssize size;
+141	
+142	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+143	  // Since coalescing can multiply two axes' dimensions together, we use an
+144	  // `r_ssize` here even though an individual dimension can't be above an `int`.
+145	  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+146	  int dimensionality;
+147	
+148	  r_ssize start;
+149	  r_ssize end;
+150	  r_ssize v_loc[RRAY_MAX_INPUTS];
+151	  // Strides for all `n` arrays, laid out axis-major in a flat array as
+152	  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+153	  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+154	};
+155	
+156	static inline struct rray_run_iterator rray_run_iterator(
+157	  const int* v_dimensions,
+158	  int dimensionality,
+159	  const r_ssize* const* v_v_strides,
+160	  r_ssize n
+161	) {
+162	  check_dimensionality(dimensionality);
+163	
+164	  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+165	    r_stop_internal(
+166	      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+167	      n,
+168	      RRAY_MAX_INPUTS
+169	    );
+170	  }
+171	
+172	  struct rray_run_iterator it;
+173	
+174	  it.size = rray_size_from_dimensions_checked(
+175	    v_dimensions,
+176	    dimensionality,
+177	    r_lazy_null
+178	  );
+179	
+180	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+181	    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+182	  }
+183	
+184	  // Reorder strides to be contiguous during next() calls
+185	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+186	    r_ssize* v_strides = it.v_strides + axis * n;
+187	    for (r_ssize i = 0; i &lt; n; ++i) {
+188	      v_strides[i] = v_v_strides[i][axis];
+189	    }
+190	  }
+191	
+192	  it.dimensionality = rray__run_iterator_axes_coalesce(
+193	    it.v_dimensions,
+194	    it.v_strides,
+195	    n,
+196	    dimensionality
+197	  );
+198	
+199	  it.start = 0;
+200	  it.end = it.v_dimensions[0];
+201	
+202	  for (r_ssize i = 0; i &lt; n; ++i) {
+203	    it.v_loc[i] = 0;
+204	  }
+205	
+206	  for (int axis = 0; axis &lt; it.dimensionality; ++axis) {
+207	    it.v_point[axis] = 0;
+208	  }
+209	
+210	  return it;
+211	}
+212	
+213	static inline struct rray_run_iterator rray_run_iterator1(
+214	  const int* v_dimensions,
+215	  int dimensionality,
+216	  const r_ssize* v_strides
+217	) {
+218	  const r_ssize* v_v_strides[] = {v_strides};
+219	  return rray_run_iterator(v_dimensions, dimensionality, v_v_strides, 1);
+220	}
+221	
+222	static inline struct rray_run_iterator rray_run_iterator2(
+223	  const int* v_dimensions,
+224	  int dimensionality,
+225	  const r_ssize* v_strides1,
+226	  const r_ssize* v_strides2
+227	) {
+228	  const r_ssize* v_v_strides[] = {v_strides1, v_strides2};
+229	  return rray_run_iterator(v_dimensions, dimensionality, v_v_strides, 2);
+230	}
+231	
+232	static inline r_ssize rray_run_iterator_size(
+233	  const struct rray_run_iterator* it
+234	) {
+235	  return it-&gt;size;
+236	}
+237	
+238	static inline r_ssize rray_run_iterator_start(
+239	  const struct rray_run_iterator* it
+240	) {
+241	  return it-&gt;start;
+242	}
+243	
+244	static inline r_ssize rray_run_iterator_end(
+245	  const struct rray_run_iterator* it
+246	) {
+247	  return it-&gt;end;
+248	}
+249	
+250	static inline r_ssize rray_run_iterator_loc(
+251	  const struct rray_run_iterator* it,
+252	  r_ssize i
+253	) {
+254	  return it-&gt;v_loc[i];
+255	}
+256	
+257	static inline r_ssize rray_run_iterator_stride(
+258	  const struct rray_run_iterator* it,
+259	  r_ssize i
+260	) {
+261	  return it-&gt;v_strides[i];
+262	}
+263	
+264	static inline bool rray_run_iterator_done(const struct rray_run_iterator* it) {
+265	  return it-&gt;start == it-&gt;size;
+266	}
+267	
+268	static inline void rray_run_iterator_next(
+269	  struct rray_run_iterator* it,
+270	  r_ssize n
+271	) {
+272	  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+273	    const r_ssize* v_strides = it-&gt;v_strides + axis * n;
+274	    const r_ssize dimension = it-&gt;v_dimensions[axis];
+275	
+276	    ++it-&gt;v_point[axis];
+277	
+278	    if (it-&gt;v_point[axis] &lt; dimension) {
+279	      for (r_ssize i = 0; i &lt; n; ++i) {
+280	        it-&gt;v_loc[i] += v_strides[i];
+281	      }
+282	      break;
+283	    }
+284	
+285	    it-&gt;v_point[axis] = 0;
+286	
+287	    for (r_ssize i = 0; i &lt; n; ++i) {
+288	      it-&gt;v_loc[i] -= (dimension - 1) * v_strides[i];
+289	    }
+290	  }
+291	
+292	  it-&gt;start = it-&gt;end;
+293	  it-&gt;end += it-&gt;v_dimensions[0];
+294	}
+295	
+296	static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {
+297	  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+298	    const r_ssize stride = it-&gt;v_strides[axis];</pre></details>
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+p=&quot;src/strided-iterator2.h&quot;; s=open(p).read()
+def rep(a,b):
+    global s
+    assert s.count(a)==1, a
+    s=s.replace(a,b)
+rep(&quot;&quot;&quot;  r_ssize v_loc[RRAY_MAX_INPUTS];
+  // Strides&quot;&quot;&quot;,&quot;&quot;&quot;  r_ssize v_loc[RRAY_MAX_INPUTS];
+
+  // Strides&quot;&quot;&quot;)
+rep(&quot;&quot;&quot;  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+};&quot;&quot;&quot;,&quot;&quot;&quot;  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+  r_ssize n;
+};&quot;&quot;&quot;)
+rep(&quot;&quot;&quot;  for (r_ssize i = 0; i &lt; n; ++i) {
+    it.v_loc[i] = 0;
+  }
+&quot;&quot;&quot;,&quot;&quot;&quot;  it.n = n;
+
+  for (r_ssize i = 0; i &lt; n; ++i) {
+    it.v_loc[i] = 0;
+  }
+&quot;&quot;&quot;)
+rep(&quot;&quot;&quot;static inline void rray_run_iterator_next(
+  struct rray_run_iterator* it,
+  r_ssize n
+) {
+  for&quot;&quot;&quot;,&quot;&quot;&quot;static inline void rray_run_iterator_next(struct rray_run_iterator* it) {
+  const r_ssize n = it-&gt;n;
+
+  for&quot;&quot;&quot;)
+open(p,&quot;w&quot;).write(s)
+EOF
+clang-format -i src/*.c src/*.h &amp;&amp; git diff</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>The project hook blocks shell scripts that write files, so I'll make these edits with Edit.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-  r_ssize v_loc[RRAY_MAX_INPUTS];</span>
+<span class="del">-  // Strides</span>
+<span class="ins">+  r_ssize v_loc[RRAY_MAX_INPUTS];</span>
+<span class="ins">+</span>
+<span class="ins">+  // Strides</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];</span>
+<span class="del">-};</span>
+<span class="ins">+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];</span>
+<span class="ins">+  r_ssize n;</span>
+<span class="ins">+};</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-  for (r_ssize i = 0; i &lt; n; ++i) {</span>
+<span class="del">-    it.v_loc[i] = 0;</span>
+<span class="del">-  }</span>
+<span class="ins">+  it.n = n;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; n; ++i) {</span>
+<span class="ins">+    it.v_loc[i] = 0;</span>
+<span class="ins">+  }</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-static inline void rray_run_iterator_next(</span>
+<span class="del">-  struct rray_run_iterator* it,</span>
+<span class="del">-  r_ssize n</span>
+<span class="del">-) {</span>
+<span class="del">-  for</span>
+<span class="ins">+static inline void rray_run_iterator_next(struct rray_run_iterator* it) {</span>
+<span class="ins">+  const r_ssize n = it-&gt;n;</span>
+<span class="ins">+</span>
+<span class="ins">+  for</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff &amp;&amp; Rscript -e 'devtools::test(reporter = &quot;summary…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff &amp;&amp; Rscript -e 'devtools::test(reporter = &quot;summary&quot;)' 2&gt;&amp;1 | grep -iE &quot;fail|error|warn|DONE&quot; | head</pre><pre class="output">diff --git a/src/strided-iterator2.h b/src/strided-iterator2.h
+index 9364a45..3311448 100644
+--- a/src/strided-iterator2.h
++++ b/src/strided-iterator2.h
+@@ -148,9 +148,11 @@ struct rray_run_iterator {
+   r_ssize start;
+   r_ssize end;
+   r_ssize v_loc[RRAY_MAX_INPUTS];
++
+   // Strides for all `n` arrays, laid out axis-major in a flat array as
+   // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+   r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
++  r_ssize n;
+ };
+ 
+ static inline struct rray_run_iterator rray_run_iterator(
+@@ -199,6 +201,8 @@ static inline struct rray_run_iterator rray_run_iterator(
+   it.start = 0;
+   it.end = it.v_dimensions[0];
+ 
++  it.n = n;
++
+   for (r_ssize i = 0; i &lt; n; ++i) {
+     it.v_loc[i] = 0;
+   }
+@@ -265,10 +269,9 @@ static inline bool rray_run_iterator_done(const struct rray_run_iterator* it) {
+   return it-&gt;start == it-&gt;size;
+ }
+ 
+-static inline void rray_run_iterator_next(
+-  struct rray_run_iterator* it,
+-  r_ssize n
+-) {
++static inline void rray_run_iterator_next(struct rray_run_iterator* it) {
++  const r_ssize n = it-&gt;n;
++
+   for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+     const r_ssize* v_strides = it-&gt;v_strides + axis * n;
+     const r_ssize dimension = it-&gt;v_dimensions[axis];
+══ DONE ════════════════════════════════════════════════════════════════════════</pre></details>
+<p>Both changes are made in <code>src/strided-iterator2.h</code>. Tests pass. Nothing is committed yet.</p>
+<ul>
+<li>
+<p><strong>The <code>n</code> field:</strong> <code>n</code> is now a field directly under <code>v_strides</code>. The constructor sets it with <code>it.n = n;</code> just before it zeroes <code>v_loc</code>. <code>rray_run_iterator_next()</code> now takes only <code>it</code> and reads <code>const r_ssize n = it-&gt;n;</code> at the top.</p>
+</li>
+<li>
+<p><strong>Newline:</strong> there is now a blank line between <code>v_loc</code> and the <code>v_strides</code> doc comment.</p>
+</li>
+</ul>
+<p>I put <code>n</code> in a local in <code>next()</code> instead of writing <code>it-&gt;n</code> in the loops. The loops write to <code>v_loc[i]</code>, which has the same type as <code>n</code>. If <code>next()</code> were ever not inlined, the compiler would have to read <code>it-&gt;n</code> again after every write. The local avoids that.</p>
+<p>Nothing calls <code>rray_run_iterator_next()</code> yet, so no callers needed updating. Its old <code>while (next(&amp;it))</code> form still appears in <code>plans/iterators.md</code>, but that is the earlier design and I left it alone.</p>
+<p>Want me to commit and push this?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>And push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git commit -qam &quot;Store n on the run iterator so rray_run_iterator_next() only takes the itera…</summary>
+<pre>git commit -qam &quot;Store n on the run iterator so rray_run_iterator_next() only takes the iterator&quot; &amp;&amp; git push -q &amp;&amp; git log --oneline -1 &amp;&amp; git status --short</pre><pre class="output">0e535be Store n on the run iterator so rray_run_iterator_next() only takes the iterator</pre></details>
+<p>I committed the change as <code>0e535be</code> (&quot;Store n on the run iterator so rray_run_iterator_next() only takes the iterator&quot;) and pushed it to <code>feature/iterator</code>. Nothing is left uncommitted.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>One more comment</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: gh api graphql -f query='</summary>
+<pre>gh api graphql -f query='
+query { repository(owner:&quot;DavisVaughan&quot;, name:&quot;rray4&quot;) { pullRequest(number:112) {
+  reviewThreads(first:100) { nodes { id isResolved path line originalLine
+    comments(first:20) { nodes { author{login} body diffHunk } } } } } } }' | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for t in d[&quot;data&quot;][&quot;repository&quot;][&quot;pullRequest&quot;][&quot;reviewThreads&quot;][&quot;nodes&quot;]:
+  if t[&quot;isResolved&quot;]: continue
+  print(&quot;=====&quot;, t[&quot;id&quot;], t[&quot;path&quot;], &quot;line&quot;, t[&quot;line&quot;], &quot;orig&quot;, t[&quot;originalLine&quot;])
+  for c in t[&quot;comments&quot;][&quot;nodes&quot;]:
+    print(&quot;--&quot;, c[&quot;author&quot;][&quot;login&quot;]); print(c[&quot;body&quot;]); print(&quot;HUNK:&quot;, c[&quot;diffHunk&quot;][-500:])
+'</pre><pre class="output">===== PRRT_kwDOUHAoJs6ogO1z src/strided-iterator2.h line 138 orig 138
+-- DavisVaughan
+Add
+
+Optimization - Next specialization
+
+The loops that callers write seem to be particularly sensitive to whether or not the &quot;next&quot; loop is unrolled on `n`. For the generic &quot;next&quot; function with a runtime `n`, it usually isn't unrolled. But most of the time you have either one or two inputs, so we manually unroll in next1() and next2(), and those should be used where possible.
+HUNK:  uses the fixed
++//   path.
++//
++// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
++//   absorbs the shared first axis and produces dimensions [3, 4], with first
++//   input strides [0, 1] and second input strides [1, 3].
++//
++// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
++//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
++//   with output strides [0, 1]. Each inner run accumulates into one fixed
++//   output location.</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-//   with output strides [0, 1]. Each inner run accumulates into one fixed</span>
+<span class="del">-//   output location.</span>
+<span class="del">-struct</span>
+<span class="ins">+//   with output strides [0, 1]. Each inner run accumulates into one fixed</span>
+<span class="ins">+//   output location.</span>
+<span class="ins">+//</span>
+<span class="ins">+// --------------------------------------------------------------------------</span>
+<span class="ins">+// Optimization - Next specialization</span>
+<span class="ins">+//</span>
+<span class="ins">+// The loops that callers write seem to be particularly sensitive to whether or</span>
+<span class="ins">+// not the &quot;next&quot; loop is unrolled on `n`. For the generic &quot;next&quot; function with</span>
+<span class="ins">+// a runtime `n`, it usually isn't unrolled. But most of the time you have</span>
+<span class="ins">+// either one or two inputs, so we manually unroll in next1() and next2(), and</span>
+<span class="ins">+// those should be used where possible.</span>
+<span class="ins">+struct</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Document the next1() a…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; git commit -qam &quot;Document the next1() and next2() specialization in the strided iterator comment&quot; &amp;&amp; git push -q &amp;&amp; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad/resolve.sh PRRT_kwDOUHAoJs6ogO1z &amp;&amp; git log --oneline -1</pre><pre class="output"> src/strided-iterator2.h | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+https://github.com/DavisVaughan/rray4/pull/112#discussion_r4170159631
+true
+3dd048c Document the next1() and next2() specialization in the strided iterator comment</pre></details>
+<p>I added the &quot;Optimization - Next specialization&quot; section with your text, reflowed to 80 columns. It's the last section of the header comment, just above <code>struct rray_run_iterator</code>, with the same divider line as the other sections. I committed it as <code>3dd048c</code>, pushed it, and resolved the thread on GitHub with a link to the commit.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Well since we’ve lifted n we may as well lift dimensionality, v_strides, and v_dimensions in all of them, at least for consistency</p>
+<p>Call the current v_strides v_axis_strides and also call dimension axis_dimension across the 3 next helpers</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/strided-iterator2.h</summary>
+<pre class="output">278	  return it-&gt;start == it-&gt;size;
+279	}
+280	
+281	static inline void rray_run_iterator_next(struct rray_run_iterator* it) {
+282	  const r_ssize n = it-&gt;n;
+283	
+284	  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+285	    const r_ssize* v_strides = it-&gt;v_strides + axis * n;
+286	    const r_ssize dimension = it-&gt;v_dimensions[axis];
+287	
+288	    ++it-&gt;v_point[axis];
+289	
+290	    if (it-&gt;v_point[axis] &lt; dimension) {
+291	      for (r_ssize i = 0; i &lt; n; ++i) {
+292	        it-&gt;v_loc[i] += v_strides[i];
+293	      }
+294	      break;
+295	    }
+296	
+297	    it-&gt;v_point[axis] = 0;
+298	
+299	    for (r_ssize i = 0; i &lt; n; ++i) {
+300	      it-&gt;v_loc[i] -= (dimension - 1) * v_strides[i];
+301	    }
+302	  }
+303	
+304	  it-&gt;start = it-&gt;end;
+305	  it-&gt;end += it-&gt;v_dimensions[0];
+306	}
+307	
+308	static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {
+309	  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+310	    const r_ssize stride = it-&gt;v_strides[axis];
+311	    const r_ssize dimension = it-&gt;v_dimensions[axis];
+312	
+313	    ++it-&gt;v_point[axis];
+314	
+315	    if (it-&gt;v_point[axis] &lt; dimension) {
+316	      it-&gt;v_loc[0] += stride;
+317	      break;
+318	    }
+319	
+320	    it-&gt;v_point[axis] = 0;
+321	
+322	    it-&gt;v_loc[0] -= (dimension - 1) * stride;
+323	  }
+324	
+325	  it-&gt;start = it-&gt;end;
+326	  it-&gt;end += it-&gt;v_dimensions[0];
+327	}
+328	
+329	static inline void rray_run_iterator_next2(struct rray_run_iterator* it) {
+330	  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {
+331	    const r_ssize* v_strides = it-&gt;v_strides + axis * 2;
+332	    const r_ssize stride1 = v_strides[0];
+333	    const r_ssize stride2 = v_strides[1];
+334	    const r_ssize dimension = it-&gt;v_dimensions[axis];
+335	
+336	    ++it-&gt;v_point[axis];
+337	
+338	    if (it-&gt;v_point[axis] &lt; dimension) {
+339	      it-&gt;v_loc[0] += stride1;
+340	      it-&gt;v_loc[1] += stride2;
+341	      break;
+342	    }
+343	
+344	    it-&gt;v_point[axis] = 0;
+345	
+346	    it-&gt;v_loc[0] -= (dimension - 1) * stride1;
+347	    it-&gt;v_loc[1] -= (dimension - 1) * stride2;
+348	  }
+349	
+350	  it-&gt;start = it-&gt;end;
+351	  it-&gt;end += it-&gt;v_dimensions[0];
+352	}
+353	
+354	static inline int rray__run_iterator_axes_coalesce(
+355	  r_ssize* v_dimensions,
+356	  r_ssize* v_strides,
+357	  r_ssize n,
+358	  int dimensionality
+359	) {
+360	  int out_axis = 0;
+361	
+362	  for (int axis = 1; axis &lt; dimensionality; ++axis) {</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-static inline void rray_run_iterator_next(struct rray_run_iterator* it) {</span>
+<span class="del">-  const r_ssize n = it-&gt;n;</span>
+<span class="del">-</span>
+<span class="del">-  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {</span>
+<span class="del">-    const r_ssize* v_strides = it-&gt;v_strides + axis * n;</span>
+<span class="del">-    const r_ssize dimension = it-&gt;v_dimensions[axis];</span>
+<span class="del">-</span>
+<span class="del">-    ++it-&gt;v_point[axis];</span>
+<span class="del">-</span>
+<span class="del">-    if (it-&gt;v_point[axis] &lt; dimension) {</span>
+<span class="del">-      for (r_ssize i = 0; i &lt; n; ++i) {</span>
+<span class="del">-        it-&gt;v_loc[i] += v_strides[i];</span>
+<span class="del">-      }</span>
+<span class="del">-      break;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_point[axis] = 0;</span>
+<span class="del">-</span>
+<span class="del">-    for (r_ssize i = 0; i &lt; n; ++i) {</span>
+<span class="del">-      it-&gt;v_loc[i] -= (dimension - 1) * v_strides[i];</span>
+<span class="del">-    }</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  it-&gt;start = it-&gt;end;</span>
+<span class="del">-  it-&gt;end += it-&gt;v_dimensions[0];</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {</span>
+<span class="del">-  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {</span>
+<span class="del">-    const r_ssize stride = it-&gt;v_strides[axis];</span>
+<span class="del">-    const r_ssize dimension = it-&gt;v_dimensions[axis];</span>
+<span class="del">-</span>
+<span class="del">-    ++it-&gt;v_point[axis];</span>
+<span class="del">-</span>
+<span class="del">-    if (it-&gt;v_point[axis] &lt; dimension) {</span>
+<span class="del">-      it-&gt;v_loc[0] += stride;</span>
+<span class="del">-      break;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_point[axis] = 0;</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_loc[0] -= (dimension - 1) * stride;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  it-&gt;start = it-&gt;end;</span>
+<span class="del">-  it-&gt;end += it-&gt;v_dimensions[0];</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline void rray_run_iterator_next2(struct rray_run_iterator* it) {</span>
+<span class="del">-  for (int axis = 1; axis &lt; it-&gt;dimensionality; ++axis) {</span>
+<span class="del">-    const r_ssize* v_strides = it-&gt;v_strides + axis * 2;</span>
+<span class="del">-    const r_ssize stride1 = v_strides[0];</span>
+<span class="del">-    const r_ssize stride2 = v_strides[1];</span>
+<span class="del">-    const r_ssize dimension = it-&gt;v_dimensions[axis];</span>
+<span class="del">-</span>
+<span class="del">-    ++it-&gt;v_point[axis];</span>
+<span class="del">-</span>
+<span class="del">-    if (it-&gt;v_point[axis] &lt; dimension) {</span>
+<span class="del">-      it-&gt;v_loc[0] += stride1;</span>
+<span class="del">-      it-&gt;v_loc[1] += stride2;</span>
+<span class="del">-      break;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_point[axis] = 0;</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_loc[0] -= (dimension - 1) * stride1;</span>
+<span class="del">-    it-&gt;v_loc[1] -= (dimension - 1) * stride2;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  it-&gt;start = it-&gt;end;</span>
+<span class="del">-  it-&gt;end += it-&gt;v_dimensions[0];</span>
+<span class="del">-}</span>
+<span class="ins">+static inline void rray_run_iterator_next(struct rray_run_iterator* it) {</span>
+<span class="ins">+  const r_ssize* v_dimensions = it-&gt;v_dimensions;</span>
+<span class="ins">+  const int dimensionality = it-&gt;dimensionality;</span>
+<span class="ins">+  const r_ssize* v_strides = it-&gt;v_strides;</span>
+<span class="ins">+  const r_ssize n = it-&gt;n;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int axis = 1; axis &lt; dimensionality; ++axis) {</span>
+<span class="ins">+    const r_ssize* v_axis_strides = v_strides + axis * n;</span>
+<span class="ins">+    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    ++it-&gt;v_point[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="ins">+      for (r_ssize i = 0; i &lt; n; ++i) {</span>
+<span class="ins">+        it-&gt;v_loc[i] += v_axis_strides[i];</span>
+<span class="ins">+      }</span>
+<span class="ins">+      break;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_point[axis] = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+    for (r_ssize i = 0; i &lt; n; ++i) {</span>
+<span class="ins">+      it-&gt;v_loc[i] -= (axis_dimension - 1) * v_axis_strides[i];</span>
+<span class="ins">+    }</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  it-&gt;start = it-&gt;end;</span>
+<span class="ins">+  it-&gt;end += v_dimensions[0];</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {</span>
+<span class="ins">+  const r_ssize* v_dimensions = it-&gt;v_dimensions;</span>
+<span class="ins">+  const int dimensionality = it-&gt;dimensionality;</span>
+<span class="ins">+  const r_ssize* v_strides = it-&gt;v_strides;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int axis = 1; axis &lt; dimensionality; ++axis) {</span>
+<span class="ins">+    const r_ssize stride = v_strides[axis];</span>
+<span class="ins">+    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    ++it-&gt;v_point[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="ins">+      it-&gt;v_loc[0] += stride;</span>
+<span class="ins">+      break;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_point[axis] = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_loc[0] -= (axis_dimension - 1) * stride;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  it-&gt;start = it-&gt;end;</span>
+<span class="ins">+  it-&gt;end += v_dimensions[0];</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+static inline void rray_run_iterator_next2(struct rray_run_iterator* it) {</span>
+<span class="ins">+  const r_ssize* v_dimensions = it-&gt;v_dimensions;</span>
+<span class="ins">+  const int dimensionality = it-&gt;dimensionality;</span>
+<span class="ins">+  const r_ssize* v_strides = it-&gt;v_strides;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int axis = 1; axis &lt; dimensionality; ++axis) {</span>
+<span class="ins">+    const r_ssize* v_axis_strides = v_strides + axis * 2;</span>
+<span class="ins">+    const r_ssize stride1 = v_axis_strides[0];</span>
+<span class="ins">+    const r_ssize stride2 = v_axis_strides[1];</span>
+<span class="ins">+    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    ++it-&gt;v_point[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="ins">+      it-&gt;v_loc[0] += stride1;</span>
+<span class="ins">+      it-&gt;v_loc[1] += stride2;</span>
+<span class="ins">+      break;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_point[axis] = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_loc[0] -= (axis_dimension - 1) * stride1;</span>
+<span class="ins">+    it-&gt;v_loc[1] -= (axis_dimension - 1) * stride2;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  it-&gt;start = it-&gt;end;</span>
+<span class="ins">+  it-&gt;end += v_dimensions[0];</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e 'devtools::test(reporter = &quot;…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e 'devtools::test(reporter = &quot;summary&quot;)' 2&gt;&amp;1 | grep -iE &quot;fail|error|warn|DONE&quot; | head</pre><pre class="output"> src/strided-iterator2.h | 55 +++++++++++++++++++++++++++++--------------------
+ 1 file changed, 33 insertions(+), 22 deletions(-)
+══ DONE ════════════════════════════════════════════════════════════════════════</pre></details>
+<p>All three next helpers now read the iterator's fields into locals at the top. The renames are done too. Tests pass. Nothing is committed yet.</p>
+<ul>
+<li>
+<p><strong>Lifted locals:</strong> each helper starts by reading <code>v_dimensions</code>, <code>dimensionality</code> and <code>v_strides</code> from <code>it</code>, and <code>next()</code> also reads <code>n</code>. They're in the same order as the struct fields. The loop condition and the final <code>it-&gt;end += v_dimensions[0]</code> now use these locals.</p>
+</li>
+<li>
+<p><strong><code>v_axis_strides</code>:</strong> the per-axis pointer is renamed from <code>v_strides</code> to <code>v_axis_strides</code> in <code>next()</code> and <code>next2()</code>.</p>
+</li>
+<li>
+<p><strong><code>axis_dimension</code>:</strong> <code>dimension</code> is renamed to <code>axis_dimension</code> in all three.</p>
+</li>
+</ul>
+<p><code>next1()</code> never had a per-axis pointer. With one input it reads <code>stride = v_strides[axis]</code> directly, so it has no <code>v_axis_strides</code>. I could add one for symmetry (<code>v_strides + axis</code>, then <code>stride = v_axis_strides[0]</code>), but that would add a line and change nothing.</p>
+<p>Want me to commit and push?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git commit -qam &quot;Lift iterator fields into locals and rename axis strides and dimension in ne…</summary>
+<pre>git commit -qam &quot;Lift iterator fields into locals and rename axis strides and dimension in next helpers&quot; &amp;&amp; git push -q &amp;&amp; git log --oneline -1 &amp;&amp; git status --short</pre><pre class="output">947d792 Lift iterator fields into locals and rename axis strides and dimension in next helpers</pre></details>
+<p>I committed the change as <code>947d792</code> and pushed it to <code>feature/iterator</code>. Nothing is left uncommitted.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>stride1-&gt;axis_stride1 and same for 2 and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-    const r_ssize stride1 = v_axis_strides[0];</span>
+<span class="del">-    const r_ssize stride2 = v_axis_strides[1];</span>
+<span class="del">-    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="del">-</span>
+<span class="del">-    ++it-&gt;v_point[axis];</span>
+<span class="del">-</span>
+<span class="del">-    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="del">-      it-&gt;v_loc[0] += stride1;</span>
+<span class="del">-      it-&gt;v_loc[1] += stride2;</span>
+<span class="del">-      break;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_point[axis] = 0;</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_loc[0] -= (axis_dimension - 1) * stride1;</span>
+<span class="del">-    it-&gt;v_loc[1] -= (axis_dimension - 1) * stride2;</span>
+<span class="ins">+    const r_ssize axis_stride1 = v_axis_strides[0];</span>
+<span class="ins">+    const r_ssize axis_stride2 = v_axis_strides[1];</span>
+<span class="ins">+    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    ++it-&gt;v_point[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="ins">+      it-&gt;v_loc[0] += axis_stride1;</span>
+<span class="ins">+      it-&gt;v_loc[1] += axis_stride2;</span>
+<span class="ins">+      break;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_point[axis] = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_loc[0] -= (axis_dimension - 1) * axis_stride1;</span>
+<span class="ins">+    it-&gt;v_loc[1] -= (axis_dimension - 1) * axis_stride2;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator2.h</summary>
+<pre class="diff"><span class="del">-    const r_ssize stride = v_strides[axis];</span>
+<span class="del">-    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="del">-</span>
+<span class="del">-    ++it-&gt;v_point[axis];</span>
+<span class="del">-</span>
+<span class="del">-    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="del">-      it-&gt;v_loc[0] += stride;</span>
+<span class="del">-      break;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_point[axis] = 0;</span>
+<span class="del">-</span>
+<span class="del">-    it-&gt;v_loc[0] -= (axis_dimension - 1) * stride;</span>
+<span class="ins">+    const r_ssize axis_stride = v_strides[axis];</span>
+<span class="ins">+    const r_ssize axis_dimension = v_dimensions[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    ++it-&gt;v_point[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    if (it-&gt;v_point[axis] &lt; axis_dimension) {</span>
+<span class="ins">+      it-&gt;v_loc[0] += axis_stride;</span>
+<span class="ins">+      break;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_point[axis] = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+    it-&gt;v_loc[0] -= (axis_dimension - 1) * axis_stride;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator2.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e 'devtools::load_all(quiet=TR…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e 'devtools::load_all(quiet=TRUE)' 2&gt;&amp;1 | tail -3 &amp;&amp; git commit -qam &quot;Rename next helper strides to axis_stride, axis_stride1, and axis_stride2&quot; &amp;&amp; git push -q &amp;&amp; git log --oneline -1 &amp;&amp; git status --short</pre><pre class="output"> src/strided-iterator2.h | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+e8d3ac9 Rename next helper strides to axis_stride, axis_stride1, and axis_stride2</pre></details>
+<p>In <code>next2()</code>, <code>stride1</code> and <code>stride2</code> are now <code>axis_stride1</code> and <code>axis_stride2</code>. I committed this as <code>e8d3ac9</code> and pushed it to <code>feature/iterator</code>.</p>
+<p>I also renamed <code>stride</code> to <code>axis_stride</code> in <code>next1()</code> so all three helpers use the same names. You didn't ask for that one, so say if you'd rather I revert it.</p>
+<p>The package compiled and loaded after the rename. I didn't rerun the tests, since only local variable names changed.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>And pulling out all those next() locals didn’t change performance right? Do a quick check</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll compare the generated assembly from just before the lift (<code>3dd048c</code>) with HEAD.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/12b7950d-69c6-4bcc-8949-640fee9800d0/scratchpad &amp;&amp; rm -rf $S/old $S/new &amp;&amp; mkdir -p $S/old $S/new &amp;&amp; git archive 3dd048c src | tar -x -C $S/old &amp;&amp; git archive HEAD src | tar -x -C $S/new &amp;&amp; for v in old new; do for f in broadcast arithmetic-add reduce-sum; do (cd $S/$v/src &amp;&amp; clang -arch arm64 -O2 -fno-common -I/Library/Frameworks/R.framework/Headers -I/opt/R/arm64/include -I./rlang -S $f.c -o $f.s) || echo FAIL; done; done; for f in broadcast arithmetic-add reduce-sum; do echo &quot;== $f $(wc -l &lt; $S/new/src/$f.s) lines, diff: $(diff $S/old/src/$f.s $S/new/src/$f.s | wc -l)&quot;; done</pre><pre class="output">== broadcast     2308 lines, diff:        0
+== arithmetic-add     7777 lines, diff:        0
+== reduce-sum     3117 lines, diff:        0</pre></details>
+<p>Correct, it changed nothing. I compiled <code>broadcast.c</code>, <code>arithmetic-add.c</code> and <code>reduce-sum.c</code> from <code>3dd048c</code> (just before the lift) and from HEAD. I used Apple clang with R's <code>-O2</code>, and the assembly is identical for all three files. HEAD includes both the lifted locals and the <code>axis_stride</code> renames.</p>
+<p>Those three files cover every current caller, which use <code>next1()</code> and <code>next2()</code>. The generic <code>next()</code> still has no callers, so it isn't in any compiled code to compare. It's the same kind of change, though, so I'd expect the same result once something calls it.</p>
+
+</section>
+</main>
+</body>
+</html>

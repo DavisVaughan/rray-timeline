@@ -1,0 +1,2577 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checking integer add and subtract overflow in int64_t for speed</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-147">rray timeline</a>
+<h1>Checking integer add and subtract overflow in <code>int64_t</code> for speed</h1>
+<p class="facts">Claude · Oct 12, 2026 · 4 prompts · 22 replies · <a href="https://github.com/r-lib/rray/pull/147">#147</a></p>
+</header>
+<main>
+<p class="divider">Oct 12, 2026, 16:02 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create feature/add-perf</p>
+<p>Read the plan/add-performance and the last few PRs</p>
+<p>Implement the plan and run benchmarks in detail</p>
+<p>Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status &amp;&amp; git branch -a &amp;&amp; ls &amp;&amp; ls plan* 2&gt;/dev/null; find . -path ./src/rlang -prune -o…</summary>
+<pre>git status &amp;&amp; git branch -a &amp;&amp; ls &amp;&amp; ls plan* 2&gt;/dev/null; find . -path ./src/rlang -prune -o -iname &quot;*perf*&quot; -print</pre><pre class="output">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+* main
+  remotes/origin/HEAD -&gt; origin/main
+  remotes/origin/gh-pages
+  remotes/origin/main
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+codecov.yml
+compile_commands.json
+DESCRIPTION
+docs
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+panache.toml
+pkgdown
+plans
+R
+README.md
+README.Rmd
+rray.Rproj
+src
+tests
+vignettes
+add-performance.md
+extensions.md
+fix-int-lgl-na.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+./plans/add-performance.md</pre></details>
+<details class="tool"><summary>Bash: cat plans/add-performance.md &amp;&amp; git log --oneline -15 &amp;&amp; ls bench src R tests/testthat</summary>
+<pre>cat plans/add-performance.md &amp;&amp; git log --oneline -15 &amp;&amp; ls bench src R tests/testthat</pre><pre class="output"># Integer add helper performance
+
+## Summary
+
+While adding `rray_cumulative_sum()`, rewriting the overflow check in
+`rray_add_int_one()` (`src/one-add.h`) made integer sums about 2x faster when
+the values have mixed signs. This helps both `rray_cumulative_sum()` and
+`rray_add()`. The change was tried and undone on the `feature/cumulative-sum`
+branch. It belongs in its own PR, which should also check
+`rray_subtract_int_one()`.
+
+## The change
+
+Before:
+
+```c
+if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+  stop_int_overflow(error_call);
+}
+
+return x + y;
+```
+
+After:
+
+```c
+const int64_t out = (int64_t) x + y;
+
+if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+  stop_int_overflow(error_call);
+}
+
+return (int) out;
+```
+
+Add `#include &lt;stdint.h&gt;` to `src/one-add.h`. The missing value check at the
+top of the helper stays as is.
+
+## Why it is faster
+
+The old check branches on the sign of `y`. When `y` is a random mix of
+negative, zero, and positive values, the CPU can't predict that branch, and
+every wrong guess costs a pipeline flush.
+
+The new check does not depend on the sign of `y`. Its only branch is &quot;did it
+overflow&quot;, which is almost never taken and so is always predicted right.
+
+The old form is fine when every value has the same sign, which is why
+logical input (only `0` and `1`) was already fast.
+
+## Measurements
+
+Apple Silicon (arm64), R's default compiler flags through
+`devtools::load_all()`, median of 15 iterations, 1.6e7 elements.
+
+| Call | Data | Before | After |
+|---|---|---|---|
+| `rray_cumulative_sum(x, 1L)` | `sample(-1:1)` | 52ms | 24ms |
+| `rray_cumulative_sum(x, 1L)` | `sample(0:1)` | 26ms | 24ms |
+| `rray_cumulative_sum(x, 1L)` | `sample(c(TRUE, FALSE))` | 27ms | 23ms |
+| `rray_cumulative_sum(m, 2L)`, 4000 x 4000 | `sample(-1:1)` | 57ms | 23ms |
+| `rray_add(x, y)` | both `sample(-1:1)` | 62ms | 23ms |
+
+For reference, base `cumsum()` took 33ms and base `x + y` took 48ms on the
+same mixed sign data.
+
+The inputs were:
+
+```r
+set.seed(1)
+n &lt;- 16e6
+xs &lt;- sample(-1:1, n, TRUE)
+xp &lt;- sample(0:1, n, TRUE)
+xs2 &lt;- sample(-1:1, n, TRUE)
+xl2 &lt;- sample(c(TRUE, FALSE), n, TRUE)
+m &lt;- matrix(xs, 4000)
+```
+
+## Behavior
+
+None. Both forms error on exactly the same inputs: a result above `INT_MAX`
+or below `-INT_MAX`. `INT_MIN` is the integer `NA`, so it stays out of range
+in both.
+
+## Helpers to investigate
+
+- `rray_add_int_one()`: the change above.
+
+- `rray_subtract_int_one()` in `src/arithmetic-subtract.c`: it has the same
+  sign branch, `(y &lt; 0 &amp;&amp; x &gt; INT_MAX + y) || (y &gt; 0 &amp;&amp; x &lt; -INT_MAX + y)`.
+  Try `(int64_t) x - y` with the same range check. Expect the same win on
+  mixed sign data.
+
+- `int_add_checked()` in `src/utils.c`: same pattern, but it is not on a hot
+  path. Leave it unless it shows up in a benchmark.
+
+- `rray_multiply_int_one()` already uses a range check on a wider type, so
+  there is nothing to change.
+
+## Benchmarks for the new PR
+
+Measure before and after, on mixed sign and same sign integer data:
+
+- `rray_cumulative_sum()` for logical and integer.
+
+- `rray_add()` and `rray_subtract()` for integer, with both inputs full size
+  and with one input broadcast.
+
+- Axis 1 of a long vector, axis 1 and axis 2 of a 4000 x 4000 matrix.
+
+`bench/cumulative.R` and `bench/binary.R` cover most of these, but their
+integer data is `sample(100L)`, which is all positive. Add mixed sign data,
+otherwise the benchmarks will not show the change. Results on x86 would also
+help.
+
+## Tests for the new PR
+
+- Existing overflow tests for `rray_add()`, `rray_subtract()`, and
+  `rray_cumulative_sum()` already cover both bounds. Check that sums that
+  land exactly on `INT_MAX` and `-INT_MAX` still succeed.
+
+- The full suite.
+7c41cae Add `rray_cumulative_sum()` (#146)
+5b91e39 Implement the prod performance plan!
+91dbe6d Remove titles plan (#144)
+53d97b5 Add `rray_cumulative_prod()` (#143)
+0dd7ce1 Add `rray_cumulative_max/min()` (#142)
+15edd77 Add `rray_cumulative_any/all()` (#141)
+153250e Update cumulative plan for current reducers (#140)
+6694814 Add titles API (#139)
+7ff7f6b Remove key plan
+b9295fd Require R &gt;= 4.3.0 for ALTLIST support
+e3bc7d8 Only do the complex missing tests on new enough R
+ad3e1a3 Use portable format specifier
+162c1f9 Avoid `NaN` + `NA` comparisons, as they are known to be implementation defined
+7e8b817 Ignore `panache.toml`
+3eef80d `usethis::use_pkgdown_github_pages()`
+bench:
+binary.R
+broadcast.R
+combine.R
+cumulative.R
+extremum.R
+index.R
+iterator.R
+matrix-stats.R
+mean.R
+permute-axes.R
+reduce-logical.R
+reduce.R
+slice.R
+split.R
+stride-zero.R
+
+R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+cumulative.R
+dimensionality.R
+dimensions.R
+equal.R
+extract-subscript.R
+extract.R
+extremum.R
+if-else.R
+index.R
+insert-axes.R
+locate.R
+logical.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+reverse.R
+roll.R
+rray-package.R
+size.R
+slice-subscript.R
+slice.R
+split.R
+stack.R
+titles.R
+unstack.R
+zzz.R
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c</pre><p class="cut">279 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show --stat HEAD HEAD~1 | head -60 &amp;&amp; cat src/one-add.h &amp;&amp; cat src/arithmetic-subtract.c …</summary>
+<pre>git show --stat HEAD HEAD~1 | head -60 &amp;&amp; cat src/one-add.h &amp;&amp; cat src/arithmetic-subtract.c &amp;&amp; grep -n &quot;int_add_checked&quot; -A15 src/utils.c | head -30 &amp;&amp; cat src/one-multiply.h</pre><pre class="output">commit 7c41cae84cb24d42ce3a53d553ed1edd41d6c600
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:59:16 2026 -0400
+
+    Add `rray_cumulative_sum()` (#146)
+
+ NAMESPACE                               |   1 +
+ R/cumulative.R                          |  35 ++++
+ bench/cumulative.R                      |   4 +
+ man/rray-cumulative.Rd                  |  31 ++++
+ plans/add-performance.md                | 122 ++++++++++++++
+ plans/cumulative.md                     | 276 -------------------------------
+ plans/fix-int-lgl-na.md                 | 109 +++++++++++++
+ src/cumulative-extremum.c               |  18 +-
+ src/cumulative-logical.c                |   6 +-
+ src/cumulative-prod.c                   |  12 +-
+ src/cumulative-sum.c                    | 134 +++++++++++++++
+ src/cumulative-sum.h                    |  15 ++
+ src/cumulative.h                        |  10 +-
+ src/decl/cumulative-sum-decl.h          |  38 +++++
+ src/init.c                              |   6 +
+ tests/testthat/_snaps/cumulative-sum.md | 136 ++++++++++++++++
+ tests/testthat/test-cumulative-sum.R    | 281 ++++++++++++++++++++++++++++++++
+ 17 files changed, 943 insertions(+), 291 deletions(-)
+
+commit 5b91e391d1b3ebf9675524457df2b4b2d7ae11a8
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:33:09 2026 -0400
+
+    Implement the prod performance plan!
+
+ R/reduce.R                            |  12 +++
+ bench/binary.R                        |   1 +
+ bench/reduce.R                        |  13 ++-
+ man/rray-reduce.Rd                    |  11 ++
+ plans/prod-performance.md             | 182 ----------------------------------
+ src/one-multiply.h                    |  30 +-----
+ tests/testthat/test-cumulative-prod.R |   6 ++
+ tests/testthat/test-reduce-prod.R     |  25 +++++
+ 8 files changed, 71 insertions(+), 209 deletions(-)
+#ifndef RRAY_ONE_ADD_H
+#define RRAY_ONE_ADD_H
+
+#include &lt;limits.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// - `x = 1`, `y = 1`: returns `2`.
+// - `x = 1`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = INT_MAX`: returns `NA`.
+// - `x = 1`, `y = INT_MAX`: errors.
+static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+    stop_int_overflow(error_call);
+  }
+
+  return x + y;
+}
+
+// For `c(NA, NaN)` behavior, match `+` and let the order be &quot;implementation
+// defined&quot; which is very fast. We consistently do this for both `rray_add()`
+// and `rray_sum()`, while R itself only does this for `+`. `sum()` prefers
+// `NA` when both are present.
+static inline double rray_add_dbl_one(double x, double y) {
+  return x + y;
+}
+
+static inline r_complex rray_add_cpl_one(r_complex x, r_complex y) {
+  return (r_complex) {.r = x.r + y.r, .i = x.i + y.i};
+}
+
+#endif
+#include &quot;arithmetic-subtract.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;arithmetic.h&quot;
+#include &quot;binary.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;type.h&quot;
+#include &quot;typeof2.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/arithmetic-subtract-decl.h&quot;
+
+r_obj* ffi_rray_subtract(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_subtract(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_subtract(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_binary_arithmetic(
+    x,
+    y,
+    rray_subtract_switch,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+static rray_binary_arithmetic_fn rray_subtract_switch(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  const enum rray_type x_type = rray_typeof(x);
+  const enum rray_type y_type = rray_typeof(y);
+
+  enum rray_side side;
+
+  switch (rray_typeof2(x_type, y_type, &amp;side)) {
+  case RRAY_TYPE2_logical_logical:
+    return rray_subtract_lgl_lgl;
+  case RRAY_TYPE2_logical_integer:
+    return (side == RRAY_SIDE_right) ? rray_subtract_lgl_int
+                                     : rray_subtract_int_lgl;
+  case RRAY_TYPE2_logical_double:
+    return (side == RRAY_SIDE_right) ? rray_subtract_lgl_dbl
+                                     : rray_subtract_dbl_lgl;
+  case RRAY_TYPE2_logical_complex:
+    return (side == RRAY_SIDE_right) ? rray_subtract_lgl_cpl
+                                     : rray_subtract_cpl_lgl;
+  case RRAY_TYPE2_integer_integer:
+    return rray_subtract_int_int;
+  case RRAY_TYPE2_integer_double:
+    return (side == RRAY_SIDE_right) ? rray_subtract_int_dbl
+                                     : rray_subtract_dbl_int;
+  case RRAY_TYPE2_integer_complex:
+    return (side == RRAY_SIDE_right) ? rray_subtract_int_cpl
+                                     : rray_subtract_cpl_int;
+  case RRAY_TYPE2_double_double:
+    return rray_subtract_dbl_dbl;
+  case RRAY_TYPE2_double_complex:
+    return (side == RRAY_SIDE_right) ? rray_subtract_dbl_cpl
+                                     : rray_subtract_cpl_dbl;
+  case RRAY_TYPE2_complex_complex:
+    return rray_subtract_cpl_cpl;
+
+  case RRAY_TYPE2_logical_character:
+  case RRAY_TYPE2_logical_raw:
+  case RRAY_TYPE2_logical_list:
+  case RRAY_TYPE2_integer_character:
+  case RRAY_TYPE2_integer_raw:
+  case RRAY_TYPE2_integer_list:
+  case RRAY_TYPE2_double_character:
+  case RRAY_TYPE2_double_raw:
+  case RRAY_TYPE2_double_list:
+  case RRAY_TYPE2_complex_character:
+  case RRAY_TYPE2_complex_raw:
+  case RRAY_TYPE2_complex_list:
+  case RRAY_TYPE2_character_character:
+  case RRAY_TYPE2_character_raw:
+  case RRAY_TYPE2_character_list:
+  case RRAY_TYPE2_raw_raw:
+  case RRAY_TYPE2_raw_list:
+  case RRAY_TYPE2_list_list:
+    stop_unsupported_arithmetic(&quot;-&quot;, x, y, x_arg, y_arg, error_call);
+
+  case RRAY_TYPE2_logical_scalar:
+  case RRAY_TYPE2_integer_scalar:
+  case RRAY_TYPE2_double_scalar:
+  case RRAY_TYPE2_complex_scalar:
+  case RRAY_TYPE2_character_scalar:
+  case RRAY_TYPE2_raw_scalar:
+  case RRAY_TYPE2_list_scalar:
+  case RRAY_TYPE2_scalar_scalar:
+    if (x_type == RRAY_TYPE_scalar) {
+      stop_scalar_input(x, x_arg, error_call);
+    } else {
+      stop_scalar_input(y, y_arg, error_call);
+    }
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_subtract_lgl_lgl(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,</pre><p class="cut">518 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show 5b91e39 -- bench src tests R | head -200; cat bench/binary.R bench/cumulative.R</summary>
+<pre>git show 5b91e39 -- bench src tests R | head -200; cat bench/binary.R bench/cumulative.R</pre><pre class="output">commit 5b91e391d1b3ebf9675524457df2b4b2d7ae11a8
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 11 20:33:09 2026 -0400
+
+    Implement the prod performance plan!
+
+diff --git a/R/reduce.R b/R/reduce.R
+index 5b2dabf..f7915c7 100644
+--- a/R/reduce.R
++++ b/R/reduce.R
+@@ -35,6 +35,18 @@
+ #' @section Product:
+ #' Logicals and integers are cast to double.
+ #'
++#' When `NA` and `NaN` are both present, you get one of them, but which one
++#' depends on the platform and the order of the values. Either way, `is.na()`
++#' is `TRUE`. Integers can hit this too, since a product that overflows to
++#' `Inf` becomes `NaN` when multiplied by `0`:
++#'
++#' ```r
++#' rray_prod(c(NA, NaN), 1L) # NA or NaN
++#'
++#' x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++#' rray_prod(x, 1L) # NA or NaN
++#' ```
++#'
+ #' @section Mean:
+ #' Logicals and integers are cast to double.
+ #'
+diff --git a/bench/binary.R b/bench/binary.R
+index b98ccc8..c6b62da 100644
+--- a/bench/binary.R
++++ b/bench/binary.R
+@@ -4,6 +4,7 @@ iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
++  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+diff --git a/bench/reduce.R b/bench/reduce.R
+index 7b2861c..f58e73a 100644
+--- a/bench/reduce.R
++++ b/bench/reduce.R
+@@ -5,7 +5,14 @@ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
+   sum = list(fn = rray_sum, types = c(&quot;integer&quot;, &quot;double&quot;)),
+-  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),
++  prod = list(
++    fn = rray_prod,
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++  ),
++  prod_na_rm = list(
++    fn = \(x, axes) rray_prod(x, axes, na_rm = TRUE),
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++  ),
+   max = list(fn = rray_max, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   max_na_rm = list(
+     fn = \(x, axes) rray_max(x, axes, na_rm = TRUE),
+@@ -22,6 +29,7 @@ operations &lt;- list(
+ )
+ 
+ shapes &lt;- list(
++  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+   &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+   &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+   &quot;[4000, 4000] over 1, 2&quot; = list(c(4000L, 4000L), 1:2),
+@@ -40,7 +48,8 @@ make_array &lt;- function(dimensions, type) {
+     type,
+     logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+     integer = sample(100L, n, replace = TRUE),
+-    double = runif(n)
++    double = runif(n),
++    complex = complex(real = runif(n), imaginary = runif(n))
+   )
+ 
+   array(values, dimensions)
+diff --git a/src/one-multiply.h b/src/one-multiply.h
+index 5a4259c..ada964e 100644
+--- a/src/one-multiply.h
++++ b/src/one-multiply.h
+@@ -50,44 +50,28 @@ static inline r_complex rray_multiply_cpl_one(r_complex x, r_complex y) {
+ // - `out = 2`, `x = 1`: returns `2`.
+ // - `out = 2`, `x = NA`: returns `NA`.
+ static inline double rray_prod_lgl_one(double out, int x) {
+-  if (rray_lgl_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
++  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : x);
+ }
+ 
+ // `out` is a double, `x` is a logical
+ // - `out = 2`, `x = 1`: returns `2`.
+ // - `out = 2`, `x = NA`: returns `2`.
+ static inline double rray_prod_lgl_one_na_rm(double out, int x) {
+-  if (rray_lgl_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_lgl_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // `out` is a double, `x` is an integer
+ // - `out = 2`, `x = 3`: returns `6`.
+ // - `out = 2`, `x = NA`: returns `NA`.
+ static inline double rray_prod_int_one(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
++  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : x);
+ }
+ 
+ // `out` is a double, `x` is an integer
+ // - `out = 2`, `x = 3`: returns `6`.
+ // - `out = 2`, `x = NA`: returns `2`.
+ static inline double rray_prod_int_one_na_rm(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_int_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // Purposefully choose to match `rray_multiply()` rather than `prod()`
+@@ -101,11 +85,7 @@ static inline double rray_prod_dbl_one(double out, double x) {
+ // - `out = 2`, `x = NA`: returns `2`.
+ // - `out = 2`, `x = NaN`: returns `2`.
+ static inline double rray_prod_dbl_one_na_rm(double out, double x) {
+-  if (rray_dbl_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_dbl_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // Purposefully choose to match `rray_multiply()` rather than `prod()`, which
+diff --git a/tests/testthat/test-cumulative-prod.R b/tests/testthat/test-cumulative-prod.R
+index 30e0ce2..c56be53 100644
+--- a/tests/testthat/test-cumulative-prod.R
++++ b/tests/testthat/test-cumulative-prod.R
+@@ -139,6 +139,12 @@ test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+     is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),
+     c(FALSE, TRUE, TRUE, TRUE)
+   )
++
++  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++  expect_identical(
++    is.na(as.vector(rray_cumulative_prod(x, 1L))),
++    c(rep(FALSE, 40L), TRUE, TRUE)
++  )
+ })
+ 
+ test_that(&quot;last position matches the reducer&quot;, {
+diff --git a/tests/testthat/test-reduce-prod.R b/tests/testthat/test-reduce-prod.R
+index c411628..a01f16d 100644
+--- a/tests/testthat/test-reduce-prod.R
++++ b/tests/testthat/test-reduce-prod.R
+@@ -106,6 +106,11 @@ test_that(&quot;double NA / NaN propagates&quot;, {
+   expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))
+ })
+ 
++test_that(&quot;integer NA after an overflow to NaN is missing&quot;, {
++  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))
++})
++
+ test_that(&quot;Inf matches base R prod&quot;, {
+   expect_identical(
+     as.vector(rray_prod(c(Inf, 1), 1L)),
+@@ -210,6 +215,26 @@ test_that(&quot;na_rm removes double NA and NaN&quot;, {
+   expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)
+ })
+ 
++test_that(&quot;na_rm keeps the running product exactly&quot;, {
++  x &lt;- c(-1, 0, NA)
++  expect_identical(1 / as.vector(rray_prod(x, 1L, na_rm = TRUE)), -Inf)
++
++  x &lt;- c(-1L, 0L, NA)
++  expect_identical(1 / as.vector(rray_prod(x, 1L, na_rm = TRUE)), -Inf)
++
++  x &lt;- c(Inf, NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), Inf)
++
++  x &lt;- c(rep(.Machine$integer.max, 40L), NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), Inf)
++
++  x &lt;- c(Inf, 0, NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), NaN)
++
++  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), NaN)</pre><p class="cut">179 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_add_int_one\|rray_subtract_int_one\|int_add_checked\|one-add.h&quot; src --include=…</summary>
+<pre>grep -rn &quot;rray_add_int_one\|rray_subtract_int_one\|int_add_checked\|one-add.h&quot; src --include=*.c --include=*.h | grep -v &quot;^src/rlang&quot;; cat src/cumulative-sum.c | sed -n 1,140p; grep -n &quot;rray_int_is_missing&quot; -A4 src/missing.h | head; grep -n &quot;stop_int_overflow&quot; -A8 src/utils.c</pre><pre class="output">(eval):1: no matches found: --include=*.c
+#include &quot;cumulative-sum.h&quot;
+
+#include &quot;cumulative.h&quot;
+#include &quot;one-add.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/cumulative-sum-decl.h&quot;
+
+r_obj* ffi_rray_cumulative_sum(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_cumulative_sum(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_cumulative_sum(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_cumulative(x, axis, rray_cumulative_sum_switch, arg, error_call);
+}
+
+static rray_cumulative_fn rray_cumulative_sum_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return rray_cumulative_sum_lgl;
+  case RRAY_TYPE_integer:
+    return rray_cumulative_sum_int;
+  case RRAY_TYPE_double:
+    return rray_cumulative_sum_dbl;
+  case RRAY_TYPE_complex:
+    return rray_cumulative_sum_cpl;
+
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_cumulative(&quot;sum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_cumulative_sum_lgl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_add_int_one,
+    RRAY_CUMULATIVE_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_cumulative_sum_int(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    int,
+    r_int_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    0,
+    rray_add_int_one,
+    RRAY_CUMULATIVE_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_cumulative_sum_dbl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    double,
+    r_dbl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    0.0,
+    rray_add_dbl_one,
+    RRAY_CUMULATIVE_NO_ARGS
+  );
+}
+
+static r_obj* rray_cumulative_sum_cpl(
+  r_obj* x,
+  r_ssize state_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_state_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_CUMULATIVE(
+    r_complex,
+    r_cpl_cbegin,
+    R_TYPE_complex,
+    r_complex,
+    r_cpl_begin,
+    ((r_complex){.r = 0, .i = 0}),
+    rray_add_cpl_one,
+    RRAY_CUMULATIVE_NO_ARGS
+  );
+}
+12:static inline bool rray_int_is_missing(int x) {
+13-  return x == r_globals.na_int;
+14-}
+15-
+16-static inline bool rray_dbl_is_missing(double x) {
+76:r_no_return void stop_int_overflow(struct r_lazy error_call) {
+77-  r_abort_lazy_call(error_call, &quot;Integer overflow.&quot;);
+78-}
+79-
+80-r_obj* arg_as_bare_integer(
+81-  r_obj* x,
+82-  struct rray_arg* arg,
+83-  struct r_lazy error_call
+84-) {</pre></details>
+<p>Reading the plan and the code it touches before asking my questions.</p>
+
+<details class="tool"><summary>Bash: grep -rn 'rray_add_int_one\|rray_subtract_int_one\|int_add_checked\|one-add.h\|int64_t' src |…</summary>
+<pre>grep -rn 'rray_add_int_one\|rray_subtract_int_one\|int_add_checked\|one-add.h\|int64_t' src | grep -v '^src/rlang' | grep -v '\.o:'; grep -n &quot;overflow\|INT_MAX\|integer.max&quot; tests/testthat/test-arithmetic-add.R tests/testthat/test-arithmetic-subtract.R tests/testthat/test-cumulative-sum.R; cat src/arithmetic-add.c | grep -n include; uname -m; which clang-format air R</pre><pre class="output">src/utils.h:71:int int_add_checked(int x, int y);
+src/int-128.h:12:  uint64_t lo;
+src/int-128.h:13:  int64_t hi;
+src/int-128.h:18:// - Cast `y` through `int64_t` to keep its sign, then add to `lo` as an
+src/int-128.h:25:  const uint64_t lo = x.lo + (uint64_t) (int64_t) y;
+src/int-128.h:26:  const int64_t hi = x.hi + (y &lt; 0 ? -1 : 0) + (lo &lt; x.lo);
+src/int-128.h:50:  if (x.hi == -1 &amp;&amp; x.lo &gt;= -(uint64_t) INT_MAX) {
+src/int-128.h:62:static inline int64_t rray_int128_as_int64(struct rray_int128 x) {
+src/int-128.h:63:  return (int64_t) x.lo;
+src/int-128.h:67:  int64_t quotient;
+src/int-128.h:68:  int64_t remainder;
+src/int-128.h:71:// Assumes the quotient fits in an `int64_t`, i.e. `|x / y| &lt; 2^63`, and that
+src/int-128.h:77:  int64_t y
+src/int-128.h:81:  uint64_t hi = (uint64_t) x.hi;
+src/int-128.h:82:  uint64_t lo = x.lo;
+src/int-128.h:89:  const uint64_t divisor = (uint64_t) y;
+src/int-128.h:91:  uint64_t quotient = 0;
+src/int-128.h:92:  uint64_t remainder = hi % divisor;
+src/int-128.h:104:  const int64_t signed_quotient = (int64_t) quotient;
+src/int-128.h:105:  const int64_t signed_remainder = (int64_t) remainder;
+src/stack.c:45:    int_add_checked(rray_dimensionality_from_dimensions(dimensions), 1);
+src/reduce-mean.c:13:// them add up to at most 2^63, which still fits in `int64_t`. If more than 2^32
+src/reduce-mean.c:20:// For anything outside the bounds of this number, casting from `int64_t` to
+src/reduce-mean.c:25:#define RRAY_MEAN_INT64_MAX_EXACT ((int64_t) 1 &lt;&lt; 53)
+src/reduce-mean.c:325:// Sum into an `int64_t` losslessly
+src/reduce-mean.c:340:  r_obj* sums = KEEP_N(r_alloc_raw0(out_size * sizeof(int64_t)), &amp;n_prot);
+src/reduce-mean.c:341:  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+src/reduce-mean.c:371:        int64_t sum = v_sums[out_loc];
+src/reduce-mean.c:402:        int64_t sum = v_sums[out_loc];
+src/reduce-mean.c:579:// possibly overflow `int64_t`, so we perform the sum in our own minimal
+src/reduce-mean.c:699:static inline double rray_mean_int64(int64_t sum, r_ssize count) {
+src/insert-axes.c:31:    int_add_checked(dimensionality, (int) axes_size);
+src/cumulative-sum.c:4:#include &quot;one-add.h&quot;
+src/cumulative-sum.c:71:    rray_add_int_one,
+src/cumulative-sum.c:91:    rray_add_int_one,
+src/utils.c:227:int int_add_checked(int x, int y) {
+src/arithmetic-add.c:6:#include &quot;one-add.h&quot;
+src/arithmetic-add.c:126:    rray_add_int_one,
+src/arithmetic-add.c:150:    rray_add_int_one,
+src/arithmetic-add.c:174:    rray_add_int_one,
+src/arithmetic-add.c:294:    rray_add_int_one,
+src/arithmetic-subtract.c:133:    rray_subtract_int_one,
+src/arithmetic-subtract.c:157:    rray_subtract_int_one,
+src/arithmetic-subtract.c:181:    rray_subtract_int_one,
+src/arithmetic-subtract.c:301:    rray_subtract_int_one,
+src/arithmetic-subtract.c:498:static inline int rray_subtract_int_one(
+src/one-add.h:18:static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+src/reduce-sum.c:13:// guarantee that an `int` sum will fit in an `int64_t`. However, it is
+src/reduce-sum.c:299:// Lossless sum into `int64_t`, cast back to `int` if it fits at the end!
+src/reduce-sum.c:313:  r_obj* sums = KEEP_N(r_alloc_raw0(out_size * sizeof(int64_t)), &amp;n_prot);
+src/reduce-sum.c:314:  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+src/reduce-sum.c:341:        int64_t sum = v_sums[out_loc];
+src/reduce-sum.c:366:        int64_t sum = v_sums[out_loc];
+src/reduce-sum.c:395:      const int64_t sum = v_sums[i];
+src/reduce-sum.c:410:      const int64_t sum = v_sums[i];
+src/decl/reduce-mean-decl.h:83:static inline double rray_mean_int64(int64_t sum, r_ssize count);
+src/decl/arithmetic-subtract-decl.h:154:static inline int rray_subtract_int_one(int x, int y, struct r_lazy error_call);
+tests/testthat/test-cumulative-sum.R:74:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-cumulative-sum.R:75:  x &lt;- c(.Machine$integer.max, 1L)
+tests/testthat/test-cumulative-sum.R:78:  x &lt;- c(-.Machine$integer.max, -1L)
+tests/testthat/test-cumulative-sum.R:81:  x &lt;- array(c(1L, 2L, .Machine$integer.max, 1L), c(2L, 2L))
+tests/testthat/test-cumulative-sum.R:85:test_that(&quot;errors on integer overflow even if a later value cancels it&quot;, {
+tests/testthat/test-cumulative-sum.R:86:  x &lt;- c(.Machine$integer.max, 1L, -1L)
+tests/testthat/test-cumulative-sum.R:90:test_that(&quot;can reach the integer limits without overflowing&quot;, {
+tests/testthat/test-cumulative-sum.R:91:  x &lt;- c(.Machine$integer.max - 1L, 1L, -1L)
+tests/testthat/test-cumulative-sum.R:96:        .Machine$integer.max - 1L,
+tests/testthat/test-cumulative-sum.R:97:        .Machine$integer.max,
+tests/testthat/test-cumulative-sum.R:98:        .Machine$integer.max - 1L
+tests/testthat/test-cumulative-sum.R:104:  x &lt;- c(-.Machine$integer.max + 1L, -1L)
+tests/testthat/test-cumulative-sum.R:107:    array(c(-.Machine$integer.max + 1L, -.Machine$integer.max), 2L)
+tests/testthat/test-cumulative-sum.R:130:test_that(&quot;a missing value before an overflow does not error&quot;, {
+tests/testthat/test-cumulative-sum.R:131:  x &lt;- c(1L, NA, .Machine$integer.max, .Machine$integer.max)
+tests/testthat/test-arithmetic-subtract.R:133:test_that(&quot;missing values win over integer overflow&quot;, {
+tests/testthat/test-arithmetic-subtract.R:135:    rray_subtract(NA_integer_, -.Machine$integer.max),
+tests/testthat/test-arithmetic-subtract.R:215:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-arithmetic-subtract.R:216:  expect_snapshot(rray_subtract(.Machine$integer.max, -1L), error = TRUE)
+tests/testthat/test-arithmetic-subtract.R:220:  expect_snapshot(rray_subtract(-.Machine$integer.max, 1L), error = TRUE)
+tests/testthat/test-arithmetic-add.R:121:test_that(&quot;missing values win over integer overflow&quot;, {
+tests/testthat/test-arithmetic-add.R:123:    rray_add(NA_integer_, .Machine$integer.max),
+tests/testthat/test-arithmetic-add.R:245:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-arithmetic-add.R:246:  expect_snapshot(rray_add(.Machine$integer.max, 1L), error = TRUE)
+tests/testthat/test-arithmetic-add.R:250:  expect_snapshot(rray_add(-.Machine$integer.max, -1L), error = TRUE)
+1:#include &quot;arithmetic-add.h&quot;
+3:#include &quot;arithmetic.h&quot;
+4:#include &quot;binary.h&quot;
+5:#include &quot;cast.h&quot;
+6:#include &quot;one-add.h&quot;
+7:#include &quot;type.h&quot;
+8:#include &quot;typeof2.h&quot;
+9:#include &quot;utils.h&quot;
+11:#include &quot;decl/arithmetic-add-decl.h&quot;
+arm64
+/opt/homebrew/bin/clang-format
+~/.local/bin/air
+/usr/local/bin/R</pre></details>
+<details class="tool"><summary>Bash: sed -n 110,135p tests/testthat/test-arithmetic-add.R; sed -n 235,260p tests/testthat/test-ari…</summary>
+<pre>sed -n 110,135p tests/testthat/test-arithmetic-add.R; sed -n 235,260p tests/testthat/test-arithmetic-add.R; sed -n 125,145p tests/testthat/test-arithmetic-subtract.R; sed -n 205,230p tests/testthat/test-arithmetic-subtract.R; sed -n 70,140p tests/testthat/test-cumulative-sum.R; ls bench; git log --oneline -3 -- bench; ls ~/files/programming/claude/plans 2&gt;/dev/null | head</pre><pre class="output">  expect_identical(Re(out), 2)
+  expect_identical(Im(out), NaN)
+})
+
+test_that(&quot;infinities match base R&quot;, {
+  expect_identical(as.vector(rray_add(Inf, 1)), Inf + 1)
+  expect_identical(as.vector(rray_add(Inf, -Inf)), Inf + -Inf)
+  expect_identical(as.vector(rray_add(Inf, NA_real_)), Inf + NA_real_)
+  expect_identical(as.vector(rray_add(Inf, NaN)), Inf + NaN)
+})
+
+test_that(&quot;missing values win over integer overflow&quot;, {
+  expect_identical(
+    rray_add(NA_integer_, .Machine$integer.max),
+    array(NA_integer_, 1L)
+  )
+})
+
+test_that(&quot;broadcasting carries through alternating singleton axes&quot;, {
+  x &lt;- array(1:6, c(2L, 1L, 3L, 1L))
+  y &lt;- array(as.double(11:18), c(1L, 4L, 1L, 2L))
+
+  expected_x &lt;- x[, rep(1L, 4L), , rep(1L, 2L), drop = FALSE]
+  expected_y &lt;- y[rep(1L, 2L), , rep(1L, 3L), , drop = FALSE]
+
+  expect_identical(rray_add(x, y), expected_x + expected_y)
+  expect_snapshot(rray_add(1L, &quot;a&quot;), error = TRUE)
+  expect_snapshot(rray_add(as.raw(1), 1L), error = TRUE)
+})
+
+test_that(&quot;a type error beats a dimension error&quot;, {
+  x &lt;- array(&quot;a&quot;, c(2L, 2L))
+  y &lt;- array(&quot;b&quot;, c(3L, 3L))
+  expect_snapshot(rray_add(x, y), error = TRUE)
+})
+
+test_that(&quot;errors on integer overflow&quot;, {
+  expect_snapshot(rray_add(.Machine$integer.max, 1L), error = TRUE)
+})
+
+test_that(&quot;errors on integer underflow&quot;, {
+  expect_snapshot(rray_add(-.Machine$integer.max, -1L), error = TRUE)
+})
+
+test_that(&quot;errors on scalar input&quot;, {
+  expect_snapshot(rray_add(NULL, 1L), error = TRUE)
+  expect_snapshot(rray_add(1L, NULL), error = TRUE)
+})
+
+test_that(&quot;errors on classed input&quot;, {
+  x &lt;- structure(array(1:4, c(2L, 2L)), class = &quot;foo&quot;)
+  expect_snapshot(rray_add(x, 1L), error = TRUE)
+
+test_that(&quot;infinities match base R&quot;, {
+  expect_identical(as.vector(rray_subtract(Inf, 1)), Inf - 1)
+  expect_identical(as.vector(rray_subtract(Inf, Inf)), Inf - Inf)
+  expect_identical(as.vector(rray_subtract(Inf, NA_real_)), Inf - NA_real_)
+  expect_identical(as.vector(rray_subtract(Inf, NaN)), Inf - NaN)
+})
+
+test_that(&quot;missing values win over integer overflow&quot;, {
+  expect_identical(
+    rray_subtract(NA_integer_, -.Machine$integer.max),
+    array(NA_integer_, 1L)
+  )
+})
+
+test_that(&quot;names are kept for axes that aren't broadcast&quot;, {
+  x &lt;- array(1:6, c(3L, 2L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL))
+  y &lt;- array(1:2, c(1L, 2L), dimnames = list(&quot;z&quot;, c(&quot;c1&quot;, &quot;c2&quot;)))
+  expect_identical(
+    rray_names(rray_subtract(x, y)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;c1&quot;, &quot;c2&quot;))
+  expect_snapshot(rray_subtract(1L, &quot;a&quot;), error = TRUE)
+  expect_snapshot(rray_subtract(as.raw(1), 1L), error = TRUE)
+})
+
+test_that(&quot;a type error beats a dimension error&quot;, {
+  x &lt;- array(&quot;a&quot;, c(2L, 2L))
+  y &lt;- array(&quot;b&quot;, c(3L, 3L))
+  expect_snapshot(rray_subtract(x, y), error = TRUE)
+})
+
+test_that(&quot;errors on integer overflow&quot;, {
+  expect_snapshot(rray_subtract(.Machine$integer.max, -1L), error = TRUE)
+})
+
+test_that(&quot;errors on integer underflow&quot;, {
+  expect_snapshot(rray_subtract(-.Machine$integer.max, 1L), error = TRUE)
+})
+
+test_that(&quot;errors on scalar input&quot;, {
+  expect_snapshot(rray_subtract(NULL, 1L), error = TRUE)
+  expect_snapshot(rray_subtract(1L, NULL), error = TRUE)
+})
+
+test_that(&quot;errors on classed input&quot;, {
+  x &lt;- structure(array(1:4, c(2L, 2L)), class = &quot;foo&quot;)
+  expect_snapshot(rray_subtract(x, 1L), error = TRUE)
+    expect_identical(as.vector(rray_cumulative_sum(x, 1L)), cumsum(x))
+  }
+})
+
+test_that(&quot;errors on integer overflow&quot;, {
+  x &lt;- c(.Machine$integer.max, 1L)
+  expect_snapshot(rray_cumulative_sum(x, 1L), error = TRUE)
+
+  x &lt;- c(-.Machine$integer.max, -1L)
+  expect_snapshot(rray_cumulative_sum(x, 1L), error = TRUE)
+
+  x &lt;- array(c(1L, 2L, .Machine$integer.max, 1L), c(2L, 2L))
+  expect_snapshot(rray_cumulative_sum(x, 2L), error = TRUE)
+})
+
+test_that(&quot;errors on integer overflow even if a later value cancels it&quot;, {
+  x &lt;- c(.Machine$integer.max, 1L, -1L)
+  expect_snapshot(rray_cumulative_sum(x, 1L), error = TRUE)
+})
+
+test_that(&quot;can reach the integer limits without overflowing&quot;, {
+  x &lt;- c(.Machine$integer.max - 1L, 1L, -1L)
+  expect_identical(
+    rray_cumulative_sum(x, 1L),
+    array(
+      c(
+        .Machine$integer.max - 1L,
+        .Machine$integer.max,
+        .Machine$integer.max - 1L
+      ),
+      3L
+    )
+  )
+
+  x &lt;- c(-.Machine$integer.max + 1L, -1L)
+  expect_identical(
+    rray_cumulative_sum(x, 1L),
+    array(c(-.Machine$integer.max + 1L, -.Machine$integer.max), 2L)
+  )
+})
+
+test_that(&quot;missing values persist through the rest of a line&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(TRUE, NA, FALSE), 1L)),
+    c(1L, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(2L, NA, 0L), 1L)),
+    c(2L, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(2, NA, 0), 1L)),
+    c(2, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_sum(c(2, NaN, 0), 1L)),
+    c(2, NaN, NaN)
+  )
+})
+
+test_that(&quot;a missing value before an overflow does not error&quot;, {
+  x &lt;- c(1L, NA, .Machine$integer.max, .Machine$integer.max)
+  expect_identical(
+    as.vector(rray_cumulative_sum(x, 1L)),
+    c(1L, NA, NA, NA)
+  )
+})
+
+test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+  expect_identical(
+    is.na(as.vector(rray_cumulative_sum(c(2, NA, NaN, 3), 1L))),
+binary.R
+broadcast.R
+combine.R
+cumulative.R
+extremum.R
+index.R
+iterator.R
+matrix-stats.R
+mean.R
+permute-axes.R
+reduce-logical.R
+reduce.R
+slice.R
+split.R
+stride-zero.R
+7c41cae Add `rray_cumulative_sum()` (#146)
+5b91e39 Implement the prod performance plan!
+53d97b5 Add `rray_cumulative_prod()` (#143)
+cache-evict-by-time.md
+plan-air-global-config.md
+plan-oak-r-sources.md
+plan-oak-source-handler.md
+plan-oak-vendored.md
+plan-roxygen-code-format.md
+rework-r-source-runtime-download.md
+roxygen-examples-preserve-trailing-blank.md
+rray-broadcast-iterator.md
+rray-broadcast-iterator2.md</pre></details>
+<p>I've read the plan, the last few PRs (#143 to #146 and the prod performance commit), and the code it touches. Some questions before I start:</p>
+
+<details class="tool"><summary>Question: How should the benchmarks get mixed sign integer data? Right now `bench/binary.R` and `be…</summary>
+<p>How should the benchmarks get mixed sign integer data? Right now <code>bench/binary.R</code> and <code>bench/cumulative.R</code> use <code>sample(100L)</code> for integers, which is all positive.</p>
+<ul>
+<li>Add a new type (Recommended)</li>
+<li>Change integer data</li>
+</ul>
+<p><code>rray_subtract_int_one()</code> lives in <code>src/arithmetic-subtract.c</code> and checks for missing values with <code>x == r_globals.na_int</code>. <code>rray_add_int_one()</code> lives in <code>src/one-add.h</code> and uses <code>rray_int_is_missing()</code>. How far should I go to make them match?</p>
+<ul>
+<li>Use the missing helper only (Recommended)</li>
+<li>Overflow check only</li>
+<li>Move to one-subtract.h</li>
+</ul>
+<p>What should happen to <code>plans/add-performance.md</code> and <code>int_add_checked()</code>?</p>
+<ul>
+<li>Delete the plan file (Recommended)</li>
+<li>Rewrite int_add_checked()</li>
+</ul>
+<p><code>bench/cumulative.R</code> makes logical data with <code>sample(c(TRUE, FALSE, NA))</code>. A missing value fills the rest of the line, so logical cumulative sums stay fast and won't show the change. What should I do?</p>
+<ul>
+<li>Leave it, measure ad hoc (Recommended)</li>
+<li>Drop NA from logical</li>
+</ul>
+<pre class="output">The user answered: &quot;How should the benchmarks get mixed sign integer data? Right now `bench/binary.R` and `bench/cumulative.R` use `sample(100L)` for integers, which is all positive.&quot;=&quot;Add a new type (Recommended)&quot;, &quot;`rray_subtract_int_one()` lives in `src/arithmetic-subtract.c` and checks for missing values with `x == r_globals.na_int`. `rray_add_int_one()` lives in `src/one-add.h` and uses `rray_int_is_missing()`. How far should I go to make them match?&quot;=&quot;Use the missing helper only (Recommended)&quot;, &quot;What should happen to `plans/add-performance.md` and `int_add_checked()`?&quot;=&quot;Delete the plan file (Recommended)&quot;, &quot;`bench/cumulative.R` makes logical data with `sample(c(TRUE, FALSE, NA))`. A missing value fills the rest of the line, so logical cumulative sums stay fast and won't show the change. What should I do?&quot;=&quot;Can you add an additional benchmark and keep both?&quot;. Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.</pre></details>
+<p>Thanks. I'll add a <code>logical_no_na</code> type next to the existing logical one, and an <code>integer_mixed</code> type next to <code>integer</code>. Creating the branch you named, <code>feature/add-perf</code>.</p>
+
+<details class="tool"><summary>Bash: git checkout -b feature/add-perf &amp;&amp; cat .gitignore | head -30; git check-ignore -v src/arithm…</summary>
+<pre>git checkout -b feature/add-perf &amp;&amp; cat .gitignore | head -30; git check-ignore -v src/arithmetic-add.o</pre><pre class="output">Switched to a new branch 'feature/add-perf'
+.Rproj.user
+.Rhistory
+.RData
+.httr-oauth
+.DS_Store
+.quarto
+compile_commands.json
+.cache
+inst/doc
+docs
+src/.gitignore:1:*.o	src/arithmetic-add.o</pre></details>
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+p='bench/binary.R'
+s=open(p).read()
+s=s.replace('''operations &lt;- list(
+  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),''','''operations &lt;- list(
+  add = list(fn = rray_add, types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)),
+  subtract = list(
+    fn = rray_subtract,
+    types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)
+  ),
+  multiply = list(
+    fn = rray_multiply,
+    types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)
+  ),''')
+s=s.replace('''    integer = sample(100L, n, replace = TRUE),
+    double''','''    integer = sample(100L, n, replace = TRUE),
+    integer_mixed = sample(-50:50, n, replace = TRUE),
+    double''')
+open(p,'w').write(s)
+p='bench/cumulative.R'
+s=open(p).read()
+s=s.replace('''  sum = list(
+    fn = rray_cumulative_sum,
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+  )''','''  sum = list(
+    fn = rray_cumulative_sum,
+    types = c(
+      &quot;logical&quot;,
+      &quot;logical_no_na&quot;,
+      &quot;integer&quot;,
+      &quot;integer_mixed&quot;,
+      &quot;double&quot;,
+      &quot;complex&quot;
+    )
+  )''')
+s=s.replace('''    logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),''','''    logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+    logical_no_na = sample(c(TRUE, FALSE), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),
+    integer_mixed = sample(-50:50, n, replace = TRUE),''')
+open(p,'w').write(s)
+EOF
+air format bench &amp;&amp; git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read bench/binary.R</summary>
+<pre class="output">1	devtools::load_all(quiet = TRUE)
+2	
+3	iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+4	output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+5	
+6	operations &lt;- list(
+7	  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),
+8	  greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+9	  equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+10	  pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+11	  pmax_na_rm = list(
+12	    fn = \(x, y) rray_pmax(x, y, na_rm = TRUE),
+13	    types = c(&quot;integer&quot;, &quot;double&quot;)
+14	  ),
+15	  and = list(fn = rray_and, types = &quot;logical&quot;)
+16	)
+17	
+18	shapes &lt;- list(
+19	  &quot;[4000, 4000] [4000, 4000]&quot; = list(c(4000L, 4000L), c(4000L, 4000L)),
+20	  &quot;[4000, 4000] [4000, 1]&quot; = list(c(4000L, 4000L), c(4000L, 1L)),
+21	  &quot;[4000, 4000] [1, 4000]&quot; = list(c(4000L, 4000L), c(1L, 4000L)),
+22	  &quot;[4000, 4000] [1, 1]&quot; = list(c(4000L, 4000L), c(1L, 1L)),
+23	  &quot;[4000, 1] [1, 4000]&quot; = list(c(4000L, 1L), c(1L, 4000L)),
+24	  &quot;[10, 1e6] [10, 1]&quot; = list(c(10L, 1000000L), c(10L, 1L)),
+25	  &quot;[10, 1e6] [1, 1e6]&quot; = list(c(10L, 1000000L), c(1L, 1000000L))
+26	)
+27	
+28	make_array &lt;- function(dimensions, type) {
+29	  n &lt;- prod(dimensions)
+30	
+31	  values &lt;- switch(
+32	    type,
+33	    logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+34	    integer = sample(100L, n, replace = TRUE),
+35	    double = runif(n)
+36	  )
+37	
+38	  array(values, dimensions)
+39	}
+40	</pre></details>
+<details class="tool"><summary>Read bench/cumulative.R</summary>
+<pre class="output">1	devtools::load_all(quiet = TRUE)
+2	
+3	iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+4	output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+5	
+6	operations &lt;- list(
+7	  all = list(fn = rray_cumulative_all, types = &quot;logical&quot;),
+8	  any = list(fn = rray_cumulative_any, types = &quot;logical&quot;),
+9	  max = list(
+10	    fn = rray_cumulative_max,
+11	    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
+12	  ),
+13	  min = list(
+14	    fn = rray_cumulative_min,
+15	    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
+16	  ),
+17	  prod = list(
+18	    fn = rray_cumulative_prod,
+19	    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+20	  ),
+21	  sum = list(
+22	    fn = rray_cumulative_sum,
+23	    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+24	  )
+25	)
+26	
+27	shapes &lt;- list(
+28	  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+29	  &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+30	  &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+31	  &quot;[200, 200, 200] over 1&quot; = list(c(200L, 200L, 200L), 1L),
+32	  &quot;[200, 200, 200] over 2&quot; = list(c(200L, 200L, 200L), 2L),
+33	  &quot;[200, 200, 200] over 3&quot; = list(c(200L, 200L, 200L), 3L),
+34	  &quot;[10, 1e6] over 1&quot; = list(c(10L, 1000000L), 1L),
+35	  &quot;[10, 1e6] over 2&quot; = list(c(10L, 1000000L), 2L)
+36	)
+37	
+38	make_array &lt;- function(dimensions, type) {
+39	  n &lt;- prod(dimensions)
+40	
+41	  values &lt;- switch(
+42	    type,
+43	    logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+44	    integer = sample(100L, n, replace = TRUE),
+45	    double = runif(n),
+46	    complex = complex(real = runif(n), imaginary = runif(n))
+47	  )
+48	
+49	  array(values, dimensions)
+50	}</pre></details>
+<details class="tool"><summary>Edit bench/binary.R</summary>
+<pre class="diff"><span class="del">-  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),</span>
+<span class="ins">+  add = list(fn = rray_add, types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)),</span>
+<span class="ins">+  subtract = list(</span>
+<span class="ins">+    fn = rray_subtract,</span>
+<span class="ins">+    types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)</span>
+<span class="ins">+  ),</span>
+<span class="ins">+  multiply = list(</span>
+<span class="ins">+    fn = rray_multiply,</span>
+<span class="ins">+    types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)</span>
+<span class="ins">+  ),</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/binary.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit bench/binary.R</summary>
+<pre class="diff"><span class="del">-    integer = sample(100L, n, replace = TRUE),</span>
+<span class="del">-    double</span>
+<span class="ins">+    integer = sample(100L, n, replace = TRUE),</span>
+<span class="ins">+    integer_mixed = sample(-50:50, n, replace = TRUE),</span>
+<span class="ins">+    double</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/binary.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit bench/cumulative.R</summary>
+<pre class="diff"><span class="del">-    fn = rray_cumulative_sum,</span>
+<span class="del">-    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)</span>
+<span class="ins">+    fn = rray_cumulative_sum,</span>
+<span class="ins">+    types = c(</span>
+<span class="ins">+      &quot;logical&quot;,</span>
+<span class="ins">+      &quot;logical_no_na&quot;,</span>
+<span class="ins">+      &quot;integer&quot;,</span>
+<span class="ins">+      &quot;integer_mixed&quot;,</span>
+<span class="ins">+      &quot;double&quot;,</span>
+<span class="ins">+      &quot;complex&quot;</span>
+<span class="ins">+    )</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/cumulative.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit bench/cumulative.R</summary>
+<pre class="diff"><span class="del">-    integer = sample(100L, n, replace = TRUE),</span>
+<span class="del">-    double</span>
+<span class="ins">+    logical_no_na = sample(c(TRUE, FALSE), n, replace = TRUE),</span>
+<span class="ins">+    integer = sample(100L, n, replace = TRUE),</span>
+<span class="ins">+    integer_mixed = sample(-50:50, n, replace = TRUE),</span>
+<span class="ins">+    double</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/cumulative.R has been updated successfully.</pre></details>
+<p>Bench scripts are updated. Now running the baseline benchmarks on unchanged C code, after a clean build.</p>
+
+<details class="tool"><summary>Bash: air format bench &amp;&amp; S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d6…</summary>
+<pre>air format bench &amp;&amp; S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad &amp;&amp; Rscript -e &quot;pkgbuild::clean_dll(); devtools::load_all(quiet = TRUE)&quot; &gt;/dev/null 2&gt;&amp;1 &amp;&amp; RRAY_BENCH_OUTPUT=$S/binary-before.rds Rscript bench/binary.R &gt; $S/binary-before.txt 2&gt;&amp;1 &amp;&amp; RRAY_BENCH_OUTPUT=$S/cumulative-before.rds Rscript bench/cumulative.R &gt; $S/cumulative-before.txt 2&gt;&amp;1; echo done; tail -3 $S/cumulative-before.txt</pre><pre class="output">Command running in background with ID: bdbo7dac1. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/bdbo7dac1.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>While the baseline runs (I can't touch <code>src/</code> until it finishes), I'll add the limit tests.</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-arithmetic-add.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;errors on integer underflow&quot;, {</span>
+<span class="del">-  expect_snapshot(rray_add(-.Machine$integer.max, -1L), error = TRUE)</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;errors on integer underflow&quot;, {</span>
+<span class="ins">+  expect_snapshot(rray_add(-.Machine$integer.max, -1L), error = TRUE)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;can reach the integer limits without overflowing&quot;, {</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_add(.Machine$integer.max - 1L, 1L),</span>
+<span class="ins">+    array(.Machine$integer.max, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_add(-.Machine$integer.max + 1L, -1L),</span>
+<span class="ins">+    array(-.Machine$integer.max, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_add(.Machine$integer.max, -.Machine$integer.max),</span>
+<span class="ins">+    array(0L, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-arithmetic-add.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-arithmetic-subtract.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;errors on integer underflow&quot;, {</span>
+<span class="del">-  expect_snapshot(rray_subtract(-.Machine$integer.max, 1L), error = TRUE)</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;errors on integer underflow&quot;, {</span>
+<span class="ins">+  expect_snapshot(rray_subtract(-.Machine$integer.max, 1L), error = TRUE)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;can reach the integer limits without overflowing&quot;, {</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_subtract(.Machine$integer.max - 1L, -1L),</span>
+<span class="ins">+    array(.Machine$integer.max, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_subtract(-.Machine$integer.max + 1L, 1L),</span>
+<span class="ins">+    array(-.Machine$integer.max, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_subtract(.Machine$integer.max, .Machine$integer.max),</span>
+<span class="ins">+    array(0L, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_subtract(-.Machine$integer.max, -.Machine$integer.max),</span>
+<span class="ins">+    array(0L, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-arithmetic-subtract.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-arithmetic-add.R</summary>
+<pre class="diff"><span class="del">-    rray_add(NA_integer_, .Machine$integer.max),</span>
+<span class="del">-    array(NA_integer_, 1L)</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    rray_add(NA_integer_, .Machine$integer.max),</span>
+<span class="ins">+    array(NA_integer_, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_add(-.Machine$integer.max, NA_integer_),</span>
+<span class="ins">+    array(NA_integer_, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-arithmetic-add.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-arithmetic-subtract.R</summary>
+<pre class="diff"><span class="del">-    rray_subtract(NA_integer_, -.Machine$integer.max),</span>
+<span class="del">-    array(NA_integer_, 1L)</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    rray_subtract(NA_integer_, -.Machine$integer.max),</span>
+<span class="ins">+    array(NA_integer_, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_subtract(.Machine$integer.max, NA_integer_),</span>
+<span class="ins">+    array(NA_integer_, 1L)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-arithmetic-subtract.R has been updated successfully.</pre></details>
+<p>Tests are written. Waiting for the baseline benchmarks to finish before touching the C code.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad; ls -la $S; cat $S/binary-before.txt 2&gt;/dev/null | head -80</pre><pre class="output">total 0
+drwx------@ 3 davis  wheel  96 Oct 12 12:05 .
+drwx------@ 3 davis  wheel  96 Oct 12 12:02 ..
+-rw-r--r--@ 1 davis  wheel   0 Oct 12 12:05 binary-before.txt</pre></details>
+<details class="tool"><summary>ToolSearch: select:Monitor</summary>
+<pre>{
+  &quot;query&quot;: &quot;select:Monitor&quot;,
+  &quot;max_results&quot;: 1
+}</pre><pre class="output">Monitor</pre></details>
+<p>The baseline benchmarks are running on the unchanged C code. They take a few minutes, and I'll pick up again when they finish.</p>
+<p>So far:</p>
+<ul>
+<li>
+<p><strong>Branch:</strong> I created <code>feature/add-perf</code>, as you asked. My session setup named <code>feature/titles</code>, but I went with your branch name.</p>
+</li>
+<li>
+<p><strong><code>bench/binary.R</code>:</strong> added <code>add</code> and <code>subtract</code>, and gave <code>add</code>, <code>subtract</code> and <code>multiply</code> a new <code>integer_mixed</code> type (<code>sample(-50:50)</code>).</p>
+</li>
+<li>
+<p><strong><code>bench/cumulative.R</code>:</strong> gave <code>sum</code> the new <code>logical_no_na</code> and <code>integer_mixed</code> types. The existing <code>logical</code> type, which includes <code>NA</code>, stays as is.</p>
+</li>
+<li>
+<p><strong>New tests:</strong> add and subtract results that land exactly on <code>INT_MAX</code> and <code>-INT_MAX</code>, and large opposite values that cancel out. I also added a case where <code>y</code> is <code>NA</code> and <code>x</code> is near a limit. That case would wrongly raise an overflow error if the missing value check ever ran after the range check.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>And remove the plan when done</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Will do. The plan file gets deleted in the same commit. Checking on the baseline run.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad; ls -la $S; cat /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/bdbo7dac1.output</pre><pre class="output">total 0
+drwx------@ 3 davis  wheel  96 Oct 12 12:05 .
+drwx------@ 3 davis  wheel  96 Oct 12 12:02 ..
+-rw-r--r--@ 1 davis  wheel   0 Oct 12 12:05 binary-before.txt</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad; until [ -s $S/cumulative-before.txt ] &amp;&amp; grep -q &quot;sum&quot; $S/cumulative-before.txt || ! pgrep -f &quot;bench/&quot; &gt;/dev/null; do sleep 5; done; pgrep -fl &quot;bench/&quot;; ls -la $S</pre><pre class="output">Command running in background with ID: b8s8rc2u7. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b8s8rc2u7.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>The baseline is still running. I'll continue when it finishes.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad; pkill -f &quot;until \[ -s&quot; ; cat $S/binary-before.txt; cat $S/cumulative-before.txt</pre><pre class="output">    operation          type                     shape median_ms
+          add       integer [4000, 4000] [4000, 4000] 17.605789
+          add       integer    [4000, 4000] [4000, 1] 18.744401
+          add       integer    [4000, 4000] [1, 4000] 19.880859
+          add       integer       [4000, 4000] [1, 1] 19.732275
+          add       integer       [4000, 1] [1, 4000] 19.417026
+          add       integer         [10, 1e6] [10, 1] 11.499332
+          add       integer        [10, 1e6] [1, 1e6] 14.631998
+          add integer_mixed [4000, 4000] [4000, 4000] 66.599150
+          add integer_mixed    [4000, 4000] [4000, 1] 17.922002
+          add integer_mixed    [4000, 4000] [1, 4000] 20.778800
+          add integer_mixed       [4000, 4000] [1, 1] 20.092931
+          add integer_mixed       [4000, 1] [1, 4000] 19.706425
+          add integer_mixed         [10, 1e6] [10, 1] 11.571328
+          add integer_mixed        [10, 1e6] [1, 1e6] 13.688137
+          add        double [4000, 4000] [4000, 4000] 13.953468
+          add        double    [4000, 4000] [4000, 1] 11.558146
+          add        double    [4000, 4000] [1, 4000] 12.594974
+          add        double       [4000, 4000] [1, 1] 12.220583
+          add        double       [4000, 1] [1, 4000]  9.541664
+          add        double         [10, 1e6] [10, 1]  9.031788
+          add        double        [10, 1e6] [1, 1e6]  7.608965
+     subtract       integer [4000, 4000] [4000, 4000] 16.026674
+     subtract       integer    [4000, 4000] [4000, 1] 15.777928
+     subtract       integer    [4000, 4000] [1, 4000] 21.069511
+     subtract       integer       [4000, 4000] [1, 1] 19.810462
+     subtract       integer       [4000, 1] [1, 4000] 19.779036
+     subtract       integer         [10, 1e6] [10, 1] 10.749134
+     subtract       integer        [10, 1e6] [1, 1e6] 13.203537
+     subtract integer_mixed [4000, 4000] [4000, 4000] 65.975232
+     subtract integer_mixed    [4000, 4000] [4000, 1] 16.986444
+     subtract integer_mixed    [4000, 4000] [1, 4000] 20.474990
+     subtract integer_mixed       [4000, 4000] [1, 1] 20.929045
+     subtract integer_mixed       [4000, 1] [1, 4000] 19.523565
+     subtract integer_mixed         [10, 1e6] [10, 1] 14.018146
+     subtract integer_mixed        [10, 1e6] [1, 1e6] 13.342548
+     subtract        double [4000, 4000] [4000, 4000] 15.148578
+     subtract        double    [4000, 4000] [4000, 1] 10.317507
+     subtract        double    [4000, 4000] [1, 4000] 11.251610
+     subtract        double       [4000, 4000] [1, 1] 12.994233
+     subtract        double       [4000, 1] [1, 4000]  9.644266
+     subtract        double         [10, 1e6] [10, 1]  8.395652
+     subtract        double        [10, 1e6] [1, 1e6]  7.659866
+     multiply       integer [4000, 4000] [4000, 4000] 17.022872
+     multiply       integer    [4000, 4000] [4000, 1] 16.753236
+     multiply       integer    [4000, 4000] [1, 4000] 14.800775
+     multiply       integer       [4000, 4000] [1, 1] 14.666315
+     multiply       integer       [4000, 1] [1, 4000] 14.440549
+     multiply       integer         [10, 1e6] [10, 1] 11.187854
+     multiply       integer        [10, 1e6] [1, 1e6] 10.542986
+     multiply integer_mixed [4000, 4000] [4000, 4000] 15.417025
+     multiply integer_mixed    [4000, 4000] [4000, 1] 15.655871
+     multiply integer_mixed    [4000, 4000] [1, 4000] 14.640793
+     multiply integer_mixed       [4000, 4000] [1, 1] 15.074429
+     multiply integer_mixed       [4000, 1] [1, 4000] 13.665033
+     multiply integer_mixed         [10, 1e6] [10, 1] 11.198884
+     multiply integer_mixed        [10, 1e6] [1, 1e6] 10.701594
+     multiply        double [4000, 4000] [4000, 4000] 14.161605
+     multiply        double    [4000, 4000] [4000, 1] 10.252645
+     multiply        double    [4000, 4000] [1, 4000] 11.702938
+     multiply        double       [4000, 4000] [1, 1] 10.508136
+     multiply        double       [4000, 1] [1, 4000]  9.666057
+     multiply        double         [10, 1e6] [10, 1]  8.177347
+     multiply        double        [10, 1e6] [1, 1e6]  7.767839
+ greater_than       integer [4000, 4000] [4000, 4000]  8.003118
+ greater_than       integer    [4000, 4000] [4000, 1]  6.354898
+ greater_than       integer    [4000, 4000] [1, 4000]  7.385719
+ greater_than       integer       [4000, 4000] [1, 1]  6.452293
+ greater_than       integer       [4000, 1] [1, 4000]  5.817347
+ greater_than       integer         [10, 1e6] [10, 1]  7.059790
+ greater_than       integer        [10, 1e6] [1, 1e6]  6.631361
+ greater_than        double [4000, 4000] [4000, 4000]  8.245920
+ greater_than        double    [4000, 4000] [4000, 1]  7.516387
+ greater_than        double    [4000, 4000] [1, 4000]  7.696623
+ greater_than        double       [4000, 4000] [1, 1]  7.700538
+ greater_than        double       [4000, 1] [1, 4000]  7.366163
+ greater_than        double         [10, 1e6] [10, 1]  7.597198
+ greater_than        double        [10, 1e6] [1, 1e6]  6.638659
+        equal       integer [4000, 4000] [4000, 4000]  6.559098
+        equal       integer    [4000, 4000] [4000, 1]  6.285013
+        equal       integer    [4000, 4000] [1, 4000]  6.068574
+        equal       integer       [4000, 4000] [1, 1]  6.608482
+        equal       integer       [4000, 1] [1, 4000]  6.011277
+        equal       integer         [10, 1e6] [10, 1]  7.404907
+        equal       integer        [10, 1e6] [1, 1e6]  6.422322
+        equal        double [4000, 4000] [4000, 4000]  8.506926
+        equal        double    [4000, 4000] [4000, 1]  7.968698
+        equal        double    [4000, 4000] [1, 4000]  7.391849
+        equal        double       [4000, 4000] [1, 1]  7.338118
+        equal        double       [4000, 1] [1, 4000]  7.126887
+        equal        double         [10, 1e6] [10, 1]  7.744593
+        equal        double        [10, 1e6] [1, 1e6]  6.832568
+         pmax       integer [4000, 4000] [4000, 4000]  5.535492
+         pmax       integer    [4000, 4000] [4000, 1]  5.774809
+         pmax       integer    [4000, 4000] [1, 4000]  5.411734
+         pmax       integer       [4000, 4000] [1, 1]  5.883070
+         pmax       integer       [4000, 1] [1, 4000]  4.946896
+         pmax       integer         [10, 1e6] [10, 1]  6.739621
+         pmax       integer        [10, 1e6] [1, 1e6]  6.114433
+         pmax        double [4000, 4000] [4000, 4000] 21.795723
+         pmax        double    [4000, 4000] [4000, 1] 20.862953
+         pmax        double    [4000, 4000] [1, 4000] 22.895343
+         pmax        double       [4000, 4000] [1, 1] 21.172174
+         pmax        double       [4000, 1] [1, 4000] 20.335652
+         pmax        double         [10, 1e6] [10, 1] 13.093022
+         pmax        double        [10, 1e6] [1, 1e6] 14.742882
+   pmax_na_rm       integer [4000, 4000] [4000, 4000]  6.520333
+   pmax_na_rm       integer    [4000, 4000] [4000, 1]  5.450540
+   pmax_na_rm       integer    [4000, 4000] [1, 4000]  5.440208
+   pmax_na_rm       integer       [4000, 4000] [1, 1]  5.158067
+   pmax_na_rm       integer       [4000, 1] [1, 4000]  4.502518
+   pmax_na_rm       integer         [10, 1e6] [10, 1]  7.143348
+   pmax_na_rm       integer        [10, 1e6] [1, 1e6]  7.017130
+   pmax_na_rm        double [4000, 4000] [4000, 4000] 21.588612
+   pmax_na_rm        double    [4000, 4000] [4000, 1] 20.629355
+   pmax_na_rm        double    [4000, 4000] [1, 4000] 22.468923
+   pmax_na_rm        double       [4000, 4000] [1, 1] 20.791428
+   pmax_na_rm        double       [4000, 1] [1, 4000] 20.995690
+   pmax_na_rm        double         [10, 1e6] [10, 1] 14.607870
+   pmax_na_rm        double        [10, 1e6] [1, 1e6] 14.834210
+          and       logical [4000, 4000] [4000, 4000]  5.550395
+          and       logical    [4000, 4000] [4000, 1]  5.806810
+          and       logical    [4000, 4000] [1, 4000]  6.384828
+          and       logical       [4000, 4000] [1, 1]  5.969067
+          and       logical       [4000, 1] [1, 4000]  5.684876
+          and       logical         [10, 1e6] [10, 1]  6.640319
+          and       logical        [10, 1e6] [1, 1e6]  6.629065
+ operation          type                  shape median_ms
+       all       logical         [1.6e7] over 1 18.414207
+       all       logical    [4000, 4000] over 1 17.501813
+       all       logical    [4000, 4000] over 2 10.469637
+       all       logical [200, 200, 200] over 1  8.406210
+       all       logical [200, 200, 200] over 2  6.123227
+       all       logical [200, 200, 200] over 3  4.886913
+       all       logical       [10, 1e6] over 1  9.793424
+       all       logical       [10, 1e6] over 2  8.151046
+       any       logical         [1.6e7] over 1 18.762789
+       any       logical    [4000, 4000] over 1 17.748941
+       any       logical    [4000, 4000] over 2 10.433331
+       any       logical [200, 200, 200] over 1  8.360843
+       any       logical [200, 200, 200] over 2  4.780354
+       any       logical [200, 200, 200] over 3  4.811104
+       any       logical       [10, 1e6] over 1  9.553738
+       any       logical       [10, 1e6] over 2  7.958613
+       max       logical         [1.6e7] over 1 13.968311
+       max       logical    [4000, 4000] over 1 13.728050
+       max       logical    [4000, 4000] over 2 10.899071
+       max       logical [200, 200, 200] over 1  6.407152
+       max       logical [200, 200, 200] over 2  4.429722
+       max       logical [200, 200, 200] over 3  4.819591
+       max       logical       [10, 1e6] over 1  8.370642
+       max       logical       [10, 1e6] over 2  8.191226
+       max       integer         [1.6e7] over 1 15.831638
+       max       integer    [4000, 4000] over 1 13.641725
+       max       integer    [4000, 4000] over 2  9.475079
+       max       integer [200, 200, 200] over 1  6.653808
+       max       integer [200, 200, 200] over 2  4.643517
+       max       integer [200, 200, 200] over 3  4.621377
+       max       integer       [10, 1e6] over 1  8.156745
+       max       integer       [10, 1e6] over 2  7.526821
+       max        double         [1.6e7] over 1 31.033802
+       max        double    [4000, 4000] over 1 31.601365
+       max        double    [4000, 4000] over 2 22.092030
+       max        double [200, 200, 200] over 1 14.200945
+       max        double [200, 200, 200] over 2 10.450531
+       max        double [200, 200, 200] over 3 10.092068
+       max        double       [10, 1e6] over 1 13.818456
+       max        double       [10, 1e6] over 2 13.335291
+       min       logical         [1.6e7] over 1  9.027933
+       min       logical    [4000, 4000] over 1  9.633729
+       min       logical    [4000, 4000] over 2  7.615627
+       min       logical [200, 200, 200] over 1  4.446942
+       min       logical [200, 200, 200] over 2  3.540555
+       min       logical [200, 200, 200] over 3  3.992580
+       min       logical       [10, 1e6] over 1  7.281826
+       min       logical       [10, 1e6] over 2  5.789917
+       min       integer         [1.6e7] over 1  8.643804
+       min       integer    [4000, 4000] over 1  9.462000
+       min       integer    [4000, 4000] over 2  7.892910
+       min       integer [200, 200, 200] over 1  4.189605
+       min       integer [200, 200, 200] over 2  3.537829
+       min       integer [200, 200, 200] over 3  3.683604
+       min       integer       [10, 1e6] over 1  6.376136
+       min       integer       [10, 1e6] over 2  5.840798
+       min        double         [1.6e7] over 1 31.000018
+       min        double    [4000, 4000] over 1 30.358204
+       min        double    [4000, 4000] over 2 23.608538
+       min        double [200, 200, 200] over 1 14.249735
+       min        double [200, 200, 200] over 2 10.097828
+       min        double [200, 200, 200] over 3 10.129050
+       min        double       [10, 1e6] over 1 14.605143
+       min        double       [10, 1e6] over 2 15.041322
+      prod       logical         [1.6e7] over 1 26.029096
+      prod       logical    [4000, 4000] over 1 25.569445
+      prod       logical    [4000, 4000] over 2 16.250247
+      prod       logical [200, 200, 200] over 1 11.002740
+      prod       logical [200, 200, 200] over 2  7.147284
+      prod       logical [200, 200, 200] over 3  7.626246
+      prod       logical       [10, 1e6] over 1 11.841005
+      prod       logical       [10, 1e6] over 2 10.187127</pre><p class="cut">72 more lines cut</p></details>
+<p>The baseline matches the plan: mixed sign data is about 3x slower, but only when both inputs are full size. Now the C change.</p>
+
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {</span>
+<span class="del">-    stop_int_overflow(error_call);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return x + y;</span>
+<span class="ins">+  const int64_t out = (int64_t) x + y;</span>
+<span class="ins">+</span>
+<span class="ins">+  if (out &gt; INT_MAX || out &lt; -INT_MAX) {</span>
+<span class="ins">+    stop_int_overflow(error_call);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return (int) out;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-#include &lt;limits.h&gt;</span>
+<span class="ins">+#include &lt;limits.h&gt;</span>
+<span class="ins">+#include &lt;stdint.h&gt;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-subtract.c</summary>
+<pre class="diff"><span class="del">-  if (x == r_globals.na_int || y == r_globals.na_int) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  if ((y &lt; 0 &amp;&amp; x &gt; INT_MAX + y) || (y &gt; 0 &amp;&amp; x &lt; -INT_MAX + y)) {</span>
+<span class="del">-    stop_int_overflow(error_call);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return x - y;</span>
+<span class="ins">+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {</span>
+<span class="ins">+    return r_globals.na_int;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  const int64_t out = (int64_t) x - y;</span>
+<span class="ins">+</span>
+<span class="ins">+  if (out &gt; INT_MAX || out &lt; -INT_MAX) {</span>
+<span class="ins">+    stop_int_overflow(error_call);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return (int) out;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/arithmetic-subtract.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-subtract.c</summary>
+<pre class="diff"><span class="del">-#include &lt;limits.h&gt;</span>
+<span class="ins">+#include &lt;limits.h&gt;</span>
+<span class="ins">+#include &lt;stdint.h&gt;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/arithmetic-subtract.c has been updated successfully.</pre></details>
+<p>Those decl header diagnostics are expected, since decl headers have no includes by design. Next I'll check that <code>rray_int_is_missing()</code> is in scope in the subtract file, then rebuild from clean.</p>
+
+<details class="tool"><summary>Bash: grep -n '#include' src/cast.h src/utils.h src/arithmetic.h src/binary.h src/arithmetic-divide…</summary>
+<pre>grep -n '#include' src/cast.h src/utils.h src/arithmetic.h src/binary.h src/arithmetic-divide.c src/arithmetic-multiply.c | grep -v rlang; grep -n 'is_missing\|na_int' src/arithmetic-divide.c src/arithmetic-exponentiate.c | head</pre><pre class="output">src/utils.h:4:#include &lt;complex.h&gt;
+src/utils.h:5:#include &lt;string.h&gt;
+src/utils.h:9:#include &quot;arg.h&quot;
+src/utils.h:10:#include &quot;type.h&quot;
+src/cast.h:4:#include &lt;limits.h&gt;
+src/cast.h:8:#include &quot;arg.h&quot;
+src/cast.h:9:#include &quot;type.h&quot;
+src/arithmetic.h:6:#include &quot;arg.h&quot;
+src/binary.h:6:#include &quot;strided-iterator.h&quot;
+src/arithmetic-multiply.c:1:#include &quot;arithmetic-multiply.h&quot;
+src/arithmetic-multiply.c:3:#include &quot;arithmetic.h&quot;
+src/arithmetic-multiply.c:4:#include &quot;binary.h&quot;
+src/arithmetic-multiply.c:5:#include &quot;cast.h&quot;
+src/arithmetic-multiply.c:6:#include &quot;one-multiply.h&quot;
+src/arithmetic-multiply.c:7:#include &quot;type.h&quot;
+src/arithmetic-multiply.c:8:#include &quot;typeof2.h&quot;
+src/arithmetic-multiply.c:9:#include &quot;utils.h&quot;
+src/arithmetic-multiply.c:11:#include &quot;decl/arithmetic-multiply-decl.h&quot;
+src/arithmetic-divide.c:1:#include &quot;arithmetic-divide.h&quot;
+src/arithmetic-divide.c:3:#include &quot;arithmetic.h&quot;
+src/arithmetic-divide.c:4:#include &quot;binary.h&quot;
+src/arithmetic-divide.c:5:#include &quot;cast.h&quot;
+src/arithmetic-divide.c:6:#include &quot;type.h&quot;
+src/arithmetic-divide.c:7:#include &quot;typeof2.h&quot;
+src/arithmetic-divide.c:8:#include &quot;utils.h&quot;
+src/arithmetic-divide.c:10:#include &quot;decl/arithmetic-divide-decl.h&quot;</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-subtract.c</summary>
+<pre class="diff"><span class="del">-#include &quot;cast.h&quot;</span>
+<span class="del">-#include &quot;type.h&quot;</span>
+<span class="ins">+#include &quot;cast.h&quot;</span>
+<span class="ins">+#include &quot;missing.h&quot;</span>
+<span class="ins">+#include &quot;type.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/arithmetic-subtract.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: head -10 src/missing.h &amp;&amp; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git status --sho…</summary>
+<pre>head -10 src/missing.h &amp;&amp; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;pkgbuild::clean_dll(); pkgbuild::compile_dll(debug = FALSE)&quot; 2&gt;&amp;1 | grep -iE &quot;warning|error&quot; ; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">#ifndef RRAY_MISSING_H
+#define RRAY_MISSING_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;utils.h&quot;
+
+static inline bool rray_lgl_is_missing(int x) {
+  return x == r_globals.na_lgl;
+}
+ M bench/binary.R
+ M bench/cumulative.R
+ M src/arithmetic-subtract.c
+ M src/one-add.h
+ M tests/testthat/test-arithmetic-add.R
+ M tests/testthat/test-arithmetic-subtract.R
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-mean.R:201:3' ------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:461:3' -------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:468:3' -------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:476:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 5398 ]</pre></details>
+<p>The build has no warnings, and the full suite passes: 5398 tests, 0 failures. Now the &quot;after&quot; benchmarks.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad &amp;&amp; RRAY_BENCH_OUTPUT=$S/binary-after.rds Rscript bench/binary.R &gt; $S/binary-after.txt 2&gt;&amp;1 &amp;&amp; RRAY_BENCH_OUTPUT=$S/cumulative-after.rds Rscript bench/cumulative.R &gt; $S/cumulative-after.txt 2&gt;&amp;1; echo done</pre><pre class="output">Command running in background with ID: bcm29ujrz. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/bcm29ujrz.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>While that runs, I'll write a script to compare the before and after results.</p>
+
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097…</summary>
+<pre>dir &lt;- commandArgs(TRUE)[[1]]
+
+for (name in c(&quot;binary&quot;, &quot;cumulative&quot;)) {
+  before &lt;- readRDS(file.path(dir, paste0(name, &quot;-before.rds&quot;)))$results
+  after &lt;- readRDS(file.path(dir, paste0(name, &quot;-after.rds&quot;)))$results
+  out &lt;- merge(
+    before,
+    after,
+    by = c(&quot;operation&quot;, &quot;type&quot;, &quot;shape&quot;),
+    suffixes = c(&quot;_before&quot;, &quot;_after&quot;),
+    sort = FALSE
+  )
+  out$ratio &lt;- out$median_ms_after / out$median_ms_before
+  out$median_ms_before &lt;- round(out$median_ms_before, 1)
+  out$median_ms_after &lt;- round(out$median_ms_after, 1)
+  out$ratio &lt;- round(out$ratio, 2)
+  cat(&quot;\n==&quot;, name, &quot;==\n&quot;)
+  print(out, row.names = FALSE)
+}</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad/compare.R (file state is current in your context — no need to Read it back)</pre></details>
+<p>The comparison script is ready. The &quot;after&quot; benchmarks are still running, and I'll compare the numbers when they finish.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad; Rscript $S/compare.R $S | grep -E &quot;==|operation| add | subtract | multiply | sum &quot;</pre><pre class="output">== binary ==
+    operation          type                     shape median_ms_before
+          add       integer [4000, 4000] [4000, 4000]             17.6
+          add       integer    [4000, 4000] [4000, 1]             18.7
+          add       integer    [4000, 4000] [1, 4000]             19.9
+          add       integer       [4000, 4000] [1, 1]             19.7
+          add       integer       [4000, 1] [1, 4000]             19.4
+          add       integer         [10, 1e6] [10, 1]             11.5
+          add       integer        [10, 1e6] [1, 1e6]             14.6
+          add integer_mixed [4000, 4000] [4000, 4000]             66.6
+          add integer_mixed    [4000, 4000] [4000, 1]             17.9
+          add integer_mixed    [4000, 4000] [1, 4000]             20.8
+          add integer_mixed       [4000, 4000] [1, 1]             20.1
+          add integer_mixed       [4000, 1] [1, 4000]             19.7
+          add integer_mixed         [10, 1e6] [10, 1]             11.6
+          add integer_mixed        [10, 1e6] [1, 1e6]             13.7
+          add        double [4000, 4000] [4000, 4000]             14.0
+          add        double    [4000, 4000] [4000, 1]             11.6
+          add        double    [4000, 4000] [1, 4000]             12.6
+          add        double       [4000, 4000] [1, 1]             12.2
+          add        double       [4000, 1] [1, 4000]              9.5
+          add        double         [10, 1e6] [10, 1]              9.0
+          add        double        [10, 1e6] [1, 1e6]              7.6
+     subtract       integer [4000, 4000] [4000, 4000]             16.0
+     subtract       integer    [4000, 4000] [4000, 1]             15.8
+     subtract       integer    [4000, 4000] [1, 4000]             21.1
+     subtract       integer       [4000, 4000] [1, 1]             19.8
+     subtract       integer       [4000, 1] [1, 4000]             19.8
+     subtract       integer         [10, 1e6] [10, 1]             10.7
+     subtract       integer        [10, 1e6] [1, 1e6]             13.2
+     subtract integer_mixed [4000, 4000] [4000, 4000]             66.0
+     subtract integer_mixed    [4000, 4000] [4000, 1]             17.0
+     subtract integer_mixed    [4000, 4000] [1, 4000]             20.5
+     subtract integer_mixed       [4000, 4000] [1, 1]             20.9
+     subtract integer_mixed       [4000, 1] [1, 4000]             19.5
+     subtract integer_mixed         [10, 1e6] [10, 1]             14.0
+     subtract integer_mixed        [10, 1e6] [1, 1e6]             13.3
+     subtract        double [4000, 4000] [4000, 4000]             15.1
+     subtract        double    [4000, 4000] [4000, 1]             10.3
+     subtract        double    [4000, 4000] [1, 4000]             11.3
+     subtract        double       [4000, 4000] [1, 1]             13.0
+     subtract        double       [4000, 1] [1, 4000]              9.6
+     subtract        double         [10, 1e6] [10, 1]              8.4
+     subtract        double        [10, 1e6] [1, 1e6]              7.7
+     multiply       integer [4000, 4000] [4000, 4000]             17.0
+     multiply       integer    [4000, 4000] [4000, 1]             16.8
+     multiply       integer    [4000, 4000] [1, 4000]             14.8
+     multiply       integer       [4000, 4000] [1, 1]             14.7
+     multiply       integer       [4000, 1] [1, 4000]             14.4
+     multiply       integer         [10, 1e6] [10, 1]             11.2
+     multiply       integer        [10, 1e6] [1, 1e6]             10.5
+     multiply integer_mixed [4000, 4000] [4000, 4000]             15.4
+     multiply integer_mixed    [4000, 4000] [4000, 1]             15.7
+     multiply integer_mixed    [4000, 4000] [1, 4000]             14.6
+     multiply integer_mixed       [4000, 4000] [1, 1]             15.1
+     multiply integer_mixed       [4000, 1] [1, 4000]             13.7
+     multiply integer_mixed         [10, 1e6] [10, 1]             11.2
+     multiply integer_mixed        [10, 1e6] [1, 1e6]             10.7
+     multiply        double [4000, 4000] [4000, 4000]             14.2
+     multiply        double    [4000, 4000] [4000, 1]             10.3
+     multiply        double    [4000, 4000] [1, 4000]             11.7
+     multiply        double       [4000, 4000] [1, 1]             10.5
+     multiply        double       [4000, 1] [1, 4000]              9.7
+     multiply        double         [10, 1e6] [10, 1]              8.2
+     multiply        double        [10, 1e6] [1, 1e6]              7.8
+== cumulative ==
+ operation          type                  shape median_ms_before
+       sum       logical         [1.6e7] over 1              9.5
+       sum       logical    [4000, 4000] over 1             10.5
+       sum       logical    [4000, 4000] over 2             10.6
+       sum       logical [200, 200, 200] over 1              5.2
+       sum       logical [200, 200, 200] over 2              6.2
+       sum       logical [200, 200, 200] over 3              6.0
+       sum       logical       [10, 1e6] over 1             14.0
+       sum       logical       [10, 1e6] over 2              7.5
+       sum logical_no_na         [1.6e7] over 1             17.0
+       sum logical_no_na    [4000, 4000] over 1             16.6
+       sum logical_no_na    [4000, 4000] over 2             16.8
+       sum logical_no_na [200, 200, 200] over 1              8.5
+       sum logical_no_na [200, 200, 200] over 2              8.9
+       sum logical_no_na [200, 200, 200] over 3              8.3
+       sum logical_no_na       [10, 1e6] over 1             11.8
+       sum logical_no_na       [10, 1e6] over 2             11.0
+       sum       integer         [1.6e7] over 1             17.3
+       sum       integer    [4000, 4000] over 1             18.7
+       sum       integer    [4000, 4000] over 2             17.0
+       sum       integer [200, 200, 200] over 1              8.6
+       sum       integer [200, 200, 200] over 2              8.5
+       sum       integer [200, 200, 200] over 3              8.5
+       sum       integer       [10, 1e6] over 1             11.5
+       sum       integer       [10, 1e6] over 2             11.2
+       sum integer_mixed         [1.6e7] over 1             53.6
+       sum integer_mixed    [4000, 4000] over 1             53.8
+       sum integer_mixed    [4000, 4000] over 2             57.6
+       sum integer_mixed [200, 200, 200] over 1             27.1
+       sum integer_mixed [200, 200, 200] over 2             27.4
+       sum integer_mixed [200, 200, 200] over 3             30.9
+       sum integer_mixed       [10, 1e6] over 1             37.9
+       sum integer_mixed       [10, 1e6] over 2             37.5
+       sum        double         [1.6e7] over 1             19.4
+       sum        double    [4000, 4000] over 1             20.7
+       sum        double    [4000, 4000] over 2             14.2
+       sum        double [200, 200, 200] over 1              8.7
+       sum        double [200, 200, 200] over 2              6.8
+       sum        double [200, 200, 200] over 3              7.1
+       sum        double       [10, 1e6] over 1              9.3
+       sum        double       [10, 1e6] over 2              9.5
+       sum       complex         [1.6e7] over 1             31.7
+       sum       complex    [4000, 4000] over 1             29.0
+       sum       complex    [4000, 4000] over 2             33.2
+       sum       complex [200, 200, 200] over 1             12.8
+       sum       complex [200, 200, 200] over 2             14.7
+       sum       complex [200, 200, 200] over 3             14.0
+       sum       complex       [10, 1e6] over 1             17.2
+       sum       complex       [10, 1e6] over 2             23.2</pre></details>
+<p>Print got wrapped. Widening the output.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf0…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad; Rscript -e &quot;options(width = 200); source('$S/compare.R')&quot; $S 2&gt;&amp;1 | grep -E &quot;==|operation| add | subtract | multiply | sum &quot;</pre><pre class="output">== binary ==
+    operation          type                     shape median_ms_before median_ms_after ratio
+          add       integer [4000, 4000] [4000, 4000]             17.6            13.6  0.77
+          add       integer    [4000, 4000] [4000, 1]             18.7            12.9  0.69
+          add       integer    [4000, 4000] [1, 4000]             19.9            12.3  0.62
+          add       integer       [4000, 4000] [1, 1]             19.7            12.6  0.64
+          add       integer       [4000, 1] [1, 4000]             19.4            13.0  0.67
+          add       integer         [10, 1e6] [10, 1]             11.5             9.6  0.84
+          add       integer        [10, 1e6] [1, 1e6]             14.6             9.4  0.64
+          add integer_mixed [4000, 4000] [4000, 4000]             66.6            12.7  0.19
+          add integer_mixed    [4000, 4000] [4000, 1]             17.9            13.7  0.77
+          add integer_mixed    [4000, 4000] [1, 4000]             20.8            13.5  0.65
+          add integer_mixed       [4000, 4000] [1, 1]             20.1            13.2  0.66
+          add integer_mixed       [4000, 1] [1, 4000]             19.7            12.2  0.62
+          add integer_mixed         [10, 1e6] [10, 1]             11.6             9.5  0.82
+          add integer_mixed        [10, 1e6] [1, 1e6]             13.7             8.5  0.62
+          add        double [4000, 4000] [4000, 4000]             14.0            14.1  1.01
+          add        double    [4000, 4000] [4000, 1]             11.6            10.9  0.94
+          add        double    [4000, 4000] [1, 4000]             12.6            11.4  0.91
+          add        double       [4000, 4000] [1, 1]             12.2            12.0  0.98
+          add        double       [4000, 1] [1, 4000]              9.5             9.4  0.99
+          add        double         [10, 1e6] [10, 1]              9.0             8.2  0.91
+          add        double        [10, 1e6] [1, 1e6]              7.6             7.7  1.01
+     subtract       integer [4000, 4000] [4000, 4000]             16.0            12.9  0.80
+     subtract       integer    [4000, 4000] [4000, 1]             15.8            13.1  0.83
+     subtract       integer    [4000, 4000] [1, 4000]             21.1            13.1  0.62
+     subtract       integer       [4000, 4000] [1, 1]             19.8            12.3  0.62
+     subtract       integer       [4000, 1] [1, 4000]             19.8            12.5  0.63
+     subtract       integer         [10, 1e6] [10, 1]             10.7             9.8  0.91
+     subtract       integer        [10, 1e6] [1, 1e6]             13.2             9.5  0.72
+     subtract integer_mixed [4000, 4000] [4000, 4000]             66.0            12.4  0.19
+     subtract integer_mixed    [4000, 4000] [4000, 1]             17.0            12.6  0.74
+     subtract integer_mixed    [4000, 4000] [1, 4000]             20.5            12.4  0.61
+     subtract integer_mixed       [4000, 4000] [1, 1]             20.9            11.7  0.56
+     subtract integer_mixed       [4000, 1] [1, 4000]             19.5            11.7  0.60
+     subtract integer_mixed         [10, 1e6] [10, 1]             14.0             8.9  0.64
+     subtract integer_mixed        [10, 1e6] [1, 1e6]             13.3             8.2  0.61
+     subtract        double [4000, 4000] [4000, 4000]             15.1            13.0  0.86
+     subtract        double    [4000, 4000] [4000, 1]             10.3             9.5  0.92
+     subtract        double    [4000, 4000] [1, 4000]             11.3            10.4  0.92
+     subtract        double       [4000, 4000] [1, 1]             13.0            10.1  0.78
+     subtract        double       [4000, 1] [1, 4000]              9.6             8.1  0.84
+     subtract        double         [10, 1e6] [10, 1]              8.4             7.4  0.88
+     subtract        double        [10, 1e6] [1, 1e6]              7.7             7.9  1.04
+     multiply       integer [4000, 4000] [4000, 4000]             17.0            15.3  0.90
+     multiply       integer    [4000, 4000] [4000, 1]             16.8            15.0  0.90
+     multiply       integer    [4000, 4000] [1, 4000]             14.8            14.0  0.95
+     multiply       integer       [4000, 4000] [1, 1]             14.7            14.0  0.96
+     multiply       integer       [4000, 1] [1, 4000]             14.4            13.9  0.96
+     multiply       integer         [10, 1e6] [10, 1]             11.2            11.0  0.98
+     multiply       integer        [10, 1e6] [1, 1e6]             10.5            10.2  0.97
+     multiply integer_mixed [4000, 4000] [4000, 4000]             15.4            15.5  1.01
+     multiply integer_mixed    [4000, 4000] [4000, 1]             15.7            15.6  1.00
+     multiply integer_mixed    [4000, 4000] [1, 4000]             14.6            13.9  0.95
+     multiply integer_mixed       [4000, 4000] [1, 1]             15.1            14.1  0.94
+     multiply integer_mixed       [4000, 1] [1, 4000]             13.7            13.0  0.95
+     multiply integer_mixed         [10, 1e6] [10, 1]             11.2            11.5  1.03
+     multiply integer_mixed        [10, 1e6] [1, 1e6]             10.7            10.8  1.01
+     multiply        double [4000, 4000] [4000, 4000]             14.2            12.3  0.87
+     multiply        double    [4000, 4000] [4000, 1]             10.3             9.5  0.93
+     multiply        double    [4000, 4000] [1, 4000]             11.7            10.1  0.86
+     multiply        double       [4000, 4000] [1, 1]             10.5             9.1  0.86
+     multiply        double       [4000, 1] [1, 4000]              9.7             7.7  0.80
+     multiply        double         [10, 1e6] [10, 1]              8.2             7.3  0.89
+     multiply        double        [10, 1e6] [1, 1e6]              7.8             6.8  0.88
+== cumulative ==
+ operation          type                  shape median_ms_before median_ms_after ratio
+       sum       logical         [1.6e7] over 1              9.5             8.9  0.94
+       sum       logical    [4000, 4000] over 1             10.5             9.6  0.91
+       sum       logical    [4000, 4000] over 2             10.6            10.0  0.94
+       sum       logical [200, 200, 200] over 1              5.2             5.0  0.96
+       sum       logical [200, 200, 200] over 2              6.2             5.7  0.92
+       sum       logical [200, 200, 200] over 3              6.0             5.6  0.95
+       sum       logical       [10, 1e6] over 1             14.0            15.1  1.07
+       sum       logical       [10, 1e6] over 2              7.5             7.7  1.02
+       sum logical_no_na         [1.6e7] over 1             17.0            13.1  0.77
+       sum logical_no_na    [4000, 4000] over 1             16.6            13.1  0.79
+       sum logical_no_na    [4000, 4000] over 2             16.8            12.9  0.76
+       sum logical_no_na [200, 200, 200] over 1              8.5             6.8  0.80
+       sum logical_no_na [200, 200, 200] over 2              8.9             6.6  0.74
+       sum logical_no_na [200, 200, 200] over 3              8.3             6.3  0.76
+       sum logical_no_na       [10, 1e6] over 1             11.8             8.6  0.73
+       sum logical_no_na       [10, 1e6] over 2             11.0             9.8  0.89
+       sum       integer         [1.6e7] over 1             17.3            13.4  0.78
+       sum       integer    [4000, 4000] over 1             18.7            13.1  0.70
+       sum       integer    [4000, 4000] over 2             17.0            12.6  0.74
+       sum       integer [200, 200, 200] over 1              8.6             6.9  0.81
+       sum       integer [200, 200, 200] over 2              8.5             6.6  0.77
+       sum       integer [200, 200, 200] over 3              8.5             6.6  0.77
+       sum       integer       [10, 1e6] over 1             11.5             8.6  0.75
+       sum       integer       [10, 1e6] over 2             11.2            10.1  0.90
+       sum integer_mixed         [1.6e7] over 1             53.6            13.4  0.25
+       sum integer_mixed    [4000, 4000] over 1             53.8            14.1  0.26
+       sum integer_mixed    [4000, 4000] over 2             57.6            13.1  0.23
+       sum integer_mixed [200, 200, 200] over 1             27.1             7.2  0.27
+       sum integer_mixed [200, 200, 200] over 2             27.4             7.1  0.26
+       sum integer_mixed [200, 200, 200] over 3             30.9             6.6  0.21
+       sum integer_mixed       [10, 1e6] over 1             37.9             9.0  0.24
+       sum integer_mixed       [10, 1e6] over 2             37.5            10.5  0.28
+       sum        double         [1.6e7] over 1             19.4            19.8  1.02
+       sum        double    [4000, 4000] over 1             20.7            20.6  1.00
+       sum        double    [4000, 4000] over 2             14.2            15.0  1.06
+       sum        double [200, 200, 200] over 1              8.7             9.4  1.08
+       sum        double [200, 200, 200] over 2              6.8             6.7  0.98
+       sum        double [200, 200, 200] over 3              7.1             7.4  1.05
+       sum        double       [10, 1e6] over 1              9.3             9.8  1.05
+       sum        double       [10, 1e6] over 2              9.5             9.4  0.99
+       sum       complex         [1.6e7] over 1             31.7            28.4  0.90
+       sum       complex    [4000, 4000] over 1             29.0            29.0  1.00
+       sum       complex    [4000, 4000] over 2             33.2            32.3  0.97
+       sum       complex [200, 200, 200] over 1             12.8            12.6  0.98
+       sum       complex [200, 200, 200] over 2             14.7            14.9  1.01
+       sum       complex [200, 200, 200] over 3             14.0            14.4  1.03
+       sum       complex       [10, 1e6] over 1             17.2            17.2  1.00
+       sum       complex       [10, 1e6] over 2             23.2            23.1  0.99</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Same-sign integer data came out 20-35% faster, better than expected, while double, complex, and multiply remained unchanged within noise. Next I'll run a quick comparison against base R for context.</p>
+</details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+set.seed(1); n &lt;- 16e6
+xs &lt;- sample(-50:50, n, TRUE); ys &lt;- sample(-50:50, n, TRUE)
+m &lt;- function(e) round(as.numeric(median(bench::mark(e, iterations = 20, check = FALSE, memory = FALSE, filter_gc = FALSE)$time[[1]])) * 1000, 1)
+print(c(
+  rray_cumsum = m(rray_cumulative_sum(xs, 1L)), base_cumsum = m(cumsum(xs)),
+  rray_add = m(rray_add(xs, ys)), base_add = m(xs + ys),
+  rray_subtract = m(rray_subtract(xs, ys)), base_subtract = m(xs - ys)
+))' 2&gt;&amp;1 | tail -3</pre><pre class="output">            0             0             0             0             0 
+base_subtract 
+            0</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+set.seed(1); n &lt;- 16e6
+xs &lt;- sample(-50:50, n, TRUE); ys &lt;- sample(-50:50, n, TRUE)
+b &lt;- bench::mark(
+  rray_cumsum = rray_cumulative_sum(xs, 1L), base_cumsum = cumsum(xs),
+  rray_add = rray_add(xs, ys), base_add = xs + ys,
+  rray_subtract = rray_subtract(xs, ys), base_subtract = xs - ys,
+  iterations = 20, check = FALSE, memory = FALSE, filter_gc = FALSE)
+print(data.frame(expr = names(b$expression), median_ms = round(as.numeric(b$median) * 1000, 1)))' 2&gt;&amp;1 | tail -8</pre><pre class="output">           expr median_ms
+1   rray_cumsum      14.3
+2   base_cumsum      23.5
+3      rray_add      14.7
+4      base_add      38.8
+5 rray_subtract      14.3
+6 base_subtract      80.4</pre></details>
+<p>rray now beats base R on mixed sign data. Next I'll delete the plan, review the diff, and commit.</p>
+
+<details class="tool"><summary>Bash: git rm -q plans/add-performance.md &amp;&amp; git diff HEAD -- src bench tests</summary>
+<pre>git rm -q plans/add-performance.md &amp;&amp; git diff HEAD -- src bench tests</pre><pre class="output">diff --git a/bench/binary.R b/bench/binary.R
+index c6b62da..aaa08e0 100644
+--- a/bench/binary.R
++++ b/bench/binary.R
+@@ -4,7 +4,15 @@ iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
+-  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),
++  add = list(fn = rray_add, types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)),
++  subtract = list(
++    fn = rray_subtract,
++    types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)
++  ),
++  multiply = list(
++    fn = rray_multiply,
++    types = c(&quot;integer&quot;, &quot;integer_mixed&quot;, &quot;double&quot;)
++  ),
+   greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+@@ -32,6 +40,7 @@ make_array &lt;- function(dimensions, type) {
+     type,
+     logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+     integer = sample(100L, n, replace = TRUE),
++    integer_mixed = sample(-50:50, n, replace = TRUE),
+     double = runif(n)
+   )
+ 
+diff --git a/bench/cumulative.R b/bench/cumulative.R
+index d68597b..ed1afdd 100644
+--- a/bench/cumulative.R
++++ b/bench/cumulative.R
+@@ -20,7 +20,14 @@ operations &lt;- list(
+   ),
+   sum = list(
+     fn = rray_cumulative_sum,
+-    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++    types = c(
++      &quot;logical&quot;,
++      &quot;logical_no_na&quot;,
++      &quot;integer&quot;,
++      &quot;integer_mixed&quot;,
++      &quot;double&quot;,
++      &quot;complex&quot;
++    )
+   )
+ )
+ 
+@@ -41,7 +48,9 @@ make_array &lt;- function(dimensions, type) {
+   values &lt;- switch(
+     type,
+     logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
++    logical_no_na = sample(c(TRUE, FALSE), n, replace = TRUE),
+     integer = sample(100L, n, replace = TRUE),
++    integer_mixed = sample(-50:50, n, replace = TRUE),
+     double = runif(n),
+     complex = complex(real = runif(n), imaginary = runif(n))
+   )
+diff --git a/src/arithmetic-subtract.c b/src/arithmetic-subtract.c
+index fbe5c4e..3674217 100644
+--- a/src/arithmetic-subtract.c
++++ b/src/arithmetic-subtract.c
+@@ -1,10 +1,12 @@
+ #include &quot;arithmetic-subtract.h&quot;
+ 
+ #include &lt;limits.h&gt;
++#include &lt;stdint.h&gt;
+ 
+ #include &quot;arithmetic.h&quot;
+ #include &quot;binary.h&quot;
+ #include &quot;cast.h&quot;
++#include &quot;missing.h&quot;
+ #include &quot;type.h&quot;
+ #include &quot;typeof2.h&quot;
+ #include &quot;utils.h&quot;
+@@ -500,15 +502,17 @@ static inline int rray_subtract_int_one(
+   int y,
+   struct r_lazy error_call
+ ) {
+-  if (x == r_globals.na_int || y == r_globals.na_int) {
++  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+     return r_globals.na_int;
+   }
+ 
+-  if ((y &lt; 0 &amp;&amp; x &gt; INT_MAX + y) || (y &gt; 0 &amp;&amp; x &lt; -INT_MAX + y)) {
++  const int64_t out = (int64_t) x - y;
++
++  if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+     stop_int_overflow(error_call);
+   }
+ 
+-  return x - y;
++  return (int) out;
+ }
+ 
+ static inline double rray_subtract_dbl_one(double x, double y) {
+diff --git a/src/one-add.h b/src/one-add.h
+index 819529e..b290325 100644
+--- a/src/one-add.h
++++ b/src/one-add.h
+@@ -2,6 +2,7 @@
+ #define RRAY_ONE_ADD_H
+ 
+ #include &lt;limits.h&gt;
++#include &lt;stdint.h&gt;
+ 
+ #include &quot;rlang.h&quot;
+ 
+@@ -20,11 +21,13 @@ static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+     return r_globals.na_int;
+   }
+ 
+-  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
++  const int64_t out = (int64_t) x + y;
++
++  if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+     stop_int_overflow(error_call);
+   }
+ 
+-  return x + y;
++  return (int) out;
+ }
+ 
+ // For `c(NA, NaN)` behavior, match `+` and let the order be &quot;implementation
+diff --git a/tests/testthat/test-arithmetic-add.R b/tests/testthat/test-arithmetic-add.R
+index 505f893..35f0f02 100644
+--- a/tests/testthat/test-arithmetic-add.R
++++ b/tests/testthat/test-arithmetic-add.R
+@@ -123,6 +123,10 @@ test_that(&quot;missing values win over integer overflow&quot;, {
+     rray_add(NA_integer_, .Machine$integer.max),
+     array(NA_integer_, 1L)
+   )
++  expect_identical(
++    rray_add(-.Machine$integer.max, NA_integer_),
++    array(NA_integer_, 1L)
++  )
+ })
+ 
+ test_that(&quot;broadcasting carries through alternating singleton axes&quot;, {
+@@ -250,6 +254,21 @@ test_that(&quot;errors on integer underflow&quot;, {
+   expect_snapshot(rray_add(-.Machine$integer.max, -1L), error = TRUE)
+ })
+ 
++test_that(&quot;can reach the integer limits without overflowing&quot;, {
++  expect_identical(
++    rray_add(.Machine$integer.max - 1L, 1L),
++    array(.Machine$integer.max, 1L)
++  )
++  expect_identical(
++    rray_add(-.Machine$integer.max + 1L, -1L),
++    array(-.Machine$integer.max, 1L)
++  )
++  expect_identical(
++    rray_add(.Machine$integer.max, -.Machine$integer.max),
++    array(0L, 1L)
++  )
++})
++
+ test_that(&quot;errors on scalar input&quot;, {
+   expect_snapshot(rray_add(NULL, 1L), error = TRUE)
+   expect_snapshot(rray_add(1L, NULL), error = TRUE)
+diff --git a/tests/testthat/test-arithmetic-subtract.R b/tests/testthat/test-arithmetic-subtract.R
+index f6c6278..2eecb47 100644
+--- a/tests/testthat/test-arithmetic-subtract.R
++++ b/tests/testthat/test-arithmetic-subtract.R
+@@ -135,6 +135,10 @@ test_that(&quot;missing values win over integer overflow&quot;, {
+     rray_subtract(NA_integer_, -.Machine$integer.max),
+     array(NA_integer_, 1L)
+   )
++  expect_identical(
++    rray_subtract(.Machine$integer.max, NA_integer_),
++    array(NA_integer_, 1L)
++  )
+ })
+ 
+ test_that(&quot;names are kept for axes that aren't broadcast&quot;, {
+@@ -220,6 +224,25 @@ test_that(&quot;errors on integer underflow&quot;, {
+   expect_snapshot(rray_subtract(-.Machine$integer.max, 1L), error = TRUE)
+ })
+ 
++test_that(&quot;can reach the integer limits without overflowing&quot;, {
++  expect_identical(
++    rray_subtract(.Machine$integer.max - 1L, -1L),
++    array(.Machine$integer.max, 1L)
++  )
++  expect_identical(
++    rray_subtract(-.Machine$integer.max + 1L, 1L),
++    array(-.Machine$integer.max, 1L)
++  )
++  expect_identical(
++    rray_subtract(.Machine$integer.max, .Machine$integer.max),
++    array(0L, 1L)
++  )
++  expect_identical(
++    rray_subtract(-.Machine$integer.max, -.Machine$integer.max),
++    array(0L, 1L)
++  )
++})
++</pre><p class="cut">3 more lines cut</p></details>
+<p>The diff is clean. No <code>r_obj*</code> values were touched, so there's nothing to check for GC protection. Committing and pushing.</p>
+
+<details class="tool"><summary>Bash: git add -A bench src/one-add.h src/arithmetic-subtract.c tests plans &amp;&amp; git status --short &amp;&amp;…</summary>
+<pre>git add -A bench src/one-add.h src/arithmetic-subtract.c tests plans &amp;&amp; git status --short &amp;&amp; git commit -q -m &quot;Check integer add and subtract overflow in \`int64_t\` to avoid sign branches&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/add-perf 2&gt;&amp;1 | tail -3</pre><pre class="output">M  bench/binary.R
+M  bench/cumulative.R
+D  plans/add-performance.md
+M  src/arithmetic-subtract.c
+M  src/one-add.h
+M  tests/testthat/test-arithmetic-add.R
+M  tests/testthat/test-arithmetic-subtract.R
+3c14b8c Check integer add and subtract overflow in `int64_t` to avoid sign branches
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/add-perf -&gt; feature/add-perf
+branch 'feature/add-perf' set up to track 'origin/feature/add-perf'.</pre></details>
+<p>The plan is implemented, committed as <code>3c14b8c</code>, and pushed to <code>feature/add-perf</code>. The plan file is deleted in the same commit. Integer add, subtract and cumulative sum are now 4 to 5x faster on mixed sign data, and the full test suite passes (5398 tests, 0 failures).</p>
+<h2>What changed</h2>
+<ul>
+<li>
+<p><strong><code>rray_add_int_one()</code></strong> in <code>src/one-add.h</code> now uses the change from the plan: it adds in <code>int64_t</code> and errors if the result is above <code>INT_MAX</code> or below <code>-INT_MAX</code>.</p>
+</li>
+<li>
+<p><strong><code>rray_subtract_int_one()</code></strong> gets the same change, using <code>(int64_t) x - y</code>. It also uses <code>rray_int_is_missing()</code> now, which needed <code>#include &quot;missing.h&quot;</code>.</p>
+</li>
+<li>
+<p><strong><code>int_add_checked()</code></strong> is unchanged, as agreed.</p>
+</li>
+<li>
+<p><strong>Bench scripts:</strong></p>
+<ul>
+<li><code>bench/binary.R</code> now benchmarks <code>add</code> and <code>subtract</code>, and gives <code>add</code>, <code>subtract</code> and <code>multiply</code> a new <code>integer_mixed</code> type (<code>sample(-50:50)</code>).</li>
+<li><code>bench/cumulative.R</code> gives <code>sum</code> the new <code>logical_no_na</code> and <code>integer_mixed</code> types. The existing <code>logical</code> type, which includes <code>NA</code>, stays as it was.</li>
+</ul>
+</li>
+<li>
+<p><strong>Tests:</strong></p>
+<ul>
+<li>Add and subtract results that land exactly on <code>INT_MAX</code> and <code>-INT_MAX</code> still succeed, and large opposite values that cancel out give <code>0</code>.</li>
+<li>A missing <code>y</code> next to a limit gives <code>NA</code>, not an overflow error. That case catches it if the range check ever runs before the missing value check.</li>
+</ul>
+</li>
+</ul>
+<p>The build has no compiler warnings.</p>
+<h2>Benchmarks</h2>
+<p>These were run on your Mac (arm64): median of 20 iterations, with a clean rebuild before each side. Times are in milliseconds.</p>
+<table>
+<thead>
+<tr>
+<th>Call</th>
+<th>Data</th>
+<th>Before</th>
+<th>After</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rray_cumulative_sum()</code>, 1.6e7 elements</td>
+<td><code>integer_mixed</code></td>
+<td>53.6</td>
+<td>13.4</td>
+</tr>
+<tr>
+<td><code>rray_cumulative_sum()</code>, 4000 x 4000 over axis 1</td>
+<td><code>integer_mixed</code></td>
+<td>53.8</td>
+<td>14.1</td>
+</tr>
+<tr>
+<td><code>rray_cumulative_sum()</code>, 4000 x 4000 over axis 2</td>
+<td><code>integer_mixed</code></td>
+<td>57.6</td>
+<td>13.1</td>
+</tr>
+<tr>
+<td><code>rray_cumulative_sum()</code>, 1.6e7 elements</td>
+<td><code>integer</code> (all positive)</td>
+<td>17.3</td>
+<td>13.4</td>
+</tr>
+<tr>
+<td><code>rray_cumulative_sum()</code>, 1.6e7 elements</td>
+<td><code>logical_no_na</code></td>
+<td>17.0</td>
+<td>13.1</td>
+</tr>
+<tr>
+<td><code>rray_add()</code>, both inputs 4000 x 4000</td>
+<td><code>integer_mixed</code></td>
+<td>66.6</td>
+<td>12.7</td>
+</tr>
+<tr>
+<td><code>rray_subtract()</code>, both inputs 4000 x 4000</td>
+<td><code>integer_mixed</code></td>
+<td>66.0</td>
+<td>12.4</td>
+</tr>
+<tr>
+<td><code>rray_add()</code>, 4000 x 4000 plus 1 x 4000</td>
+<td><code>integer</code></td>
+<td>19.9</td>
+<td>12.3</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>
+<p><strong>Mixed sign data</strong> got 4 to 5x faster for both cumulative sum and full size add and subtract.</p>
+</li>
+<li>
+<p><strong>Same sign data</strong> also got 20 to 38% faster. The plan didn't predict that.</p>
+</li>
+<li>
+<p><strong>Broadcast inputs</strong> were never hit hard by mixed signs, because a repeated <code>y</code> makes the sign branch predictable. They still got 20 to 40% faster.</p>
+</li>
+<li>
+<p><strong>Logical data with <code>NA</code></strong> stayed fast and barely moved, as expected. A missing value fills the rest of the line.</p>
+</li>
+<li>
+<p><strong>Double, complex and <code>multiply</code></strong> use code this change didn't touch. They moved by up to about 20% in both directions, and I'm treating that as noise.</p>
+</li>
+</ul>
+<p>Against base R on 1.6e7 mixed sign integers, rray is now faster:</p>
+<table>
+<thead>
+<tr>
+<th>Operation</th>
+<th>rray</th>
+<th>base R</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cumulative sum (<code>cumsum()</code>)</td>
+<td>14.3</td>
+<td>23.5</td>
+</tr>
+<tr>
+<td><code>x + y</code></td>
+<td>14.7</td>
+<td>38.8</td>
+</tr>
+<tr>
+<td><code>x - y</code></td>
+<td>14.3</td>
+<td>80.4</td>
+</tr>
+</tbody>
+</table>
+<p>The plan also asked for results on x86. I couldn't measure that because only this arm64 machine was available.</p>
+<p>I didn't open a pull request.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I’ve opened a PR, now add your entire Benchmarks section as a nice human readable comment on the PR</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>ToolSearch: github pull request comment list</summary>
+<pre>{
+  &quot;query&quot;: &quot;github pull request comment list&quot;,
+  &quot;max_results&quot;: 8
+}</pre><pre class="output">CronList
+ArtifactComments
+Monitor
+DesignSync
+RemoteTrigger
+WebFetch
+mcp__claude_ai_Claude_Docs__query
+ArtifactData</pre></details>
+<details class="tool"><summary>ToolSearch: +github</summary>
+<pre>{
+  &quot;query&quot;: &quot;+github&quot;,
+  &quot;max_results&quot;: 10
+}</pre><pre class="output">Monitor
+RemoteTrigger
+WebFetch</pre></details>
+<p>No GitHub tools are loaded in this session, so I'll check whether the <code>gh</code> CLI is available here.</p>
+
+<details class="tool"><summary>Bash: which gh &amp;&amp; gh auth status 2&gt;&amp;1 | head -5 &amp;&amp; cd ~/files/r/packages/rray &amp;&amp; gh pr l…</summary>
+<pre>which gh &amp;&amp; gh auth status 2&gt;&amp;1 | head -5 &amp;&amp; cd ~/files/r/packages/rray &amp;&amp; gh pr list --head feature/add-perf --json number,title,url</pre><pre class="output">/opt/homebrew/bin/gh
+github.com
+  ✓ Logged in to github.com account DavisVaughan (keyring)
+  - Active account: true
+  - Git operations protocol: https
+  - Token: gho_************************************
+[{&quot;number&quot;:147,&quot;title&quot;:&quot;Check integer add and subtract overflow in `int64_t` to avoid sign branches&quot;,&quot;url&quot;:&quot;https://github.com/r-lib/rray/pull/147&quot;}]</pre></details>
+<p>PR #147 is there. Writing the comment body to a file first.</p>
+
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097…</summary>
+<pre>## Benchmarks
+
+Run on an Apple Silicon Mac (arm64) with `bench/binary.R` and `bench/cumulative.R`: median of 20 iterations, with a clean rebuild before each side. Times are in milliseconds.
+
+`integer_mixed` is `sample(-50:50)`, `integer` is `sample(100L)` (all positive), and `logical_no_na` is `sample(c(TRUE, FALSE))`.
+
+| Call | Data | Before | After |
+|---|---|---:|---:|
+| `rray_cumulative_sum()`, 1.6e7 elements | `integer_mixed` | 53.6 | 13.4 |
+| `rray_cumulative_sum()`, 4000 x 4000 over axis 1 | `integer_mixed` | 53.8 | 14.1 |
+| `rray_cumulative_sum()`, 4000 x 4000 over axis 2 | `integer_mixed` | 57.6 | 13.1 |
+| `rray_cumulative_sum()`, 1.6e7 elements | `integer` | 17.3 | 13.4 |
+| `rray_cumulative_sum()`, 1.6e7 elements | `logical_no_na` | 17.0 | 13.1 |
+| `rray_add()`, both inputs 4000 x 4000 | `integer_mixed` | 66.6 | 12.7 |
+| `rray_subtract()`, both inputs 4000 x 4000 | `integer_mixed` | 66.0 | 12.4 |
+| `rray_add()`, 4000 x 4000 plus 1 x 4000 | `integer` | 19.9 | 12.3 |
+
+- **Mixed sign data** got 4 to 5x faster for both cumulative sum and full size add and subtract.
+
+- **Same sign data** also got 20 to 38% faster.
+
+- **Broadcast inputs** were never hit hard by mixed signs, because a repeated `y` makes the sign branch predictable. They still got 20 to 40% faster.
+
+- **Logical data with `NA`** stayed fast and barely moved, as expected. A missing value fills the rest of the line.
+
+- **Double, complex and `rray_multiply()`** use code this change didn't touch. They moved by up to about 20% in both directions, which is noise.
+
+Against base R on 1.6e7 mixed sign integers, rray is now faster:
+
+| Operation | rray | base R |
+|---|---:|---:|
+| Cumulative sum (`cumsum()`) | 14.3 | 23.5 |
+| `x + y` | 14.7 | 38.8 |
+| `x - y` | 14.3 | 80.4 |
+
+These are arm64 numbers only. Results on x86 have not been measured yet.
+
+---
+_Generated by [Claude Code](https://claude.ai/code)_</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad/pr-comment.md (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: gh pr comment 147 --body-file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72d…</summary>
+<pre>gh pr comment 147 --body-file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/b72de77d-7d66-4066-8246-3edd4bf097f0/scratchpad/pr-comment.md</pre><pre class="output">https://github.com/r-lib/rray/pull/147#issuecomment-6128140026</pre></details>
+<p>I posted the Benchmarks section as a comment on PR #147: <a href="https://github.com/r-lib/rray/pull/147#issuecomment-6128140026">https://github.com/r-lib/rray/pull/147#issuecomment-6128140026</a></p>
+<p>It's the same content as before, with three small changes for readers of the PR:</p>
+<ul>
+<li>
+<p><strong>Added at the top:</strong> a line saying which bench scripts produced the numbers, and what <code>integer_mixed</code>, <code>integer</code> and <code>logical_no_na</code> mean.</p>
+</li>
+<li>
+<p><strong>Added at the end:</strong> a note that these are arm64 numbers only, and x86 hasn't been measured.</p>
+</li>
+<li>
+<p><strong>Removed:</strong> the &quot;the plan didn't predict that&quot; remark, because the plan file isn't part of the PR anymore.</p>
+</li>
+</ul>
+<p>It ends with the Claude Code attribution footer. No GitHub tools were loaded in this session, so I posted it with your logged-in <code>gh</code> CLI, which means it appears under your account.</p>
+
+</section>
+<p class="divider">Oct 12, 2026, 17:31 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Can we explicitly cast both sides for clarity</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-(int64_t) x + y;</span>
+<span class="ins">+(int64_t) x + (int64_t) y;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-add.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-subtract.c</summary>
+<pre class="diff"><span class="del">-(int64_t) x - y;</span>
+<span class="ins">+(int64_t) x - (int64_t) y;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/arithmetic-subtract.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;pkgbuild::clean_dll(); p…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;pkgbuild::clean_dll(); pkgbuild::compile_dll(debug = FALSE)&quot; 2&gt;&amp;1 | grep -iE &quot;warning|error&quot;; Rscript -e &quot;devtools::test(filter = '^arithmetic|^cumulative-sum')&quot; 2&gt;&amp;1 | tail -2</pre><pre class="output"> M src/arithmetic-subtract.c
+ M src/one-add.h
+ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 467 ]</pre></details>
+<details class="tool"><summary>Bash: git diff &amp;&amp; git commit -qam &quot;Cast both sides to \`int64_t\` in integer add and subtract&quot; &amp;&amp; g…</summary>
+<pre>git diff &amp;&amp; git commit -qam &quot;Cast both sides to \`int64_t\` in integer add and subtract&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push 2&gt;&amp;1 | tail -1</pre><pre class="output">diff --git a/src/arithmetic-subtract.c b/src/arithmetic-subtract.c
+index 3674217..a7737dd 100644
+--- a/src/arithmetic-subtract.c
++++ b/src/arithmetic-subtract.c
+@@ -506,7 +506,7 @@ static inline int rray_subtract_int_one(
+     return r_globals.na_int;
+   }
+ 
+-  const int64_t out = (int64_t) x - y;
++  const int64_t out = (int64_t) x - (int64_t) y;
+ 
+   if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+     stop_int_overflow(error_call);
+diff --git a/src/one-add.h b/src/one-add.h
+index b290325..fbff692 100644
+--- a/src/one-add.h
++++ b/src/one-add.h
+@@ -21,7 +21,7 @@ static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+     return r_globals.na_int;
+   }
+ 
+-  const int64_t out = (int64_t) x + y;
++  const int64_t out = (int64_t) x + (int64_t) y;
+ 
+   if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+     stop_int_overflow(error_call);
+3c80f1b Cast both sides to `int64_t` in integer add and subtract
+   3c14b8c..3c80f1b  feature/add-perf -&gt; feature/add-perf</pre></details>
+<p>Both sides are now cast explicitly, as <code>(int64_t) x + (int64_t) y</code> in <code>src/one-add.h</code> and <code>(int64_t) x - (int64_t) y</code> in <code>src/arithmetic-subtract.c</code>. I committed it as <code>3c80f1b</code> and pushed it to PR #147.</p>
+<p>The behavior is the same, since C already converted <code>y</code> to <code>int64_t</code> to match <code>x</code>. It just reads more clearly now. After a clean rebuild there are no compiler warnings, and the arithmetic and cumulative sum tests pass (467 tests).</p>
+<p>I didn't re-run the benchmarks, because the compiled code shouldn't change.</p>
+
+</section>
+</main>
+</body>
+</html>

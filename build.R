@@ -33,6 +33,31 @@ review_title <- "/gh-pr-review"
 
 title_width <- 72L
 
+# Relative to a transcript page
+chart_url <- "../../"
+
+me_label <- "Davis"
+tool_labels <- c(claude = "Claude", codex = "Codex")
+
+transcript_lines <- 200L
+summary_width <- 100L
+
+# Names for the tools that Codex scripts call
+codex_tool_labels <- c(
+  exec_command = "Bash",
+  write_stdin = "Wait for output",
+  web__run = "Web"
+)
+
+# Local commands that say nothing about the work
+hidden_commands <- c("/clear", "/context", "/exit", "/login", "/usage")
+
+# GitHub, Anthropic, and OpenAI key prefixes
+secret_pattern <- paste0(
+  "\\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{22,}|",
+  "sk-ant-[A-Za-z0-9_-]{20,}|sk-(?:proj-)?[A-Za-z0-9_-]{20,})"
+)
+
 main <- function() {
   overrides <- yaml::read_yaml("overrides.yml")
 
@@ -48,6 +73,7 @@ main <- function() {
   report_unmatched(sessions, links)
 
   timeline <- build_timeline(commits, prs, sessions, links, overrides$labels)
+  write_transcripts(sessions, prs, links)
 
   dir.create("site", showWarnings = FALSE)
   jsonlite::write_json(
@@ -62,7 +88,7 @@ main <- function() {
     "Wrote {.file site/timeline.json}:",
     "{length(timeline$prs)} PRs,",
     "{length(timeline$commits)} commits,",
-    "{length(timeline$sessions)} sessions"
+    "{length(timeline$sessions)} sessions and their transcripts"
   ))
 }
 
@@ -287,16 +313,7 @@ read_sessions <- function() {
 
 read_claude_session <- function(path) {
   uuid <- sub("\\.jsonl$", "", basename(path))
-
-  # Some sessions carry copies of other sessions' entries
-  entries <- read_jsonl(path)
-  entries <- Filter(
-    function(entry) {
-      !isTRUE(entry$isSidechain) &&
-        (is.null(entry$sessionId) || identical(entry$sessionId, uuid))
-    },
-    entries
-  )
+  entries <- claude_entries(path)
 
   messages <- Filter(
     function(entry) is_type(entry, c("user", "assistant")),
@@ -340,6 +357,8 @@ read_claude_session <- function(path) {
   new_session(
     tool = "claude",
     uuid = uuid,
+    path = path,
+    cwd = Find(Negate(is.null), lapply(messages, function(entry) entry$cwd)),
     times = vapply(messages, function(entry) entry$timestamp, character(1)),
     branches = vapply(
       messages,
@@ -438,6 +457,8 @@ read_codex_session <- function(path) {
   new_session(
     tool = "codex",
     uuid = meta$id,
+    path = path,
+    cwd = meta$cwd,
     times = vapply(messages, function(entry) entry$timestamp, character(1)),
     # Codex only records the branch a session started on
     branches = c(
@@ -457,6 +478,8 @@ read_codex_session <- function(path) {
 new_session <- function(
   tool,
   uuid,
+  path,
+  cwd,
   times,
   branches,
   prompts,
@@ -480,6 +503,8 @@ new_session <- function(
     id = paste0(tool, "-", substr(uuid, nchar(uuid) - 7L, nchar(uuid))),
     tool = tool,
     agent = agent,
+    path = path,
+    cwd = cwd,
     title = session_title(prompts),
     branches = branches,
     start = times[[1L]],
@@ -489,6 +514,18 @@ new_session <- function(
     replies = replies,
     tokens = input_tokens + output_tokens,
     pr_links = unique(pr_links)
+  )
+}
+
+# Some sessions carry copies of other sessions' entries
+claude_entries <- function(path) {
+  uuid <- sub("\\.jsonl$", "", basename(path))
+  Filter(
+    function(entry) {
+      !isTRUE(entry$isSidechain) &&
+        (is.null(entry$sessionId) || identical(entry$sessionId, uuid))
+    },
+    read_jsonl(path)
   )
 }
 
@@ -553,11 +590,7 @@ session_title <- function(prompts) {
     return(review_title)
   }
   lines <- strsplit(trimws(prompt), "\n", fixed = TRUE)[[1L]]
-  title <- trimws(lines[[1L]])
-  if (nchar(title) > title_width) {
-    title <- paste0(substr(title, 1L, title_width - 1L), "…")
-  }
-  title
+  ellipsize(trimws(lines[[1L]]), title_width)
 }
 
 retitle <- function(sessions, titles) {
@@ -746,6 +779,7 @@ build_timeline <- function(commits, prs, sessions, links, labels) {
       tool = session$tool,
       agent = session$agent,
       title = session$title,
+      page = page_path(session$id),
       segments = lapply(session$segments, format_time),
       messages = list(user = session$prompts, assistant = session$replies),
       tokens = session$tokens,
@@ -837,6 +871,750 @@ invert <- function(links, numbers) {
 }
 
 # ------------------------------------------------------------------------------
+# Transcripts
+
+page_path <- function(id) {
+  paste0("transcripts/", id, ".html")
+}
+
+write_transcripts <- function(sessions, prs, links) {
+  dir.create("site/transcripts", showWarnings = FALSE)
+  unlink(list.files(
+    "site/transcripts",
+    pattern = "\\.html$",
+    full.names = TRUE
+  ))
+
+  urls <- vapply(prs, function(pr) pr$url, character(1))
+  names(urls) <- vapply(prs, function(pr) pr$number, integer(1))
+
+  for (session in sessions) {
+    items <- switch(
+      session$tool,
+      claude = claude_items(
+        claude_entries(session$path),
+        session$cwd,
+        claude_subagents(session$path)
+      ),
+      codex = codex_items(read_jsonl(session$path), session$cwd)
+    )
+    page <- transcript_page(session, items, links[[session$id]], urls)
+    page <- redact(page, session$id)
+    writeLines(page, file.path("site", page_path(session$id)), useBytes = TRUE)
+  }
+}
+
+transcript_page <- function(session, items, prs, urls) {
+  title <- if (is.na(session$title)) "Untitled session" else session$title
+
+  pr_links <- vapply(
+    prs,
+    function(number) {
+      sprintf('<a href="%s">#%d</a>', urls[[as.character(number)]], number)
+    },
+    character(1)
+  )
+  back <- if (length(prs)) {
+    sprintf("%s#pr-%d", chart_url, prs[[1L]])
+  } else {
+    chart_url
+  }
+
+  facts <- c(
+    tool_labels[[session$tool]],
+    if (session$agent) "started by Claude",
+    format_day(session$start),
+    plural(session$prompts, "prompt", "prompts"),
+    plural(session$replies, "reply", "replies"),
+    if (length(prs)) paste(pr_links, collapse = ", ") else "didn't ship"
+  )
+
+  labels <- c(
+    user = if (session$agent) "Claude" else me_label,
+    assistant = tool_labels[[session$tool]]
+  )
+
+  paste0(
+    '<!doctype html>\n<html lang="en">\n<head>\n',
+    '<meta charset="utf-8">\n',
+    '<meta name="viewport" content="width=device-width, initial-scale=1">\n',
+    "<title>",
+    html_escape(gsub("`", "", title, fixed = TRUE)),
+    "</title>\n",
+    '<link rel="icon" href="data:,">\n',
+    '<link rel="stylesheet" href="transcript.css">\n',
+    sprintf('</head>\n<body class="%s">\n<header>\n', session$tool),
+    sprintf('<a class="back" href="%s">rray timeline</a>\n', back),
+    "<h1>",
+    inline_html(title),
+    "</h1>\n",
+    '<p class="facts">',
+    paste(facts, collapse = " · "),
+    "</p>\n</header>\n<main>\n",
+    render_turns(items, labels),
+    "\n</main>\n</body>\n</html>"
+  )
+}
+
+# Groups items into turns, with a divider wherever the conversation went idle
+render_turns <- function(items, labels, dividers = TRUE) {
+  out <- character()
+  role <- NULL
+  last <- NA_real_
+
+  for (item in items) {
+    time <- as.numeric(item$time)
+    gap <- dividers &&
+      !is.na(time) &&
+      (is.na(last) || time - last > segment_gap)
+
+    if (gap || !identical(item$role, role)) {
+      if (!is.null(role)) {
+        out <- c(out, "</section>")
+      }
+      if (gap) {
+        out <- c(
+          out,
+          sprintf('<p class="divider">%s</p>', format_minute(item$time))
+        )
+      }
+      out <- c(
+        out,
+        sprintf(
+          '<section class="turn turn-%s">\n<p class="who">%s</p>',
+          item$role,
+          labels[[item$role]]
+        )
+      )
+      role <- item$role
+    }
+
+    if (!is.na(time)) {
+      last <- time
+    }
+    out <- c(out, item$html)
+  }
+
+  if (!is.null(role)) {
+    out <- c(out, "</section>")
+  }
+  paste(out, collapse = "\n")
+}
+
+new_item <- function(role, time, html) {
+  list(role = role, time = time, html = html)
+}
+
+prose_item <- function(role, time, text) {
+  if (!nzchar(trimws(text))) {
+    return(NULL)
+  }
+  new_item(role, time, markdown(text, hardbreaks = role == "user"))
+}
+
+thinking_item <- function(time, text) {
+  if (!nzchar(trimws(text))) {
+    return(NULL)
+  }
+  new_item(
+    "assistant",
+    time,
+    paste0(
+      '<details class="thinking"><summary>Thinking</summary>\n',
+      markdown(text),
+      "</details>"
+    )
+  )
+}
+
+tool_html <- function(summary, input, output, error = FALSE, children = NULL) {
+  paste0(
+    '<details class="tool',
+    if (error) " tool-error",
+    '"><summary>',
+    html_escape(ellipsize(summary, summary_width)),
+    "</summary>\n",
+    paste(input, collapse = "\n"),
+    children,
+    if (length(output) && nzchar(output)) pre_html(output, "output"),
+    "</details>"
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Claude transcripts
+
+claude_items <- function(entries, cwd, subagents = character()) {
+  results <- claude_results(entries)
+
+  items <- lapply(entries, function(entry) {
+    if (is_type(entry, "assistant")) {
+      time <- parse_time(entry$timestamp)
+      lapply(entry$message$content, function(block) {
+        switch(
+          block$type,
+          text = prose_item("assistant", time, block$text),
+          thinking = thinking_item(time, block$thinking %||% ""),
+          tool_use = new_item(
+            "assistant",
+            time,
+            claude_tool_html(block, results[[block$id]], cwd, subagents)
+          )
+        )
+      })
+    } else if (is_type(entry, "user") && !isTRUE(entry$isMeta)) {
+      time <- parse_time(entry$timestamp)
+      content <- entry$message$content
+      prompt <- claude_prompt(content)
+      if (!is.null(prompt)) {
+        return(list(prose_item("user", time, prompt)))
+      }
+      command <- claude_command(content)
+      if (!is.null(command)) {
+        return(list(new_item("user", time, command)))
+      }
+      NULL
+    }
+  })
+
+  compact(unlist(items, recursive = FALSE))
+}
+
+# Tool results by the id of the call they answer
+claude_results <- function(entries) {
+  results <- list()
+  for (entry in entries) {
+    content <- entry$message$content
+    if (!is_type(entry, "user") || !is.list(content)) {
+      next
+    }
+    for (block in content) {
+      if (identical(block$type, "tool_result")) {
+        results[[block$tool_use_id]] <- list(
+          text = claude_result_text(block$content),
+          error = isTRUE(block$is_error)
+        )
+      }
+    }
+  }
+  results
+}
+
+claude_result_text <- function(content) {
+  if (is.list(content)) {
+    content <- vapply(
+      content,
+      function(block) {
+        switch(
+          block$type,
+          text = block$text,
+          image = "[image]",
+          tool_reference = block$tool_name %||% "",
+          ""
+        )
+      },
+      character(1)
+    )
+    content <- paste(content[nzchar(content)], collapse = "\n")
+  }
+  content <- content %||% ""
+
+  # Large outputs are saved next to the session, with only a stub inline
+  saved <- regmatches(
+    content,
+    regexec("Full output saved to: (\\S+)", content)
+  )[[1L]]
+  if (length(saved) && file.exists(saved[[2L]])) {
+    content <- paste(
+      readLines(saved[[2L]], warn = FALSE, encoding = "UTF-8"),
+      collapse = "\n"
+    )
+  }
+
+  content
+}
+
+# Subagent transcripts by the id of the tool call that started them
+claude_subagents <- function(path) {
+  dir <- file.path(sub("\\.jsonl$", "", path), "subagents")
+  metas <- list.files(dir, pattern = "\\.meta\\.json$", full.names = TRUE)
+  ids <- vapply(
+    metas,
+    function(meta) jsonlite::read_json(meta)$toolUseId %||% NA_character_,
+    character(1)
+  )
+  stats::setNames(sub("\\.meta\\.json$", ".jsonl", metas), ids)
+}
+
+claude_command <- function(content) {
+  if (!is.character(content)) {
+    return(NULL)
+  }
+  name <- regmatches(
+    content,
+    regexec("<command-name>(/[^<]+)</command-name>", content)
+  )[[1L]]
+  if (length(name) == 0L || name[[2L]] %in% hidden_commands) {
+    return(NULL)
+  }
+  args <- regmatches(
+    content,
+    regexec("<command-args>([^<]*)</command-args>", content)
+  )[[1L]]
+  args <- if (length(args)) trimws(args[[2L]]) else ""
+
+  paste0(
+    '<p class="command"><code>',
+    html_escape(name[[2L]]),
+    "</code>",
+    if (nzchar(args)) paste0(" ", html_escape(args)),
+    "</p>"
+  )
+}
+
+claude_tool_html <- function(block, result, cwd, subagents) {
+  input <- block$input
+
+  children <- NULL
+  subagent <- subagents[block$id]
+  if (!is.na(subagent) && file.exists(subagent)) {
+    # The subagent's own prompt is the tool input
+    items <- Filter(
+      function(item) item$role == "assistant",
+      claude_items(read_jsonl(subagent), cwd)
+    )
+    children <- paste0(
+      '<div class="subagent">\n',
+      render_turns(items, c(assistant = "Subagent"), dividers = FALSE),
+      "\n</div>"
+    )
+  }
+
+  tool_html(
+    summary = claude_tool_summary(block$name, input, cwd),
+    input = claude_tool_input(block$name, input),
+    output = result$text,
+    error = isTRUE(result$error),
+    children = children
+  )
+}
+
+claude_tool_summary <- function(name, input, cwd) {
+  switch(
+    name,
+    Read = ,
+    Edit = ,
+    Write = paste(name, relative_path(input$file_path, cwd)),
+    NotebookEdit = paste(name, relative_path(input$notebook_path, cwd)),
+    WebFetch = paste(name, input$url),
+    Bash = paste0(name, ": ", first_line(input$command)),
+    Agent = ,
+    Task = paste0(name, ": ", input$description),
+    AskUserQuestion = paste0("Question: ", input$questions[[1L]]$question),
+    WebSearch = ,
+    ToolSearch = paste0(name, ": ", input$query),
+    name
+  )
+}
+
+claude_tool_input <- function(name, input) {
+  switch(
+    name,
+    Read = NULL,
+    Bash = pre_html(input$command),
+    Edit = diff_html(c(
+      paste0("-", split_lines(input$old_string)),
+      paste0("+", split_lines(input$new_string))
+    )),
+    Write = pre_html(input$content),
+    Agent = ,
+    Task = markdown(input$prompt),
+    AskUserQuestion = questions_html(
+      vapply(input$questions, function(q) q$question, character(1)),
+      lapply(input$questions, function(q) {
+        vapply(q$options, function(option) option$label, character(1))
+      })
+    ),
+    if (length(input)) {
+      pre_html(jsonlite::toJSON(input, auto_unbox = TRUE, pretty = TRUE))
+    }
+  )
+}
+
+# ------------------------------------------------------------------------------
+# Codex transcripts
+
+codex_items <- function(entries, cwd) {
+  outputs <- codex_outputs(entries)
+
+  items <- lapply(entries, function(entry) {
+    if (!is_type(entry, "response_item")) {
+      return(NULL)
+    }
+    payload <- entry$payload
+    time <- parse_time(entry$timestamp)
+
+    switch(
+      payload$type,
+      message = {
+        text <- codex_text(payload$content)
+        if (identical(payload$role, "assistant")) {
+          prose_item("assistant", time, text)
+        } else if (identical(payload$role, "user") && is_prompt(text)) {
+          prose_item("user", time, text)
+        }
+      },
+      reasoning = thinking_item(
+        time,
+        paste(
+          vapply(
+            payload$summary,
+            function(block) block$text %||% "",
+            character(1)
+          ),
+          collapse = "\n\n"
+        )
+      ),
+      function_call = ,
+      custom_tool_call = {
+        input <- payload$input %||% payload$arguments
+        new_item(
+          "assistant",
+          time,
+          tool_html(
+            summary = codex_tool_summary(payload$name, input, cwd),
+            input = codex_tool_input(payload$name, input),
+            output = outputs[[payload$call_id]]
+          )
+        )
+      }
+    )
+  })
+
+  compact(items)
+}
+
+codex_text <- function(content) {
+  paste(
+    vapply(content, function(block) block$text %||% "", character(1)),
+    collapse = ""
+  )
+}
+
+# Tool outputs by the id of the call they answer
+codex_outputs <- function(entries) {
+  outputs <- list()
+  for (entry in entries) {
+    if (!is_type(entry, "response_item")) {
+      next
+    }
+    payload <- entry$payload
+
+    if (payload$type %in% c("function_call_output", "custom_tool_call_output")) {
+      outputs[[payload$call_id]] <- codex_output_text(payload$output)
+      next
+    }
+
+    if (!identical(payload$type, "message")) {
+      next
+    }
+
+    # Answers to `request_user_input_async` arrive as a separate user message
+    text <- codex_text(payload$content)
+    reply <- regmatches(
+      text,
+      regexec(
+        "^<send_user_message_question_reply>(.*)</send_user_message_question_reply>",
+        text
+      )
+    )[[1L]]
+    if (length(reply) == 0L) {
+      next
+    }
+    for (answer in jsonlite::parse_json(reply[[2L]])) {
+      call_id <- jsonlite::parse_json(answer$questionItemId)[[2L]]
+      outputs[[call_id]] <- paste(
+        c(outputs[[call_id]], answer$question, paste("→", answer$answer)),
+        collapse = "\n"
+      )
+    }
+  }
+  outputs
+}
+
+codex_output_text <- function(output) {
+  if (is.character(output)) {
+    return(output)
+  }
+  texts <- vapply(
+    output,
+    function(block) unwrap_outputs(block$text %||% ""),
+    character(1)
+  )
+  paste(texts[nzchar(texts)], collapse = "\n")
+}
+
+# `exec` results are JSON that wraps each command's output
+unwrap_outputs <- function(text) {
+  value <- tryCatch(jsonlite::parse_json(text), error = function(e) NULL)
+  if (!is.list(value)) {
+    return(text)
+  }
+
+  outputs <- character()
+  walk <- function(x) {
+    if (!is.list(x)) {
+      return()
+    }
+    if (is.character(x$output) && length(x$output) == 1L) {
+      outputs[[length(outputs) + 1L]] <<- x$output
+    }
+    lapply(x, walk)
+  }
+  walk(value)
+
+  if (length(outputs)) paste(outputs, collapse = "\n") else text
+}
+
+codex_tool_summary <- function(name, input, cwd) {
+  if (name == "request_user_input_async") {
+    questions <- jsonlite::parse_json(input)$questions
+    return(paste0("Question: ", questions[[1L]]$title))
+  }
+  if (name != "exec") {
+    return(name)
+  }
+
+  files <- patch_files(codex_patches(input))
+  if (length(files)) {
+    return(paste("Edit", with_more(relative_path(files, cwd))))
+  }
+
+  commands <- codex_commands(input)
+  if (length(commands)) {
+    return(paste0("Bash: ", with_more(first_line(commands))))
+  }
+
+  tools <- regmatches(input, gregexpr("(?<=tools\\.)\\w+", input, perl = TRUE))
+  tools <- unique(tools[[1L]])
+  if (length(tools)) {
+    labels <- codex_tool_labels[tools]
+    return(paste(ifelse(is.na(labels), tools, labels), collapse = ", "))
+  }
+
+  first_line(input)
+}
+
+codex_tool_input <- function(name, input) {
+  if (name == "request_user_input_async") {
+    questions <- jsonlite::parse_json(input)$questions
+    return(questions_html(
+      vapply(questions, function(q) q$title, character(1)),
+      lapply(questions, function(q) as.character(unlist(q$options)))
+    ))
+  }
+  if (name != "exec") {
+    return(pre_html(input))
+  }
+
+  patches <- codex_patches(input)
+  if (length(patches)) {
+    return(diff_html(split_lines(paste(patches, collapse = "\n"))))
+  }
+
+  commands <- codex_commands(input)
+  if (length(commands)) {
+    return(pre_html(paste0("$ ", commands, collapse = "\n")))
+  }
+
+  pre_html(input)
+}
+
+codex_patches <- function(code) {
+  patches <- regmatches(
+    code,
+    gregexpr("(?s)\\*\\*\\* Begin Patch.*?\\*\\*\\* End Patch", code, perl = TRUE)
+  )[[1L]]
+
+  out <- character()
+  for (patch in patches) {
+    # Template literals hold real newlines, string literals hold escapes
+    template <- grepl("\n", patch, fixed = TRUE)
+
+    # A patch assembled in code spans more than one literal
+    if (template && grepl("`", patch, fixed = TRUE)) {
+      next
+    }
+    if (!template && grepl('(?<!\\\\)"', patch, perl = TRUE)) {
+      next
+    }
+
+    out <- c(out, if (template) patch else decode_js_string(patch))
+  }
+  out
+}
+
+patch_files <- function(patches) {
+  files <- regmatches(
+    patches,
+    gregexpr(
+      "(?m)^\\*\\*\\* (?:Update|Add|Delete) File: \\K.+$",
+      patches,
+      perl = TRUE
+    )
+  )
+  unique(trimws(unlist(files)))
+}
+
+# Shell commands from `cmd: "..."` arguments, or a `cmds = [...]` array
+codex_commands <- function(code) {
+  commands <- js_strings(code, '(?<!\\w)"?cmd"?\\s*:\\s*')
+  if (length(commands)) {
+    return(commands)
+  }
+  array <- regmatches(
+    code,
+    regexec("(?s)(?<!\\w)cmds\\s*=\\s*\\[(.*?)\\]", code, perl = TRUE)
+  )[[1L]]
+  if (length(array)) js_strings(array[[2L]]) else character()
+}
+
+# Double quoted JS strings, each following `prefix`
+js_strings <- function(code, prefix = "") {
+  pattern <- paste0(prefix, '"((?:[^"\\\\]|\\\\.)*)"')
+  matches <- regmatches(code, gregexpr(pattern, code, perl = TRUE))[[1L]]
+  vapply(
+    sub(pattern, "\\1", matches, perl = TRUE),
+    decode_js_string,
+    character(1),
+    USE.NAMES = FALSE
+  )
+}
+
+decode_js_string <- function(x) {
+  tryCatch(
+    jsonlite::parse_json(paste0('"', x, '"')),
+    error = function(e) x
+  )
+}
+
+# ------------------------------------------------------------------------------
+# HTML
+
+markdown <- function(text, hardbreaks = FALSE) {
+  # commonmark passes raw HTML through, so `<` is shielded from it
+  text <- gsub("<", "", text, fixed = TRUE)
+  html <- commonmark::markdown_html(
+    text,
+    hardbreaks = hardbreaks,
+    extensions = TRUE
+  )
+  html <- gsub("", "&lt;", html, fixed = TRUE)
+
+  # Links to local files are dead on the web
+  gsub(
+    '<a href="(?!https?://)[^"]*">(.*?)</a>',
+    "\\1",
+    html,
+    perl = TRUE
+  )
+}
+
+pre_html <- function(text, class = NULL) {
+  lines <- split_lines(text)
+  cut <- length(lines) - transcript_lines
+  if (cut > 0L) {
+    lines <- lines[seq_len(transcript_lines)]
+  }
+  paste0(
+    "<pre",
+    if (!is.null(class)) sprintf(' class="%s"', class),
+    ">",
+    html_escape(paste(lines, collapse = "\n")),
+    "</pre>",
+    cut_html(cut)
+  )
+}
+
+diff_html <- function(lines) {
+  cut <- length(lines) - transcript_lines
+  if (cut > 0L) {
+    lines <- lines[seq_len(transcript_lines)]
+  }
+  classes <- ifelse(
+    startsWith(lines, "+") & !startsWith(lines, "+++"),
+    "ins",
+    ifelse(
+      startsWith(lines, "-") & !startsWith(lines, "---"),
+      "del",
+      ifelse(startsWith(lines, "@@") | startsWith(lines, "***"), "hunk", "")
+    )
+  )
+  lines <- ifelse(
+    nzchar(classes),
+    sprintf('<span class="%s">%s</span>', classes, html_escape(lines)),
+    html_escape(lines)
+  )
+  paste0(
+    '<pre class="diff">',
+    paste(lines, collapse = "\n"),
+    "</pre>",
+    cut_html(cut)
+  )
+}
+
+cut_html <- function(cut) {
+  if (cut <= 0L) {
+    return("")
+  }
+  sprintf(
+    '<p class="cut">%s more line%s cut</p>',
+    format(cut, big.mark = ","),
+    if (cut == 1L) "" else "s"
+  )
+}
+
+questions_html <- function(questions, options) {
+  markdown(paste(
+    vapply(
+      seq_along(questions),
+      function(i) {
+        paste(c(questions[[i]], paste("-", options[[i]])), collapse = "\n")
+      },
+      character(1)
+    ),
+    collapse = "\n\n"
+  ))
+}
+
+inline_html <- function(text) {
+  gsub("`([^`]+)`", "<code>\\1</code>", html_escape(text))
+}
+
+html_escape <- function(text) {
+  text <- gsub("&", "&amp;", text, fixed = TRUE)
+  text <- gsub("<", "&lt;", text, fixed = TRUE)
+  text <- gsub(">", "&gt;", text, fixed = TRUE)
+  gsub('"', "&quot;", text, fixed = TRUE)
+}
+
+# Fails rather than masks, so a leaked token is noticed and revoked
+redact <- function(page, id) {
+  page <- gsub("/Users/davis", "~", page, fixed = TRUE)
+
+  secrets <- regmatches(page, gregexpr(secret_pattern, page, perl = TRUE))
+  secrets <- unique(secrets[[1L]])
+  if (length(secrets)) {
+    cli::cli_abort(c(
+      "The transcript of {.field {id}} contains {length(secrets)} token-shaped string{?s}.",
+      "i" = "Starting with: {.val {substr(secrets, 1, 10)}}"
+    ))
+  }
+
+  page
+}
+
+# ------------------------------------------------------------------------------
 # Utils
 
 git <- function(..., error_on_status = TRUE) {
@@ -873,6 +1651,59 @@ parse_time <- function(x) {
 
 format_time <- function(x) {
   format(x, "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+}
+
+format_day <- function(x) {
+  paste0(format(x, "%b "), as.integer(format(x, "%d")), format(x, ", %Y"))
+}
+
+format_minute <- function(x) {
+  paste0(format_day(x), format(x, ", %H:%M UTC"))
+}
+
+relative_path <- function(path, cwd) {
+  path <- path %||% ""
+  if (is.null(cwd)) {
+    return(path)
+  }
+  prefix <- paste0(cwd, "/")
+  ifelse(startsWith(path, prefix), substring(path, nchar(prefix) + 1L), path)
+}
+
+split_lines <- function(text) {
+  text <- paste(text %||% "", collapse = "\n")
+  if (!nzchar(text)) {
+    return(character())
+  }
+  strsplit(text, "\n", fixed = TRUE)[[1L]]
+}
+
+first_line <- function(text) {
+  vapply(
+    text,
+    function(x) {
+      lines <- split_lines(trimws(x))
+      if (length(lines)) lines[[1L]] else ""
+    },
+    character(1),
+    USE.NAMES = FALSE
+  )
+}
+
+with_more <- function(x) {
+  if (length(x) > 1L) {
+    paste0(x[[1L]], " (+", length(x) - 1L, " more)")
+  } else {
+    x
+  }
+}
+
+ellipsize <- function(x, width) {
+  if (nchar(x) > width) paste0(substr(x, 1L, width - 1L), "…") else x
+}
+
+plural <- function(n, one, many) {
+  paste(n, if (n == 1L) one else many)
 }
 
 sum_field <- function(entries, fields) {

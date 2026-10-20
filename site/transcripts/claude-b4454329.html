@@ -1,0 +1,1414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnosing stale pointers from the r_wrap() ALTREP wrapper</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../">rray timeline</a>
+<h1>Diagnosing stale pointers from the <code>r_wrap()</code> ALTREP wrapper</h1>
+<p class="facts">Claude · Oct 13, 2026 · 6 prompts · 10 replies · didn't ship</p>
+</header>
+<main>
+<p class="divider">Oct 13, 2026, 19:54 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I think there may be an unsoundness in <code>r_wrap()</code>. We return an ALTREP wrapper class where <code>DATAPTR_RO</code> method can return a pointer into the underlying data. This can be a long lived pointer. If the wrapper object is forcibly materialized while someone is holding one of those read only pointers, I think the pointer can go stale out from under them. Is this correct? I think base R also had to deal with something like this recently according to their git log</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray 2&gt;/dev/null || pwd; grep -rn &quot;r_wrap\|wrap&quot; src --inclu…</summary>
+<pre>cd ~/files/r/packages/rray 2&gt;/dev/null || pwd; grep -rn &quot;r_wrap\|wrap&quot; src --include=*.c --include=*.h -l | grep -v &quot;^src/rlang&quot; ; grep -rln &quot;r_wrap&quot; src</pre><pre class="output">(eval):1: no matches found: --include=*.c
+src/names.c
+src/wrapper.h
+src/dimensions.c
+src/dimensionality.c
+src/remove-axes.c
+src/titles.c
+src/insert-axes.c
+src/wrapper.c
+src/utils.c</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; cat src/wrapper.h src/wrapper.c; ls src/decl | grep wr…</summary>
+<pre>cd ~/files/r/packages/rray; cat src/wrapper.h src/wrapper.c; ls src/decl | grep wrap &amp;&amp; cat src/decl/wrapper-decl.h</pre><pre class="output">#ifndef RRAY_WRAPPER_H
+#define RRAY_WRAPPER_H
+
+#include &quot;rlang.h&quot;
+
+r_obj* r_wrap(r_obj* x);
+
+#endif
+#include &quot;wrapper.h&quot;
+
+#include &lt;R_ext/Altrep.h&gt;
+
+#include &quot;clone.h&quot;
+
+#include &quot;decl/wrapper-decl.h&quot;
+
+static char* package = &quot;rray&quot;;
+
+// Wrap an R object in a lightweight ALTREP wrapper
+//
+// Useful when only modifying the attributes of an object,
+// without touching the underlying data.
+//
+// - Read only accesses to the data are &quot;passed through&quot; to the wrapped object
+// - Writable access forces a shallow duplication of the wrapped object if it
+//   EVER looks shared, which happens if we are wrapping a basic R object
+//   supplied from the R side by a user, or if we rewrap a wrapper's underlying
+//   data (because the original wrapper also shares it).
+r_obj* r_wrap(r_obj* x) {
+  R_altrep_class_t cls = wrapper_class(r_typeof(x));
+
+  // If `x` is a wrapper, unwrap it to gain access to the underlying data. This
+  // is what we wrap and bump the reference count of. This avoids a
+  // proliferation of wrappers. We manage writable access to the underlying data
+  // by always cloning it before giving out a writable handle if it is ever
+  // `MAYBE_SHARED()` (i.e. a ref count &gt;1), meaning that we aren't the sole
+  // owner of it at that time.
+  r_obj* data = is_wrapper(x) ? wrapper_readonly(x) : x;
+
+  // Reference count on `data` is bumped when we wrap it here.
+  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+
+  // Creates a fresh attribute pairlist!
+  // Note that we always use `x` here, not `data`.
+  r_attrib_clone_from(out, x);
+
+  FREE(1);
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// Class
+
+static R_altrep_class_t wrapper_logical_class;
+static R_altrep_class_t wrapper_integer_class;
+static R_altrep_class_t wrapper_double_class;
+static R_altrep_class_t wrapper_complex_class;
+static R_altrep_class_t wrapper_raw_class;
+static R_altrep_class_t wrapper_character_class;
+static R_altrep_class_t wrapper_list_class;
+
+static inline bool is_wrapper(r_obj* x) {
+  if (!ALTREP(x)) {
+    return false;
+  }
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    return R_altrep_inherits(x, wrapper_logical_class);
+  case R_TYPE_integer:
+    return R_altrep_inherits(x, wrapper_integer_class);
+  case R_TYPE_double:
+    return R_altrep_inherits(x, wrapper_double_class);
+  case R_TYPE_complex:
+    return R_altrep_inherits(x, wrapper_complex_class);
+  case R_TYPE_raw:
+    return R_altrep_inherits(x, wrapper_raw_class);
+  case R_TYPE_character:
+    return R_altrep_inherits(x, wrapper_character_class);
+  case R_TYPE_list:
+    return R_altrep_inherits(x, wrapper_list_class);
+  default:
+    return false;
+  }
+}
+
+static inline R_altrep_class_t wrapper_class(enum r_type type) {
+  switch (type) {
+  case R_TYPE_logical:
+    return wrapper_logical_class;
+  case R_TYPE_integer:
+    return wrapper_integer_class;
+  case R_TYPE_double:
+    return wrapper_double_class;
+  case R_TYPE_complex:
+    return wrapper_complex_class;
+  case R_TYPE_raw:
+    return wrapper_raw_class;
+  case R_TYPE_character:
+    return wrapper_character_class;
+  case R_TYPE_list:
+    return wrapper_list_class;
+  default:
+    r_abort(&quot;Can't wrap a %s.&quot;, Rf_type2char(type));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Data
+
+static inline r_obj* wrapper_readonly(r_obj* x) {
+  return R_altrep_data1(x);
+}
+
+static inline r_obj* wrapper_writable(r_obj* x) {
+  r_obj* data = R_altrep_data1(x);
+
+  // If ANYONE besides us shares the wrapped data, clone it
+  // before giving out a writable handle.
+  if (MAYBE_SHARED(data)) {
+    data = r_clone_data(data);
+    R_set_altrep_data1(x, data);
+  }
+
+  return data;
+}
+
+// -----------------------------------------------------------------------------
+// Generic
+
+static r_obj* wrapper_serialized_state(r_obj* x) {
+  // Full serialization, lose ALTREP-ness
+  return NULL;
+}
+
+// Powers `Rf_duplicate()` and `Rf_shallow_duplicate()`
+static r_obj* wrapper_duplicate(r_obj* x, Rboolean deep) {
+  if (deep) {
+    // Wrapper only guarantees shallow ownership.
+    // No need to return another wrapper if we fully duplicate.
+    return Rf_duplicate(wrapper_readonly(x));
+  } else {
+    // Perform shallow duplication by rewrapping the wrapped
+    // data in a new wrapper. This won't wrap the wrapper itself.
+    return r_wrap(x);
+  }
+}
+
+static Rboolean wrapper_inspect(
+  r_obj* x,
+  int pre,
+  int deep,
+  int pvec,
+  void (*inspect_subtree)(r_obj*, int, int, int)
+) {
+  Rprintf(&quot;&lt;wrapper&gt;\n&quot;);
+  inspect_subtree(wrapper_readonly(x), pre, deep, pvec);
+  return TRUE;
+}
+
+static r_ssize wrapper_length(r_obj* x) {
+  return r_length(wrapper_readonly(x));
+}
+
+// -----------------------------------------------------------------------------
+// Dataptr
+
+static void* wrapper_logical_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_lgl_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_lgl_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_integer_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_int_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_int_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_double_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_dbl_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_dbl_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_complex_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_cpl_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_cpl_cbegin(wrapper_readonly(x));
+  }
+}
+</pre><p class="cut">322 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git log --oneline -n 3; git log -i --grep=wrapper --since=2023…</summary>
+<pre>cd ~/files/r/r-svn; git log --oneline -n 3; git log -i --grep=wrapper --since=2023-01-01 --format='%h %ad %s' --date=short | head -30; git log -i --grep='DATAPTR' --since=2023-01-01 --format='%h %ad %s' --date=short | head -30</pre><pre class="output">e79cedcd25 tweak datalist doc (PR#18015)
+ef666ce93b Have fisher.test() and mantelhaen.test() optionally compute central instead of minlike exact two-sided p-values.
+c27713a754 fix for 18842
+dec7e930bf 2024-03-08 Add and use inferior call wrapper for pkgVignettes().
+1b2929f1cb 2023-12-26 mention need to use wrappers for ar and ranlib
+1bb9eb5020 2023-02-04 allow for wrappers such as ccache
+981bad601a 2023-02-04 notes if CC etc are wrappers
+0bd5d6e600 2026-03-03 Move the declaration of DATAPTR from Rinternals.h to Defn.h.
+baf70919b5 2026-03-03 Move declaration for STDVEC_DATAPTR and hide entry point.
+01101b190d 2025-11-15 Upgrade check NOTE for using DATAPTR to WARNING.
+5afad7a0f1 2025-11-15 Add NEWS item for DATAPTR_RW.
+0b8f647dac 2025-11-15 Add DATAPTR_RW for use in ALTREP Dataptr methods.
+44dc8f4617 2025-11-12 Use STDVEC_DATAPTR instead of DATAPTR.
+a5fd5247c5 2025-11-12 Add BCODE_PTR macro and drop uing DATAPTR in eval.c.
+3db3c01394 2025-11-12 Prepare for droppin DATAPTR from Rinternals.h.
+8f420f0d24 2024-12-17 Turn accesses to 0-length vector elements to segfault also in Rf_ accessors with inlined DATAPTR().
+b1ad899d23 2023-03-16 VECTOR_ELT_0 and SET_VECTOR_ELT_0 macros in memory.c should use STDVEC_DATAPTR (PR18493).
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git log --since=2024-06-01 --format='%h %ad %s' --date=short -…</summary>
+<pre>cd ~/files/r/r-svn; git log --since=2024-06-01 --format='%h %ad %s' --date=short -- src/main/altclasses.c src/main/altrep.c | head -30; grep -n &quot;wrapper_Dataptr\b&quot; -A30 src/main/altclasses.c | head -60</pre><pre class="output">648c5b1786 2025-12-30 Add R_altrep_class_name and R_altrep_class_package.
+28539f0c7d 2025-12-18 Handle assigning a compact integer sequence as rownames more efficiently. Reported by Davis Vaughan in https://github.com/r-devel/r-dev-day/y/issues/146 r-dev-day
+0b8f647dac 2025-11-15 Add DATAPTR_RW for use in ALTREP Dataptr methods.
+8d4c760c62 2025-03-08 C standard has attributes before return values
+0b58c375af 2025-02-25 more Rboolean tweaks
+acfdf3d8d7 2024-09-20 -Wall; cosmetic
+a8a07f2746 2024-09-20 Memcpy, memmove and memset should be only called on valid pointers even when the size is zero to avoid undefined behavior.
+1533:static void *wrapper_Dataptr(SEXP x, Rboolean writeable)
+1534-{
+1535-    if (writeable)
+1536-	return DATAPTR_RW(WRAPPER_WRAPPED_RW(x));
+1537-    else
+1538-	/**** could avoid the cast by having separate methods */
+1539-	return (void *) DATAPTR_RO(WRAPPER_WRAPPED(x));
+1540-}
+1541-
+1542-static const void *wrapper_Dataptr_or_null(SEXP x)
+1543-{
+1544-    return DATAPTR_OR_NULL(WRAPPER_WRAPPED(x));
+1545-}
+1546-
+1547-static SEXP wrapper_Extract_subset(SEXP x, SEXP indx, SEXP call)
+1548-{
+1549-  return ExtractSubset(WRAPPER_WRAPPED(x), indx, call);
+1550-}
+1551-
+1552-
+1553-/*
+1554- * ALTINTEGER Methods
+1555- */
+1556-
+1557-static int wrapper_integer_Elt(SEXP x, R_xlen_t i)
+1558-{
+1559-    return INTEGER_ELT(WRAPPER_WRAPPED(x), i);
+1560-}
+1561-
+1562-static
+1563-R_xlen_t wrapper_integer_Get_region(SEXP x, R_xlen_t i, R_xlen_t n, int *buf)
+--
+1755:    R_set_altvec_Dataptr_method(cls, wrapper_Dataptr);
+1756-    R_set_altvec_Dataptr_or_null_method(cls, wrapper_Dataptr_or_null);
+1757-    R_set_altvec_Extract_subset_method(cls, wrapper_Extract_subset);
+1758-
+1759-    /* override ALTINTEGER methods */
+1760-    R_set_altinteger_Elt_method(cls, wrapper_integer_Elt);
+1761-    R_set_altinteger_Get_region_method(cls, wrapper_integer_Get_region);
+1762-    R_set_altinteger_Is_sorted_method(cls, wrapper_integer_Is_sorted);
+1763-    R_set_altinteger_No_NA_method(cls, wrapper_integer_no_NA);
+1764-}
+1765-
+1766-static void InitWrapLogicalClass(DllInfo *dll)
+1767-{
+1768-    R_altrep_class_t cls =
+1769-	R_make_altlogical_class(&quot;wrap_logical&quot;, WRAPPKG, dll);
+1770-    wrap_logical_class = cls;
+1771- 
+1772-    /* override ALTREP methods */
+1773-    R_set_altrep_Unserialize_method(cls, wrapper_Unserialize);
+1774-    R_set_altrep_Serialized_state_method(cls, wrapper_Serialized_state);
+1775-    R_set_altrep_Duplicate_method(cls, wrapper_Duplicate);
+1776-    R_set_altrep_Inspect_method(cls, wrapper_Inspect);
+1777-    R_set_altrep_Length_method(cls, wrapper_Length);
+1778-
+1779-    /* override ALTVEC methods */
+1780:    R_set_altvec_Dataptr_method(cls, wrapper_Dataptr);
+1781-    R_set_altvec_Dataptr_or_null_method(cls, wrapper_Dataptr_or_null);
+1782-    R_set_altvec_Extract_subset_method(cls, wrapper_Extract_subset);
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -n &quot;WRAPPER_WRAPPED_RW&quot; -B2 -A25 src/main/altclasses.c | …</summary>
+<pre>cd ~/files/r/r-svn; grep -n &quot;WRAPPER_WRAPPED_RW&quot; -B2 -A25 src/main/altclasses.c | head -50; git log -S&quot;WRAPPER_WRAPPED_RW&quot; --format='%h %ad %an %s' --date=short -- src/main/altclasses.c</pre><pre class="output">1438-#define WRAPPER_NO_NA(x) INTEGER(WRAPPER_METADATA(x))[1]
+1439-
+1440:static R_INLINE SEXP WRAPPER_WRAPPED_RW(SEXP x)
+1441-{
+1442-    /* If the data might be shared and is accessed for possible
+1443-       modification, then it needs to be duplicated now. */
+1444-    SEXP data = WRAPPER_WRAPPED(x);
+1445-    if (MAYBE_SHARED(data)) {
+1446-	PROTECT(x);
+1447-	WRAPPER_SET_WRAPPED(x, shallow_duplicate(data));
+1448-	UNPROTECT(1);
+1449-    }
+1450-
+1451-    /* The meta data also needs to be cleared as it may no longer be
+1452-       valid after a write. */
+1453-    SEXP meta = WRAPPER_METADATA(x);
+1454-    INTEGER(meta)[0] = UNKNOWN_SORTEDNESS;
+1455-    for (int i = 1; i &lt; NMETA; i++)
+1456-	INTEGER(meta)[i] = 0;
+1457-
+1458-    return WRAPPER_WRAPPED(x);
+1459-}
+1460-
+1461-
+1462-/*
+1463- * ALTREP Methods
+1464- */
+1465-
+--
+1534-{
+1535-    if (writeable)
+1536:	return DATAPTR_RW(WRAPPER_WRAPPED_RW(x));
+1537-    else
+1538-	/**** could avoid the cast by having separate methods */
+1539-	return (void *) DATAPTR_RO(WRAPPER_WRAPPED(x));
+1540-}
+1541-
+1542-static const void *wrapper_Dataptr_or_null(SEXP x)
+1543-{
+1544-    return DATAPTR_OR_NULL(WRAPPER_WRAPPED(x));
+1545-}
+1546-
+1547-static SEXP wrapper_Extract_subset(SEXP x, SEXP indx, SEXP call)
+1548-{
+1549-  return ExtractSubset(WRAPPER_WRAPPED(x), indx, call);
+1550-}
+1551-
+1552-
+1553-/*
+1554- * ALTINTEGER Methods
+96b4528daa 2023-02-28 luke ALTREP now supports \code{VECSXP} vectors. Contributed by Gabor Csardi in PR17620.
+0a87308caf 2018-10-26 luke For string wrappers make sure data is not shared and meta data is cleard before possible modifications.
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Checking R's git log for the change you remember.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git log -i -E --grep='materiali|dangl|stale|DATAPTR_RO|use.aft…</summary>
+<pre>cd ~/files/r/r-svn; git log -i -E --grep='materiali|dangl|stale|DATAPTR_RO|use.after|invalidat' --since=2022-01-01 --format='%h %ad %s' --date=short | head -30</pre><pre class="output">110a07d544 2025-09-10 add R_eval_with_gd() to &quot;lock&quot; a graphics device during eval() calls during device drawing.  When graphics device is locked, any attempt to close/kill the device is ignored.  This is to protect against the user closing the device via asyncronous event (e.g., mouse click) during device drawing (which could result in a crash as killing the device left dangling device pointers for any drawing code that was still to complete)
+c51120cf70 2024-04-02 Save/restore R_BCpc in bcEval_loop so gcc-13 sees it isn't a dangling pointer.
+b1ed5564c9 2023-10-25 Fix dangling pointer (PR#18602).
+606eb4539c 2023-03-01 report definite -Wuse-after-free errors
+94ae23e493 2022-09-13 Improve performance of .remove_stale_dups when the same packages with the same versions are in multiple repositories.
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git show --stat b1ed5564c9 | head -20; git show 0b8f647dac | h…</summary>
+<pre>cd ~/files/r/r-svn; git show --stat b1ed5564c9 | head -20; git show 0b8f647dac | head -80; git log --since=2025-01-01 -i -E --grep='ALTREP|altrep' --format='%h %ad %s' --date=short | head -30</pre><pre class="output">commit b1ed5564c90e499b46411d9366557ef86578a6d8
+Author: kalibera &lt;kalibera@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Wed Oct 25 17:58:09 2023 +0000
+
+    Fix dangling pointer (PR#18602).
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@85412 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+ src/library/grDevices/src/devPS.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+commit 0b8f647dac80294cb0d7c57fec790ad59866e7c2
+Author: luke &lt;luke@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Sat Nov 15 20:05:57 2025 +0000
+
+    Add DATAPTR_RW for use in ALTREP Dataptr methods.
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@89022 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/doc/manual/R-exts.texi b/doc/manual/R-exts.texi
+index 016ced6051..e80d34557f 100644
+--- a/doc/manual/R-exts.texi
++++ b/doc/manual/R-exts.texi
+@@ -14969,14 +14969,15 @@ iteration strategy.
+ Some functions useful in implementing new alternate representation
+ classes, beyond those defined in @file{R_ext/Altrep.h}, include
+ @code{ALTREP}, @code{ALTREP_CLASS}, @code{R_altrep_data1},
+-@code{R_set_altrep_data1}, @code{R_altrep_data2}, and
+-@code{R_set_altrep_data2}.
++@code{R_set_altrep_data1}, @code{R_altrep_data2},
++@code{R_set_altrep_data2}, and @code{DATAPTR_RW}.
+ @eapifun ALTREP
+ @eapifun ALTREP_CLASS
+ @eapifun R_altrep_data1
+ @eapifun R_set_altrep_data1
+ @eapifun R_set_altrep_data2
+ @eapifun R_altrep_data2
++@eapifun DATAPTR_RW
+ @eapihdr R_ext/Altrep.h
+ 
+ For some objects it may be possible to very efficiently determine
+@@ -17497,8 +17498,11 @@ functions that should be used instead:
+ @itemx DATAPTR
+ @itemx STDVEC_DATAPTR
+        Use @code{STRING_PTR_RO} and @code{DATAPTR_RO}. Obtaining
+-        writable pointers to these data can violate the memory manager's
+-        integrity assumptions and is not supported.
++       writable pointers to these data can violate the memory manager's
++       integrity assumptions and is not supported.
++       One exception is that a writable pointer may need to be returned
++       by an @code{ALTREP} @code{Dataptr} method. The function
++       @code{DATAPTR_RW}  can use for this purpose.
+ @item isFrame
+       Use @code{Rf_isDataFrame}, added in @R{} 4.5.0.
+ @item BODY
+@@ -17742,6 +17746,10 @@ void CLEAR_ATTRIB(SEXP x)
+     UNSET_S4_OBJECT(x);
+ @}
+ #endif
++
++#if R_VERSION &lt; R_Version(4, 6, 0)
++# define DATAPTR_RW(x) DATAPTR(x)
++#endif
+ @end example
+ 
+ 
+diff --git a/src/include/R_ext/Altrep.h b/src/include/R_ext/Altrep.h
+index b5e0df7345..0160dcc696 100644
+--- a/src/include/R_ext/Altrep.h
++++ b/src/include/R_ext/Altrep.h
+@@ -172,6 +172,10 @@ DECLARE_METHOD_SETTER(altstring, No_NA)
+ DECLARE_METHOD_SETTER(altlist, Elt)
+ DECLARE_METHOD_SETTER(altlist, Set_elt)
+ 
++/* DATAPTR_RW is declared here since it should only be used to
++   implement Dataptr methods. */
++void *DATAPTR_RW(SEXP);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/src/main/altclasses.c b/src/main/altclasses.c
+index 3d1ab36d73..1d6cb2ef11 100644
+--- a/src/main/altclasses.c
++++ b/src/main/altclasses.c
+@@ -183,13 +183,13 @@ static void *compact_intseq_Dataptr(SEXP x, Rboolean writeable)
+ 	SET_COMPACT_SEQ_EXPANDED(x, val);
+ 	UNPROTECT(1);
+     }
+-    return DATAPTR(COMPACT_SEQ_EXPANDED(x));
+384602de85 2026-03-10 Allow for preserving ALTREP row.names.
+648c5b1786 2025-12-30 Add R_altrep_class_name and R_altrep_class_package.
+0b8f647dac 2025-11-15 Add DATAPTR_RW for use in ALTREP Dataptr methods.
+f4a76835a4 2025-09-17 Use read-only (altrep) accessors in copyVector (PR#18762).
+e843717df4 2025-09-03 Use read-only (possibly altrep) pointers in duplicate1 with atomic vectors (PR#18759).
+6e23952e0a 2025-09-03 Use read-only (possibly altrep) pointers in R_compute_identical with atomic vectors (PR#18761).
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/r-svn; for c in e843717df4 6e23952e0a f4a76835a4; do git show $c | he…</summary>
+<pre>cd ~/files/r/r-svn; for c in e843717df4 6e23952e0a f4a76835a4; do git show $c | head -60; echo ======; done</pre><pre class="output">Exit code 1
+commit e843717df4aa853c676efc9daa4fd6d88d1de1e7
+Author: kalibera &lt;kalibera@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Wed Sep 3 18:36:31 2025 +0000
+
+    Use read-only (possibly altrep) pointers in duplicate1 with atomic vectors
+    (PR#18759).
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@88787 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/src/main/duplicate.c b/src/main/duplicate.c
+index 2033863674..ac9b6e4143 100644
+--- a/src/main/duplicate.c
++++ b/src/main/duplicate.c
+@@ -52,14 +52,15 @@
+ */
+ #ifdef __APPLE__
+ /* it seems macOS builds did not copy &gt;= 2^32 bytes fully */
+-#define DUPLICATE_ATOMIC_VECTOR(type, fun, to, from, deep) do {	\
++#define DUPLICATE_ATOMIC_VECTOR(type, fun, fun_ro, to, from, deep) do {	\
+   R_xlen_t __n__ = XLENGTH(from); \
+   PROTECT(from); \
+   PROTECT(to = allocVector(TYPEOF(from), __n__)); \
+-  if (__n__ == 1) fun(to)[0] = fun(from)[0]; \
++  if (__n__ == 1) fun(to)[0] = fun_ro(from)[0]; \
+   else { \
+       R_xlen_t __this; \
+-      type *__to = fun(to), *__from = fun(from); \
++      type *__to = fun(to); \
++      const type *__from = fun_ro(from); \
+       while(__n__ &gt; 0) { \
+ 	 __this = (__n__ &lt; 1000000) ? __n__ : 1000000; \
+ 	 memcpy(__to, __from, __this * sizeof(type));  \
+@@ -71,12 +72,12 @@
+   UNPROTECT(2); \
+ } while (0)
+ #else
+-#define DUPLICATE_ATOMIC_VECTOR(type, fun, to, from, deep) do {	\
++#define DUPLICATE_ATOMIC_VECTOR(type, fun, fun_ro, to, from, deep) do {	\
+   R_xlen_t __n__ = XLENGTH(from); \
+   PROTECT(from); \
+   PROTECT(to = allocVector(TYPEOF(from), __n__)); \
+-  if (__n__ == 1) fun(to)[0] = fun(from)[0]; \
+-  else if (__n__) memcpy(fun(to), fun(from), __n__ * sizeof(type)); \
++  if (__n__ == 1) fun(to)[0] = fun_ro(from)[0]; \
++  else if (__n__) memcpy(fun(to), fun_ro(from), __n__ * sizeof(type)); \
+   DUPLICATE_ATTRIB(to, from, deep); \
+   COPY_TRUELENGTH(to, from); \
+   UNPROTECT(2); \
+@@ -341,16 +342,16 @@ static SEXP duplicate1(SEXP s, Rboolean deep)
+ 	COPY_TRUELENGTH(t, s);
+ 	UNPROTECT(2);
+ 	break;
+-    case LGLSXP: DUPLICATE_ATOMIC_VECTOR(int, LOGICAL, t, s, deep); break;
+-    case INTSXP: DUPLICATE_ATOMIC_VECTOR(int, INTEGER, t, s, deep); break;
+-    case REALSXP: DUPLICATE_ATOMIC_VECTOR(double, REAL, t, s, deep); break;
+-    case CPLXSXP: DUPLICATE_ATOMIC_VECTOR(Rcomplex, COMPLEX, t, s, deep); break;
+-    case RAWSXP: DUPLICATE_ATOMIC_VECTOR(Rbyte, RAW, t, s, deep); break;
++    case LGLSXP: DUPLICATE_ATOMIC_VECTOR(int, LOGICAL, LOGICAL_RO, t, s, deep); break;
++    case INTSXP: DUPLICATE_ATOMIC_VECTOR(int, INTEGER, INTEGER_RO, t, s, deep); break;
+(eval):1: ===== not found</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -n &quot;^static SEXP real_binary&quot; -A70 src/main/arithmetic.c …</summary>
+<pre>cd ~/files/r/r-svn; grep -n &quot;^static SEXP real_binary&quot; -A70 src/main/arithmetic.c | grep -n -E &quot;REAL|NO_REFERENCES|ans =|R_ITERATE&quot; | head -30</pre><pre class="output">83:967-    if (n1 == 0 || n2 == 0) return(allocVector(REALSXP, 0));
+86:970-    PROTECT(ans = R_allocOrReuseVector(s1, s2, REALSXP, n));
+90:974-	if(TYPEOF(s1) == REALSXP &amp;&amp; TYPEOF(s2) == REALSXP) {
+91:975-	    double *da = REAL(ans);
+92:976-	    const double *dx = REAL_RO(s1);
+93:977-	    const double *dy = REAL_RO(s2);
+96:980-		R_ITERATE_CHECK(NINTERRUPT, n, i, da[i] = dx[i] + tmp;);
+100:984-		R_ITERATE_CHECK(NINTERRUPT, n, i, da[i] = tmp + dy[i];);
+103:987-		R_ITERATE_CHECK(NINTERRUPT, n, i, da[i] = dx[i] + dy[i];);
+109:993-	    double *da = REAL(ans);
+111:995-	    const double *px2 = REAL_RO(s2);
+116:1000-	    double *da = REAL(ans);
+117:1001-	    const double *px1 = REAL_RO(s1);
+124:1008-	if(TYPEOF(s1) == REALSXP &amp;&amp; TYPEOF(s2) == REALSXP) {
+125:1009-	    double *da = REAL(ans);
+126:1010-	    const double *dx = REAL_RO(s1);
+127:1011-	    const double *dy = REAL_RO(s2);
+130:1014-		R_ITERATE_CHECK(NINTERRUPT, n, i, da[i] = dx[i] - tmp;);
+134:1018-		R_ITERATE_CHECK(NINTERRUPT, n, i, da[i] = tmp - dy[i];);
+137:1021-		R_ITERATE_CHECK(NINTERRUPT, n, i, da[i] = dx[i] - dy[i];);
+143:1027-	    double *da = REAL(ans);
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; grep -n &quot;r_wrap(&quot; src/*.c | grep -v &quot;^src/wrapper.c&quot;; …</summary>
+<pre>cd ~/files/r/packages/rray; grep -n &quot;r_wrap(&quot; src/*.c | grep -v &quot;^src/wrapper.c&quot;; grep -nE &quot;r_(lgl|int|dbl|cpl|raw)_begin\(|LOGICAL\(|INTEGER\(|REAL\(&quot; src/*.c | grep -v &quot;^src/wrapper.c&quot; | wc -l</pre><pre class="output">src/dimensionality.c:59:  r_obj* out = KEEP(r_wrap(x));
+src/dimensions.c:94:  r_obj* out = KEEP(r_wrap(x));
+src/insert-axes.c:71:  r_obj* out = KEEP(r_wrap(x));
+src/names.c:108:  r_obj* out = KEEP(r_wrap(x));
+src/names.c:171:  r_obj* out = KEEP(r_wrap(x));
+src/remove-axes.c:82:  r_obj* out = KEEP(r_wrap(x));
+src/titles.c:101:  r_obj* out = KEEP(r_wrap(x));
+src/titles.c:186:  r_obj* out = KEEP(r_wrap(x));
+src/utils.c:24:  r_obj* out = KEEP(r_wrap(x));
+      58</pre></details>
+<p>Let me confirm with a small repro rather than argue from reading alone.</p>
+
+<details class="tool tool-error"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad; mkdir -p $S/repro; cd $S/repro; cat &gt; repro.c &lt;&lt;'EOF'
+#include &lt;Rinternals.h&gt;
+SEXP stale(SEXP w) {
+  const double* p = REAL_RO(w);
+  double* q = REAL(w);
+  q[0] = 99;
+  return Rf_ScalarLogical(p == q);
+}
+SEXP dangle(SEXP w) {
+  const double* p = REAL_RO(w);
+  (void) REAL(w);
+  R_gc();
+  for (int i = 0; i &lt; 50; i++) Rf_allocVector(REALSXP, 1e5);
+  R_gc();
+  return Rf_ScalarReal(p[0]);
+}
+EOF
+R CMD SHLIB repro.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; ls repro.so</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b44543…</summary>
+<pre>#include &lt;Rinternals.h&gt;
+
+SEXP stale(SEXP w) {
+  const double* p = REAL_RO(w);
+  double* q = REAL(w);
+  q[0] = 99;
+  SEXP out = PROTECT(Rf_allocVector(REALSXP, 2));
+  REAL(out)[0] = p[0];
+  REAL(out)[1] = q[0];
+  UNPROTECT(1);
+  return out;
+}
+
+SEXP dangle(SEXP w) {
+  const double* p = REAL_RO(w);
+  (void) REAL(w);
+  R_gc();
+  for (int i = 0; i &lt; 50; i++) {
+    double* v = REAL(Rf_allocVector(REALSXP, 4));
+    v[0] = v[1] = v[2] = v[3] = -1;
+  }
+  return Rf_ScalarReal(p[0]);
+}</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro/repro.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b44543…</summary>
+<pre>devtools::load_all(&quot;~/files/r/packages/rray&quot;, quiet = TRUE)
+dyn.load(commandArgs(TRUE)[[1]])
+wrap &lt;- function(x) .Call(rray:::ffi_test_wrap, x)
+
+# Stale: other owner still alive
+x &lt;- c(1, 2, 3, 4)
+w &lt;- wrap(x)
+print(.Call(&quot;stale&quot;, w))
+print(x)
+print(w[1])
+
+# Dangling: the other &quot;owner&quot; is gone, but the refcount says shared
+make &lt;- function() {
+  x &lt;- c(1, 2, 3, 4)
+  wrap(x)
+}
+w &lt;- make()
+print(.Call(&quot;dangle&quot;, w))</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro/repro.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro; cd $S &amp;&amp; R CMD SHLIB repro.c 2&gt;&amp;1 | tail -2 &amp;&amp; cd ~/files/r/packages/rray &amp;&amp; Rscript $S/repro.R $S/repro.so</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG   -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c repro.c -o repro.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o repro.so repro.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+[1]  1 99
+[1] 1 2 3 4
+[1] 99
+[1] 1</pre></details>
+<p>Stale case confirmed. The dangling case didn't trigger because R decremented the refcount when <code>make()</code> returned, so no clone happened. Let me force a sticky refcount.</p>
+
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445432…</summary>
+<pre class="diff"><span class="del">-make &lt;- function() {</span>
+<span class="del">-  x &lt;- c(1, 2, 3, 4)</span>
+<span class="del">-  wrap(x)</span>
+<span class="del">-}</span>
+<span class="del">-w &lt;- make()</span>
+<span class="del">-print(.Call(&quot;dangle&quot;, w))</span>
+<span class="ins">+x &lt;- c(1, 2, 3, 4)</span>
+<span class="ins">+l &lt;- list(x)</span>
+<span class="ins">+w &lt;- wrap(x)</span>
+<span class="ins">+rm(x, l)</span>
+<span class="ins">+invisible(gc())</span>
+<span class="ins">+print(.Call(&quot;dangle&quot;, w))</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro/repro.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445432…</summary>
+<pre class="diff"><span class="del">-  (void) REAL(w);</span>
+<span class="del">-  R_gc();</span>
+<span class="ins">+  double* q = REAL(w);</span>
+<span class="ins">+  Rprintf(&quot;cloned: %d\n&quot;, p != q);</span>
+<span class="ins">+  R_gc();</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro/repro.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro; cd $S &amp;&amp; rm -f repro.o repro.so &amp;&amp; R CMD SHLIB repro.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; cd ~/files/r/packages/rray &amp;&amp; Rscript $S/repro.R $S/repro.so</pre><pre class="output">[1]  1 99
+[1] 1 2 3 4
+[1] 99
+cloned: 1
+[1] 1</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Since nothing reachable holds the old data, I'll test this by enabling macOS's MallocScribble, which overwrites freed memory with 0x55—this will help confirm the read is pulling from freed memory.</p>
+</details>
+<details class="tool"><summary>Edit /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445432…</summary>
+<pre class="diff"><span class="del">-x &lt;- c(1, 2, 3, 4)</span>
+<span class="del">-l &lt;- list(x)</span>
+<span class="ins">+x &lt;- as.double(1:1e6)</span>
+<span class="ins">+l &lt;- list(x)</span></pre><pre class="output">The file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro/repro.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b445…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/404c77ee-9307-4fd7-89a6-0ea1b4454329/scratchpad/repro; cd ~/files/r/packages/rray &amp;&amp; MallocScribble=1 Rscript $S/repro.R $S/repro.so 2&gt;&amp;1 | grep -v &quot;malloc:&quot;</pre><pre class="output">[1]  1 99
+[1] 1 2 3 4
+[1] 99
+cloned: 1
+[1] 1.194531e+103</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -rn &quot;R_allocOrReuseVector&quot; -A14 src/main/arithmetic.c | s…</summary>
+<pre>cd ~/files/r/r-svn; grep -rn &quot;R_allocOrReuseVector&quot; -A14 src/main/arithmetic.c | sed -n 1,30p | grep -n -E &quot;ALTREP|NO_REFERENCES|return&quot;</pre><pre class="output">2:src/main/arithmetic.c-830-    if (n == 0) return(ans);
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -rn &quot;^SEXP R_allocOrReuseVector&quot; -A25 src/main/*.c | grep…</summary>
+<pre>cd ~/files/r/r-svn; grep -rn &quot;^SEXP R_allocOrReuseVector&quot; -A25 src/main/*.c | grep -E &quot;ALTREP|NO_REFERENCES|REUSE&quot;</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -rn &quot;R_allocOrReuseVector&quot; src/main/*.c src/include/*.h |…</summary>
+<pre>cd ~/files/r/r-svn; grep -rn &quot;R_allocOrReuseVector&quot; src/main/*.c src/include/*.h | head -3; grep -rn &quot;define R_allocOrReuseVector\|SEXP R_allocOrReuseVector&quot; -A20 src/main/arithmetic.c src/include/Defn.h | grep -iE &quot;altrep|no_ref|reuse&quot; | head</pre><pre class="output">src/main/arithmetic.c:829:	ans = R_allocOrReuseVector(s1, s2, INTSXP, n);
+src/main/arithmetic.c:970:    PROTECT(ans = R_allocOrReuseVector(s1, s2, REALSXP, n));
+src/main/complex.c:184:    ans = R_allocOrReuseVector(s1, s2, CPLXSXP, n);
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Yes, you're right, and it is worse than a stale pointer. I reproduced both problems against the current <code>r_wrap()</code>.</p>
+<h2>What goes wrong</h2>
+<p><code>wrapper_writable()</code> (<code>src/wrapper.c</code>) swaps a new copy into <code>data1</code> whenever the wrapped data looks shared. Any read-only pointer handed out before that swap still points at the old data.</p>
+<p><strong>1. Stale pointer.</strong> If someone else still owns the old data, the pointer stays valid but no longer shows the wrapper's contents:</p>
+<pre><code class="language-c">const double* p = REAL_RO(w);
+double* q = REAL(w);   // clones, swaps data1
+q[0] = 99;
+// p[0] == 1, q[0] == 99, w[1] == 99
+</code></pre>
+<p><strong>2. Use after free.</strong> R refcounts are only an upper bound. Here <code>MAYBE_SHARED()</code> is true, yet the wrapper is the only thing that can still reach the data:</p>
+<pre><code class="language-r">x &lt;- as.double(1:1e6)
+l &lt;- list(x)   # bumps refcount, never decremented
+w &lt;- wrap(x)
+rm(x, l)
+</code></pre>
+<p>After the swap, the old vector is unreachable and the next GC frees it. With <code>MallocScribble=1</code>, reading <code>p[0]</code> after a GC returned <code>1.194531e+103</code>. That is the <code>0x5555...</code> scribble pattern, so the read really is from freed memory.</p>
+<p>The repro is in the scratchpad (<code>repro/repro.c</code>, <code>repro/repro.R</code>). I made no changes to rray.</p>
+<h2>Base R</h2>
+<p>Base R's own wrapper class has exactly the same pattern today, in <code>WRAPPER_WRAPPED_RW()</code> at <code>src/main/altclasses.c:1440</code>. It dates from 2018 and I found no commit that changes it. The recent R work I found is nearby but different:</p>
+<ul>
+<li>
+<p><strong>Sep 2025</strong> (PR#18759, PR#18761, PR#18762): <code>duplicate1()</code>, <code>R_compute_identical()</code> and <code>copyVector()</code> now read through <code>*_RO</code> accessors, so they no longer trigger a writable copy of ALTREP objects just to read them.</p>
+</li>
+<li>
+<p><strong>Nov 2025:</strong> <code>DATAPTR_RW()</code> was added for use inside ALTREP <code>Dataptr</code> methods.</p>
+</li>
+</ul>
+<p>If you remember a commit that fixes the hazard itself, I didn't find it in the log.</p>
+<p>R's own code mostly avoids the problem by asking for the writable pointer before the read-only ones (for example <code>real_binary()</code> in <code>arithmetic.c</code>). The trigger is any caller that does it the other way round: read-only first, then writable on the same object.</p>
+<h2>Fix options</h2>
+<ol>
+<li>
+<p><strong>Keep the old data alive.</strong> Hold on to the replaced vector (for example in <code>data2</code>) instead of dropping it. This removes the use after free for the life of the wrapper. The stale-pointer behaviour stays, which matches base R. The cost is keeping both copies in memory after a write.</p>
+</li>
+<li>
+<p><strong>Refuse writable access</strong> for every type, as the character and list wrappers already do. This makes the problem impossible, but it may break R code that writes in place through <code>REAL()</code>, such as <code>[&lt;-</code> on a wrapper. I haven't checked which base R paths do that.</p>
+</li>
+<li>
+<p><strong>Copy on any data pointer request, read-only included.</strong> This makes the problem impossible too, but it defeats the purpose of the wrapper.</p>
+</li>
+</ol>
+<p>I'd go with option 1. Do you want me to implement it?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>ive pulled more recent R git info, try looking again</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git log -n 3 --format='%h %ad %s' --date=short; git log --sinc…</summary>
+<pre>cd ~/files/r/r-svn; git log -n 3 --format='%h %ad %s' --date=short; git log --since=2026-03-01 --format='%h %ad %an %s' --date=short -- src/main/altclasses.c src/main/altrep.c src/include/R_ext/Altrep.h; git log --since=2026-03-01 -i -E --grep='altrep|wrapper|dataptr|materiali|stale|dangl' --format='%h %ad %s' --date=short</pre><pre class="output">840a3b9d6a 2026-10-13 C implementation of base64_encode
+77bf9554c7 2026-10-13 Tweaks for c90660.
+85a6f68b11 2026-10-12 deparseline1(.) needs PROTECT() inside matchArgs_NR()
+a8cef49f5f 2026-10-08 luke Fix from PR19047.
+3580627fa3 2026-07-29 luke Adjust wrapper check for cases where value duplicate() is marked not mutable.
+c40bda6593 2026-07-27 luke Reworked wrapper objects to ensure date pointers, once obtained, remain valid as long as the wrapper object is reachable. This is a more complete fix than r90261 to the issue originally reported by Ivan Krylov.
+dbc99e13e8 2026-07-15 luke Ported r90260 (wrapper stale pointer fix) from R-patched.
+a1e76d87a8 2026-08-17 sync w/ &quot;Wrapper&quot; msg from R-patched
+8eef315650 2026-07-30 Add mailx() wrapper for S-nail (Unixen) or Blat (Windows).
+3580627fa3 2026-07-29 Adjust wrapper check for cases where value duplicate() is marked not mutable.
+c40bda6593 2026-07-27 Reworked wrapper objects to ensure date pointers, once obtained, remain valid as long as the wrapper object is reachable. This is a more complete fix than r90261 to the issue originally reported by Ivan Krylov.
+dbc99e13e8 2026-07-15 Ported r90260 (wrapper stale pointer fix) from R-patched.
+384602de85 2026-03-10 Allow for preserving ALTREP row.names.
+0bd5d6e600 2026-03-03 Move the declaration of DATAPTR from Rinternals.h to Defn.h.
+baf70919b5 2026-03-03 Move declaration for STDVEC_DATAPTR and hide entry point.
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>That's it. Reading the commits.</p>
+
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/r-svn; git show dbc99e13e8 -- src/main doc/NEWS.Rd; echo =========; g…</summary>
+<pre>cd ~/files/r/r-svn; git show dbc99e13e8 -- src/main doc/NEWS.Rd; echo =========; git show c40bda6593; echo ========; git show 3580627fa3; echo =======; git show a8cef49f5f --stat; git show a1e76d87a8 | head -40</pre><pre class="output">Exit code 1
+commit dbc99e13e864c1603a3f59674889d158ecb65f0e
+Author: luke &lt;luke@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Wed Jul 15 20:34:27 2026 +0000
+
+    Ported r90260 (wrapper stale pointer fix) from R-patched.
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@90261 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/doc/NEWS.Rd b/doc/NEWS.Rd
+index 4da52bb4c6..399ac3c235 100644
+--- a/doc/NEWS.Rd
++++ b/doc/NEWS.Rd
+@@ -201,10 +201,6 @@
+       named vectors for \code{lower} and \code{upper} arguments to match
+       names of coefficients (\PR{18415}).
+ 
+-      \item Fix for \PR{19100}: \code{seq.int} was not handling
+-      non-vector \code{along.width} arguments properly. Thanks to
+-      \I{Mitchell O'Hara-Wild}.
+-
+       \item \code{summary(&lt;aov&gt;)} for an almost perfect fit now warns
+       analogously to \code{summary(&lt;lm&gt;)}, using the same check.  Fixes
+       fixes \PR{18341} thanks to R Dev Day members \I{Deepansh Khurana},
+@@ -226,6 +222,14 @@
+       scenario when \code{m + n} is larger than
+       \code{.Machine$integer.max}, preventing integer overflow, thanks to
+       \I{Jonathan Blood}'s report on R-devel.
++
++      \item Fix for \PR{19100}: \code{seq.int} was not handling
++      non-vector \code{along.width} arguments properly. Thanks to
++      \I{Mitchell O'Hara-Wild}.
++
++      \item Wrappers now duplicate even a wrapped object that might be
++      shared before returning a read-only pointer. This prevents cached
++      read-only pointers from becoming invalid. Reported by \I{Ivan Krylov}.
+     }
+   }
+ }
+diff --git a/src/main/altclasses.c b/src/main/altclasses.c
+index 6608a05633..46e7377fc4 100644
+--- a/src/main/altclasses.c
++++ b/src/main/altclasses.c
+@@ -1535,13 +1535,17 @@ static void *wrapper_Dataptr(SEXP x, Rboolean writeable)
+     if (writeable)
+ 	return DATAPTR_RW(WRAPPER_WRAPPED_RW(x));
+     else
++	/* This has to use WRAPPER_WRAPPED_RW even for a read-only
++	   pointer to make sure a later request for a writable pointer
++	   will return the same address. */
+ 	/**** could avoid the cast by having separate methods */
+-	return (void *) DATAPTR_RO(WRAPPER_WRAPPED(x));
++	return (void *) DATAPTR_RO(WRAPPER_WRAPPED_RW(x));
+ }
+ 
+ static const void *wrapper_Dataptr_or_null(SEXP x)
+ {
+-    return DATAPTR_OR_NULL(WRAPPER_WRAPPED(x));
++    /* This has to use WRAPPER_WRAPPED_RW as above. */
++    return DATAPTR_OR_NULL(WRAPPER_WRAPPED_RW(x));
+ }
+ 
+ static SEXP wrapper_Extract_subset(SEXP x, SEXP indx, SEXP call)
+(eval):1: ======== not found</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git show c40bda6593 -- src/main doc/NEWS.Rd</summary>
+<pre>cd ~/files/r/r-svn; git show c40bda6593 -- src/main doc/NEWS.Rd</pre><pre class="output">commit c40bda6593de6890f21936b76d1095a84328853e
+Author: luke &lt;luke@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Mon Jul 27 21:24:01 2026 +0000
+
+    Reworked wrapper objects to ensure date pointers, once obtained,
+    remain valid as long as the wrapper object is reachable. This is a
+    more complete fix than r90261 to the issue originally reported by Ivan
+    Krylov.
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@90309 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/doc/NEWS.Rd b/doc/NEWS.Rd
+index dc09238f02..c87969314b 100644
+--- a/doc/NEWS.Rd
++++ b/doc/NEWS.Rd
+@@ -249,9 +249,9 @@
+       non-vector \code{along.width} arguments properly. Thanks to
+       \I{Mitchell O'Hara-Wild}.
+ 
+-      \item Wrappers now duplicate even a wrapped object that might be
+-      shared before returning a read-only pointer. This prevents cached
+-      read-only pointers from becoming invalid. Reported by \I{Ivan Krylov}.
++      \item Wrapper objects make sure data pointers remain once obtained
++      remain valid as long as a wrapper object is reachable. Reported by
++      \I{Ivan Krylov}.
+     }
+   }
+ }
+diff --git a/src/main/altclasses.c b/src/main/altclasses.c
+index 46e7377fc4..5dfc7fd77f 100644
+--- a/src/main/altclasses.c
++++ b/src/main/altclasses.c
+@@ -1,6 +1,6 @@
+ /*
+  *  R : A Computer Language for Statistical Data Analysis
+- *  Copyright (C) 2016--2025   The R Core Team
++ *  Copyright (C) 2016--2026   The R Core Team
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -1432,20 +1432,43 @@ static R_altrep_class_t wrap_list_class;
+ #define WRAPPER_WRAPPED(x) R_altrep_data1(x)
+ #define WRAPPER_SET_WRAPPED(x, v) R_set_altrep_data1(x, v)
+ #define WRAPPER_METADATA(x) R_altrep_data2(x)
+-#define WRAPPER_SET_METADATA(x, v) R_set_altrep_data2(x, v)
+ 
+ #define WRAPPER_SORTED(x) INTEGER(WRAPPER_METADATA(x))[0]
+ #define WRAPPER_NO_NA(x) INTEGER(WRAPPER_METADATA(x))[1]
+ 
++/* When a wrapper is created, e.g. using structure(), the data may
++   initially be shared. Once it is modified to be modified or a
++   DATAPTR is requested the data has to be remain unchanged and the
++   wrapper should be the only reference. The metadata is marked to
++   reflecth this. The data then has to be duplicated by the duplicate
++   method to ensure that no new references are created. This ensures
++   that a DATAPTR, once obtained, remains valid while the wrapper
++   object is reachable.
++   
++   For now the sxpinfo.gp field is used via PRSEEN for the lock.
++ */
++#define WRAPPER_DATA_IS_LOCKED(x) PRSEEN(WRAPPER_METADATA(x))
++#define WRAPPER_LOCK_DATA(x) SET_PRSEEN(WRAPPER_METADATA(x), 1)
++#define WRAPPER_UNLOCK_DATA(x) SET_PRSEEN(WRAPPER_METADATA(x), 0)
++
+ static R_INLINE SEXP WRAPPER_WRAPPED_RW(SEXP x)
+ {
+-    /* If the data might be shared and is accessed for possible
+-       modification, then it needs to be duplicated now. */
+     SEXP data = WRAPPER_WRAPPED(x);
+-    if (MAYBE_SHARED(data)) {
+-	PROTECT(x);
+-	WRAPPER_SET_WRAPPED(x, shallow_duplicate(data));
+-	UNPROTECT(1);
++    if (WRAPPER_DATA_IS_LOCKED(x)) {
++	/* Once data is locked it's reference cout should remain at one. */
++	if (MAYBE_SHARED(data))
++	    error(&quot;REFCNT on locked WRAPPER data increased to %d&quot;,
++		  REFCNT(data));
++    }
++    else {
++	/* If the data might be shared and is accessed for possible
++	   modification, then it needs to be duplicated now. */
++	if (MAYBE_SHARED(data)) {
++	    PROTECT(x);
++	    WRAPPER_SET_WRAPPED(x, shallow_duplicate(data));
++	    UNPROTECT(1);
++	}
++	WRAPPER_LOCK_DATA(x);
+     }
+ 
+     /* The meta data also needs to be cleared as it may no longer be
+@@ -1492,7 +1515,7 @@ static SEXP wrapper_Duplicate(SEXP x, Rboolean deep)
+     /* For a shallow copy, mark as immutable in the NAMED world; with
+        reference counting the reference count will be incremented when
+        the data is installed in the new wrapper object. */
+-    if (deep)
++    if (deep || WRAPPER_DATA_IS_LOCKED(x)) // **** shallow duplicate if only locked?
+ 	data = duplicate(data);
+ #ifndef SWITCH_TO_REFCNT
+     else
+@@ -1515,7 +1538,8 @@ static Rboolean wrapper_Inspect(SEXP x, int pre, int deep, int pvec,
+ {
+     Rboolean srt = (Rboolean) WRAPPER_SORTED(x);
+     Rboolean no_na = (Rboolean) WRAPPER_NO_NA(x);
+-    Rprintf(&quot; wrapper [srt=%d,no_na=%d]\n&quot;, srt, no_na);
++    Rboolean lck = (Rboolean) WRAPPER_DATA_IS_LOCKED(x);
++    Rprintf(&quot; wrapper [srt=%d,no_na=%d,lck=%d]\n&quot;, srt, no_na, lck);
+     inspect_subtree(WRAPPER_WRAPPED(x), pre, deep, pvec);
+     return TRUE;
+ }
+@@ -1950,7 +1974,8 @@ static SEXP make_wrapper(SEXP x, SEXP meta)
+ 	/* make sure no mutation can happen through another reference */
+ 	MARK_NOT_MUTABLE(x);
+ #endif
+-    
++
++    WRAPPER_UNLOCK_DATA(ans);
+     return ans;
+ }
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git show 3580627fa3 -- src/main; git show a8cef49f5f --stat | …</summary>
+<pre>cd ~/files/r/r-svn; git show 3580627fa3 -- src/main; git show a8cef49f5f --stat | head; git show a8cef49f5f -- src/main/altclasses.c | head -40; grep -n &quot;WRAPPER_WRAPPED_RW\|WRAPPER_WRAPPED(x)&quot; src/main/altclasses.c | head -40</pre><pre class="output">commit 3580627fa3733fdc453060bbfce9c4abe897ef63
+Author: luke &lt;luke@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Wed Jul 29 14:20:32 2026 +0000
+
+    Adjust wrapper check for cases where value duplicate() is marked not mutable.
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@90315 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/src/main/altclasses.c b/src/main/altclasses.c
+index 5dfc7fd77f..b852c5f108 100644
+--- a/src/main/altclasses.c
++++ b/src/main/altclasses.c
+@@ -1446,17 +1446,23 @@ static R_altrep_class_t wrap_list_class;
+    object is reachable.
+    
+    For now the sxpinfo.gp field is used via PRSEEN for the lock.
++   Allow for cases where shallow_duplicate() returns a value with
++   non-zero REFCNT (e.g. returns a value marked not mutable.
+  */
+-#define WRAPPER_DATA_IS_LOCKED(x) PRSEEN(WRAPPER_METADATA(x))
+-#define WRAPPER_LOCK_DATA(x) SET_PRSEEN(WRAPPER_METADATA(x), 1)
+-#define WRAPPER_UNLOCK_DATA(x) SET_PRSEEN(WRAPPER_METADATA(x), 0)
++#define WRAPPER_DATA_LOCK(x) PRSEEN(WRAPPER_METADATA(x))
++#define WRAPPER_SET_DATA_LOCK(x, v) SET_PRSEEN(WRAPPER_METADATA(x), v)
++#define WRAPPER_DATA_IS_LOCKED(x) (WRAPPER_DATA_LOCK(x) &gt; 0)
++#define WRAPPER_LOCK_DATA(x) WRAPPER_SET_DATA_LOCK(x, 1)
++#define WRAPPER_UNLOCK_DATA(x) WRAPPER_SET_DATA_LOCK(x, 0)
+ 
++ 
+ static R_INLINE SEXP WRAPPER_WRAPPED_RW(SEXP x)
+ {
+     SEXP data = WRAPPER_WRAPPED(x);
+     if (WRAPPER_DATA_IS_LOCKED(x)) {
+-	/* Once data is locked it's reference cout should remain at one. */
+-	if (MAYBE_SHARED(data))
++	/* Once data is locked it's reference count should remain at one. */
++	/* Unless duplicate() doesn't produce a zero reference count object */ 
++	if (MAYBE_SHARED(data) &amp;&amp; WRAPPER_DATA_LOCK(x) == 1)
+ 	    error(&quot;REFCNT on locked WRAPPER data increased to %d&quot;,
+ 		  REFCNT(data));
+     }
+@@ -1467,8 +1473,12 @@ static R_INLINE SEXP WRAPPER_WRAPPED_RW(SEXP x)
+ 	    PROTECT(x);
+ 	    WRAPPER_SET_WRAPPED(x, shallow_duplicate(data));
+ 	    UNPROTECT(1);
++	    if (REFCNT(WRAPPER_WRAPPED(x)) == 1)
++		WRAPPER_LOCK_DATA(x);
++	    else
++		WRAPPER_SET_DATA_LOCK(x, 2);
+ 	}
+-	WRAPPER_LOCK_DATA(x);
++	else WRAPPER_LOCK_DATA(x);
+     }
+ 
+     /* The meta data also needs to be cleared as it may no longer be
+commit a8cef49f5fbf0055560a79c7bd45095a7d609a9e
+Author: luke &lt;luke@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Thu Oct 8 20:46:45 2026 +0000
+
+    Fix from PR19047.
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@90650 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+ src/main/altrep.c    | 40 +++++++++++++++++++++++++++++++++++++++-
+1432:#define WRAPPER_WRAPPED(x) R_altrep_data1(x)
+1459:static R_INLINE SEXP WRAPPER_WRAPPED_RW(SEXP x)
+1461:    SEXP data = WRAPPER_WRAPPED(x);
+1476:	    if (REFCNT(WRAPPER_WRAPPED(x)) == 1)
+1491:    return WRAPPER_WRAPPED(x);
+1505:    if (! ALTREP(WRAPPER_WRAPPED(x)) &amp;&amp;
+1510:    return CONS(WRAPPER_WRAPPED(x), WRAPPER_METADATA(x));
+1522:    SEXP data = WRAPPER_WRAPPED(x);
+1553:    inspect_subtree(WRAPPER_WRAPPED(x), pre, deep, pvec);
+1559:    return XLENGTH(WRAPPER_WRAPPED(x));
+1570:	return DATAPTR_RW(WRAPPER_WRAPPED_RW(x));
+1572:	/* This has to use WRAPPER_WRAPPED_RW even for a read-only
+1576:	return (void *) DATAPTR_RO(WRAPPER_WRAPPED_RW(x));
+1581:    /* This has to use WRAPPER_WRAPPED_RW as above. */
+1582:    return DATAPTR_OR_NULL(WRAPPER_WRAPPED_RW(x));
+1587:  return ExtractSubset(WRAPPER_WRAPPED(x), indx, call);
+1597:    return INTEGER_ELT(WRAPPER_WRAPPED(x), i);
+1603:    return INTEGER_GET_REGION(WRAPPER_WRAPPED(x), i, n, buf);
+1612:	return INTEGER_IS_SORTED(WRAPPER_WRAPPED(x));
+1621:	return INTEGER_NO_NA(WRAPPER_WRAPPED(x));
+1631:    return LOGICAL_ELT(WRAPPER_WRAPPED(x), i);
+1637:    return LOGICAL_GET_REGION(WRAPPER_WRAPPED(x), i, n, buf);
+1646:	return LOGICAL_IS_SORTED(WRAPPER_WRAPPED(x));
+1655:	return LOGICAL_NO_NA(WRAPPER_WRAPPED(x));
+1665:    return REAL_ELT(WRAPPER_WRAPPED(x), i);
+1671:    return REAL_GET_REGION(WRAPPER_WRAPPED(x), i, n, buf);
+1680:	return REAL_IS_SORTED(WRAPPER_WRAPPED(x));
+1689:	return REAL_NO_NA(WRAPPER_WRAPPED(x));
+1699:    return COMPLEX_ELT(WRAPPER_WRAPPED(x), i);
+1706:    return COMPLEX_GET_REGION(WRAPPER_WRAPPED(x), i, n, buf);
+1716:    return RAW_ELT(WRAPPER_WRAPPED(x), i);
+1722:    return RAW_GET_REGION(WRAPPER_WRAPPED(x), i, n, buf);
+1732:    return STRING_ELT(WRAPPER_WRAPPED(x), i);
+1737:    SET_STRING_ELT(WRAPPER_WRAPPED_RW(x), i, v);
+1746:	return STRING_IS_SORTED(WRAPPER_WRAPPED(x));
+1755:	return STRING_NO_NA(WRAPPER_WRAPPED(x));
+1765:    return VECTOR_ELT(WRAPPER_WRAPPED(x), i);
+1770:    SET_VECTOR_ELT(WRAPPER_WRAPPED_RW(x), i, v);
+2086:	SEXP data = WRAPPER_WRAPPED(x);
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; git show a8cef49f5f | head -30; sed -n 1515,1545p src/main/alt…</summary>
+<pre>cd ~/files/r/r-svn; git show a8cef49f5f | head -30; sed -n 1515,1545p src/main/altclasses.c; git show a1e76d87a8 | grep -A6 -i wrapper | head -20</pre><pre class="output">commit a8cef49f5fbf0055560a79c7bd45095a7d609a9e
+Author: luke &lt;luke@00db46b3-68df-0310-9c12-caf00c1e9a41&gt;
+Date:   Thu Oct 8 20:46:45 2026 +0000
+
+    Fix from PR19047.
+    
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@90650 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/src/main/altrep.c b/src/main/altrep.c
+index 40238840bf..83c4e7e51d 100644
+--- a/src/main/altrep.c
++++ b/src/main/altrep.c
+@@ -1,6 +1,6 @@
+ /*
+  *  R : A Computer Language for Statistical Data Analysis
+- *  Copyright (C) 2016--2023   The R Core Team
++ *  Copyright (C) 2016--2026   The R Core Team
+  *
+  *  This program is free software; you can redistribute it and/or modify
+  *  it under the terms of the GNU General Public License as published by
+@@ -276,6 +276,41 @@ ALTREP_SERIALIZED_CLASS(SEXP x)
+ static SEXP find_namespace(void *data) { return R_FindNamespace((SEXP) data); }
+ static SEXP handle_namespace_error(SEXP cond, void *data) { return R_NilValue; }
+ 
++static bool valid_altrep_serialized_type(int type)
++{
++    switch(type) {
++    case LGLSXP:
++    case INTSXP:
+static SEXP wrapper_Unserialize(SEXP class, SEXP state)
+{
+    return make_wrapper(CAR(state), CDR(state));
+}
+
+static SEXP wrapper_Duplicate(SEXP x, Rboolean deep)
+{
+    SEXP data = WRAPPER_WRAPPED(x);
+
+    /* For a deep copy, duplicate the data. */
+    /* For a shallow copy, mark as immutable in the NAMED world; with
+       reference counting the reference count will be incremented when
+       the data is installed in the new wrapper object. */
+    if (deep || WRAPPER_DATA_IS_LOCKED(x)) // **** shallow duplicate if only locked?
+	data = duplicate(data);
+#ifndef SWITCH_TO_REFCNT
+    else
+	/* not needed with reference counting */
+	MARK_NOT_MUTABLE(data);
+#endif
+    PROTECT(data);
+
+    /* always duplicate the meta data */
+    SEXP meta = PROTECT(duplicate(WRAPPER_METADATA(x)));
+
+    SEXP ans = make_wrapper(data, meta);
+
+    UNPROTECT(2); /* data, meta */
+    return ans;
+}
+
+    sync w/ &quot;Wrapper&quot; msg from R-patched
+    
+    git-svn-id: https://svn.r-project.org/R/trunk@90423 00db46b3-68df-0310-9c12-caf00c1e9a41
+
+diff --git a/doc/NEWS.Rd b/doc/NEWS.Rd
+index afcd24ddd6..2b56f5ba05 100644
+--- a/doc/NEWS.Rd
+--
+-      \item Wrapper objects make sure data pointers remain once obtained
+-      remain valid as long as a wrapper object is reachable. Reported by
+-      \I{Ivan Krylov}.
++      \item Wrappers now duplicate even a wrapped object that might be
++      shared before returning a read-only pointer. This prevents cached
++      read-only pointers from becoming invalid. Reported by \I{Ivan Krylov}.
+ 
+       \item \code{dummy.coef()} becomes more robust to non-syntactic
+       variable names, fixing \PR{18468}.  Thanks to \I{Bill Dunlap} and
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>I was wrong earlier: base R did fix this, in July 2026, and the fix is a lot like the option I dismissed (copy on any data pointer request). Your diagnosis of rray holds, and our wrapper still has the bug.</p>
+<h2>What R changed</h2>
+<p>The bug was reported by Ivan Krylov. Luke Tierney fixed it in three commits:</p>
+<ul>
+<li>
+<p><strong><code>dbc99e13e8</code></strong> (r90261, also in R-patched as r90260): the read-only <code>Dataptr</code> and <code>Dataptr_or_null</code> now go through <code>WRAPPER_WRAPPED_RW()</code>, the same path as writable access. Any data pointer request now copies the data first if it might be shared. The code comment says this is so &quot;a later request for a writable pointer will return the same address&quot;.</p>
+</li>
+<li>
+<p><strong><code>c40bda6593</code></strong> (r90309, R-devel only): the &quot;lock&quot; rework. Once any data pointer has been handed out, the wrapper is marked locked, and its data is never replaced again. To keep it that way:</p>
+<ul>
+<li>
+<p>Shallow <code>Duplicate</code> of a locked wrapper copies the data instead of sharing it.</p>
+</li>
+<li>
+<p><code>WRAPPER_WRAPPED_RW()</code> errors if the refcount of locked data ever rises above one.</p>
+</li>
+<li>
+<p>The lock is stored in the <code>PRSEEN</code> bits of the metadata.</p>
+</li>
+</ul>
+<p>The NEWS entry: pointers &quot;remain valid as long as a wrapper object is reachable&quot;.</p>
+</li>
+<li>
+<p><strong><code>3580627fa3</code></strong>: allows for <code>shallow_duplicate()</code> returning an object whose refcount is not zero. A lock value of <code>2</code> means &quot;locked, but skip the refcount check&quot;.</p>
+</li>
+</ul>
+<p>R-patched NEWS (<code>a1e76d87a8</code>) keeps the simpler description from the first commit. <code>Elt</code>, <code>Get_region</code> and <code>Extract_subset</code> still read the wrapped data directly, without copying or locking.</p>
+<h2>What this means for rray</h2>
+<p>The rule is now: no data pointer leaves the wrapper unless the wrapper is the only owner of its data, and after that the data never changes. That closes both the stale case and the use after free.</p>
+<p>The cost is one copy per wrapper the first time C code calls <code>r_dbl_cbegin()</code> (or similar) on a wrapper whose data is shared. For rray this happens often, because most functions wrap user data and the next rray call reads it through <code>cbegin</code>. Element-wise access stays free.</p>
+<p>Porting it to <code>src/wrapper.c</code> would mean:</p>
+<ol>
+<li>
+<p>Make <code>wrapper_readonly()</code>, used in the <code>dataptr</code> and <code>dataptr_or_null</code> methods, go through <code>wrapper_writable()</code>. The rest of the class can keep reading the data directly.</p>
+</li>
+<li>
+<p>Add a lock flag, set the first time any pointer is handed out.</p>
+</li>
+<li>
+<p>In <code>wrapper_duplicate()</code>, copy the data instead of rewrapping when the wrapper is locked.</p>
+</li>
+<li>
+<p>In <code>r_wrap()</code>, decide what to do when <code>x</code> is a locked wrapper. Unwrapping it would bump the refcount on locked data, so it has to copy instead.</p>
+</li>
+</ol>
+<p>One possible change from R: <code>dataptr_or_null</code> could return <code>NULL</code> for shared data that isn't locked yet, instead of copying. That method is meant to be cheap, and callers already fall back to <code>Elt</code> or <code>Get_region</code>. R copies here, and I don't know whether they had a reason beyond keeping it simple.</p>
+<p>Should I implement the port, and do you want <code>dataptr_or_null</code> to copy like R or return <code>NULL</code>?</p>
+
+</section>
+<p class="divider">Oct 14, 2026, 00:34 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Is it possible we could copy for the official dataptr api but have our own cbegin that doesn’t copy if we know we aren’t going to ask for a writable pointer before we are done with it?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Yes. The trick is to borrow the data from the object underneath the wrapper and protect that object yourself, rather than going through the wrapper's <code>Dataptr</code> method.</p>
+<h2>How it would work</h2>
+<p>Internal C code can already tell when it has one of our wrappers, and <code>R_altrep_data1()</code> gives the vector it wraps. So instead of a special <code>cbegin</code>, add an unwrap step:</p>
+<pre><code class="language-c">r_obj* data = KEEP(rray_unwrap(x));     // data1 for our wrappers, x otherwise
+const double* v_x = r_dbl_cbegin(data); // plain REAL_RO() on the real vector
+</code></pre>
+<ul>
+<li>
+<p><strong>No copy.</strong> <code>data</code> is an ordinary vector, or another ALTREP class like a compact sequence that caches its expanded form. Either way the pointer is stable and nothing is copied.</p>
+</li>
+<li>
+<p><strong>The pointer can't dangle.</strong> The bug came from <code>data</code> being reachable only through the wrapper's <code>data1</code> slot, so a swap could leave it unreachable and the GC would free it. Here <code>data</code> is on our protect stack, so it stays alive even if something swaps <code>data1</code>.</p>
+</li>
+<li>
+<p><strong>The worst case is a stale view.</strong> The pointer can only go stale if someone writes to <code>x</code> through the wrapper while we are still reading. rray never writes to its inputs, so in our own code that cannot happen.</p>
+</li>
+<li>
+<p><strong>Attributes still come from <code>x</code>.</strong> Only the data comes from the unwrapped vector.</p>
+</li>
+</ul>
+<h2>Why &quot;no writable request in the meantime&quot; isn't quite the right rule</h2>
+<p>After the port, a read-only <code>Dataptr</code> request on an unlocked, shared wrapper also swaps <code>data1</code>. Without the <code>KEEP()</code>, the condition would have to be &quot;no official data pointer request of any kind on this wrapper while I hold the pointer&quot;. That is easy to break by accident: rlang's <code>r_dbl_cbegin()</code> is <code>REAL_RO()</code>, so passing <code>x</code> to any helper that calls it would trigger the swap. Keeping <code>data</code> protected removes that whole class of mistakes, and <code>KEEP()</code> doesn't change refcounts.</p>
+<h2>What this gives us</h2>
+<ul>
+<li>
+<p><strong>Inside rray:</strong> wrappers never copy, as long as our loops read through <code>rray_unwrap()</code>.</p>
+</li>
+<li>
+<p><strong>Outside rray:</strong> other packages and base R go through the official API. They pay at most one copy per wrapper, then get the locked, always-valid pointer R now guarantees.</p>
+</li>
+<li>
+<p><strong>Element access</strong> (<code>Elt</code>, <code>Get_region</code>) stays free everywhere.</p>
+</li>
+</ul>
+<p>The main upkeep is discipline. Every <code>cbegin</code> on a possible wrapper in <code>src/</code> would need to go through <code>rray_unwrap()</code>. Otherwise it still works, but it pays the copy. That's about 58 sites to check, though most read freshly allocated outputs that can never be wrappers.</p>
+<p>Want me to write this up as a plan (the R port plus <code>rray_unwrap()</code>) for you to review before I touch the code?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Do we really need the “locked” idea</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Not strictly, but dropping it makes rewrapping more expensive. The lock records one bit that the refcount can't tell us: whether this wrapper has ever handed out a pointer.</p>
+<h2>What has to stay true</h2>
+<p>Once a wrapper hands out a pointer, its <code>data1</code> must never be swapped again. A swap only happens when the data looks shared. Right after a pointer is handed out the data's refcount is 1, so the only risk is it rising later. Nothing outside rray can reach <code>data1</code>, so only our own code can raise it:</p>
+<ul>
+<li>
+<p><strong><code>wrapper_duplicate()</code></strong> with <code>deep = FALSE</code> rewraps the same data.</p>
+</li>
+<li>
+<p><strong><code>r_wrap()</code> on a wrapper</strong> unwraps it and shares the data.</p>
+</li>
+</ul>
+<h2>Without the lock</h2>
+<p>Use the refcount itself as the rule. When rewrapping or duplicating, share the data only if it is already <code>MAYBE_SHARED()</code>, and copy it otherwise.</p>
+<p>This is safe because a pointer is only handed out once the data's refcount is 1. Sharing data whose refcount is already 2 or more can't touch any data with a live pointer. Copying in the other case means a refcount of 1 never goes back up. No extra state is needed.</p>
+<p>The cost is that a refcount of 1 is ambiguous. It can mean &quot;a pointer is out there&quot;, or just &quot;this wrapper owns its data and nobody has looked at it&quot;. The rule has to assume the first, so it copies in both cases. The second case is the common one for rray chains:</p>
+<pre><code class="language-r">x |&gt; rray_set_names(nms) |&gt; rray_set_dimensions(dims)
+</code></pre>
+<p>When <code>x</code> is a temporary, the first wrapper is the sole owner of its data. Without the lock, every later rewrap in the chain copies. With the lock, those rewraps share for free, and only a wrapper that actually handed out a pointer copies.</p>
+<h2>Recommendation</h2>
+<p>Keep the lock, it's cheap. We don't use <code>data2</code>, so the flag can live there (for example <code>data2 = r_true</code> once locked), with no <code>PRSEEN</code> trick needed.</p>
+<p>Note that our own <code>rray_unwrap()</code> borrows would not set the lock. They protect the data themselves, so the wrapper doesn't need to promise anything. Only the official <code>Dataptr</code> and <code>Dataptr_or_null</code> methods lock.</p>
+<p>I'd skip R's refcount error check on locked data. Both ways the refcount could rise go through <code>wrapper.c</code>, and the rule above covers both.</p>
+
+</section>
+<p class="divider">Oct 14, 2026, 12:39 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>“Right after a pointer is handed out the data's refcount is 1” isn’t it often user data? How is user data guaranteed to have a refcount of 1?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; cat src/clone.h; grep -n &quot;r_clone_data&quot; -A30 src/clone…</summary>
+<pre>cd ~/files/r/packages/rray; cat src/clone.h; grep -n &quot;r_clone_data&quot; -A30 src/clone.c | head -60</pre><pre class="output">#ifndef RRAY_CLONE_H
+#define RRAY_CLONE_H
+
+#include &quot;rlang.h&quot;
+
+r_obj* r_clone_data(r_obj* x);
+
+#endif
+4:r_obj* r_clone_data(r_obj* x) {
+5-  switch (r_typeof(x)) {
+6-  case R_TYPE_logical: {
+7-    const int* v_x = r_lgl_cbegin(x);
+8-    const r_ssize size = r_length(x);
+9-    r_obj* out = KEEP(r_alloc_logical(size));
+10-    int* v_out = r_lgl_begin(out);
+11-    r_memcpy(v_out, v_x, sizeof(int) * size);
+12-    FREE(1);
+13-    return out;
+14-  }
+15-  case R_TYPE_integer: {
+16-    const int* v_x = r_int_cbegin(x);
+17-    const r_ssize size = r_length(x);
+18-    r_obj* out = KEEP(r_alloc_integer(size));
+19-    int* v_out = r_int_begin(out);
+20-    r_memcpy(v_out, v_x, sizeof(int) * size);
+21-    FREE(1);
+22-    return out;
+23-  }
+24-  case R_TYPE_double: {
+25-    const double* v_x = r_dbl_cbegin(x);
+26-    const r_ssize size = r_length(x);
+27-    r_obj* out = KEEP(r_alloc_double(size));
+28-    double* v_out = r_dbl_begin(out);
+29-    r_memcpy(v_out, v_x, sizeof(double) * size);
+30-    FREE(1);
+31-    return out;
+32-  }
+33-  case R_TYPE_complex: {
+34-    const r_complex* v_x = r_cpl_cbegin(x);</pre></details>
+<p>It isn't. User data can have any refcount. What guarantees a refcount of 1 is the copy that happens when a pointer is requested. I worded that too loosely.</p>
+<h2>Two cases when a pointer is requested</h2>
+<p>Say a user wraps their own vector and then something asks for a pointer:</p>
+<pre><code class="language-r">x &lt;- c(1, 2, 3)
+w &lt;- rray_set_names(x, nms)   # data1(w) is the user's x
+</code></pre>
+<p><strong>1. The data looks shared.</strong> While <code>x</code> is still bound, the vector is referenced by the binding and by the wrapper, so its refcount is at least 2. The pointer request copies it with <code>r_clone_data()</code> and installs the copy in <code>data1</code>. The copy is a fresh plain vector, and only the wrapper refers to it, so its refcount is 1. The pointer points into that copy, never into the user's vector.</p>
+<p><strong>2. The data doesn't look shared.</strong> If the user's binding is gone and R decremented the refcount, the wrapper is the only thing that refers to the vector. Its refcount is 1, so we hand out a pointer into the user's original vector without copying. That's fine: nobody else can see it through R anymore.</p>
+<p>So the claim is: after a pointer request, <code>data1</code> has a refcount of exactly 1. Either it was 1 already, or we just replaced it with a copy whose refcount is 1. It can't be 0, because the wrapper itself counts as a reference.</p>
+<h2>The case R's third commit handled</h2>
+<p>R's follow-up commit <code>3580627fa3</code> exists because this can fail for R's own wrapper. R copies with <code>shallow_duplicate()</code>. When the wrapped data is itself ALTREP (say a compact <code>1:10</code>, or a vroom or arrow vector), that call dispatches to the other class's <code>Duplicate</code> method. That method can return an object whose refcount is already above zero. R then marks the lock as <code>2</code>, meaning locked but with no guarantee about the refcount.</p>
+<p>We don't have that problem. <code>r_clone_data()</code> (<code>src/clone.c</code>) never calls <code>Duplicate</code>. It always allocates a fresh plain vector and copies into it, so whatever the input class is, the copy starts at refcount 0 and is 1 once installed.</p>
+<h2>Effect on the earlier argument</h2>
+<p>This holds with or without the lock. The lock only decides what happens on a later rewrap: share the refcount-1 data (unlocked) or copy it (locked).</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Does r_wrap currently copy all attributes from x over to the new altrep object?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; grep -rn &quot;r_attrib_clone_from&quot; src --include=*.c --inc…</summary>
+<pre>cd ~/files/r/packages/rray; grep -rn &quot;r_attrib_clone_from&quot; src --include=*.c --include=*.h | grep -v &quot;^src/wrapper.c&quot;; grep -rn &quot;r_attrib_clone_from&quot; -A25 src/rlang/*.c src/rlang/*.h | head -50</pre><pre class="output">(eval):1: no matches found: --include=*.c
+src/rlang/attrib.h:31:static inline void r_attrib_clone_from(r_obj* to, r_obj* from) {
+src/rlang/attrib.h-32-    SHALLOW_DUPLICATE_ATTRIB(to, from);
+src/rlang/attrib.h-33-}
+src/rlang/attrib.h-34-
+src/rlang/attrib.h-35-// Unlike Rf_getAttrib(), this doesn't allocate, but in practice requires
+src/rlang/attrib.h-36-// protection because rchk considers the return value to be a fresh pointer.
+src/rlang/attrib.h-37-r_obj* r_attrib_get(r_obj* x, r_obj* tag);
+src/rlang/attrib.h-38-
+src/rlang/attrib.h-39-static inline r_obj* r_class(r_obj* x) {
+src/rlang/attrib.h-40-    return r_attrib_get(x, r_syms.class_);
+src/rlang/attrib.h-41-}
+src/rlang/attrib.h-42-
+src/rlang/attrib.h-43-void r_attrib_poke_classes(r_obj* x, const char** classes, r_ssize n);
+src/rlang/attrib.h-44-
+src/rlang/attrib.h-45-static inline r_obj* r_dim(r_obj* x) {
+src/rlang/attrib.h-46-    return r_attrib_get(x, r_syms.dim);
+src/rlang/attrib.h-47-}
+src/rlang/attrib.h-48-
+src/rlang/attrib.h-49-static inline r_obj* r_dim_names(r_obj* x) {
+src/rlang/attrib.h-50-    return r_attrib_get(x, r_syms.dim_names);
+src/rlang/attrib.h-51-}
+src/rlang/attrib.h-52-
+src/rlang/attrib.h-53-static inline r_obj* r_names(r_obj* x) {
+src/rlang/attrib.h-54-    return r_attrib_get(x, r_syms.names);
+src/rlang/attrib.h-55-}
+src/rlang/attrib.h-56-</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn; grep -rn &quot;void (SHALLOW_DUPLICATE_ATTRIB)\|void SHALLOW_DUPLIC…</summary>
+<pre>cd ~/files/r/r-svn; grep -rn &quot;void (SHALLOW_DUPLICATE_ATTRIB)\|void SHALLOW_DUPLICATE_ATTRIB&quot; -A12 src/main/*.c</pre><pre class="output">src/main/memory.c:3968:void SHALLOW_DUPLICATE_ATTRIB(SEXP to, SEXP from) {
+src/main/memory.c-3969-    SET_ATTRIB(CHK(to), shallow_duplicate(CHK(ATTRIB(CHK(from)))));
+src/main/memory.c-3970-    SET_OBJECT(CHK(to), OBJECT(from));
+src/main/memory.c-3971-    IS_S4_OBJECT(from) ?  SET_S4_OBJECT(to) : UNSET_S4_OBJECT(to);
+src/main/memory.c-3972-}
+src/main/memory.c-3973-void CLEAR_ATTRIB(SEXP x)
+src/main/memory.c-3974-{
+src/main/memory.c-3975-    SET_ATTRIB(CHK(x), R_NilValue);
+src/main/memory.c-3976-    SET_OBJECT(x, 0);
+src/main/memory.c-3977-    UNSET_S4_OBJECT(x);
+src/main/memory.c-3978-}
+src/main/memory.c-3979-
+src/main/memory.c-3980-NORET static void bad_SET_TYPEOF(int from, int to)
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Yes. <code>r_wrap()</code> copies every attribute of <code>x</code> onto the new wrapper, plus the object bit and the S4 bit.</p>
+<p><code>r_attrib_clone_from()</code> is rlang's name for <code>SHALLOW_DUPLICATE_ATTRIB()</code> (<code>src/rlang/attrib.h:31</code>). In R that is (<code>src/main/memory.c:3968</code>):</p>
+<pre><code class="language-c">SET_ATTRIB(to, shallow_duplicate(ATTRIB(from)));
+SET_OBJECT(to, OBJECT(from));
+IS_S4_OBJECT(from) ? SET_S4_OBJECT(to) : UNSET_S4_OBJECT(to);
+</code></pre>
+<p>What that means for <code>r_wrap()</code>:</p>
+<ul>
+<li>
+<p><strong>The attribute list is new, its values are shared.</strong> The wrapper gets its own pairlist of attributes, but the values (<code>dim</code>, <code>dimnames</code>, <code>class</code>, ...) are the same objects as on <code>x</code>, with their refcounts bumped. Callers like <code>rray_set_names()</code> then replace entries on <code>out</code> without touching <code>x</code>.</p>
+</li>
+<li>
+<p><strong>Attributes always come from <code>x</code>.</strong> If <code>x</code> is a wrapper, the wrapper's attributes are copied, not the ones on the data inside it. The code comment at that line says this too.</p>
+</li>
+<li>
+<p><strong>The wrapped data keeps its own attributes.</strong> When we wrap a user's vector, <code>data1</code> still has the user's original attributes attached. Nothing reads them through the wrapper, so this is harmless today.</p>
+</li>
+</ul>
+<p>That last point matters for the <code>rray_unwrap()</code> idea. The unwrapped vector can carry out-of-date <code>dim</code> or <code>dimnames</code>. Code that borrows a pointer from it must still read dimensions and names from <code>x</code>, never from <code>data</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

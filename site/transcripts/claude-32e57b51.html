@@ -1,0 +1,1978 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reviewing the plans/slice.md design against the codebase</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-83">rray timeline</a>
+<h1>Reviewing the <code>plans/slice.md</code> design against the codebase</h1>
+<p class="facts">Claude · Sep 20, 2026 · 1 prompt · 3 replies · <a href="https://github.com/r-lib/rray/pull/83">#83</a></p>
+</header>
+<main>
+<p class="divider">Sep 20, 2026, 17:56 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Do a full review of the new slice plan</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll start by finding the slice plan.</p>
+
+<details class="tool"><summary>Bash: ls plans/ &amp;&amp; git log --oneline -5</summary>
+<pre>ls plans/ &amp;&amp; git log --oneline -5</pre><pre class="output">extensions.md
+implementation.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+84d6159 Document the array slicing API
+bf08249 Remove `rray_expand()` from the implementation plan
+72cb7ec Remove `rray_tile()` from the implementation plan
+032a90f Add `rray_rep()` and `rray_rep_each()` (#82)
+73570c8 Rename pkgdown Binary section to Elementwise</pre></details>
+<details class="tool"><summary>Bash: wc -l plans/slice.md &amp;&amp; cat plans/slice.md</summary>
+<pre>wc -l plans/slice.md &amp;&amp; cat plans/slice.md</pre><pre class="output">     930 plans/slice.md
+# Array slicing plan
+
+## Recommendation
+
+Use `slice` for orthogonal, dimension-preserving selection. Use `extract` for
+selection that returns a one-dimensional array. Flat positions and coordinate
+points are two input forms for `rray_extract()`. Fold shared and per-lane axis
+indices into `rray_slice_axis()`, using the dimensionality of `i` to dispatch.
+
+The proposed family is:
+
+| Operation | Read | Assign |
+|---|---|---|
+| Slice every axis | `rray_slice(x, ...)` | `rray_slice_assign(x, ..., value)` |
+| Slice one axis | `rray_slice_axis(x, i, axis)` | `rray_slice_assign_axis(x, i, axis, value)` |
+| Extract flat positions or points | `rray_extract(x, i)` | `rray_extract_assign(x, i, value)` |
+
+The two slice rows should be implemented first. Extraction forms the second
+layer.
+
+Do not add replacement functions such as `rray_slice&lt;-()`. The `_assign()`
+forms return a modified copy and match the rest of rray4's function API.
+There are no `[` or `[[` methods because rray4 provides functions rather than
+an array class.
+
+## The model
+
+There are four different addressing modes. Flat positions and coordinate points
+share `rray_extract()` because both return a one-dimensional array. Shared and
+per-lane axis indices share `rray_slice_axis()` because both preserve
+dimensionality and differ naturally by the dimensionality of `i`.
+
+### Orthogonal slices
+
+Each subscript selects locations on one axis. Multiple subscripts form a
+Cartesian product.
+
+```r
+x &lt;- array(1:24, c(2, 3, 4))
+
+rray_slice(x, c(2, 1), c(3, 1), 2)
+# dimensions: c(2, 2, 1)
+
+rray_slice_axis(x, c(3, 1), axis = 2)
+# dimensions: c(2, 2, 4)
+```
+
+This is the ordinary array operation. It is close to base R's
+`x[..., drop = FALSE]` and NumPy's open-mesh indexing. It always preserves
+dimensionality.
+
+### Coordinate points
+
+Each row of `points` identifies one element. Rows are paired coordinates, not a
+Cartesian product.
+
+```r
+points &lt;- rbind(
+  c(1, 1, 1),
+  c(2, 3, 4),
+  c(1, 2, 3)
+)
+
+rray_extract(x, points)
+# dimensions: 3L
+# values: c(1L, 24L, 15L)
+```
+
+This is base R's matrix indexing and xtensor's `index_view()` model. The result
+is one dimensional because no source axis survives as an output axis.
+
+### Flat positions
+
+The array is treated as its column-major storage vector.
+
+```r
+rray_extract(x, c(1, 4, 24))
+rray_extract(x, x %% 5 == 0)
+```
+
+This covers base R's single-subscript array indexing and whole-array logical
+masks. The result is one dimensional.
+
+### Per-lane axis slices
+
+The index array supplies a different axis location for each lane through the
+array.
+
+```r
+x &lt;- array(c(10, 60, 30, 40, 20, 50), c(2, 3))
+i &lt;- array(c(2, 1), c(2, 1))
+
+rray_slice_axis(x, i, axis = 2)
+# dimensions: c(2, 1)
+# values: c(30, 60)
+```
+
+This mode matches NumPy's `take_along_axis()`. It is useful with functions such
+as `rray_locate_max()` and with per-lane sorting or ranking indices.
+
+## Why these divisions
+
+Base R gives `[` several unrelated meanings. A single subscript on an array is
+flat, one subscript per axis is orthogonal, and a matrix subscript is pointwise.
+It also drops dimensions by default. The behavior is powerful, but the same
+syntax can return unrelated shapes.
+
+NumPy distinguishes basic and advanced indexing, but multiple integer arrays
+switch to paired advanced indexing. `x[rows, columns]` selects paired points,
+while `x[np.ix_(rows, columns)]` selects the Cartesian product. This is one of
+the easiest indexing rules to misread.
+
+The original rray improved shape stability, but its names did not line up with
+the addressing modes:
+
+- `rray_subset()` performed dimension-preserving orthogonal slicing.
+- `rray_extract()` performed the same orthogonal selection and then flattened
+  it.
+- `rray_yank()` used flat positions.
+- `rray_slice()` was only the one-axis convenience wrapper.
+
+The proposed API makes the common operation `rray_slice()`. `rray_extract()`
+uses the shape of `i` to distinguish flat positions from coordinate points.
+
+## `rray_slice()`
+
+```r
+rray_slice(x, ...)
+rray_slice_assign(x, ..., value)
+```
+
+`value` follows `...`, so it must be supplied by name.
+
+Each element of `...` applies to the matching axis. A missing argument selects
+the whole axis. Unspecified trailing axes also select the whole axis.
+
+```r
+rray_slice(x, 1)
+# dimensions: c(1, 3, 4)
+
+rray_slice(x, , 1)
+# dimensions: c(2, 1, 4)
+
+rray_slice(x)
+# dimensions: c(2, 3, 4)
+```
+
+Trailing missing arguments have no effect. More subscripts than the
+dimensionality of `x` are an error.
+
+The dots should support dynamic splicing. This gives a programmatic API without
+adding `rray_slice_axes()`.
+
+```r
+indices &lt;- list(1:2, c(3, 1))
+rray_slice(x, !!!indices)
+```
+
+Subscripts in `...` must be unnamed. This keeps selection positional and leaves
+named axes available as a future extension.
+
+## `rray_slice_axis()`
+
+```r
+rray_slice_axis(x, i, axis)
+rray_slice_assign_axis(x, i, axis, value)
+```
+
+`rray_slice_axis()` has two modes. A vector or one-dimensional `i` is one shared
+subscript used by every lane. A multidimensional integer `i` contains a
+different subscript for every lane. A lane is the one-dimensional vector left
+after every coordinate except `axis` has been fixed.
+
+This shape dispatch folds the useful part of NumPy's `take_along_axis()` into
+the ordinary one-axis slicing function.
+
+### Dispatch on `i`
+
+| Form of `i` | Mode |
+|---|---|
+| Missing, `NULL`, or an unshaped atomic vector | Shared |
+| A one-dimensional array | Shared |
+| A bare integer array with dimensionality two or greater | Per-lane |
+| Any other multidimensional object | Error |
+
+A bare array has no class other than the implicit `array` or `matrix` class
+provided by its dimensions. Dispatch chooses a mode before the subscript is
+validated. For example, an unshaped raw vector reaches shared mode and then
+errors because raw vectors are not valid shared subscripts.
+
+A multidimensional integer array always requests per-lane mode. If its
+dimensionality does not equal that of `x`, it is an error rather than a shared
+subscript. Convert it to a vector or one-dimensional array to request shared
+mode.
+
+Per-lane mode accepts integer storage only. Double, logical, and character
+arrays do not activate it. Position-producing functions such as
+`rray_locate_max()` should return integer arrays.
+</pre><p class="cut">731 more lines cut</p></details>
+<details class="tool"><summary>Read plans/slice.md</summary>
+<pre class="output">1	# Array slicing plan
+2	
+3	## Recommendation
+4	
+5	Use `slice` for orthogonal, dimension-preserving selection. Use `extract` for
+6	selection that returns a one-dimensional array. Flat positions and coordinate
+7	points are two input forms for `rray_extract()`. Fold shared and per-lane axis
+8	indices into `rray_slice_axis()`, using the dimensionality of `i` to dispatch.
+9	
+10	The proposed family is:
+11	
+12	| Operation | Read | Assign |
+13	|---|---|---|
+14	| Slice every axis | `rray_slice(x, ...)` | `rray_slice_assign(x, ..., value)` |
+15	| Slice one axis | `rray_slice_axis(x, i, axis)` | `rray_slice_assign_axis(x, i, axis, value)` |
+16	| Extract flat positions or points | `rray_extract(x, i)` | `rray_extract_assign(x, i, value)` |
+17	
+18	The two slice rows should be implemented first. Extraction forms the second
+19	layer.
+20	
+21	Do not add replacement functions such as `rray_slice&lt;-()`. The `_assign()`
+22	forms return a modified copy and match the rest of rray4's function API.
+23	There are no `[` or `[[` methods because rray4 provides functions rather than
+24	an array class.
+25	
+26	## The model
+27	
+28	There are four different addressing modes. Flat positions and coordinate points
+29	share `rray_extract()` because both return a one-dimensional array. Shared and
+30	per-lane axis indices share `rray_slice_axis()` because both preserve
+31	dimensionality and differ naturally by the dimensionality of `i`.
+32	
+33	### Orthogonal slices
+34	
+35	Each subscript selects locations on one axis. Multiple subscripts form a
+36	Cartesian product.
+37	
+38	```r
+39	x &lt;- array(1:24, c(2, 3, 4))
+40	
+41	rray_slice(x, c(2, 1), c(3, 1), 2)
+42	# dimensions: c(2, 2, 1)
+43	
+44	rray_slice_axis(x, c(3, 1), axis = 2)
+45	# dimensions: c(2, 2, 4)
+46	```
+47	
+48	This is the ordinary array operation. It is close to base R's
+49	`x[..., drop = FALSE]` and NumPy's open-mesh indexing. It always preserves
+50	dimensionality.
+51	
+52	### Coordinate points
+53	
+54	Each row of `points` identifies one element. Rows are paired coordinates, not a
+55	Cartesian product.
+56	
+57	```r
+58	points &lt;- rbind(
+59	  c(1, 1, 1),
+60	  c(2, 3, 4),
+61	  c(1, 2, 3)
+62	)
+63	
+64	rray_extract(x, points)
+65	# dimensions: 3L
+66	# values: c(1L, 24L, 15L)
+67	```
+68	
+69	This is base R's matrix indexing and xtensor's `index_view()` model. The result
+70	is one dimensional because no source axis survives as an output axis.
+71	
+72	### Flat positions
+73	
+74	The array is treated as its column-major storage vector.
+75	
+76	```r
+77	rray_extract(x, c(1, 4, 24))
+78	rray_extract(x, x %% 5 == 0)
+79	```
+80	
+81	This covers base R's single-subscript array indexing and whole-array logical
+82	masks. The result is one dimensional.
+83	
+84	### Per-lane axis slices
+85	
+86	The index array supplies a different axis location for each lane through the
+87	array.
+88	
+89	```r
+90	x &lt;- array(c(10, 60, 30, 40, 20, 50), c(2, 3))
+91	i &lt;- array(c(2, 1), c(2, 1))
+92	
+93	rray_slice_axis(x, i, axis = 2)
+94	# dimensions: c(2, 1)
+95	# values: c(30, 60)
+96	```
+97	
+98	This mode matches NumPy's `take_along_axis()`. It is useful with functions such
+99	as `rray_locate_max()` and with per-lane sorting or ranking indices.
+100	
+101	## Why these divisions
+102	
+103	Base R gives `[` several unrelated meanings. A single subscript on an array is
+104	flat, one subscript per axis is orthogonal, and a matrix subscript is pointwise.
+105	It also drops dimensions by default. The behavior is powerful, but the same
+106	syntax can return unrelated shapes.
+107	
+108	NumPy distinguishes basic and advanced indexing, but multiple integer arrays
+109	switch to paired advanced indexing. `x[rows, columns]` selects paired points,
+110	while `x[np.ix_(rows, columns)]` selects the Cartesian product. This is one of
+111	the easiest indexing rules to misread.
+112	
+113	The original rray improved shape stability, but its names did not line up with
+114	the addressing modes:
+115	
+116	- `rray_subset()` performed dimension-preserving orthogonal slicing.
+117	- `rray_extract()` performed the same orthogonal selection and then flattened
+118	  it.
+119	- `rray_yank()` used flat positions.
+120	- `rray_slice()` was only the one-axis convenience wrapper.
+121	
+122	The proposed API makes the common operation `rray_slice()`. `rray_extract()`
+123	uses the shape of `i` to distinguish flat positions from coordinate points.
+124	
+125	## `rray_slice()`
+126	
+127	```r
+128	rray_slice(x, ...)
+129	rray_slice_assign(x, ..., value)
+130	```
+131	
+132	`value` follows `...`, so it must be supplied by name.
+133	
+134	Each element of `...` applies to the matching axis. A missing argument selects
+135	the whole axis. Unspecified trailing axes also select the whole axis.
+136	
+137	```r
+138	rray_slice(x, 1)
+139	# dimensions: c(1, 3, 4)
+140	
+141	rray_slice(x, , 1)
+142	# dimensions: c(2, 1, 4)
+143	
+144	rray_slice(x)
+145	# dimensions: c(2, 3, 4)
+146	```
+147	
+148	Trailing missing arguments have no effect. More subscripts than the
+149	dimensionality of `x` are an error.
+150	
+151	The dots should support dynamic splicing. This gives a programmatic API without
+152	adding `rray_slice_axes()`.
+153	
+154	```r
+155	indices &lt;- list(1:2, c(3, 1))
+156	rray_slice(x, !!!indices)
+157	```
+158	
+159	Subscripts in `...` must be unnamed. This keeps selection positional and leaves
+160	named axes available as a future extension.
+161	
+162	## `rray_slice_axis()`
+163	
+164	```r
+165	rray_slice_axis(x, i, axis)
+166	rray_slice_assign_axis(x, i, axis, value)
+167	```
+168	
+169	`rray_slice_axis()` has two modes. A vector or one-dimensional `i` is one shared
+170	subscript used by every lane. A multidimensional integer `i` contains a
+171	different subscript for every lane. A lane is the one-dimensional vector left
+172	after every coordinate except `axis` has been fixed.
+173	
+174	This shape dispatch folds the useful part of NumPy's `take_along_axis()` into
+175	the ordinary one-axis slicing function.
+176	
+177	### Dispatch on `i`
+178	
+179	| Form of `i` | Mode |
+180	|---|---|
+181	| Missing, `NULL`, or an unshaped atomic vector | Shared |
+182	| A one-dimensional array | Shared |
+183	| A bare integer array with dimensionality two or greater | Per-lane |
+184	| Any other multidimensional object | Error |
+185	
+186	A bare array has no class other than the implicit `array` or `matrix` class
+187	provided by its dimensions. Dispatch chooses a mode before the subscript is
+188	validated. For example, an unshaped raw vector reaches shared mode and then
+189	errors because raw vectors are not valid shared subscripts.
+190	
+191	A multidimensional integer array always requests per-lane mode. If its
+192	dimensionality does not equal that of `x`, it is an error rather than a shared
+193	subscript. Convert it to a vector or one-dimensional array to request shared
+194	mode.
+195	
+196	Per-lane mode accepts integer storage only. Double, logical, and character
+197	arrays do not activate it. Position-producing functions such as
+198	`rray_locate_max()` should return integer arrays.
+199	
+200	When `x` is one-dimensional, per-lane and shared indexing are the same because</pre><p class="cut">731 more lines cut</p></details>
+<p>Now let me check the plan against the actual codebase.</p>
+
+<details class="tool"><summary>Bash: ls &amp;&amp; echo &quot;--- R ---&quot; &amp;&amp; ls R/ &amp;&amp; echo &quot;--- src ---&quot; &amp;&amp; ls src/ &amp;&amp; echo &quot;--- decl ---&quot; &amp;&amp; ls…</summary>
+<pre>ls &amp;&amp; echo &quot;--- R ---&quot; &amp;&amp; ls R/ &amp;&amp; echo &quot;--- src ---&quot; &amp;&amp; ls src/ &amp;&amp; echo &quot;--- decl ---&quot; &amp;&amp; ls src/decl/ 2&gt;/dev/null</pre><pre class="output">_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+CLAUDE.md
+compile_commands.json
+DESCRIPTION
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+plans
+R
+rray4.Rproj
+src
+tests
+--- R ---
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+insert-axes.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+rray4-package.R
+size.R
+split.R
+stack.R
+unstack.R
+zzz.R
+--- src ---
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extremum.c
+extremum.h
+extremum.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rep.c
+rep.h
+rep.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+split.c
+split.h
+split.o
+stack.c
+stack.h
+stack.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+unstack.c
+unstack.h
+unstack.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o
+--- decl ---
+arg-decl.h
+arithmetic-add-decl.h
+arithmetic-divide-decl.h
+arithmetic-exponentiate-decl.h
+arithmetic-multiply-decl.h
+arithmetic-subtract-decl.h
+broadcast-decl.h
+broadcast-names-decl.h
+cast-decl.h
+combine-decl.h
+compare-decl.h
+dimensions-decl.h
+equal-decl.h
+extremum-decl.h
+names-decl.h
+permute-axes-decl.h</pre><p class="cut">14 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat NAMESPACE</summary>
+<pre>cat NAMESPACE</pre><pre class="output"># Generated by roxygen2: do not edit by hand
+
+export(rray_add)
+export(rray_all_along)
+export(rray_any_along)
+export(rray_axis_names)
+export(rray_broadcast)
+export(rray_broadcast_common)
+export(rray_col_names)
+export(rray_combine)
+export(rray_dimensionality)
+export(rray_dimensions)
+export(rray_dimensions_common)
+export(rray_divide)
+export(rray_equal)
+export(rray_exponentiate)
+export(rray_greater_than)
+export(rray_greater_than_or_equal)
+export(rray_insert_axes)
+export(rray_less_than)
+export(rray_less_than_or_equal)
+export(rray_max)
+export(rray_mean_along)
+export(rray_min)
+export(rray_move_axes)
+export(rray_multiply)
+export(rray_names)
+export(rray_not_equal)
+export(rray_permute_axes)
+export(rray_product_along)
+export(rray_remove_axes)
+export(rray_rep)
+export(rray_rep_each)
+export(rray_row_names)
+export(rray_set_axis_names)
+export(rray_set_col_names)
+export(rray_set_dimensions)
+export(rray_set_names)
+export(rray_set_row_names)
+export(rray_size)
+export(rray_split)
+export(rray_stack)
+export(rray_subtract)
+export(rray_sum_along)
+export(rray_unstack)
+import(rlang)
+import(vctrs)
+useDynLib(rray4, .registration = TRUE)</pre></details>
+<details class="tool"><summary>Bash: head -30 R/extremum.R; echo &quot;=== cast ===&quot;; grep -n &quot;^rray_cast\|^#' @export\|^rray_&quot; R/cast.…</summary>
+<pre>head -30 R/extremum.R; echo &quot;=== cast ===&quot;; grep -n &quot;^rray_cast\|^#' @export\|^rray_&quot; R/cast.R | head -20; echo &quot;=== set_dimensions ===&quot;; grep -n &quot;rray_set_dimensions&quot; R/dimensions.R | head</pre><pre class="output">#' Elementwise maximum and minimum
+#'
+#' @description
+#' - `rray_max()` computes the elementwise maximum of two arrays.
+#'
+#' - `rray_min()` computes the elementwise minimum of two arrays.
+#'
+#' @details
+#' The arrays are broadcast to common dimensions first, so they do not have to
+#' be the same shape.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param y An array.
+#'
+#' @param na_rm If `TRUE`, missing values are removed before taking the maximum
+#'   or minimum.
+#'
+#' @returns
+#' An array with the common dimensions and common type of `x` and `y`.
+#'
+#' @name extremum
+#' @examples
+#' x &lt;- array(1:6, c(3L, 2L))
+#'
+#' rray_max(x, 4L)
+#' rray_min(x, 4L)
+#'
+=== cast ===
+1:rray_cast &lt;- function(
+=== set_dimensions ===
+51:#' `rray_set_dimensions()` sets the dimensions of `x` to a new set of dimensions
+53:#' which repeats elements to fill new dimensions, `rray_set_dimensions()` simply
+69:#' rray_set_dimensions(x, c(2L, 3L))
+72:#' rray_set_dimensions(x, c(3L, 2L, 1L))
+75:#' try(rray_set_dimensions(x, c(6L, 2L)))
+76:rray_set_dimensions &lt;- function(x, dimensions) {
+77:  .Call(ffi_rray_set_dimensions, x, dimensions, environment())</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;^#\|^###&quot; plans/implementation.md | head -80</summary>
+<pre>grep -n &quot;^#\|^###&quot; plans/implementation.md | head -80</pre><pre class="output">1:# rray4 implementation plan
+3:## What this is
+18:## How to use this plan
+30:# Part 1: Conventions
+35:## Files
+116:## Naming
+141:## C style
+181:## Comments
+195:## R style
+201:## Prose
+210:# Part 2: The core ideas
+212:## 2.1 Arrays in, arrays out
+239:## 2.2 Broadcasting
+289:## 2.3 Names
+355:### The names API
+366:## 2.4 Types
+460:### Argument tags and the error call
+501:#&gt; Error in `f()`:
+502:#&gt; ! Can't combine `a` &lt;integer&gt; and `b` &lt;character&gt;.
+523:#&gt; Error: Can't combine &lt;integer&gt; and &lt;character&gt;.
+548:#&gt; Error: Can't combine `..2` &lt;double&gt; and `..3` &lt;character&gt;.
+592:### The common type rules
+611:### Operator promotion
+649:#&gt; Error in `rray_add()`:
+650:#&gt; ! Can't apply `+` to `x` &lt;character&gt; and `y` &lt;character&gt;.
+681:### Operators that promote nothing
+691:### Operators with a fixed output type
+707:## 2.5 Iterators
+746:# Part 3: Testing
+798:# Part 4: The pull requests
+818:# Part 5: Function reference
+839:## 5.1 Shape
+841:### `rray_flatten()`
+865:### `rray_flip()`
+885:## 5.2 Elementwise arithmetic
+911:## 5.3 Other elementwise numeric
+913:### `rray_clip()`
+941:### `rray_if_else()`
+970:#&gt; a y c
+971:#&gt; 1 8 3
+984:### `rray_full_like()`, `rray_ones_like()`, `rray_zeros_like()`
+1004:## 5.4 Logical
+1029:## 5.5 Reductions
+1086:## 5.6 Indexing
+1097:### `rray_subset()`, by index, keeps dimensionality
+1117:### `rray_extract()`, by index, always drops
+1132:### `rray_yank()`, by position, always flattens
+1149:### `rray_slice()`
+1159:### The assignment forms
+1173:## 5.7 Binding
+1208:# Part 6: Out of scope
+1256:# Part 7: Possible improvements for later
+1261:## `x_arg` and `call` on the exported functions
+1272:## Unary elementwise math
+1282:## A null type
+1290:## An unspecified type
+1299:## Classed arrays</pre></details>
+<details class="tool"><summary>Bash: sed -n '1029,1175p' plans/implementation.md</summary>
+<pre>sed -n '1029,1175p' plans/implementation.md</pre><pre class="output">## 5.5 Reductions
+
+All use the reduction iterator. All keep dimensionality, with reduced axes
+collapsed to a dimension of 1. There is no `keep_dimensions` argument.
+
+`axes` is **required** on every one of them. The original defaulted it to `NULL`
+meaning &quot;all axes&quot;. We do not.
+
+Names: reduce.
+
+| function | op | type rule |
+|---|---|---|
+| `rray_sum_along(x, axes, ..., na_rm = FALSE)` | `sum` | promoted, exists |
+| `rray_product_along(x, axes, ..., na_rm = FALSE)` | `prod` | promoted, int to dbl |
+| `rray_mean_along(x, axes, ..., na_rm = FALSE)` | `mean` | promoted, lgl and int to dbl, exists |
+| `rray_max_along(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |
+| `rray_min_along(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |
+| `rray_all_along(x, axes, ..., na_rm = FALSE)` | `all` | fixed, logical in, logical out, exists |
+| `rray_any_along(x, axes, ..., na_rm = FALSE)` | `any` | fixed, logical in, logical out, exists |
+
+`rray_max_pos(x, axis)` and `rray_min_pos(x, axis)` give the position of the
+maximum or minimum along a single axis. Type: fixed, integer output.
+
+```r
+x &lt;- array(c(1:10, 20:11), c(5, 2, 2))
+rray_max_pos(x, 1)     # position of the max along the rows
+rray_max_pos(x, 2)     # along the columns
+```
+
+`rray_sum_along()` already exists, documented under the shared `reduce` topic in
+`R/reduce.R`, with its C in `src/reduce-sum.c` on top of the `rray_reduce()`
+shell in `src/reduce.c`/`src/reduce.h` (see 2.1).
+
+`rray_product_along()`, `rray_mean_along()`, `rray_max_along()`, and
+`rray_min_along()` share
+`rray_sum_along()`'s
+`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to
+`R/reduce.R` and their own `src/reduce-{name}.c` beside it.
+
+`rray_mean_along()` needs numerical state per output element, so it uses the
+`rray_reduce_nested()` shell rather than `rray_reduce()`. That shell walks the
+retained axes and the reduced axes with two immutable plans, which lets the
+mean core make several passes over one reduced slice before moving on.
+
+`rray_all_along()` and `rray_any_along()` share that shape too, so they are
+`@rdname reduce` entries as well. They are the one place two reducers share a C
+pair, `src/reduce-logical.c` and `src/reduce-logical.h`, because each supports
+only logical input and so is small. Their `na_rm = FALSE` behaviour follows
+`all()` and `any()`: a missing value only reaches the result when it could
+change the answer, so `all(c(FALSE, NA))` is `FALSE` and not `NA`.
+
+`rray_max_pos()` and `rray_min_pos()` take `axis` rather than `axes` and return
+positions rather than reduced values, so they do not match `rray_reduce()`'s
+shape. They need their own file and topic, `R/max-pos.R`, with its own C pair.
+Whether any part of `rray_reduce()` can be shared with them is a design question
+for whoever picks them up.
+
+## 5.6 Indexing
+
+**A human should design review this whole section before any of it is
+implemented.** It was the most confusing part of the original rray, and it
+deserves a fresh look rather than a port. What follows documents what rray did,
+so the review has something concrete to react to.
+
+Three ways to pull data out, distinguished by what happens to dimensionality.
+
+Type: preserved throughout.
+
+### `rray_subset()`, by index, keeps dimensionality
+
+Never drops dimensions. Ignores trailing commas, so `x[1]` and `x[1, ]` agree.
+Missing arguments select a whole axis.
+
+```r
+x &lt;- array(1:8, c(2, 2, 2))
+
+rray_subset(x, 1)        # first row, still (1, 2, 2)
+rray_subset(x, , 1)      # all rows, first column, still (2, 1, 2)
+```
+
+Base R cannot do the second one without fully specifying every axis and passing
+`drop = FALSE`.
+
+Index types: integer-ish selects elements, logical must be length 1 or the
+dimension, character requires names on that axis, `NULL` means 0.
+
+Names: subset.
+
+### `rray_extract()`, by index, always drops
+
+Always returns a one dimensional result, and never keeps names.
+
+```r
+x &lt;- array(1:16, c(2, 4, 2), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL, NULL))
+
+rray_extract(x, 1)          # first row, flattened
+rray_extract(x, 1, 1:2)     # first row, first two columns, flattened
+```
+
+Like `x[[i, j, ...]]` but each subscript may have length greater than 1.
+
+Names: dropped.
+
+### `rray_yank()`, by position, always flattens
+
+Pulls elements out by their position in the flat array, ignoring dimensions
+entirely. Always one dimensional.
+
+```r
+x &lt;- array(10:17, c(2, 2, 2))
+
+rray_yank(x, 1:3)
+rray_yank(x, FALSE)
+```
+
+`i` is an integer vector of positions, a logical of length 1 or `rray_size(x)`,
+or a logical with exactly `x`'s dimensions.
+
+Names: dropped.
+
+### `rray_slice()`
+
+Subset a single axis by index, keeping dimensionality.
+
+```r
+rray_slice(x, i, axis)
+```
+
+Names: subset.
+
+### The assignment forms
+
+`rray_subset_assign()`, `rray_extract_assign()`, `rray_yank_assign()`,
+`rray_slice_assign()`.
+
+The original cast `value` to `x` rather than the other way round, and broadcast
+`value` to the shape of the selection. Both decisions are worth re-examining in
+the design review.
+
+No `&lt;-` replacement forms, consistent with the names API.
+
+Files: one pair per function, plus a shared `src/index.c` and `src/index.h` for
+turning user supplied subscripts into locations.
+
+## 5.7 Binding
+
+**A human should design review this before implementation.** The axis semantics</pre></details>
+<details class="tool"><summary>Bash: head -80 src/strided-iterator.h; echo &quot;=== POINT ===&quot;; head -60 src/point-iterator.h</summary>
+<pre>head -80 src/strided-iterator.h; echo &quot;=== POINT ===&quot;; head -60 src/point-iterator.h</pre><pre class="output">#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+=== POINT ===
+#ifndef RRAY_POINT_ITERATOR_H
+#define RRAY_POINT_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+
+// Simplest iterator
+//
+// Walks the multidimensional point space, providing access to the current
+// multidimensional point
+struct rray_point_iterator {
+  r_ssize index;
+  r_ssize size;
+
+  int v_point[RRAY_MAX_DIMENSIONALITY];
+  int v_point_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int point_dimensionality;
+};
+
+static inline void rray_point_iterator_init(
+  struct rray_point_iterator* it,
+  r_ssize size,
+  const int* v_point_dimensions,
+  int point_dimensionality
+) {
+  check_dimensionality(point_dimensionality);
+
+  it-&gt;index = 0;
+  it-&gt;size = size;
+
+  it-&gt;point_dimensionality = point_dimensionality;
+
+  for (int i = 0; i &lt; point_dimensionality; ++i) {
+    it-&gt;v_point_dimensions[i] = v_point_dimensions[i];
+  }
+  memset(it-&gt;v_point, 0, sizeof(int) * point_dimensionality);
+}
+
+#define RRAY_POINT_ITERATOR_FOR_EACH(IT, INDEX, V_POINT, ...)                  \
+  do {                                                                         \
+    struct rray_point_iterator* const iterator = (IT);                         \
+    r_ssize INDEX = iterator-&gt;index;                                           \
+    const r_ssize size = iterator-&gt;size;                                       \
+    int* V_POINT = iterator-&gt;v_point;                                          \
+    const int* v_point_dimensions = iterator-&gt;v_point_dimensions;              \
+    const int point_dimensionality = iterator-&gt;point_dimensionality;           \
+                                                                               \
+    while (INDEX != size) {                                                    \
+      __VA_ARGS__                                                              \
+      ++INDEX;                                                                 \
+                                                                               \
+      for (int axis = 0; axis &lt; point_dimensionality; ++axis) {                \
+        ++V_POINT[axis];                                                       \
+                                                                               \
+        if (V_POINT[axis] &lt; v_point_dimensions[axis]) {                        \
+          break;                                                               \
+        }                                                                      \
+                                                                               \
+        V_POINT[axis] = 0;                                                     \
+      }                                                                        \</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;two_location\|LOCATION2\|location2\|_two\b\|struct rray_strided_iterator&quot; src/stride…</summary>
+<pre>grep -n &quot;two_location\|LOCATION2\|location2\|_two\b\|struct rray_strided_iterator&quot; src/strided-iterator.h | head -40; echo &quot;=== decl ===&quot;; cat src/decl/strided-iterator-decl.h</pre><pre class="output">149:struct rray_strided_iterator_plan {
+160:static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+167:  struct rray_strided_iterator_plan plan;
+190:static inline struct rray_strided_iterator_plan rray_broadcast_iterator_plan(
+222:  const struct rray_strided_iterator_plan* plan
+227:  const struct rray_strided_iterator_plan* plan
+232:  const struct rray_strided_iterator_plan* plan
+237:  const struct rray_strided_iterator_plan* plan,
+258:struct rray_strided_iterator2_plan {
+270:static inline struct rray_strided_iterator2_plan rray_strided_iterator2_plan(
+278:  struct rray_strided_iterator2_plan plan;
+300:static inline struct rray_strided_iterator2_plan rray_broadcast_iterator2_plan(
+350:  const struct rray_strided_iterator2_plan* plan
+355:  const struct rray_strided_iterator2_plan* plan
+360:  const struct rray_strided_iterator2_plan* plan
+365:  const struct rray_strided_iterator2_plan* plan
+370:  const struct rray_strided_iterator2_plan* plan,
+=== decl ===
+static inline int rray__strided_iterator_axes_coalesce(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides,
+  int dimensionality
+);
+
+static inline int rray__strided_iterator_axes_coalesce2(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides1,
+  r_ssize* v_strides2,
+  int dimensionality
+);
+
+static inline bool rray__strided_iterator_axes_coalescible(
+  r_ssize left_dimension,
+  r_ssize left_stride,
+  r_ssize right_dimension,
+  r_ssize right_stride
+);
+
+static inline void rray__check_broadcast_dimensions(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+);</pre></details>
+<details class="tool"><summary>Bash: sed -n '239,300p' plans/implementation.md</summary>
+<pre>sed -n '239,300p' plans/implementation.md</pre><pre class="output">## 2.2 Broadcasting
+
+Broadcasting is independent of type, the same way recycling is.
+
+```r
+rray_dimensions(x)
+rray_dimensions_common(..., .dimensions = NULL)
+rray_broadcast(x, dimensions)
+rray_broadcast_common(..., .dimensions = NULL)
+```
+
+Rules, per axis:
+
+- Equal dimensions are compatible.
+
+- A dimension of 1 broadcasts to anything, including 0.
+
+- Anything else is an error, with a message naming the axis, both dimensions and
+  both inputs. Which input owns the existing dimension is tracked per axis,
+  since the input that set axis 1 can differ from the one that set axis 2. That
+  is why vctrs' single `arg-counter.c` counter does not fit here. Only
+  `rray_dimensions_common()` needs that tracking. `rray_dimensions2()` is the
+  two input form, and with two inputs a conflict always names `x` and `y`.
+
+- Missing trailing axes are treated as a dimension of 1, so dimensionality can
+  grow.
+
+Dimensionality can never shrink. `rray_broadcast()` errors on any decrease, even
+when the dimensions being dropped are all 1.
+
+A `NULL` is not an array, so anything taking arrays refuses it. That holds for
+one input and for `...` alike, so `rray_dimensions_common(NULL, 1:5)` is an
+error, not a way to skip an argument. A caller holding an array that might be
+absent drops it before the call.
+
+The one exception is `.dimensions`. It returns before `...` is looked at, so
+nothing in `...` is checked when it is supplied. That matches `.size` in
+`vec_size_common()`.
+
+`rray_broadcast_common()` keeps the names of `...` on the list it returns, the
+same way `vec_recycle_common()` keeps them.
+
+`RRAY_MAX_DIMENSIONALITY` is 64.
+
+Long arrays are supported where it is not painful. R allows an array's total
+length to exceed 2^31 while every individual dimension stays under it, because
+`dim` is always integer. That is why `rray_size()` returns a double while
+`rray_dimensions()` returns integer. Use `r_ssize` throughout. If long array
+support makes something genuinely hard, drop it and say so in the pull request.
+
+## 2.3 Names
+
+There are five rules. Every function in Part 5 declares which one it follows.
+
+**Follow the axis.** An axis keeps its names if its dimension is unchanged, and
+loses them if its dimension changed. Whatever it keeps travels with it to
+wherever the axis ends up. New axes have no names.
+
+This is the rule for almost everything that reshapes an array. An axis of
+dimension 1 broadcast to 1 counts as unchanged and keeps its length 1 names.
+
+**Reduce.** Reduced axes lose their names. Every other axis keeps them.</pre></details>
+<details class="tool"><summary>Bash: sed -n '839,890p' plans/implementation.md; echo &quot;=== naming ===&quot;; sed -n '116,141p' plans/imp…</summary>
+<pre>sed -n '839,890p' plans/implementation.md; echo &quot;=== naming ===&quot;; sed -n '116,141p' plans/implementation.md</pre><pre class="output">## 5.1 Shape
+
+### `rray_flatten()`
+
+Collapse to one dimension.
+
+```r
+rray_flatten(array(1:10, c(5, 2)))     # (5, 2) -&gt; (10)
+```
+
+Names: follow the axis. Type: preserved. So names survive only when the first
+axis' dimension is unchanged.
+
+```r
+y &lt;- array(1:2, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+rray_flatten(y)                                   # (2) -&gt; (2), names kept
+rray_flatten(array(1:2, c(2, 1), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL)))
+                                                  # (2, 1) -&gt; (2), names kept
+rray_flatten(array(1:2, c(1, 2), dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;))))
+                                                  # (1, 2) -&gt; (2), names dropped
+```
+
+Signature: `rray_flatten(x)`. Attributes only.
+
+Files: `R/flatten.R`, `src/flatten.c`, `src/flatten.h`.
+
+### `rray_flip()`
+
+Reverse the order along an axis.
+
+```r
+x &lt;- array(1:10, c(5, 2))
+rray_flip(x, 1)      # reverse the rows
+rray_flip(x, 2)      # reverse the columns
+```
+
+Names: follow the axis, with one exception. The flipped axis keeps its dimension,
+so it keeps its names, but they must be **reversed** alongside the data rather
+than copied across.
+
+Type: preserved.
+
+Signature: `rray_flip(x, axis)`. Single axis.
+
+Files: `R/flip.R`, `src/flip.c`, `src/flip.h`.
+
+## 5.2 Elementwise arithmetic
+
+Names: coalesce. Type: promoted.
+
+All binary, all sharing the loop and the pipeline from 2.4: pick a core from the
+type pair, find common dimensions, loop with an `rray_iterator2` converting as
+=== naming ===
+## Naming
+
+- Internal C: `rray_{name}()`, returns C types.
+
+- FFI wrappers: `ffi_rray_{name}()`, thin SEXP bridges, placed above the
+  internal functions in the `.c` file.
+
+- Typed cores are file static, and keep the prefix with a type suffix, e.g.
+  `rray_broadcast_dbl()`. A binary core carries both input types, `x` first, so
+  `rray_add_int_dbl()` reads integers from `x` and doubles from `y`.
+
+- Headers declare internal functions only, never FFI wrappers.
+
+- `src/init.c` uses `extern` declarations, it does not include feature headers.
+
+- An `arg` is a `struct rray_arg*`, the argument tag ported from vctrs. Tags
+  nest, and nothing is materialised until an error is actually raised, so
+  carrying one through a loop costs nothing. `src/arg.c` is the whole of it.
+
+  `rray_args` holds the fixed ones, so `check_unclassed(x, rray_args.x, ...)`.
+  A function taking `...` builds one tag with `new_subscript_arg()`, which reads
+  a pointer to the caller's loop index and gives an input's name when it has one
+  and `..2` otherwise. `rray_arg_format()` turns a tag into a string with the
+  backticks already on, so messages write `%s` and not `` `%s` ``.
+
+## C style</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,200p' R/rep.R</summary>
+<pre>sed -n '1,200p' R/rep.R</pre><pre class="output">#' Repeat an array
+#'
+#' @description
+#' - `rray_rep()` repeats the entire `axis` of `x` in bulk, i.e. repeat all of
+#'   the columns 5 `times`.
+#'
+#' - `rray_rep_each()` repeats each individual element of the `axis` of `x`
+#'   separately, i.e. repeat the first column 2 `times`, the second column 3
+#'   `times`, and so on. For convenience, you can also provide a single number
+#'   to repeat each element along the `axis` the same number of times.
+#'
+#' These are the array versions of [vctrs::vec_rep()] and
+#' [vctrs::vec_rep_each()], which repeat along the size of a vector rather than
+#' along an axis.
+#'
+#' @details
+#' Names repeat alongside the data, so the repeated axis can come back with
+#' duplicate names. Every other axis keeps its names untouched.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param times For `rray_rep()`, a single integer greater than or equal
+#'   to 0.
+#'
+#'   For `rray_rep_each()`, a vector of integers greater than or equal to
+#'   0. It is recycled to the dimension of `x` along `axis`.
+#'
+#' @param axis A single integer representing the axis to repeat along.
+#'
+#' @returns
+#' An array with the same dimensions as `x`, except along `axis`.
+#'
+#' @name rray-rep
+#' @examples
+#' x &lt;- array(1:6, c(3, 2))
+#'
+#' # All rows in bulk, twice
+#' rray_rep(x, times = 2, axis = 1)
+#'
+#' # Each row individually, twice
+#' rray_rep_each(x, times = 2, axis = 1)
+#'
+#' # Columns rather than rows
+#' rray_rep(x, times = 2, axis = 2)
+#'
+#' # A different number of repeats per row
+#' rray_rep_each(x, times = c(1, 2, 3), axis = 1)
+#'
+#' # Zeroes drop slices entirely
+#' rray_rep_each(x, times = c(1, 0, 2), axis = 1)
+#'
+#' # Names repeat with the data, duplicates and all
+#' y &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+#' rray_names(rray_rep(y, times = 2, axis = 1))
+#' rray_names(rray_rep_each(y, times = 2, axis = 1))
+NULL
+
+#' @rdname rray-rep
+#' @export
+rray_rep &lt;- function(x, ..., times, axis) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_rep, x, times, axis, environment())
+}
+
+#' @rdname rray-rep
+#' @export
+rray_rep_each &lt;- function(x, ..., times, axis) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_rep_each, x, times, axis, environment())
+}</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;^rray_[a-z_]* &lt;- function&quot; R/*.R</summary>
+<pre>grep -n &quot;^rray_[a-z_]* &lt;- function&quot; R/*.R</pre><pre class="output">R/cast-common.R:1:rray_cast_common &lt;- function(
+R/broadcast.R:29:rray_broadcast &lt;- function(x, dimensions) {
+R/broadcast.R:56:rray_broadcast_common &lt;- function(..., .dimensions = NULL) {
+R/broadcast-names.R:2:rray_broadcast_names &lt;- function(x, dimensions) {
+R/broadcast-names.R:10:rray_broadcast_names_common &lt;- function(..., .dimensions) {
+R/arithmetic.R:70:rray_add &lt;- function(x, y) {
+R/arithmetic.R:76:rray_subtract &lt;- function(x, y) {
+R/arithmetic.R:82:rray_multiply &lt;- function(x, y) {
+R/arithmetic.R:88:rray_divide &lt;- function(x, y) {
+R/arithmetic.R:94:rray_exponentiate &lt;- function(x, y) {
+R/combine.R:26:rray_combine &lt;- function(..., .axis) {
+R/cast.R:1:rray_cast &lt;- function(
+R/dimensionality.R:16:rray_dimensionality &lt;- function(x) {
+R/compare.R:34:rray_greater_than &lt;- function(x, y) {
+R/compare.R:40:rray_greater_than_or_equal &lt;- function(x, y) {
+R/compare.R:46:rray_less_than &lt;- function(x, y) {
+R/compare.R:52:rray_less_than_or_equal &lt;- function(x, y) {
+R/equal.R:28:rray_equal &lt;- function(x, y) {
+R/equal.R:34:rray_not_equal &lt;- function(x, y) {
+R/extremum.R:37:rray_max &lt;- function(x, y, ..., na_rm = FALSE) {
+R/extremum.R:44:rray_min &lt;- function(x, y, ..., na_rm = FALSE) {
+R/dimensions.R:20:rray_dimensions &lt;- function(x) {
+R/dimensions.R:44:rray_dimensions_common &lt;- function(..., .dimensions = NULL) {
+R/dimensions.R:76:rray_set_dimensions &lt;- function(x, dimensions) {
+R/insert-axes.R:66:rray_insert_axes &lt;- function(x, axes) {
+R/permute-axes.R:35:rray_permute_axes &lt;- function(x, axes) {
+R/move-axes.R:42:rray_move_axes &lt;- function(x, ..., from, to) {
+R/ptype-common.R:1:rray_ptype_common &lt;- function(
+R/names.R:25:rray_names &lt;- function(x) {
+R/names.R:54:rray_axis_names &lt;- function(x, axis) {
+R/names.R:60:rray_row_names &lt;- function(x) {
+R/names.R:66:rray_col_names &lt;- function(x) {
+R/names.R:92:rray_set_names &lt;- function(x, names) {
+R/names.R:124:rray_set_axis_names &lt;- function(x, axis, names) {
+R/names.R:130:rray_set_row_names &lt;- function(x, names) {
+R/names.R:136:rray_set_col_names &lt;- function(x, names) {
+R/reduce.R:69:rray_sum_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:76:rray_product_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:83:rray_mean_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:90:rray_all_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:97:rray_any_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/ptype.R:1:rray_ptype &lt;- function(x, ..., arg = caller_arg(x), call = caller_env()) {
+R/remove-axes.R:23:rray_remove_axes &lt;- function(x, axes) {
+R/rep.R:62:rray_rep &lt;- function(x, ..., times, axis) {
+R/rep.R:69:rray_rep_each &lt;- function(x, ..., times, axis) {
+R/reduce-names.R:2:rray_reduce_names &lt;- function(x, axes) {
+R/stack.R:47:rray_stack &lt;- function(..., .axis) {
+R/size.R:16:rray_size &lt;- function(x) {
+R/split.R:43:rray_split &lt;- function(x, ..., axis, dimensions) {
+R/unstack.R:43:rray_unstack &lt;- function(x, axis) {</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;locate_max\|max_pos\|locate_min\|min_pos&quot; plans/ | head -20; echo &quot;=== extensions =…</summary>
+<pre>grep -rn &quot;locate_max\|max_pos\|locate_min\|min_pos&quot; plans/ | head -20; echo &quot;=== extensions ===&quot;; grep -n &quot;^#\|^###&quot; plans/extensions.md | head -40</pre><pre class="output">plans/slice.md:99:as `rray_locate_max()` and with per-lane sorting or ranking indices.
+plans/slice.md:198:`rray_locate_max()` should return integer arrays.
+plans/slice.md:348:### Assignment with `rray_locate_max()`
+plans/slice.md:350:`rray_locate_max()` should return one-based positions local to `axis`. It must
+plans/slice.md:360:i &lt;- rray_locate_max(x, axis = 2)
+plans/slice.md:404:If a lane has tied maxima, `rray_locate_max()` selects one according to its tie
+plans/slice.md:770:- Hand-built `rray_locate_max()` shaped indices select and assign one position
+plans/slice.md:771:  per lane. Add a direct integration test when `rray_locate_max()` lands.
+plans/slice.md:825:`rray_locate_max()`.
+plans/implementation.md:98:shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+plans/implementation.md:702:- `rray_max_pos()` and `rray_min_pos()` return an integer array.
+plans/implementation.md:1049:`rray_max_pos(x, axis)` and `rray_min_pos(x, axis)` give the position of the
+plans/implementation.md:1054:rray_max_pos(x, 1)     # position of the max along the rows
+plans/implementation.md:1055:rray_max_pos(x, 2)     # along the columns
+plans/implementation.md:1080:`rray_max_pos()` and `rray_min_pos()` take `axis` rather than `axes` and return
+plans/extensions.md:237:- `rray_max_pos()` and `rray_min_pos()` return a bare integer array.
+=== extensions ===
+1:# Supporting classed arrays
+11:# Part 1: Why this is deferred
+16:## The user base is thin
+34:## It is most of the work
+41:## It gives class authors less than it looks like
+51:## Deferring is safe
+66:# Part 2: Proxy and restore
+76:## The proxy contract
+87:## The restore contract
+99:## Dispatch
+112:## No built in methods
+118:# Part 3: The generic type system
+124:## Ptypes
+130:#&gt; &lt;double array, dim 0&gt;
+133:#&gt; the same object
+144:## The invariant that makes this work
+159:## Ptype2 and cast
+185:## Operator type hooks
+212:### The pipeline
+227:### Operators that are not covered
+243:## Writing methods
+294:# Part 4: The cases that must shape the design
+300:## A class with a dimensionality invariant
+315:## A class with length dependent attributes
+326:## What both cases tell us
+339:## Classes that will never fit
+352:# Part 5: When to build this
+377:## What happens to the boundary helpers</pre></details>
+<details class="tool"><summary>Bash: sed -n '289,366p' plans/implementation.md</summary>
+<pre>sed -n '289,366p' plans/implementation.md</pre><pre class="output">## 2.3 Names
+
+There are five rules. Every function in Part 5 declares which one it follows.
+
+**Follow the axis.** An axis keeps its names if its dimension is unchanged, and
+loses them if its dimension changed. Whatever it keeps travels with it to
+wherever the axis ends up. New axes have no names.
+
+This is the rule for almost everything that reshapes an array. An axis of
+dimension 1 broadcast to 1 counts as unchanged and keeps its length 1 names.
+
+**Reduce.** Reduced axes lose their names. Every other axis keeps them.
+
+Nearly the same rule, but a reduced axis loses its names even when its dimension
+was already 1, so it needs stating separately.
+
+This lives in `rray_reduce_names(x, axes)`. Reductions take one array, so unlike
+the broadcasting family below there is no `2` or `_common` form, and no fill
+helper to share between them.
+
+**Coalesce.** Used by anything with two or more array inputs. For each axis of
+the common dimensions:
+
+1. Use `x`'s names if `x`'s dimension there equals the common dimension and `x`
+   has names there.
+
+2. Otherwise apply the same test to `y`.
+
+3. Otherwise `NULL`.
+
+This lives in three internal functions, one per arity:
+
+```c
+r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions);
+r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions);
+r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions);
+```
+
+All three fill one output list from a shared helper, never overwriting a slot
+that an earlier input already filled. Coalescing is just that &quot;don't overwrite&quot;
+rule, so the one-input case is the follow the axis rule and needs no separate
+implementation.
+
+They take arrays rather than extracted names, because `arg_as_array()` gives
+every input a real `dim`, which makes `r_dim()` and `r_dim_names()` free reads
+off an object the caller already protects. They assume validated, broadcastable
+inputs, so they take no `arg` and no `error_call` and cannot fail. Validation
+belongs in the caller, which has always done it already.
+
+**Subset.** Names are subset alongside the data, so an axis keeps the names of
+the elements that survived.
+
+`rray_split()` is the one case producing many arrays at once, so it owns its
+own name handling rather than calling into this family. Each output slices the
+names on the split axis over the same range as its data, and carries the names
+on every other axis over whole.
+
+**Dropped.** All names are discarded. Used where no axis survives in a
+recognisable form, such as a reshape.
+
+The reasoning behind the split: a function that manipulates an existing array is
+still functionally the same array, so names travel with the axes that did not
+move. A function with two inputs builds a genuinely new array, but dropping
+every name would make `rray_add(named_matrix, 1)` lose its names, which reads as
+a bug.
+
+### The names API
+
+`rray_names(x)` returns the `dimnames` attribute as it is. A one dimensional
+array with names returns a one element list. No normalization on read.
+
+Setters take a list of length exactly the dimensionality, where each element is
+either `NULL` or a character vector of exactly that axis' dimension. `NULL`
+clears everything. Short lists are not padded, they are an error.
+
+There are no `&lt;-` replacement forms.
+
+## 2.4 Types</pre></details>
+<details class="tool"><summary>Bash: ls bench tests/testthat | head -60; echo &quot;=== AGENTS protection ===&quot;; grep -n &quot;protection\|cl…</summary>
+<pre>ls bench tests/testthat | head -60; echo &quot;=== AGENTS protection ===&quot;; grep -n &quot;protection\|clang-format&quot; AGENTS.md | head</pre><pre class="output">bench:
+broadcast.R
+extremum.R
+iterator.R
+matrix-stats.R
+mean.R
+reduce-logical.R
+stride-zero.R
+
+tests/testthat:
+_snaps
+helper-ptype.R
+helper-rep.R
+helper-stack.R
+helper-wrapper.R
+test-arithmetic-add.R
+test-arithmetic-divide.R
+test-arithmetic-exponentiate.R
+test-arithmetic-multiply.R
+test-arithmetic-subtract.R
+test-broadcast-names.R
+test-broadcast.R
+test-cast-common.R
+test-cast.R
+test-combine.R
+test-compare.R
+test-dimensionality.R
+test-dimensions.R
+test-equal.R
+test-extremum.R
+test-insert-axes.R
+test-move-axes.R
+test-names.R
+test-permute-axes.R
+test-ptype-common.R
+test-ptype.R
+test-reduce-logical.R
+test-reduce-mean.R
+test-reduce-names.R
+test-reduce-product.R
+test-reduce-sum.R
+test-remove-axes.R
+test-rep.R
+test-size.R
+test-split.R
+test-stack.R
+test-unstack.R
+test-wrapper.R
+=== AGENTS protection ===
+113:- Before calling any C change done: for every new or touched `r_obj*` in the diff, name the function it is next passed to or read by, and check whether that function allocates before it protects or consumes the value. A value is not safe just because it looks used immediately — the callee's own allocations count. Do this as an explicit, separate pass over the diff, the same way `clang-format` is a separate mandatory step, not something folded into &quot;look over the code once.&quot;
+114:- Never use `gctorture()` or `gctorture2()` to look for protection problems. They are far too slow to be practical, even on a single call. The reading pass described above is the check.
+118:- Always run `clang-format -i src/*.c src/*.h` after generating C code. Always run it over all files, not just changed files.</pre></details>
+<details class="tool"><summary>Bash: sed -n '35,116p' plans/implementation.md</summary>
+<pre>sed -n '35,116p' plans/implementation.md</pre><pre class="output">## Files
+
+Each feature is a `src/{name}.c` and `src/{name}.h` pair, with an R file at
+`R/{name}.R` and tests at `tests/testthat/test-{name}.R`.
+
+Functions that need per type code split into a shell and a core, both living in
+`src/{name}.c`. Copy the shape of `src/broadcast.c`.
+
+The shell is ordinary C, written once. It holds everything that does not depend
+on the type: argument checks, dimension arithmetic, iterator setup and names. It
+ends in a `switch` on `r_typeof(x)` that hands off to the core.
+
+The core is one small function per type. It takes `x`, the output size and the
+iterator, allocates the output at its own type, fills it, and returns it.
+Allocation belongs to the core because the type is the one thing the shell does
+not know.
+
+Putting the core behind a function call costs nothing. It was benchmarked across
+five types and four shapes, and every case landed within 1%, which is the run to
+run noise, because the call happens once per array rather than once per element.
+Do not re-open this.
+
+Two families vary from this.
+
+`rray_split()` returns a list of arrays rather than one array, and `r_typeof(x)`
+is enough to allocate every element at the right type, so the shell builds the
+list and the core fills what it is handed.
+
+The binary arithmetic operators share one shell across many files, so the shell
+lives in `src/arithmetic.c` and each operator gets its own
+`src/arithmetic-{op}.c`. They switch on the type pair rather than on one type,
+and the switch returns the core instead of calling it. 2.4 covers why.
+
+The reducers that take `(x, axes, ..., na_rm = FALSE)` share the same shape of
+shell for the same reason. `rray_reduce()` and the `RRAY_REDUCE` macro live in
+`src/reduce.c`/`src/reduce.h`, and each reducer gets its own
+`src/reduce-{name}.c`, switching on `rray_typeof(x)` and returning the core.
+`rray_sum_along()` is the first of these, in `src/reduce-sum.c`.
+
+Each core's whole body is a call into a macro, following `SLICE` in vctrs'
+`src/slice.c`. There are usually two. `RRAY_{NAME}_ATOMIC` covers `lgl`, `int`,
+`dbl`, `cpl` and `raw`, which write straight to a data pointer.
+`RRAY_{NAME}_BARRIER` covers `chr` and `list`, which write through the barrier.
+Undefine both once the cores are written.
+
+The arithmetic family needs only one macro, since it has no `chr` or `list`
+cores, but several files share it. So `RRAY_ARITHMETIC` lives in
+`src/arithmetic.h` and nothing undefines it. Only undefine a macro the file
+defined itself.
+
+Write each core's parameter list out in full. Do not hide it behind a macro.
+
+A flag that swaps the scalar operation, like `na_rm`, is folded into the same
+switch that dispatches on type, returning the core instead of calling it:
+
+```c
+case RRAY_TYPE_double:
+  return na_rm ? rray_sum_along_dbl_na_rm : rray_sum_along_dbl;
+```
+
+So there is one core per type per variant, the flag stays off the core's
+parameter list, and the loop is written once. `rray_mean()`, `rray_max_along()`, and
+`rray_min_along()` want the same shape when they land, sharing `rray_reduce()`'s
+shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+`axes` and return positions rather than reduced values, so whether they fit this
+shell at all is still an open question for whoever picks them up.
+
+A `.c` file reads top down: the main entry point first, its helpers below, in
+the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+`rray_broadcast()`, the `rray_broadcast_lgl()` family, `rray_broadcast_names()`,
+then everything else. You should meet the shell before the cores it dispatches
+to.
+
+`src/decl/{name}-decl.h` is what makes that ordering work. Declare every helper
+there, so the `.c` file never needs a forward declaration of its own.
+
+A decl header has no includes and no include guard. It is included last, from
+exactly one `.c` file, so everything it names is already in scope and there is
+nothing to guard against. It could not reach a sibling header in `src/` anyway,
+since only `src/rlang` is on the include path.
+
+## Naming</pre></details>
+<details class="tool"><summary>Bash: sed -n '140,260p' src/strided-iterator.h</summary>
+<pre>sed -n '140,260p' src/strided-iterator.h</pre><pre class="output">//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_strided_iterator_plan {
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_dimensionality(dimensionality);
+
+  struct rray_strided_iterator_plan plan;
+
+  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    plan.v_strides[i] = v_strides[i];
+  }
+
+  plan.dimensionality = rray__strided_iterator_axes_coalesce(
+    plan.v_dimensions,
+    plan.v_strides,
+    dimensionality
+  );
+
+  return plan;
+}
+
+// Strided iterator specific to broadcasting
+//
+// An axis of `from` with a dimension of 1 gets a stride of 0, so it stands
+// still while the matching axis of `to` walks. Axes past
+// `from_dimensionality` are treated as dimension 1.
+static inline struct rray_strided_iterator_plan rray_broadcast_iterator_plan(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+) {
+  check_dimensionality(to_dimensionality);
+
+  rray__check_broadcast_dimensions(
+    v_from_dimensions,
+    from_dimensionality,
+    v_to_dimensions,
+    to_dimensionality
+  );
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  rray_fill_broadcast_strides_from_dimensions(
+    v_from_dimensions,
+    from_dimensionality,
+    to_dimensionality,
+    v_strides
+  );
+
+  return rray_strided_iterator_plan(
+    v_to_dimensions,
+    to_dimensionality,
+    v_strides
+  );
+}
+
+static inline r_ssize rray_strided_iterator_plan_size(
+  const struct rray_strided_iterator_plan* plan
+) {
+  return plan-&gt;size;
+}
+static inline r_ssize rray_strided_iterator_plan_run_size(
+  const struct rray_strided_iterator_plan* plan
+) {
+  return plan-&gt;v_dimensions[0];
+}
+static inline r_ssize rray_strided_iterator_plan_run_stride(
+  const struct rray_strided_iterator_plan* plan
+) {
+  return plan-&gt;v_strides[0];
+}
+static inline void rray_strided_iterator_plan_point_init(
+  const struct rray_strided_iterator_plan* plan,
+  r_ssize* v_point
+) {
+  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);
+}
+
+#define RRAY_STRIDED_ITERATOR_NEXT(START, V_POINT, PLAN)                       \
+  for (int axis = 1; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+    ++V_POINT[axis];                                                           \
+    if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+      START += PLAN-&gt;v_strides[axis];                                          \
+      break;                                                                   \
+    }                                                                          \
+    V_POINT[axis] = 0;                                                         \
+    START -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides[axis];           \
+  }
+
+// --------------------------------------------------------------------------
+
+// Same as `rray_strided_iterator_plan`, but reports in two location spaces
+// while only walking the point space once
+struct rray_strided_iterator2_plan {
+  r_ssize size;</pre></details>
+<details class="tool"><summary>Bash: grep -n -A 20 &quot;rray__strided_iterator_axes_coalescible(&quot; src/strided-iterator.h | tail -30</summary>
+<pre>grep -n -A 20 &quot;rray__strided_iterator_axes_coalescible(&quot; src/strided-iterator.h | tail -30</pre><pre class="output">461-    } else {
+462-      ++out_axis;
+463-      v_dimensions[out_axis] = right_dimension;
+464-      v_strides1[out_axis] = right_stride1;
+465-      v_strides2[out_axis] = right_stride2;
+466-    }
+467-  }
+468-
+--
+472:static inline bool rray__strided_iterator_axes_coalescible(
+473-  r_ssize left_dimension,
+474-  r_ssize left_stride,
+475-  r_ssize right_dimension,
+476-  r_ssize right_stride
+477-) {
+478-  return left_dimension == 1 || right_dimension == 1 ||
+479-    right_stride == left_dimension * left_stride;
+480-}
+481-
+482-static inline void rray__check_broadcast_dimensions(
+483-  const int* v_from_dimensions,
+484-  int from_dimensionality,
+485-  const int* v_to_dimensions,
+486-  int to_dimensionality
+487-) {
+488-  if (from_dimensionality &gt; to_dimensionality) {
+489-    r_stop_internal(
+490-      &quot;Can't broadcast from dimensionality %d to %d. &quot;
+491-      &quot;Can't decrease dimensionality.&quot;,
+492-      from_dimensionality,</pre></details>
+<details class="tool"><summary>Bash: sed -n '798,840p' plans/implementation.md</summary>
+<pre>sed -n '798,840p' plans/implementation.md</pre><pre class="output"># Part 4: The pull requests
+
+What exists today: the argument tags, the argument checking helpers, the names
+API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and
+shape helpers, the type rules as the `rray_ptype2()` and `rray_cast()` families,
+the scalar casts as `static inline` functions in `src/cast.h`, and
+`rray_broadcast()`, `rray_broadcast_common()`, `rray_split()`,
+`rray_sum_along()`,
+`rray_add()`, `rray_multiply()`, `rray_subtract()`, `rray_divide()` and
+`rray_exponentiate()`. The array functions all follow the shell and core
+pattern in Part 1, and no templates are left in `src/`.
+
+`rray_modulo()` and `rray_integer_divide()` (`%%` and `%/%`) are deferred. See
+`plans/mod-and-idiv.md`.
+
+Every pull request that was tracked here has landed. Work through Part 5 next,
+in any order that respects the dependencies noted there.
+
+---
+
+# Part 5: Function reference
+
+Each entry gives what the function does, what the original rray did, the
+proposed signature, the files it touches, and two rules.
+
+**Names rule**, from 2.3: follow the axis, reduce, coalesce, subset, or
+dropped.
+
+**Type rule**, from 2.4:
+
+- *Preserved.* The output has `x`'s type. Any other array argument is cast to
+  it, rather than being given a say in the result.
+
+- *Common.* Every input has a say. They are cast to a common type with
+  `rray_ptype2()`.
+
+- *Promoted.* The common type, then pushed through the operator's promotion
+  table.
+
+- *Fixed.* Output type is fixed regardless of input.
+
+## 5.1 Shape</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+f &lt;- function(x, ...) rlang::dots_list(..., .ignore_empty = &quot;none&quot;, .preserve_empty = TRUE)
+str(f(1, , 2))
+str(f(1, 1, ))
+i &lt;- list(1:2, 3)
+str(f(1, !!!i))
+' 2&gt;&amp;1 | head -30</pre><pre class="output">List of 2
+ $ : symbol 
+ $ : num 2
+List of 2
+ $ : num 1
+ $ : symbol 
+List of 2
+ $ : int [1:2] 1 2
+ $ : num 3</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'x &lt;- array(1:3, 3); print(try(x[1, ], silent=TRUE)); y &lt;- array(1:6,c(2,3)); prin…</summary>
+<pre>Rscript -e 'x &lt;- array(1:3, 3); print(try(x[1, ], silent=TRUE)); y &lt;- array(1:6,c(2,3)); print(try(y[1,2,], silent=TRUE))' 2&gt;&amp;1 | head</pre><pre class="output">[1] &quot;Error in x[1, ] : incorrect number of dimensions\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;simpleError in x[1, ]: incorrect number of dimensions&gt;
+[1] &quot;Error in y[1, 2, ] : incorrect number of dimensions\n&quot;
+attr(,&quot;class&quot;)
+[1] &quot;try-error&quot;
+attr(,&quot;condition&quot;)
+&lt;simpleError in y[1, 2, ]: incorrect number of dimensions&gt;</pre></details>
+<p>I read <code>plans/slice.md</code> (930 lines) against the codebase and against <code>plans/implementation.md</code>. The design is solid and the shape rules mostly hold up. I found one example that contradicts the plan's own rules, four inconsistencies with the rest of the package, and a set of gaps. Here they are, worst first.</p>
+<h2>Errors</h2>
+<p><strong>1. The per-lane example at lines 90-96 errors under the plan's own dispatch table.</strong></p>
+<pre><code class="language-r">i &lt;- array(c(2, 1), c(2, 1))
+</code></pre>
+<p><code>c(2, 1)</code> is double. The dispatch table says per-lane needs &quot;a bare integer array&quot;, and a 2-D double array falls to the last row, &quot;Any other multidimensional object | Error&quot;. So this example does not return <code>c(30, 60)</code>, it errors. It needs <code>c(2L, 1L)</code>.</p>
+<p>The other three shaped examples (lines 256, 307, 332) all use <code>L</code>. This one slipping is evidence for point 6 below.</p>
+<p><strong>2. <code>rray_locate_max()</code> does not exist and conflicts with the established name.</strong></p>
+<p>The slice plan uses <code>rray_locate_max()</code> nine times. <code>plans/implementation.md:1049</code> and <code>plans/extensions.md:237</code> both call it <code>rray_max_pos(x, axis)</code>. Pick one. If the slice plan is proposing a rename, it should say so explicitly, because a whole section (lines 348-415) is built on it.</p>
+<p>Related: the slice plan asserts <code>rray_max_pos()</code> &quot;must preserve dimensionality, replacing the located axis with dimension one&quot;. <code>implementation.md</code> 5.5 never says that. Since the per-lane contract depends on it, that requirement belongs in 5.5 too.</p>
+<p><strong>3. Line 611 recommends <code>rray_set_dimensions()</code> where <code>rray_flatten()</code> is the planned function.</strong></p>
+<blockquote>
+<p>Use <code>rray_slice()</code> followed by <code>rray_set_dimensions()</code> when it is genuinely needed.</p>
+</blockquote>
+<p><code>rray_flatten()</code> (implementation.md 5.1) is exactly &quot;collapse to one dimension&quot; and takes no dimensions argument. Should be <code>rray_slice()</code> then <code>rray_flatten()</code>.</p>
+<p><strong>4. The double-subscript rule breaks long arrays in flat extraction.</strong></p>
+<p>Line 431: &quot;Doubles are accepted only when every non-missing value is a whole number that can be represented as an R integer.&quot;</p>
+<p>Line 578 then applies those same rules to flat positions &quot;against <code>rray_size(x)</code>&quot;. But <code>rray_size()</code> returns a double precisely because total length can exceed <code>2^31</code> (implementation.md 2.2). So <code>rray_extract(x, 3e9)</code> on a long array would be rejected by a rule written for axis dimensions. The integer bound is right for axes and for point coordinates, wrong for flat positions.</p>
+<p><strong>5. Trailing missing subscripts contradict the too-many-subscripts rule.</strong></p>
+<p>Line 148: &quot;Trailing missing arguments have no effect.&quot;
+Line 148-149: &quot;More subscripts than the dimensionality of <code>x</code> are an error.&quot;</p>
+<p>For a 1-D <code>x</code>, what is <code>rray_slice(x, 1, )</code>? It captures two dots. Base R errors here (<code>x[1, ]</code> gives &quot;incorrect number of dimensions&quot;). The original rray ignored trailing commas. The plan needs to say which, in the form &quot;trailing <em>empty</em> subscripts past the dimensionality are ignored, trailing <em>supplied</em> ones are an error.&quot;</p>
+<h2>Inconsistencies with the package</h2>
+<p><strong>6. Per-lane mode dispatches on integer-vs-double storage, which R users cannot see.</strong></p>
+<p>This is my main design objection. <code>matrix(c(2, 1), ncol = 1)</code> and <code>matrix(c(2L, 1L), ncol = 1)</code> look identical in every R session, print identically, and compare <code>==</code>. One is per-lane, one is an error. The plan's own author wrote the double version by accident.</p>
+<p>The plan spends a whole section (lines 101-111) criticising NumPy for switching semantics on the shape of the index, then does shape dispatch twice and adds a storage-type dispatch on top. Shape dispatch in <code>rray_extract()</code> is fine, because base R has trained everyone that a matrix subscript means points. Storage-type dispatch has no such precedent.</p>
+<p>I would split per-lane back out into its own function. You already listed <code>rray_take_along_axis()</code> under &quot;Functions not proposed&quot;; it earns its place. Then <code>rray_slice_axis(x, i, axis)</code> is one rule with no dispatch, and the take-along function can require an integer array with a clear error instead of silently falling into shared mode.</p>
+<p><strong>7. <code>value</code> after dots should be <code>.value</code>.</strong></p>
+<p>Every rray4 function where <code>...</code> carries the payload prefixes the following argument:</p>
+<pre><code class="language-r">rray_combine(..., .axis)
+rray_stack(..., .axis)
+rray_broadcast_common(..., .dimensions = NULL)
+</code></pre>
+<p>So <code>rray_slice_assign(x, ..., .value)</code>. The dot is also what makes &quot;subscripts must be unnamed&quot; enforceable without the rule feeling arbitrary.</p>
+<p><strong>8. <code>rray_slice_assign_axis()</code> splits the base name.</strong></p>
+<p>The operation is <code>rray_slice_axis()</code>. <code>_assign</code> is the modifier, so <code>rray_slice_axis_assign()</code> keeps the base name intact and sorts next to it in the reference index. <code>rray_slice_assign_axis()</code> reads as three loose words.</p>
+<p><strong>9. No Names rule or Type rule declared.</strong></p>
+<p><code>implementation.md:820-838</code> requires every Part 5 entry to declare one of five names rules and one of four type rules. The slice plan describes names behavior in prose over 20 lines but never says &quot;Names: subset&quot; or &quot;Type: preserved&quot;.</p>
+<p>More than bookkeeping: per-lane mode needs a rule that does not exist yet. &quot;Follow the axis&quot; would keep the selected axis's names whenever <code>dim(i)[axis] == dim(x)[axis]</code>, which is wrong, since each lane picked a different source position. The plan gets the behavior right (line 489, drop them) but this is a sixth rule and 2.3 needs to grow to hold it.</p>
+<p><strong>10. Per-lane requires exact dimensionality, unlike every other broadcast in the package.</strong></p>
+<p>implementation.md 2.2: &quot;Missing trailing axes are treated as a dimension of 1, so dimensionality can grow.&quot; The plan makes a 2-D <code>i</code> against a 3-D <code>x</code> an error rather than padding it. I think that is the right call for dispatch clarity, but it is the package's only exception to a stated universal rule, so it should be named as a deliberate divergence with the reason.</p>
+<p><strong>11. <code>rray_slice(x, ...)</code> is the first function where dots carry payload next to <code>x</code>.</strong></p>
+<p>Everywhere else <code>...</code> is empty and guarded by <code>check_dots_empty0()</code>. <code>rray_combine()</code> and <code>rray_stack()</code> take dots, but dots-first with no leading <code>x</code>. This is not wrong, but it retires a package-wide invariant, so it is worth confirming you want it rather than a list-taking form.</p>
+<p>The mechanism does work, for the record:</p>
+<pre><code class="language-r">f &lt;- function(x, ...) rlang::dots_list(..., .ignore_empty = &quot;none&quot;, .preserve_empty = TRUE)
+str(f(1, , 2))     # symbol, num 2
+str(f(1, !!!list(1:2, 3)))  # int [1:2], num 3
+</code></pre>
+<p>Empty args come back as the missing symbol and <code>!!!</code> still splices. The plan should name <code>.ignore_empty = &quot;none&quot;</code> and <code>.preserve_empty = TRUE</code>, since the default <code>list2()</code> drops empty args and would silently break <code>rray_slice(x, , 1)</code>.</p>
+<p><strong>12. Silent behavior change for anyone coming from rray.</strong></p>
+<p><code>rray_slice(x, 1, 2)</code> meant &quot;index 1 on axis 2&quot; and now means &quot;row 1, column 2&quot;. <code>rray_extract(x, 1)</code> meant &quot;first row, flattened&quot; and now means &quot;flat position 1&quot;. Both run without error and return different data. The plan explains the renames but never flags that two calls survive the move with new meanings. Worth a short note, and worth deciding whether that argues for different names.</p>
+<h2>Gaps</h2>
+<ul>
+<li>
+<p><strong>Shaped subscripts inside <code>rray_slice()</code>'s dots are undefined.</strong> <code>rray_slice_axis()</code> has a dispatch table covering this (&quot;Any other multidimensional object | Error&quot;). The &quot;Shared axis subscript rules&quot; section covers classed subscripts but says nothing about a bare integer matrix passed as one axis subscript.</p>
+</li>
+<li>
+<p><strong><code>NULL</code> is missing from the <code>rray_extract()</code> dispatch list.</strong> It appears in the <code>rray_slice_axis()</code> table and in the shared rules, but lines 546-561 never mention it.</p>
+</li>
+<li>
+<p><strong>Logical arrays with 3+ dims that do not match <code>x</code>.</strong> Line 559 says numeric arrays with 3+ dims are errors. For logicals, only &quot;dimensions identical to <code>x</code>&quot; is covered. The non-matching case is implied but not stated.</p>
+</li>
+<li>
+<p><strong><code>i</code> is listed as possibly missing</strong> (dispatch table, line 181) but the signature <code>rray_slice_axis(x, i, axis)</code> gives it no default, so <code>rray_slice_axis(x, axis = 2)</code> produces base R's &quot;argument i is missing&quot; error, which AGENTS.md says not to snapshot. Either give it a default or drop &quot;Missing&quot; from the table.</p>
+</li>
+<li>
+<p><strong>No <code>arg</code> or error-call design.</strong> implementation.md:134 describes <code>new_subscript_arg()</code>, built exactly for functions taking <code>...</code>, so errors say <code>..2</code>. The implementation section never mentions it, and <code>rray_slice()</code> is the main consumer.</p>
+</li>
+<li>
+<p><strong>No <code>axis</code> validation spec.</strong> Single integer, in bounds, what about negative or 0. Every other single-axis function in the package has this settled.</p>
+</li>
+<li>
+<p><strong>No benchmark.</strong> <code>bench/</code> has seven files. The affine-versus-indexed two-path design is justified entirely on speed, and &quot;Required checks&quot; lists no benchmark step. A <code>bench/slice.R</code> should be part of delivery step 1.</p>
+</li>
+<li>
+<p><strong>Delivery step 1 is too large for one pull request.</strong> It bundles the whole <code>src/index.c</code> normalization layer, the affine path, the indexed path, read, assign, shared-mode axis, and per-lane mode. Given you prefer stacked PRs, I would split it: index normalization alone, then <code>rray_slice()</code> read, then <code>rray_slice_assign()</code>, then <code>rray_slice_axis()</code>.</p>
+</li>
+</ul>
+<h2>Things I checked that hold up</h2>
+<ul>
+<li>
+<p>Every worked example's arithmetic is correct (points at lines 58-67, per-lane at 256-275, shared at 280-285, broadcast at 296-320).</p>
+</li>
+<li>
+<p><code>rray_strided_iterator2_plan</code> exists in <code>src/strided-iterator.h:258</code> and does fit the per-lane design, with one location for <code>x</code> and one for <code>i</code>.</p>
+</li>
+<li>
+<p>Negative strides survive coalescing. <code>rray__strided_iterator_axes_coalescible()</code> uses <code>right_stride == left_dimension * left_stride</code>, which is sign-correct, and <code>RRAY_STRIDED_ITERATOR_NEXT</code> unwinds with <code>START -= (dim - 1) * stride</code>. So folding a reverse step into a stride works.</p>
+</li>
+<li>
+<p>The empty-selection names rule matches base R: <code>dimnames(x[integer(), , drop = FALSE])</code> gives <code>list(character(0), NULL)</code>.</p>
+</li>
+<li>
+<p><code>src/index.c</code> as a shared layer matches what implementation.md 5.6 already called for.</p>
+</li>
+</ul>
+<p>Want me to work these into the plan file, or do you want to settle points 6, 7, 8, and 11 first?</p>
+
+</section>
+</main>
+</body>
+</html>

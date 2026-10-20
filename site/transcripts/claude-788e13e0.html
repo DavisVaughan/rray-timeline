@@ -1,0 +1,1015 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Using &quot;&quot; names for NA slice locations and tidying slice loops</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-90">rray timeline</a>
+<h1>Using <code>&quot;&quot;</code> names for <code>NA</code> slice locations and tidying slice loops</h1>
+<p class="facts">Claude · Sep 26, 2026 · 8 prompts · 9 replies · <a href="https://github.com/r-lib/rray/pull/90">#90</a></p>
+</header>
+<main>
+<p class="divider">Sep 26, 2026, 18:35 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In rray slice axis names, NA is used as name when index is NA. Does vctrs use “”?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;names&quot; src/slice.c | head -60; echo ---; gre…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;names&quot; src/slice.c | head -60; echo ---; grep -rn &quot;na_str\|r_strs.empty\|strings_empty&quot; ~/files/r/packages/vctrs/src/slice.c ~/files/r/packages/vctrs/src/names.c | head -40</pre><pre class="output">48:  r_obj* x_names = r_dim_names(x);
+49:  r_obj* const* v_x_names = x_names == r_null ? NULL : r_list_cbegin(x_names);
+64:  if (r_names(indices) != r_null) {
+79:    r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[axis];
+84:      x_axis_names,
+125:  r_obj* names = KEEP_N(
+126:    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_axes),
+233:  if (names != r_null) {
+234:    r_attrib_poke_dim_names(out, names);
+293:static r_obj* rray_slice_names(
+294:  r_obj* const* v_x_names,
+299:  if (v_x_names == NULL) {
+306:    r_obj* x_axis_names = v_x_names[axis];
+308:    if (x_axis_names == r_null) {
+312:    r_obj* axis_names = rray_slice_axis_names(
+313:      x_axis_names,
+318:    r_list_poke(out, axis, axis_names);
+325:static r_obj* rray_slice_axis_names(
+326:  r_obj* x_axis_names,
+332:    return x_axis_names;
+335:  r_obj* const* v_x_axis_names = r_chr_cbegin(x_axis_names);
+345:                                     : v_x_axis_names[location]
+---
+~/files/r/packages/vctrs/src/slice.c:158:  SLICE_BARRIER(R_TYPE_character, r_chr_cbegin, r_chr_poke, r_globals.na_str);
+~/files/r/packages/vctrs/src/slice.c:162:  SLICE_BARRIER(R_TYPE_character, r_chr_cbegin, r_chr_poke, r_strs.empty);
+~/files/r/packages/vctrs/src/names.c:197:    if (v_names[i] == r_globals.na_str) {
+~/files/r/packages/vctrs/src/names.c:208:    if (v_names[i] == r_globals.na_str) {
+~/files/r/packages/vctrs/src/names.c:209:      r_chr_poke(names, i, strings_empty);
+~/files/r/packages/vctrs/src/names.c:290:      elt = strings_empty;
+~/files/r/packages/vctrs/src/names.c:313:    if (elt != strings_empty &amp;&amp; !dups_ptr[i]) {
+~/files/r/packages/vctrs/src/names.c:442:    str == r_globals.na_str ||
+~/files/r/packages/vctrs/src/names.c:444:    str == strings_empty ||
+~/files/r/packages/vctrs/src/names.c:532:  if (outer == strings_empty || outer == r_globals.na_str) {
+~/files/r/packages/vctrs/src/names.c:588:  if (outer == strings_empty || outer == r_globals.na_str) {
+~/files/r/packages/vctrs/src/names.c:1006:  if (r_chr_has_string(names, r_globals.na_str)) {</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 325,355p src/slice.c; echo ---; sed -n 140,175…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 325,355p src/slice.c; echo ---; sed -n 140,175p ~/files/r/packages/vctrs/src/slice.c; grep -n &quot;slice_names\|chr_names_slice&quot; ~/files/r/packages/vctrs/src/slice.c | head</pre><pre class="output">static r_obj* rray_slice_axis_names(
+  r_obj* x_axis_names,
+  bool identity,
+  const r_ssize* v_locations,
+  int dimension
+) {
+  if (identity) {
+    return x_axis_names;
+  }
+
+  r_obj* const* v_x_axis_names = r_chr_cbegin(x_axis_names);
+
+  r_obj* out = KEEP(r_alloc_character(dimension));
+
+  for (int i = 0; i &lt; dimension; ++i) {
+    const r_ssize location = v_locations[i];
+    r_chr_poke(
+      out,
+      i,
+      location == RRAY_SLICE_MISSING ? r_globals.na_str
+                                     : v_x_axis_names[location]
+    );
+  }
+
+  FREE(1);
+  return out;
+}
+
+static bool rray_slice_locations_any_missing(
+  const struct rray_slice_axis* v_axes,
+  const int* v_dimensions,
+---
+  }                                                             \
+                                                                \
+  FREE(1);                                                      \
+  return out
+
+#define SLICE_BARRIER(RTYPE, CONST_DEREF, SET, NA_VALUE)                \
+  if (!materialize &amp;&amp; ALTREP(x)) {                                      \
+    return vec_slice_altrep(x, subscript);                              \
+  } else if (is_compact_rep(subscript)) {                               \
+    SLICE_BARRIER_COMPACT_REP(RTYPE, CONST_DEREF, SET, NA_VALUE);       \
+  } else if (is_compact_seq(subscript)) {                               \
+    SLICE_BARRIER_COMPACT_SEQ(RTYPE, CONST_DEREF, SET);                 \
+  } else {                                                              \
+    SLICE_BARRIER_SUBSCRIPT(RTYPE, CONST_DEREF, SET, NA_VALUE);         \
+  }
+
+static
+r_obj* chr_slice(r_obj* x, r_obj* subscript, enum vctrs_materialize materialize) {
+  SLICE_BARRIER(R_TYPE_character, r_chr_cbegin, r_chr_poke, r_globals.na_str);
+}
+static
+r_obj* chr_names_slice(r_obj* x, r_obj* subscript, enum vctrs_materialize materialize) {
+  SLICE_BARRIER(R_TYPE_character, r_chr_cbegin, r_chr_poke, r_strs.empty);
+}
+static
+r_obj* list_slice(r_obj* x, r_obj* subscript, enum vctrs_materialize materialize) {
+  SLICE_BARRIER(R_TYPE_list, r_list_cbegin, r_list_poke, r_null);
+}
+
+
+static
+r_obj* df_slice(r_obj* x, r_obj* subscript) {
+  r_ssize n = r_length(x);
+  r_ssize size = df_size(x);
+
+  r_obj* out = KEEP(r_alloc_list(n));
+161:r_obj* chr_names_slice(r_obj* x, r_obj* subscript, enum vctrs_materialize materialize) {
+274:r_obj* slice_names(r_obj* names, r_obj* subscript) {
+279:    return chr_names_slice(names, subscript, VCTRS_MATERIALIZE_false);
+356:        row_names = KEEP_N(slice_names(row_names, subscript), &amp;nprot);
+364:      names = KEEP_N(slice_names(names, subscript), &amp;nprot);</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'x &lt;- c(a = 1, b = 2); print(names(vctrs::vec_slice(x, c(1, NA)))); print(names(x[…</summary>
+<pre>Rscript -e 'x &lt;- c(a = 1, b = 2); print(names(vctrs::vec_slice(x, c(1, NA)))); print(names(x[c(1, NA)])); m &lt;- matrix(1:4, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL)); print(rownames(m[c(1, NA), , drop = FALSE])); print(rownames(vctrs::vec_slice(m, c(1, NA))))'</pre><pre class="output">[1] &quot;a&quot; &quot;&quot; 
+[1] &quot;a&quot; NA 
+[1] &quot;a&quot; NA 
+[1] &quot;a&quot; &quot;&quot;</pre></details>
+<p>Yes. vctrs fills the name with <code>&quot;&quot;</code> when the index is <code>NA</code>. rray4 fills it with <code>NA</code> (<code>src/slice.c:344</code>), which is what base R does.</p>
+<p>In vctrs, <code>slice_names()</code> calls <code>chr_names_slice()</code>, and that function uses <code>r_strs.empty</code> as the fill value instead of <code>r_globals.na_str</code> (<code>vctrs/src/slice.c:161</code>). This also applies to the row names of a matrix passed to <code>vec_slice()</code>.</p>
+<pre><code class="language-r">x &lt;- c(a = 1, b = 2)
+names(vctrs::vec_slice(x, c(1, NA)))
+#&gt; [1] &quot;a&quot; &quot;&quot;
+names(x[c(1, NA)])
+#&gt; [1] &quot;a&quot; NA
+
+m &lt;- matrix(1:4, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+rownames(vctrs::vec_slice(m, c(1, NA)))
+#&gt; [1] &quot;a&quot; &quot;&quot;
+rownames(m[c(1, NA), , drop = FALSE])
+#&gt; [1] &quot;a&quot; NA
+</code></pre>
+<p>I'd switch to <code>r_strs.empty</code> to match vctrs. vctrs treats an <code>NA</code> name as a missing name and repairs it to <code>&quot;&quot;</code> anyway (<code>vctrs/src/names.c:209</code>). Keeping <code>NA</code> would only make sense if you want <code>rray_slice()</code> to match base <code>[</code>. It's a one-token change plus updated tests. Should I make it?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Yes switch and update tests and commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;NA&quot; tests/testthat/test-slice.R | head -40; …</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;NA&quot; tests/testthat/test-slice.R | head -40; grep -rn &quot;NA_character_\|NA)&quot; tests/testthat/_snaps/slice.md 2&gt;/dev/null | head; grep -n &quot;r_strs\|empty&quot; src/*.c src/*.h | grep -v rlang | head</pre><pre class="output">31:    rray_slice(x, c(NA_integer_, 2L), whole, c(4L, 1L)),
+32:    slice_base(x, c(NA_integer_, 2L), , c(4L, 1L))
+47:    list(c(NA, 2L), c(1, NA, 4), NA),
+63:    c(TRUE, FALSE, NA, TRUE, FALSE, TRUE),
+79:      rray_slice(x, c(2L, NA), c(NA, 1L)),
+80:      slice_base(x, c(2L, NA), c(NA, 1L))
+89:    rray_slice(x, TRUE, c(1L, NA), c(NA, 4L)),
+90:    slice_base(x, , c(1L, NA), c(NA, 4L))
+93:    rray_slice(x, NA, TRUE, 1L),
+94:    array(NA_integer_, c(2L, 3L, 1L))
+146:  i &lt;- c(3L, NA, 1L)
+173:    rray_slice(x, c(1L, NA), -2L, TRUE),
+174:    slice_base(x, c(1L, NA), -2L, )
+177:    rray_slice(x, c(TRUE, FALSE), c(NA, &quot;d&quot;), 4L),
+179:      c(NA, 21L),
+181:      dimnames = list(&quot;a&quot;, c(NA, &quot;d&quot;), NULL)
+src/arg.c:14:    return r_chrs.empty_string;
+src/arg.c:42:  if (rray_arg_is_empty(arg)) {
+src/arg.c:170:  const bool child = !rray_arg_is_empty(p_data-&gt;self.parent);
+src/arg.c:195:bool rray_arg_is_empty(struct rray_arg* arg) {
+src/arg.c:217:  INIT_ARG2(empty, &quot;&quot;);
+src/broadcast.c:256:    KEEP(rray_dimensions_common(xs, dimensions, rray_args.empty, error_call));
+src/combine.c:25:    rray_args.empty,
+src/combine.c:26:    rray_args.empty,
+src/dimensions.c:112:    rray_args.empty,
+src/index.c:17:    rray_args.empty,</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 1,60p tests/testthat/test-slice.R; sed -n 140,…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 1,60p tests/testthat/test-slice.R; sed -n 140,200p tests/testthat/test-slice.R; cat tests/testthat/helper-slice.R 2&gt;/dev/null; grep -n &quot;r_strs\b\|r_strs\.&quot; src/rlang/globals.h</pre><pre class="output">test_that(&quot;selects the Cartesian product of the subscripts&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_identical(
+    rray_slice(x, c(2L, 1L), c(3L, 1L), 2L),
+    array(c(12L, 11L, 8L, 7L), c(2L, 2L, 1L))
+  )
+})
+
+test_that(&quot;`TRUE` selects a whole axis&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_identical(rray_slice(x, 1L, TRUE, TRUE), slice_base(x, 1L, , ))
+  expect_identical(rray_slice(x, TRUE, 1L, TRUE), slice_base(x, , 1L, ))
+  expect_identical(rray_slice(x, TRUE, TRUE, TRUE), x)
+})
+
+test_that(&quot;scalar `TRUE` works on each axis with other subscripts&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2L, 3L, 4L),
+    dimnames = list(letters[1:2], letters[3:5], letters[6:9])
+  )
+  whole &lt;- TRUE
+
+  expect_identical(
+    rray_slice(x, whole, c(3L, 1L), whole),
+    slice_base(x, , c(3L, 1L), )
+  )
+  expect_identical(
+    rray_slice(x, c(NA_integer_, 2L), whole, c(4L, 1L)),
+    slice_base(x, c(NA_integer_, 2L), , c(4L, 1L))
+  )
+  expect_identical(
+    rray_slice(x, array(TRUE, 1L), whole, 2L),
+    slice_base(x, , , 2L)
+  )
+})
+
+test_that(&quot;matches base R for every kind of subscript&quot;, {
+  x &lt;- array(1:60, c(3L, 4L, 5L))
+  subscripts &lt;- list(
+    list(c(3L, 1L, 3L), 2:4, c(5L, 1L)),
+    list(c(3, 1), c(4, 0, 2), 5:1),
+    list(-2L, c(-1, -4), -(2:5)),
+    list(c(TRUE, FALSE, TRUE), TRUE, c(FALSE, TRUE, TRUE, FALSE, TRUE)),
+    list(c(NA, 2L), c(1, NA, 4), NA),
+    list(seq(1L, 3L, by = 2L), 4:1, seq(5, 1, by = -2)),
+    list(integer(), 1L, TRUE),
+    list(FALSE, 0L, 1L)
+  )
+
+  for (i in subscripts) {
+    expect_identical(
+      rray_slice(x, !!!i),
+      slice_base(x, i[[1]], i[[2]], i[[3]])
+    )
+  }
+})
+
+    array(c(4L, 2L), c(rep(1L, 62L), 1L, 2L))
+  )
+})
+
+test_that(&quot;matches `rray_index()` over an open mesh of locations&quot;, {
+  x &lt;- array(1:60, c(3L, 4L, 5L))
+  i &lt;- c(3L, NA, 1L)
+  j &lt;- c(2L, 2L)
+  k &lt;- c(5L, 1L, 4L, 2L)
+
+  expect_identical(
+    rray_slice(x, i, j, k),
+    rray_index(
+      x,
+      array(i, c(3L, 1L, 1L)),
+      array(j, c(1L, 2L, 1L)),
+      array(k, c(1L, 1L, 4L))
+    )
+  )
+})
+
+test_that(&quot;selects names along with the values&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2L, 3L, 4L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;), NULL)
+  )
+
+  expect_identical(
+    rray_slice(x, c(2L, 1L, 2L), c(&quot;e&quot;, &quot;c&quot;), 1L),
+    slice_base(x, c(2L, 1L, 2L), c(&quot;e&quot;, &quot;c&quot;), 1L)
+  )
+  expect_identical(
+    rray_slice(x, c(1L, NA), -2L, TRUE),
+    slice_base(x, c(1L, NA), -2L, )
+  )
+  expect_identical(
+    rray_slice(x, c(TRUE, FALSE), c(NA, &quot;d&quot;), 4L),
+    array(
+      c(NA, 21L),
+      c(1L, 2L, 1L),
+      dimnames = list(&quot;a&quot;, c(NA, &quot;d&quot;), NULL)
+    )
+  )
+})
+
+test_that(&quot;keeps names of a whole axis&quot;, {
+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+
+  expect_identical(rray_slice(x, TRUE, TRUE), x)
+  expect_identical(rray_slice(x, 1:2, 3L), slice_base(x, , 3L))
+})
+
+test_that(&quot;an empty selection has no names&quot;, {
+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+
+  expect_identical(
+    rray_slice(x, NULL, 2L),
+    array(integer(), c(0L, 1L), dimnames = list(NULL, &quot;d&quot;))
+  )
+})
+slice_base &lt;- function(x, ...) {
+  x[..., drop = FALSE]
+}
+99:extern struct r_globals_strs r_strs;</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 70,100p tests/testthat/test-slice.R; grep -n &quot;…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 70,100p tests/testthat/test-slice.R; grep -n &quot;NA\|name&quot; R/slice.R; grep -n &quot;empty&quot; src/rlang/globals.h</pre><pre class="output">  )
+
+  for (x in xs) {
+    x &lt;- array(x, c(2L, 3L))
+    expect_identical(
+      rray_slice(x, c(2L, 1L), c(3L, 1L)),
+      slice_base(x, 2:1, c(3L, 1L))
+    )
+    expect_identical(
+      rray_slice(x, c(2L, NA), c(NA, 1L)),
+      slice_base(x, c(2L, NA), c(NA, 1L))
+    )
+  }
+})
+
+test_that(&quot;a missing location on any axis gives a missing value&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_identical(
+    rray_slice(x, TRUE, c(1L, NA), c(NA, 4L)),
+    slice_base(x, , c(1L, NA), c(NA, 4L))
+  )
+  expect_identical(
+    rray_slice(x, NA, TRUE, 1L),
+    array(NA_integer_, c(2L, 3L, 1L))
+  )
+})
+
+test_that(&quot;works with a bare vector&quot;, {
+  expect_identical(rray_slice(1:5, c(5L, 1L)), array(c(5L, 1L), 2L))
+  expect_identical(
+8:#' `NA` in a subscript gives missing values in the result. For raw arrays the
+26:#' @param ... One unnamed subscript for each axis of `x`, in axis order. Each
+36:#'   - A character vector of names, matched against the names of the axis. The
+37:#'     first match is used when names are duplicated.
+43:#' axis is the number of positions selected on it. The names of each axis are
+59:#' # Select by name
+60:#' y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+9:    r_obj* empty_lgl;
+10:    r_obj* empty_int;
+11:    r_obj* empty_dbl;
+12:    r_obj* empty_cpl;
+13:    r_obj* empty_raw;
+14:    r_obj* empty_chr;
+15:    r_obj* empty_list;
+25:    r_obj* empty_string;
+37:    r_obj* empty;
+90:    r_obj* empty;</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 1,50p R/slice.R; sed -n 20,40p src/rlang/globa…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 1,50p R/slice.R; sed -n 20,40p src/rlang/globals.h; sed -n 85,100p src/rlang/globals.h</pre><pre class="output">#' Slice an array
+#'
+#' @description
+#' `rray_slice()` selects positions along each axis of `x`. The result always
+#' has the same dimensionality as `x`.
+#'
+#' @details
+#' `NA` in a subscript gives missing values in the result. For raw arrays the
+#' missing value is `as.raw(0)`, and for list arrays it is `NULL`.
+#'
+#' Unlike `[`, an empty argument does not select a whole axis. Use `TRUE`
+#' instead, so that every axis is provided explicitly:
+#'
+#' ```r
+#' x &lt;- array(1:24, c(2L, 3L, 4L))
+#'
+#' # Base R
+#' x[1, , , drop = FALSE]
+#'
+#' # rray
+#' rray_slice(x, 1, TRUE, TRUE)
+#' ```
+#'
+#' @param x An array.
+#'
+#' @param ... One unnamed subscript for each axis of `x`, in axis order. Each
+#'   subscript is one of:
+#'
+#'   - `TRUE`, to select the whole axis.
+#'
+#'   - A logical vector the size of the axis. `TRUE` selects a position.
+#'
+#'   - An integer or double vector of locations. Negative values drop
+#'     positions, zero is ignored, and duplicates repeat positions.
+#'
+#'   - A character vector of names, matched against the names of the axis. The
+#'     first match is used when names are duplicated.
+#'
+#'   - `NULL`, to select nothing.
+#'
+#' @returns
+#' An array with the same type and dimensionality as `x`. The dimension of each
+#' axis is the number of positions selected on it. The names of each axis are
+#' selected along with the values.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:24, c(2L, 3L, 4L))
+#'
+#' # The first row
+    r_complex na_cpl;
+    r_obj* na_str;
+};
+
+struct r_globals_chrs {
+    r_obj* empty_string;
+    r_obj* full;
+};
+
+struct r_globals_classes {
+    r_obj* data_frame;
+    r_obj* tibble;
+};
+
+struct r_globals_strs {
+    r_obj* dots;
+    r_obj* condition;
+    r_obj* empty;
+    r_obj* error;
+    r_obj* interrupt;
+    r_obj* message;
+    r_obj* y;
+    r_obj* z;
+};
+
+struct r_globals_envs {
+    r_obj* empty;
+    r_obj* base;
+    r_obj* global;
+    r_obj* ns; // The namespace of the embedding package
+};
+
+extern struct r_globals r_globals;
+extern struct r_globals_chrs r_chrs;
+extern struct r_globals_classes r_classes;
+extern struct r_globals_strs r_strs;
+extern struct r_globals_syms r_syms;</pre></details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray4; sed -i '' 's/location == RRAY_SLICE_MISSING ? r_globa…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -i '' 's/location == RRAY_SLICE_MISSING ? r_globals.na_str/location == RRAY_SLICE_MISSING ? r_strs.empty/' src/slice.c &amp;&amp; clang-format -i src/*.c src/*.h &amp;&amp; git diff src</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a sed in-place edit. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>Switching the fill value in <code>src/slice.c</code> now, then the tests.</p>
+
+<details class="tool"><summary>Read src/slice.c</summary>
+<pre class="output">338	
+339	  for (int i = 0; i &lt; dimension; ++i) {
+340	    const r_ssize location = v_locations[i];
+341	    r_chr_poke(
+342	      out,
+343	      i,
+344	      location == RRAY_SLICE_MISSING ? r_globals.na_str
+345	                                     : v_x_axis_names[location]
+346	    );
+347	  }</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-      location == RRAY_SLICE_MISSING ? r_globals.na_str</span>
+<span class="del">-                                     : v_x_axis_names[location]</span>
+<span class="ins">+      location == RRAY_SLICE_MISSING ? r_strs.empty : v_x_axis_names[location]</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-slice.R</summary>
+<pre class="output">18	test_that(&quot;scalar `TRUE` works on each axis with other subscripts&quot;, {
+19	  x &lt;- array(
+20	    1:24,
+21	    c(2L, 3L, 4L),
+22	    dimnames = list(letters[1:2], letters[3:5], letters[6:9])
+23	  )
+24	  whole &lt;- TRUE
+25	
+26	  expect_identical(
+27	    rray_slice(x, whole, c(3L, 1L), whole),
+28	    slice_base(x, , c(3L, 1L), )
+29	  )
+30	  expect_identical(
+31	    rray_slice(x, c(NA_integer_, 2L), whole, c(4L, 1L)),
+32	    slice_base(x, c(NA_integer_, 2L), , c(4L, 1L))
+33	  )
+34	  expect_identical(
+35	    rray_slice(x, array(TRUE, 1L), whole, 2L),
+36	    slice_base(x, , , 2L)
+37	  )</pre></details>
+<details class="tool"><summary>Read R/slice.R</summary>
+<pre class="output">1	#' Slice an array
+2	#'
+3	#' @description
+4	#' `rray_slice()` selects positions along each axis of `x`. The result always
+5	#' has the same dimensionality as `x`.
+6	#'
+7	#' @details
+8	#' `NA` in a subscript gives missing values in the result. For raw arrays the
+9	#' missing value is `as.raw(0)`, and for list arrays it is `NULL`.
+10	#'</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-slice.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(</span>
+<span class="del">-    rray_slice(x, c(NA_integer_, 2L), whole, c(4L, 1L)),</span>
+<span class="del">-    slice_base(x, c(NA_integer_, 2L), , c(4L, 1L))</span>
+<span class="del">-  )</span>
+<span class="ins">+  expected &lt;- slice_base(x, c(NA_integer_, 2L), , c(4L, 1L))</span>
+<span class="ins">+  dimnames(expected)[[1]] &lt;- c(&quot;&quot;, &quot;b&quot;)</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_slice(x, c(NA_integer_, 2L), whole, c(4L, 1L)),</span>
+<span class="ins">+    expected</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-slice.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(</span>
+<span class="del">-    rray_slice(x, c(1L, NA), -2L, TRUE),</span>
+<span class="del">-    slice_base(x, c(1L, NA), -2L, )</span>
+<span class="del">-  )</span>
+<span class="del">-  expect_identical(</span>
+<span class="del">-    rray_slice(x, c(TRUE, FALSE), c(NA, &quot;d&quot;), 4L),</span>
+<span class="del">-    array(</span>
+<span class="del">-      c(NA, 21L),</span>
+<span class="del">-      c(1L, 2L, 1L),</span>
+<span class="del">-      dimnames = list(&quot;a&quot;, c(NA, &quot;d&quot;), NULL)</span>
+<span class="del">-    )</span>
+<span class="del">-  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;a missing location has an empty name&quot;, {</span>
+<span class="ins">+  x &lt;- array(</span>
+<span class="ins">+    1:24,</span>
+<span class="ins">+    c(2L, 3L, 4L),</span>
+<span class="ins">+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;), NULL)</span>
+<span class="ins">+  )</span>
+<span class="ins">+</span>
+<span class="ins">+  expected &lt;- slice_base(x, c(1L, NA), -2L, )</span>
+<span class="ins">+  dimnames(expected)[[1]] &lt;- c(&quot;a&quot;, &quot;&quot;)</span>
+<span class="ins">+  expect_identical(rray_slice(x, c(1L, NA), -2L, TRUE), expected)</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_slice(x, c(TRUE, FALSE), c(NA, &quot;d&quot;), 4L),</span>
+<span class="ins">+    array(</span>
+<span class="ins">+      c(NA, 21L),</span>
+<span class="ins">+      c(1L, 2L, 1L),</span>
+<span class="ins">+      dimnames = list(&quot;a&quot;, c(&quot;&quot;, &quot;d&quot;), NULL)</span>
+<span class="ins">+    )</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/slice.R</summary>
+<pre class="diff"><span class="del">-#' `NA` in a subscript gives missing values in the result. For raw arrays the</span>
+<span class="del">-#' missing value is `as.raw(0)`, and for list arrays it is `NULL`.</span>
+<span class="ins">+#' `NA` in a subscript gives missing values in the result. For raw arrays the</span>
+<span class="ins">+#' missing value is `as.raw(0)`, and for list arrays it is `NULL`. If the axis</span>
+<span class="ins">+#' has names, the name of a missing value is `&quot;&quot;`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rs…</summary>
+<pre>cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -3 &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8; git status --short</pre><pre class="output">** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray4)
+Writing 'rray_slice.Rd'
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2701 ]
+ M R/slice.R
+ M man/rray_slice.Rd
+ M src/slice.c
+ M tests/testthat/test-slice.R</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git add -A &amp;&amp; git commit -q -m 'Name missing `rray_sl…</summary>
+<pre>cd ~/files/r/packages/rray4; git add -A &amp;&amp; git commit -q -m 'Name missing `rray_slice()` locations `&quot;&quot;` rather than `NA`, like vctrs' &amp;&amp; git push -u origin feature/slice 2&gt;&amp;1 | tail -2; git log --oneline -1</pre><pre class="output">   0fbcb63..ed0bf5f  feature/slice -&gt; feature/slice
+branch 'feature/slice' set up to track 'origin/feature/slice'.
+ed0bf5f Name missing `rray_slice()` locations `&quot;&quot;` rather than `NA`, like vctrs</pre></details>
+<p>I made the switch, then committed and pushed it to <code>feature/slice</code> as <code>ed0bf5f</code>. All tests pass (2701).</p>
+<ul>
+<li>
+<p><strong>C:</strong> <code>rray_slice_axis_names()</code> now fills the name with <code>r_strs.empty</code> instead of <code>r_globals.na_str</code> (<code>src/slice.c:344</code>). <code>r_strs.empty</code> is a global that R never frees, so it needs no protection.</p>
+</li>
+<li>
+<p><strong>Tests:</strong> two existing checks compared <code>rray_slice()</code> against base <code>[</code> with an <code>NA</code> location on a named axis. They still compare against base, but first set the expected name to <code>&quot;&quot;</code>.</p>
+</li>
+<li>
+<p><strong>New test:</strong> I moved the missing-name checks into their own test, &quot;a missing location has an empty name&quot;. That includes the old <code>c(NA, &quot;d&quot;)</code> case, now <code>c(&quot;&quot;, &quot;d&quot;)</code>.</p>
+</li>
+<li>
+<p><strong>Docs:</strong> I added one sentence to the <code>@details</code> of <code>rray_slice()</code>, because it no longer matches base <code>[</code> here: &quot;If the axis has names, the name of a missing value is <code>&quot;&quot;</code>.&quot; I then re-ran <code>devtools::document()</code>.</p>
+</li>
+</ul>
+<p>Your global instructions say never to commit for you, but you asked for it directly this time. The commit message has no <code>Co-Authored-By</code> line, as your project <code>CLAUDE.md</code> requires.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In slice locations as offsets turn the branch into a ternary so v locations is always updated on every iteration</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;locations_as_offsets&quot; src/*.c src/decl/*.h</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;locations_as_offsets&quot; src/*.c src/decl/*.h</pre><pre class="output">src/slice.c:144:      rray_slice_locations_as_offsets(
+src/slice.c:375:static void rray_slice_locations_as_offsets(
+src/decl/slice-decl.h:26:static void rray_slice_locations_as_offsets(</pre></details>
+<details class="tool"><summary>Read src/slice.c</summary>
+<pre class="output">370	  }
+371	
+372	  return false;
+373	}
+374	
+375	static void rray_slice_locations_as_offsets(
+376	  r_ssize* v_locations,
+377	  int dimension,
+378	  r_ssize stride,
+379	  bool any_missing
+380	) {
+381	  if (any_missing) {
+382	    for (int i = 0; i &lt; dimension; ++i) {
+383	      const r_ssize location = v_locations[i];
+384	
+385	      if (location == RRAY_SLICE_MISSING) {
+386	        continue;
+387	      }
+388	
+389	      v_locations[i] = location * stride;
+390	    }
+391	  } else {
+392	    for (int i = 0; i &lt; dimension; ++i) {
+393	      v_locations[i] = v_locations[i] * stride;
+394	    }
+395	  }
+396	}
+397	
+398	static inline r_ssize rray_slice_start(
+399	  const struct rray_slice_axis* v_axes,</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-      const r_ssize location = v_locations[i];</span>
+<span class="del">-</span>
+<span class="del">-      if (location == RRAY_SLICE_MISSING) {</span>
+<span class="del">-        continue;</span>
+<span class="del">-      }</span>
+<span class="del">-</span>
+<span class="del">-      v_locations[i] = location * stride;</span>
+<span class="ins">+      const r_ssize location = v_locations[i];</span>
+<span class="ins">+      v_locations[i] =</span>
+<span class="ins">+        location == RRAY_SLICE_MISSING ? location : location * stride;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; sed -n 375,392p sr…</summary>
+<pre>cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; sed -n 375,392p src/slice.c &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -2</pre><pre class="output">static void rray_slice_locations_as_offsets(
+  r_ssize* v_locations,
+  int dimension,
+  r_ssize stride,
+  bool any_missing
+) {
+  if (any_missing) {
+    for (int i = 0; i &lt; dimension; ++i) {
+      const r_ssize location = v_locations[i];
+      v_locations[i] =
+        location == RRAY_SLICE_MISSING ? location : location * stride;
+    }
+  } else {
+    for (int i = 0; i &lt; dimension; ++i) {
+      v_locations[i] = v_locations[i] * stride;
+    }
+  }
+}
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2701 ]</pre></details>
+<p>Done. In <code>rray_slice_locations_as_offsets()</code> (<code>src/slice.c:381</code>), the <code>continue</code> branch in the missing-values loop is now a ternary, so <code>v_locations[i]</code> is written on every pass:</p>
+<pre><code class="language-c">const r_ssize location = v_locations[i];
+v_locations[i] =
+  location == RRAY_SLICE_MISSING ? location : location * stride;
+</code></pre>
+<p>A missing location is written back as <code>RRAY_SLICE_MISSING</code>, so the result is the same as before. I ran <code>clang-format</code> and all tests pass (2701). I haven't committed this one.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Also extract local location in the other branch just for symmetry</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-      v_locations[i] = v_locations[i] * stride;</span>
+<span class="ins">+      const r_ssize location = v_locations[i];</span>
+<span class="ins">+      v_locations[i] = location * stride;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; git diff src/slice…</summary>
+<pre>cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; git diff src/slice.c &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -1</pre><pre class="output">diff --git a/src/slice.c b/src/slice.c
+index 7d3a8b9..f36ffc5 100644
+--- a/src/slice.c
++++ b/src/slice.c
+@@ -381,16 +381,13 @@ static void rray_slice_locations_as_offsets(
+   if (any_missing) {
+     for (int i = 0; i &lt; dimension; ++i) {
+       const r_ssize location = v_locations[i];
+-
+-      if (location == RRAY_SLICE_MISSING) {
+-        continue;
+-      }
+-
+-      v_locations[i] = location * stride;
++      v_locations[i] =
++        location == RRAY_SLICE_MISSING ? location : location * stride;
+     }
+   } else {
+     for (int i = 0; i &lt; dimension; ++i) {
+-      v_locations[i] = v_locations[i] * stride;
++      const r_ssize location = v_locations[i];
++      v_locations[i] = location * stride;
+     }
+   }
+ }
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2701 ]</pre></details>
+<p>Done. The loop with no missing values now also reads into a <code>const r_ssize location</code> local before it writes <code>location * stride</code>, so both loops have the same shape. I ran <code>clang-format</code> and all tests pass (2701). This change and the ternary one are both uncommitted.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git status --short &amp;&amp; git add src/slice.c &amp;&amp; git comm…</summary>
+<pre>cd ~/files/r/packages/rray4; git status --short &amp;&amp; git add src/slice.c &amp;&amp; git commit -q -m 'Write every location in `rray_slice_locations_as_offsets()` with a ternary' &amp;&amp; git push origin feature/slice 2&gt;&amp;1 | tail -1; git log --oneline -1</pre><pre class="output"> M src/slice.c
+   ed0bf5f..64bc8ef  feature/slice -&gt; feature/slice
+64bc8ef Write every location in `rray_slice_locations_as_offsets()` with a ternary</pre></details>
+<p>I committed both changes as <code>64bc8ef</code> and pushed them to <code>feature/slice</code>. The commit message is: &quot;Write every location in <code>rray_slice_locations_as_offsets()</code> with a ternary&quot;.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In slice start is the early exit with 0 required?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;rray_slice_start\|rray_slice_step\|RRAY_SLIC…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;rray_slice_start\|rray_slice_step\|RRAY_SLICE_MISSING&quot; src/slice.c src/slice.h src/decl/slice-decl.h; sed -n 395,470p src/slice.c</pre><pre class="output">src/decl/slice-decl.h:33:static inline r_ssize rray_slice_start(
+src/slice.c:10:#define RRAY_SLICE_MISSING R_SSIZE_MIN
+src/slice.c:251:      v_locations[i] = rray_int_is_missing(location) ? RRAY_SLICE_MISSING
+src/slice.c:262:      v_locations[i] = rray_dbl_is_missing(location) ? RRAY_SLICE_MISSING
+src/slice.c:281:      v_locations[i] = elt == r_globals.na_lgl ? RRAY_SLICE_MISSING : location;
+src/slice.c:344:      location == RRAY_SLICE_MISSING ? r_strs.empty : v_x_axis_names[location]
+src/slice.c:366:      if (v_locations[i] == RRAY_SLICE_MISSING) {
+src/slice.c:385:        location == RRAY_SLICE_MISSING ? location : location * stride;
+src/slice.c:395:static inline r_ssize rray_slice_start(
+src/slice.c:462:  r_ssize start = rray_slice_start(v_axes, dimensionality, size);              \
+static inline r_ssize rray_slice_start(
+  const struct rray_slice_axis* v_axes,
+  int dimensionality,
+  r_ssize size
+) {
+  if (size == 0) {
+    return 0;
+  }
+
+  r_ssize out = 0;
+
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    if (!v_axes[axis].identity) {
+      out += v_axes[axis].v_offsets[0];
+    }
+  }
+
+  return out;
+}
+
+static inline r_ssize rray_slice_offset(
+  const struct rray_slice_axis* v_axes,
+  int axis,
+  r_ssize point
+) {
+  const struct rray_slice_axis* p_axis = &amp;v_axes[axis];
+  return p_axis-&gt;identity ? point * p_axis-&gt;stride : p_axis-&gt;v_offsets[point];
+}
+
+#define RRAY_SLICE_NEXT(START, V_POINT)                                        \
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {                          \
+    START -= rray_slice_offset(v_axes, axis, V_POINT[axis]);                   \
+    ++V_POINT[axis];                                                           \
+    if (V_POINT[axis] &lt; v_dimensions[axis]) {                                  \
+      START += rray_slice_offset(v_axes, axis, V_POINT[axis]);                 \
+      break;                                                                   \
+    }                                                                          \
+    V_POINT[axis] = 0;                                                         \
+    START += rray_slice_offset(v_axes, axis, 0);                               \
+  }
+
+#define RRAY_SLICE_LOOP(POKE, OFFSET)                                          \
+  while (run_start != size) {                                                  \
+    for (r_ssize i = 0; i &lt; run_size; ++i) {                                   \
+      POKE(out, run_start + i, v_x[start + (OFFSET)]);                         \
+    }                                                                          \
+                                                                               \
+    run_start += run_size;                                                     \
+    RRAY_SLICE_NEXT(start, v_point);                                           \
+  }
+
+#define RRAY_SLICE_LOOP_MISSING(POKE, MISSING, OFFSET)                         \
+  while (run_start != size) {                                                  \
+    for (r_ssize i = 0; i &lt; run_size; ++i) {                                   \
+      const r_ssize location = start + (OFFSET);                               \
+      POKE(out, run_start + i, location &lt; 0 ? MISSING : v_x[location]);        \
+    }                                                                          \
+                                                                               \
+    run_start += run_size;                                                     \
+    RRAY_SLICE_NEXT(start, v_point);                                           \
+  }
+
+#define RRAY_SLICE_ITERATE(POKE, MISSING)                                      \
+  const r_ssize* v_run_offsets = v_axes[0].v_offsets;                          \
+  const r_ssize run_size = v_dimensions[0];                                    \
+  r_ssize run_start = 0;                                                       \
+                                                                               \
+  r_ssize start = rray_slice_start(v_axes, dimensionality, size);              \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY] = {0};                              \
+                                                                               \
+  if (v_axes[0].identity) {                                                    \
+    if (any_missing) {                                                         \
+      RRAY_SLICE_LOOP_MISSING(POKE, MISSING, i);                               \
+    } else {                                                                   \
+      RRAY_SLICE_LOOP(POKE, i);                                                \
+    }                                                                          \</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;v_offsets\|identity =&quot; src/slice.c | head -2…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;v_offsets\|identity =&quot; src/slice.c | head -20; sed -n 100,160p src/slice.c</pre><pre class="output">13:  r_ssize* v_offsets;
+101:    const bool identity = r_is_true(v_indices[i]);
+115:      v_axes[i].identity = true;
+116:      v_axes[i].v_offsets = NULL;
+118:      v_axes[i].identity = false;
+119:      v_axes[i].v_offsets = v_locations;
+145:        v_axes[i].v_offsets,
+315:      v_axes[axis].v_offsets,
+362:    const r_ssize* v_locations = v_axes[axis].v_offsets;
+408:      out += v_axes[axis].v_offsets[0];
+421:  return p_axis-&gt;identity ? point * p_axis-&gt;stride : p_axis-&gt;v_offsets[point];
+458:  const r_ssize* v_run_offsets = v_axes[0].v_offsets;                          \
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const bool identity = r_is_true(v_indices[i]);
+    v_identity[i] = identity;
+    if (!identity) {
+      locations_size += v_dimensions[i];
+    }
+  }
+
+  r_obj* locations =
+    KEEP_N(r_alloc_raw(sizeof(r_ssize) * locations_size), &amp;n_prot);
+  r_ssize* v_locations = (r_ssize*) r_raw_begin(locations);
+
+  struct rray_slice_axis v_axes[RRAY_MAX_DIMENSIONALITY];
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    if (v_identity[i]) {
+      v_axes[i].identity = true;
+      v_axes[i].v_offsets = NULL;
+    } else {
+      v_axes[i].identity = false;
+      v_axes[i].v_offsets = v_locations;
+      rray_slice_fill_locations(v_subscripts[i], v_locations);
+      v_locations += v_dimensions[i];
+    }
+  }
+
+  r_obj* names = KEEP_N(
+    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_axes),
+    &amp;n_prot
+  );
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  const bool any_missing =
+    rray_slice_locations_any_missing(v_axes, v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    v_axes[i].stride = v_x_strides[i];
+
+    if (!v_axes[i].identity) {
+      rray_slice_locations_as_offsets(
+        v_axes[i].v_offsets,
+        v_dimensions[i],
+        v_x_strides[i],
+        any_missing
+      );
+    }
+  }
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_slice_lgl(
+      x,
+      v_axes,
+      v_dimensions,</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 40,99p src/slice.c | grep -n &quot;size\|return&quot;</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 40,99p src/slice.c | grep -n &quot;size\|return&quot;</pre><pre class="output">13:  const r_ssize indices_size = r_length(indices);
+15:  if (indices_size != dimensionality) {
+21:      indices_size
+34:  r_ssize axis = 0;
+52:    v_dimensions[axis] = r_ssize_as_integer(subscript.size);
+55:  const r_ssize size =
+56:    rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+58:  r_ssize locations_size = 0;</pre></details>
+<p>Yes, it's required. Without it, <code>rray_slice_start()</code> can read past the end of memory when the result is empty.</p>
+<ul>
+<li>
+<p><strong>Where the offsets live:</strong> every non-identity axis gets its offsets from one shared raw buffer. Each axis takes <code>v_dimensions[axis]</code> slots, one after another (<code>src/slice.c:109-122</code>).</p>
+</li>
+<li>
+<p><strong>What goes wrong:</strong> if a non-identity axis selects nothing (<code>NULL</code>, <code>integer()</code>, <code>FALSE</code>), it gets zero slots. Its <code>v_offsets</code> then points either at the next axis's slots or just past the end of the buffer. <code>v_offsets[0]</code> reads that. In the second case, for example <code>rray_slice(x, 1L, NULL)</code>, the read is out of bounds, which is undefined behaviour in C.</p>
+</li>
+<li>
+<p><strong>Why returning 0 is safe:</strong> <code>rray_slice()</code> has no earlier exit for an empty result. With <code>size == 0</code>, the <code>while (run_start != size)</code> loop in <code>RRAY_SLICE_ITERATE</code> never runs, so <code>start</code> is never used. The guard only prevents the bad read. The value it returns doesn't matter.</p>
+</li>
+</ul>
+<p>Only a non-identity axis with dimension 0 needs the guard, but any such axis makes <code>size</code> 0, so <code>size == 0</code> covers every case. An identity axis with dimension 0 is fine on its own, since its <code>v_offsets</code> is never read.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>The outer iterate loop should just be an if/else not an if/elseif</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/slice.c</summary>
+<pre class="output">455	  }
+456	
+457	#define RRAY_SLICE_ITERATE(POKE, MISSING)                                      \
+458	  const r_ssize* v_run_offsets = v_axes[0].v_offsets;                          \
+459	  const r_ssize run_size = v_dimensions[0];                                    \
+460	  r_ssize run_start = 0;                                                       \
+461	                                                                               \
+462	  r_ssize start = rray_slice_start(v_axes, dimensionality, size);              \
+463	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY] = {0};                              \
+464	                                                                               \
+465	  if (v_axes[0].identity) {                                                    \
+466	    if (any_missing) {                                                         \
+467	      RRAY_SLICE_LOOP_MISSING(POKE, MISSING, i);                               \
+468	    } else {                                                                   \
+469	      RRAY_SLICE_LOOP(POKE, i);                                                \
+470	    }                                                                          \
+471	  } else if (any_missing) {                                                    \
+472	    RRAY_SLICE_LOOP_MISSING(POKE, MISSING, v_run_offsets[i]);                  \
+473	  } else {                                                                     \
+474	    RRAY_SLICE_LOOP(POKE, v_run_offsets[i]);                                   \
+475	  }
+476	
+477	#define RRAY_SLICE_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+478	
+479	#define RRAY_SLICE_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF, MISSING)           \
+480	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+481	  CTYPE* v_out = DEREF(out);                                                   \
+482	                                                                               \
+483	  const CTYPE* v_x = CONST_DEREF(x);                                           \
+484	                                                                               \
+485	  RRAY_SLICE_ITERATE(RRAY_SLICE_ATOMIC_POKE, MISSING);                         \
+486	                                                                               \
+487	  FREE(1);                                                                     \
+488	  return out;
+489	</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-  } else if (any_missing) {                                                    \</span>
+<span class="del">-    RRAY_SLICE_LOOP_MISSING(POKE, MISSING, v_run_offsets[i]);                  \</span>
+<span class="del">-  } else {                                                                     \</span>
+<span class="del">-    RRAY_SLICE_LOOP(POKE, v_run_offsets[i]);                                   \</span>
+<span class="del">-  }</span>
+<span class="ins">+  } else {                                                                     \</span>
+<span class="ins">+    if (any_missing) {                                                         \</span>
+<span class="ins">+      RRAY_SLICE_LOOP_MISSING(POKE, MISSING, v_run_offsets[i]);                \</span>
+<span class="ins">+    } else {                                                                   \</span>
+<span class="ins">+      RRAY_SLICE_LOOP(POKE, v_run_offsets[i]);                                 \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+  }</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; git diff src/slice…</summary>
+<pre>cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; git diff src/slice.c &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -1</pre><pre class="output">diff --git a/src/slice.c b/src/slice.c
+index f36ffc5..9b659a5 100644
+--- a/src/slice.c
++++ b/src/slice.c
+@@ -468,10 +468,12 @@ static inline r_ssize rray_slice_offset(
+     } else {                                                                   \
+       RRAY_SLICE_LOOP(POKE, i);                                                \
+     }                                                                          \
+-  } else if (any_missing) {                                                    \
+-    RRAY_SLICE_LOOP_MISSING(POKE, MISSING, v_run_offsets[i]);                  \
+   } else {                                                                     \
+-    RRAY_SLICE_LOOP(POKE, v_run_offsets[i]);                                   \
++    if (any_missing) {                                                         \
++      RRAY_SLICE_LOOP_MISSING(POKE, MISSING, v_run_offsets[i]);                \
++    } else {                                                                   \
++      RRAY_SLICE_LOOP(POKE, v_run_offsets[i]);                                 \
++    }                                                                          \
+   }
+ 
+ #define RRAY_SLICE_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2701 ]</pre></details>
+<p>Done. The outer branch in <code>RRAY_SLICE_ITERATE</code> (<code>src/slice.c:465</code>) is now a plain if/else on <code>v_axes[0].identity</code>. Each side has its own inner if/else on <code>any_missing</code>, so the two halves look the same.</p>
+<p>I ran <code>clang-format</code> and all tests pass (2701). This change is not committed yet.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git status --short &amp;&amp; git add src/slice.c &amp;&amp; git comm…</summary>
+<pre>cd ~/files/r/packages/rray4; git status --short &amp;&amp; git add src/slice.c &amp;&amp; git commit -q -m 'Nest the missing check under each side of the identity branch in `rray_slice()`' &amp;&amp; git push origin feature/slice 2&gt;&amp;1 | tail -1; git log --oneline -1</pre><pre class="output"> M src/slice.c
+   64bc8ef..faf07c0  feature/slice -&gt; feature/slice
+faf07c0 Nest the missing check under each side of the identity branch in `rray_slice()`</pre></details>
+<p>I committed the change as <code>faf07c0</code> and pushed it to <code>feature/slice</code>. The commit message is: &quot;Nest the missing check under each side of the identity branch in <code>rray_slice()</code>&quot;.</p>
+
+</section>
+</main>
+</body>
+</html>

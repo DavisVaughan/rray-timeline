@@ -1,0 +1,2932 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moving rray_permute_axes() to the run iterator</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-118">rray timeline</a>
+<h1>Moving <code>rray_permute_axes()</code> to the run iterator</h1>
+<p class="facts">Claude · Oct 3, 2026 · 2 prompts · 13 replies · <a href="https://github.com/r-lib/rray/pull/118">#118</a></p>
+</header>
+<main>
+<p class="divider">Oct 3, 2026, 19:09 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>What’s left in the transition to new iterator</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls plans/ src/ &amp;&amp; git log --oneline -15</summary>
+<pre>ls plans/ src/ &amp;&amp; git log --oneline -15</pre><pre class="output">plans/:
+accuracy.md
+combine-fixed.md
+cumulative.md
+extensions.md
+implementation.md
+index.md
+iterators.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+sum.md
+
+src/:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+one-add.h
+one-extremum.h
+one-logical.h
+one-multiply.h
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-extremum.c
+reduce-extremum.h
+reduce-extremum.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-prod.c
+reduce-prod.h
+reduce-prod.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rep-each.c
+rep-each.h
+rep-each.o
+rep.c
+rep.h
+rep.o
+reverse.c
+reverse.h
+reverse.o
+rlang
+rlang.c
+rlang.o
+roll-each.c
+roll-each.h
+roll-each.o
+roll.c
+roll.h
+roll.o
+rray4.so
+size.c
+size.h
+size.o
+slice-assign.c
+slice-assign.h
+slice-assign.o
+slice-axis.c
+slice-axis.h
+slice-axis.o
+slice-iterator.h
+slice-subscript.c
+slice-subscript.h
+slice-subscript.o
+slice.c
+slice.h
+slice.o
+split.c
+split.h
+split.o
+stack.c
+stack.h
+stack.o
+strided-iterator.h
+strided-iterator2.h
+strides.c
+strides.h
+strides.o
+subscript.c
+subscript.h
+subscript.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+unstack.c
+unstack.h</pre><p class="cut">22 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: cat plans/iterators.md; echo ======; head -60 src/strided-iterator.h; echo ====; head -60 src…</summary>
+<pre>cat plans/iterators.md; echo ======; head -60 src/strided-iterator.h; echo ====; head -60 src/strided-iterator2.h; echo ===; head -40 src/point-iterator.h src/slice-iterator.h</pre><pre class="output">Exit code 1
+# Run iterators: loops in each function instead of loop macros
+
+Today the loops that walk arrays live in macros: `RRAY_BROADCAST_ATOMIC()`, `RRAY_BINARY()` and `RRAY_REDUCE()`. Each operation passes in a one-element kernel (`ONE`). Anything an operation needs beyond that one-element kernel, like a 64-bit total or a pairwise sum, has to become a new macro parameter or a new macro. `plans/accuracy.md` shows how quickly that grows.
+
+This plan looks at the alternative: an iterator that the operation drives itself, with the loops written in each function. We built three iterator designs into a variant of rray4 and benchmarked them against the current macros on broadcasting, addition and sums.
+
+---
+
+# Summary
+
+- A per-element iterator (a `next()` that hands back `x` and `out` locations for every element) is simplest to use, but too slow. It's up to 7x slower on sums, 2x to 2.7x slower on double addition, and 1.1x to 1.5x slower on broadcasting.
+
+- An iterator that hands back one run at a time, used with a single loop over the run, matches the macros when every operand moves along the run. When one operand stays fixed, it's 1.3x to 1.5x slower on broadcasting and addition, and 4x to 7x slower on sums.
+
+- The same run iterator, with each function writing one loop per stride case (an operand fixed or moving), matches the macros in nearly every case we measured. The exception is very short runs: adding `[10, 1e6] + [10, 1]` (a million runs of 10 elements) is 4% to 6% slower, in every one of six runs. It's faster in one case: summing `[10, 1e6]` over axis 1 takes 2.75 ms against 3.53 ms, because the total stays in a local variable.
+
+- That design is what NumPy does. It is also what the macros already do. The loops are the same, so the speed is the same. What changes is where the loops live: in each function, where they can be read and changed, instead of inside a macro.
+
+- One run iterator can serve any number of inputs, replacing today's separate one-input and two-input plans. It's as fast as the specialized ones, as long as each function passes the number of inputs as a literal (`1`, `2`) and the call is inlined. With the count known only at runtime, short runs get 25% to 75% slower.
+
+- The short-run gap goes away when the iterator does less per run: keep one location array that the iterator advances directly (no per-run copy for the caller), and advance at the end of each run instead of checking for the first run at the start, like the macros do. That version is within 2.5% of the macro on every short-run case.
+
+- Keep the plan and the iterator as separate structs. A merged struct is just as fast when it's built inside the kernel. But when the driver builds it and the kernel uses it through a pointer, raw broadcasting gets up to 5x slower and a strided mean 11% slower. With a small `const` plan passed in and the iterator built locally in the kernel, the fast version is the default, with no rule to remember.
+
+- The cost is repetition. rray4 has 84 `RRAY_BINARY()` calls, 32 `RRAY_REDUCE()` calls and 5 `RRAY_BROADCAST_ATOMIC()` calls. Writing every stride case out by hand in each of them is a lot of code. How to handle the per-type repetition is the main open question.
+
+Recommendation: adopt one run iterator for any number of inputs, in the &quot;advance at the end&quot; shape, with per-stride-case loops written in each function. Decide separately how to avoid writing every type out by hand.
+
+---
+
+# How it works today
+
+`src/strided-iterator.h` builds a plan from a point space (the dimensions being walked) and a subspace (the strides of the array being read or written). After merging axes that can be walked as one (&quot;coalescing&quot;), the first axis is walked as one run, and later axes advance between runs with `RRAY_STRIDED_ITERATOR_NEXT()`.
+
+The header documents three things that matter here:
+
+- &quot;For performance and flexibility, the user is responsible for managing the run loop along the first axis. We've tried many alternative approaches but they tend to tank performance quickly as you increase the level of abstractions.&quot;
+
+- The plan holds only fixed state. The positions that change are kept by the caller, so the compiler can keep them in registers.
+
+- When a stride along the run is 0, the macros take a separate path where the compiler can see the location doesn't change. It then loads the fixed value once and vectorizes the rest.
+
+Each macro owns the full walk: allocate the output, set up the plan, loop over runs, branch on the stride cases, call `ONE` per element, and advance between runs. A few functions (`combine.c`, `index.c`, `permute-axes.c`, `split.c`) already write their own loops against the plan directly, without a macro.
+
+---
+
+# What NumPy does
+
+This section is from knowledge of NumPy's source, not checked against it. NumPy isn't installed on the benchmark machine.
+
+- One iterator, `nditer`, for everything. It reorders axes so the inner loop follows memory order, merges axes that can be walked as one, and h
+
+... [20012 characters truncated] ...
+
+the count is decided at runtime, like `rray_index()`.
+
+Both pass the same 262 test expectations, and match `macro` with `identical()` in every case.
+
+The first attempt shared one function body between the two versions, with each wrapper passing its count. clang didn't inline that body into the literal wrapper, so the literal never reached the iterator, and `run_n` was as slow as `run_n_runtime`. Marking the shared body `__attribute__((always_inline))` fixed it. In real code each function calls the iterator directly with its literal, which is what the first `run_n` measurement did, and it matched `run_split` without any forced inlining. But it shows the speed depends on the compiler actually seeing the literal.
+
+Median ms, with inlining forced:
+
+| Case | Macro | Run split | Run n | Run n, runtime count |
+|---|---|---|---|---|
+| Broadcast `[10, 1]` to `[10, 1e6]` | 6.24 | 6.38 | 6.45 | 8.07 |
+| Broadcast `[1, 1e6]` to `[10, 1e6]` | 6.68 | 7.12 | 7.25 | 8.11 |
+| Broadcast `[200, 1, 200]` to `[200, 200, 200]` | 4.05 | 4.13 | 4.05 | 4.37 |
+| Add `[10, 1e6] + [10, 1]` | 7.69 | 8.33 | 8.71 | 10.76 |
+| Add `[10, 1e6] + [1, 1e6]` | 7.24 | 7.68 | 7.92 | 10.25 |
+| Add, integer, `[10, 1e6] + [10, 1]` | 10.97 | 11.57 | 12.08 | 14.89 |
+| Add, integer, `[10, 1e6] + [1, 1e6]` | 13.23 | 13.84 | 13.54 | 15.68 |
+| Sum `[10, 1e6]` over 1 | 3.53 | 2.65 | 2.93 | 4.68 |
+| Sum `[10, 1e6]` over 2 | 3.79 | 3.75 | 3.75 | 5.23 |
+| Sum `[200, 200, 200]` over 2 | 1.18 | 1.18 | 1.18 | 1.28 |
+
+Every other case in the suite (long runs: the `[4000, 4000]` and most `[200, 200, 200]` cases) was the same for all four versions, within noise.
+
+With `RRAY_MAX_INPUTS` raised to 64, so `rray_index()` could use it, `run_n` was unchanged: for example 2.84 ms on the short sum along axis 1 and 6.16 ms on the short broadcast. The compiler still keeps the used slots in registers.
+
+## What the numbers say
+
+- With a literal count, one iterator for any number of inputs is as fast as the separate one-input and two-input versions. The small differences between `run_split` and `run_n` move in both directions between runs.
+
+- A count known only at runtime costs 25% to 75% on short runs, and nothing on long runs. The loops over inputs run once per run, so they only matter when there are millions of runs.
+
+- So the plan structs can be merged into one, as long as every function passes its count as a literal. Code like `rray_index()`, where the count really is decided at runtime, keeps its `switch` on the count, with a literal in each case.
+
+---
+
+# Removing the per-run cost
+
+`rray_run_iterator_n` does two things per run that the macros don't:
+
+- It keeps two location arrays. `v_loc_start` is what `next()` advances, and `v_loc` is a copy made at the start of every run for the caller. The copy only protects against a caller that changes `it.v_loc[i]` while walking the run. No caller does: every loop copies the start into a local (`r_ssize x_loc = it.v_loc[0];`) and moves the local.
+
+- `next()` checks `it-&gt;end != 0` on every run, so that the first call doesn't advance.
+
+## Two leaner iterators
+
+`rray_run_iterator_n_lean` keeps one array, `v_loc`, which `next()` advances directly. The caller reads it and never writes it. C can't enforce that, since the iterator itself has to change the field. It still has the first-run check.
+
+```c
+static inline bool rray_run_iterator_n_lean_next(
+  struct rray_run_iterator_n_lean* it,
+  const r_ssize n
+) {
+  if (it-&gt;end == it-&gt;size) {
+    return false;
+  }
+
+  if (it-&gt;end != 0) {
+    const struct rray_strided_iterator_n_plan* plan = it-&gt;plan;
+    RRAY_STRIDED_ITERATOR_NEXT_N(it-&gt;v_loc, it-&gt;v_point, plan, n);
+  }
+
+  it-&gt;start = it-&gt;end;
+  it-&gt;end = it-&gt;start + it-&gt;run_size;
+
+  return true;
+}
+```
+
+`rray_run_iterator_n_advance` also drops the first-run check. Its constructor already describes the first run (`it.end = it.run_size`), and the loop advances at the end of each run. That is the same shape as the macros' `while (run_start != size) { ...; RRAY_STRIDED_ITERATOR_NEXT(); }`.
+
+```c
+static inline bool rray_run_iterator_n_advance_done(
+  const struct rray_run_iterator_n_advance* it
+) {
+  return it-&gt;start == it-&gt;size;
+}
+
+static inline void rray_run_iterator_n_advance_next(
+  struct rray_run_iterator_n_advance* it,
+  const r_ssize n
+) {
+  const struct rray_strided_iterator_n_plan* plan = it-&gt;plan;
+  RRAY_STRIDED_ITERATOR_NEXT_N(it-&gt;v_loc, it-&gt;v_point, plan, n);
+
+  it-&gt;start = it-&gt;end;
+  it-&gt;end = it-&gt;start + it-&gt;run_size;
+}
+```
+
+The caller's loop becomes a `for` instead of a `while`:
+
+```c
+struct rray_run_iterator_n_advance it = rray_run_iterator_n_advance(plan, 2);
+
+for (; !rray_run_iterator_n_advance_done(&amp;it);
+     rray_run_iterator_n_advance_next(&amp;it, 2)) {
+  r_ssize x_loc = it.v_loc[0];
+  r_ssize y_loc = it.v_loc[1];
+  ...
+}
+```
+
+After the last run, `next()` carries the point back to zero one extra time. That only changes `v_point` and `v_loc`, which nothing reads afterwards. An empty array (`size == 0`) is done before the first run</pre></details>
+<details class="tool tool-error"><summary>Bash: grep -n &quot;^#\|^##&quot; plans/iterators.md | tail -30; echo ====; grep -rnE &quot;RRAY_BROADCAST_ATOMIC|…</summary>
+<pre>grep -n &quot;^#\|^##&quot; plans/iterators.md | tail -30; echo ====; grep -rnE &quot;RRAY_BROADCAST_ATOMIC|RRAY_BINARY\(|RRAY_REDUCE\(|RRAY_STRIDED_ITERATOR_NEXT\b|rray_strided_iterator_plan\b|strided-iterator\.h|strided-iterator2\.h|point-iterator\.h|slice-iterator\.h|rray_run_iterator&quot; src --include=*.c --include=*.h | grep -v &quot;^src/rlang&quot; | awk -F: '{print $1}' | sort | uniq -c</pre><pre class="output">Exit code 1
+357:## Add, double
+370:## Add, integer
+380:## Sum, double
+394:## What the numbers say
+410:# Any number of inputs
+414:## What NumPy does
+424:## `rray_run_iterator_n`
+429:#define RRAY_MAX_INPUTS 8
+509:## Benchmarks
+540:## What the numbers say
+550:# Removing the per-run cost
+558:## Two leaner iterators
+619:## Benchmarks
+636:## What the numbers say
+650:# Plan and iterator: separate or merged
+654:## How the variant package is wired
+660:## The merged struct
+694:## Round 1: merged, built inside the kernel
+734:## Round 2: merged, built by the driver
+773:## What the numbers say
+789:# The cost: repetition
+813:# Open questions
+829:# Appendix
+831:## `src/run-iterator.h`, two subspaces
+897:## `src/element-iterator.h`, one subspace
+985:## Single loop run variants
+1013:## Benchmark script
+1181:## Short-run benchmark script
+1253:## Merged, round 1, benchmark script
+1349:## Merged, round 2, benchmark script
+(eval):1: === not found</pre></details>
+<details class="tool"><summary>Bash: sed -n 789,830p plans/iterators.md; echo; echo ---; for p in RRAY_BROADCAST_ATOMIC 'RRAY_BINA…</summary>
+<pre>sed -n 789,830p plans/iterators.md; echo; echo ---; for p in RRAY_BROADCAST_ATOMIC 'RRAY_BINARY(' 'RRAY_REDUCE(' 'RRAY_STRIDED_ITERATOR_NEXT(' 'RRAY_STRIDED_ITERATOR_NEXT2(' 'strided-iterator.h' 'strided-iterator2.h' 'point-iterator.h' 'slice-iterator.h' 'rray_run_iterator'; do echo &quot;## $p&quot;; grep -rlF &quot;$p&quot; src --include=*.c --include=*.h | grep -v rlang/ | tr '\n' ' '; echo; done</pre><pre class="output"># The cost: repetition
+
+Moving the loops into each function means each function carries its own copy of the stride cases. Today:
+
+| Macro | Call sites | Stride cases per call |
+|---|---|---|
+| `RRAY_BINARY()` | 84 | 4 |
+| `RRAY_REDUCE()` | 32 | 2 |
+| `RRAY_REDUCE_OUTER()` | 6 | 1 (plus an inner loop) |
+| `RRAY_BROADCAST_ATOMIC()` | 5 | 2 |
+| `RRAY_BROADCAST_BARRIER()` | 2 | 2 |
+
+The add example above is about 50 lines. Written out by hand, 84 binary call sites is several thousand lines that differ only in types and the one-element kernel. Most of those call sites differ only by type: `rray_add_dbl_dbl()`, `rray_add_int_dbl()`, `rray_add_lgl_dbl()` and so on.
+
+Options for the per-type repetition:
+
+- Write every type out. Every loop is plain C you can read. The most code, and a fix to one loop has to be copied to the others.
+
+- One loop body per operation, stamped out per type by a small macro. This is what NumPy does with templates. The macro would only fill in types and the kernel, not hide the loop structure: the loops for `add` would be written once in `arithmetic-add.c`, not in a shared header. Different operations can still choose different loops, which is the point.
+
+- A mix: write out the operations with special needs (sums, means, anything in `plans/accuracy.md`), and keep a type-stamping macro for the many plain elementwise operations (arithmetic, comparison, equality).
+
+---
+
+# Open questions
+
+- How should the per-type repetition be handled? Write it out, stamp it per type, or a mix?
+
+- Should checked integer operations skip the fixed-operand cases, given they were slower there?
+
+- Should the run iterators replace direct uses of `RRAY_STRIDED_ITERATOR_NEXT()` in `combine.c`, `index.c`, `permute-axes.c` and `split.c` too, so there's one way to walk an array?
+
+- Should `rray_strided_iterator_plan` and `rray_strided_iterator2_plan` be replaced by `rray_strided_iterator_n_plan` and `rray_run_iterator_n`, so there is one plan and one iterator?
+
+- The `advance` shape needs two calls (`done()` and `next()`) and a `for` loop instead of one `while (next())`. Is that acceptable, or is there a single-call shape that is just as fast?
+
+- None of this has been measured with GCC or on x86_64. Is one Linux run worth doing before committing to the design?
+
+---
+
+# Appendix
+
+
+---
+## RRAY_BROADCAST_ATOMIC
+(eval):1: no matches found: --include=*.c
+
+## RRAY_BINARY(
+(eval):1: no matches found: --include=*.c
+
+## RRAY_REDUCE(
+(eval):1: no matches found: --include=*.c
+
+## RRAY_STRIDED_ITERATOR_NEXT(
+(eval):1: no matches found: --include=*.c
+
+## RRAY_STRIDED_ITERATOR_NEXT2(
+(eval):1: no matches found: --include=*.c
+
+## strided-iterator.h
+(eval):1: no matches found: --include=*.c
+
+## strided-iterator2.h
+(eval):1: no matches found: --include=*.c
+
+## point-iterator.h
+(eval):1: no matches found: --include=*.c
+
+## slice-iterator.h
+(eval):1: no matches found: --include=*.c
+
+## rray_run_iterator
+(eval):1: no matches found: --include=*.c</pre></details>
+<details class="tool"><summary>Bash: ls src/*iterator* ; for p in RRAY_BROADCAST_ATOMIC RRAY_BROADCAST_BARRIER 'RRAY_BINARY(' 'RRA…</summary>
+<pre>ls src/*iterator* ; for p in RRAY_BROADCAST_ATOMIC RRAY_BROADCAST_BARRIER 'RRAY_BINARY(' 'RRAY_REDUCE(' 'RRAY_REDUCE_OUTER(' 'RRAY_STRIDED_ITERATOR_NEXT(' 'RRAY_STRIDED_ITERATOR2_NEXT' 'rray_strided_iterator_plan' 'rray_strided_iterator2_plan' 'rray_point_iterator' 'rray_slice_iterator' 'rray_run_iterator' '&quot;strided-iterator.h&quot;' '&quot;strided-iterator2.h&quot;' '&quot;point-iterator.h&quot;' '&quot;slice-iterator.h&quot;' '&quot;run-iterator.h&quot;'; do echo &quot;## $p&quot;; grep -rlF -- &quot;$p&quot; src/*.c src/*.h src/decl 2&gt;/dev/null | tr '\n' ' '; echo; done</pre><pre class="output">src/point-iterator.h
+src/slice-iterator.h
+src/strided-iterator.h
+src/strided-iterator2.h
+## RRAY_BROADCAST_ATOMIC
+src/broadcast.c 
+## RRAY_BROADCAST_BARRIER
+src/broadcast.c 
+## RRAY_BINARY(
+src/arithmetic-add.c src/arithmetic-exponentiate.c src/arithmetic-divide.c src/arithmetic-multiply.c src/arithmetic-subtract.c src/equal.c src/compare.c src/extremum.c src/logical.c src/binary.h 
+## RRAY_REDUCE(
+src/reduce-extremum.c src/reduce-logical.c src/reduce-prod.c src/reduce-sum.c src/reduce.h 
+## RRAY_REDUCE_OUTER(
+src/reduce-mean.c src/reduce.h 
+## RRAY_STRIDED_ITERATOR_NEXT(
+src/permute-axes.c src/split.c src/reduce.h src/strided-iterator.h 
+## RRAY_STRIDED_ITERATOR2_NEXT
+
+## rray_strided_iterator_plan
+src/permute-axes.c src/reduce-mean.c src/reduce.c src/split.c src/reduce.h src/strided-iterator.h src/decl/reduce-mean-decl.h src/decl/permute-axes-decl.h src/decl/reduce-decl.h src/decl/split-decl.h 
+## rray_strided_iterator2_plan
+
+## rray_point_iterator
+src/point-iterator.h 
+## rray_slice_iterator
+
+## rray_run_iterator
+src/broadcast.c src/combine.c src/index.c src/binary.h src/reduce.h src/strided-iterator2.h 
+## &quot;strided-iterator.h&quot;
+src/permute-axes.c src/split.c src/reduce.h 
+## &quot;strided-iterator2.h&quot;
+src/broadcast.c src/index.c src/combine.c src/binary.h src/reduce.h 
+## &quot;point-iterator.h&quot;
+
+## &quot;slice-iterator.h&quot;
+src/slice-assign.c src/slice.c 
+## &quot;run-iterator.h&quot;</pre></details>
+<p>Checking which files still use the old strided iterator versus the new run iterator.</p>
+
+<details class="tool"><summary>Bash: grep -nE &quot;RRAY_STRIDED_ITERATOR_NEXT\(|rray_strided_iterator_plan|rray_run_iterator|^#define&quot;…</summary>
+<pre>grep -nE &quot;RRAY_STRIDED_ITERATOR_NEXT\(|rray_strided_iterator_plan|rray_run_iterator|^#define&quot; src/reduce.h src/binary.h src/broadcast.c src/permute-axes.c src/split.c src/reduce-mean.c src/reduce.c | head -60; echo; grep -n &quot;^#define\|^struct\|^static inline&quot; src/strided-iterator.h src/strided-iterator2.h src/slice-iterator.h src/point-iterator.h; grep -rn &quot;slice_iterator\|RRAY_SLICE&quot; src/slice.c src/slice-assign.c | head</pre><pre class="output">src/binary.h:2:#define RRAY_BINARY_H
+src/binary.h:8:#define RRAY_BINARY_ARGS(...) , __VA_ARGS__
+src/binary.h:9:#define RRAY_BINARY_NO_ARGS
+src/binary.h:11:#define RRAY_BINARY(                                                           \
+src/binary.h:24:  struct rray_run_iterator it = rray_run_iterator2(                            \
+src/binary.h:31:  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, rray_run_iterator_size(&amp;it)));   \
+src/binary.h:37:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next2(&amp;it)) {         \
+src/binary.h:38:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/binary.h:39:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/binary.h:41:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+src/binary.h:42:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+src/binary.h:44:    r_ssize y_loc = rray_run_iterator_loc(&amp;it, 1);                             \
+src/binary.h:45:    const r_ssize y_stride = rray_run_iterator_stride(&amp;it, 1);                 \
+src/reduce.h:2:#define RRAY_REDUCE_H
+src/reduce.h:10:#define RRAY_REDUCE_ARGS(...) , __VA_ARGS__
+src/reduce.h:11:#define RRAY_REDUCE_NO_ARGS
+src/reduce.h:47:#define RRAY_REDUCE(                                                           \
+src/reduce.h:57:  struct rray_run_iterator it =                                                \
+src/reduce.h:58:    rray_run_iterator1(v_dimensions, dimensionality, v_out_broadcast_strides); \
+src/reduce.h:69:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+src/reduce.h:70:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/reduce.h:71:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/reduce.h:73:    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);                           \
+src/reduce.h:74:    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);               \
+src/reduce.h:103:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce.h:104:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce.h:124:#define RRAY_REDUCE_OUTER(                                                     \
+src/reduce.h:133:  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
+src/reduce.h:142:    rray_strided_iterator_plan_run_size(outer_plan);                           \
+src/reduce.h:146:    rray_strided_iterator_plan_run_stride(outer_plan);                         \
+src/reduce.h:149:  rray_strided_iterator_plan_point_init(outer_plan, v_point);                  \
+src/reduce.h:161:    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+src/reduce.h:167:#define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+src/reduce.h:169:    const r_ssize size = rray_strided_iterator_plan_size(inner_plan);          \
+src/reduce.h:172:    const r_ssize run_size = rray_strided_iterator_plan_run_size(inner_plan);  \
+src/reduce.h:175:      rray_strided_iterator_plan_run_stride(inner_plan);                       \
+src/reduce.h:178:    rray_strided_iterator_plan_point_init(inner_plan, v_point);                \
+src/reduce.h:191:      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, inner_plan);                \
+src/broadcast.c:148:#define RRAY_BROADCAST_LOOP(CTYPE, POKE)                                       \
+src/broadcast.c:149:  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+src/broadcast.c:150:    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+src/broadcast.c:151:    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+src/broadcast.c:153:    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+src/broadcast.c:154:    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+src/broadcast.c:169:#define RRAY_BROADCAST_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+src/broadcast.c:171:#define RRAY_BROADCAST_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)                \
+src/broadcast.c:172:  struct rray_run_iterator it =                                                \
+src/broadcast.c:173:    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+src/broadcast.c:175:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/broadcast.c:185:#define RRAY_BROADCAST_BARRIER(RTYPE, CONST_DEREF, POKE)                       \
+src/broadcast.c:186:  struct rray_run_iterator it =                                                \
+src/broadcast.c:187:    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+src/broadcast.c:189:  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+src/permute-axes.c:55:  struct rray_strided_iterator_plan plan =
+src/permute-axes.c:56:    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);
+src/permute-axes.c:99:#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \
+src/permute-axes.c:100:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+src/permute-axes.c:108:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+src/permute-axes.c:111:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+src/permute-axes.c:114:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+
+src/point-iterator.h:2:#define RRAY_POINT_ITERATOR_H
+src/point-iterator.h:11:struct rray_point_iterator {
+src/point-iterator.h:20:static inline void rray_point_iterator_init(
+src/point-iterator.h:39:#define RRAY_POINT_ITERATOR_FOR_EACH(IT, INDEX, V_POINT, ...)                  \
+src/slice-iterator.h:2:#define RRAY_SLICE_ITERATOR_H
+src/slice-iterator.h:7:static inline r_ssize rray_slice_start(
+src/slice-iterator.h:29:#define RRAY_SLICE_NEXT_POINT(V_POINT, N)                                      \
+src/slice-iterator.h:38:#define RRAY_SLICE_LOOP(RUN, LOCATION, N, ANY_MISSING, ...)                    \
+src/slice-iterator.h:51:#define RRAY_SLICE_LOOPS(RUN, LOCATION, ...)                                   \
+src/slice-iterator.h:95:#define RRAY_SLICE_ITERATE(RUN, ...)                                           \
+src/strided-iterator.h:2:#define RRAY_STRIDED_ITERATOR_H
+src/strided-iterator.h:145:struct rray_strided_iterator_plan {
+src/strided-iterator.h:156:static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+src/strided-iterator.h:185:static inline r_ssize rray_strided_iterator_plan_size(
+src/strided-iterator.h:190:static inline r_ssize rray_strided_iterator_plan_run_size(
+src/strided-iterator.h:195:static inline r_ssize rray_strided_iterator_plan_run_stride(
+src/strided-iterator.h:200:static inline void rray_strided_iterator_plan_point_init(
+src/strided-iterator.h:207:#define RRAY_STRIDED_ITERATOR_NEXT(START, V_POINT, PLAN)                       \
+src/strided-iterator.h:220:static inline int rray__strided_iterator_axes_coalesce(
+src/strided-iterator.h:255:static inline bool rray__strided_iterator_axes_coalescible(
+src/strided-iterator2.h:2:#define RRAY_STRIDED_ITERATOR2_H
+src/strided-iterator2.h:148:struct rray_run_iterator {
+src/strided-iterator2.h:167:static inline struct rray_run_iterator rray_run_iterator(
+src/strided-iterator2.h:226:static inline struct rray_run_iterator rray_run_iterator1(
+src/strided-iterator2.h:235:static inline struct rray_run_iterator rray_run_iterator2(
+src/strided-iterator2.h:245:static inline r_ssize rray_run_iterator_size(
+src/strided-iterator2.h:251:static inline r_ssize rray_run_iterator_start(
+src/strided-iterator2.h:257:static inline r_ssize rray_run_iterator_end(
+src/strided-iterator2.h:263:static inline r_ssize rray_run_iterator_loc(
+src/strided-iterator2.h:270:static inline r_ssize rray_run_iterator_stride(
+src/strided-iterator2.h:277:static inline const r_ssize* rray_run_iterator_v_loc(
+src/strided-iterator2.h:283:static inline const r_ssize* rray_run_iterator_v_strides(
+src/strided-iterator2.h:289:static inline bool rray_run_iterator_done(const struct rray_run_iterator* it) {
+src/strided-iterator2.h:293:static inline void rray_run_iterator_next(struct rray_run_iterator* it) {
+src/strided-iterator2.h:323:static inline void rray_run_iterator_next1(struct rray_run_iterator* it) {
+src/strided-iterator2.h:348:static inline void rray_run_iterator_next2(struct rray_run_iterator* it) {
+src/strided-iterator2.h:377:static inline void rray_run_iterator_next3(struct rray_run_iterator* it) {
+src/strided-iterator2.h:409:static inline void rray_run_iterator_next4(struct rray_run_iterator* it) {
+src/strided-iterator2.h:444:static inline int rray__run_iterator_axes_coalesce(
+src/strided-iterator2.h:492:static inline bool rray__run_iterator_axes_coalescible(
+src/slice.c:264:#define RRAY_SLICE_RUN(LOCATION, N, ANY_MISSING, POKE, MISSING)                \
+src/slice.c:277:#define RRAY_SLICE_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+src/slice.c:279:#define RRAY_SLICE_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF, MISSING)           \
+src/slice.c:285:  RRAY_SLICE_ITERATE(RRAY_SLICE_RUN, RRAY_SLICE_ATOMIC_POKE, MISSING);         \
+src/slice.c:290:#define RRAY_SLICE_BARRIER(RTYPE, CONST_DEREF, POKE, MISSING)                  \
+src/slice.c:295:  RRAY_SLICE_ITERATE(RRAY_SLICE_RUN, POKE, MISSING);                           \
+src/slice.c:309:  RRAY_SLICE_ATOMIC(
+src/slice.c:327:  RRAY_SLICE_ATOMIC(
+src/slice.c:345:  RRAY_SLICE_ATOMIC(
+src/slice.c:363:  RRAY_SLICE_ATOMIC(</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;strided_iterator&quot; src/reduce.c src/reduce-mean.c src/split.c | head -30; grep -rn &quot;p…</summary>
+<pre>grep -n &quot;strided_iterator&quot; src/reduce.c src/reduce-mean.c src/split.c | head -30; grep -rn &quot;point_iterator\|POINT_ITERATOR\|point-iterator&quot; src/*.c src/*.h src/decl | grep -v &quot;^src/point-iterator.h&quot;</pre><pre class="output">src/reduce.c:108:  const struct rray_strided_iterator_plan outer_plan =
+src/reduce.c:116:  const struct rray_strided_iterator_plan inner_plan =
+src/reduce.c:147:static struct rray_strided_iterator_plan rray_reduce_nested_iterator_plan(
+src/reduce.c:161:    return rray_strided_iterator_plan(&amp;dimension, dimensionality, &amp;stride);
+src/reduce.c:173:  return rray_strided_iterator_plan(v_dimensions, (int) axes_size, v_strides);
+src/reduce-mean.c:59:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:60:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce-mean.c:76:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:77:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce-mean.c:93:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:94:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce-mean.c:110:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:111:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce-mean.c:127:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:128:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce-mean.c:144:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:145:  const struct rray_strided_iterator_plan* inner_plan,
+src/reduce-mean.c:162:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:174:  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+src/reduce-mean.c:182:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:201:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:213:  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+src/reduce-mean.c:221:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:239:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:261:  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+src/reduce-mean.c:293:  const struct rray_strided_iterator_plan* inner_plan
+src/split.c:88:  struct rray_strided_iterator_plan out_elt_plan = {0};
+src/split.c:113:      out_elt_plan = rray_strided_iterator_plan(
+src/split.c:119:      out_elt_size = rray_strided_iterator_plan_size(&amp;out_elt_plan);
+src/split.c:229:  const struct rray_strided_iterator_plan* plan</pre></details>
+<p>Four files still use the old iterator. Once they move over, <code>src/strided-iterator.h</code> can be deleted.</p>
+<p><strong>Still on the old <code>rray_strided_iterator_plan</code> + <code>RRAY_STRIDED_ITERATOR_NEXT()</code>:</strong></p>
+<ul>
+<li>
+<p><strong><code>src/permute-axes.c</code></strong>: <code>RRAY_PERMUTE_AXES_ATOMIC()</code> walks the plan by hand (lines 55 and 99 onward).</p>
+</li>
+<li>
+<p><strong><code>src/split.c</code></strong>: <code>out_elt_plan</code> at line 88, with the helper at line 229 taking the plan.</p>
+</li>
+<li>
+<p><strong><code>src/reduce.c</code> and <code>src/reduce-mean.c</code></strong>: the mean path. <code>rray_reduce_nested_iterator_plan()</code> (<code>reduce.c:147</code>) builds an outer and an inner plan. <code>RRAY_REDUCE_OUTER()</code> and <code>RRAY_REDUCE_INNER()</code> in <code>src/reduce.h:124-191</code> walk them. All six mean kernels plus the <code>count</code> helpers take <code>const struct rray_strided_iterator_plan*</code>. This is the biggest piece left, because it's a nested walk rather than the single walk that <code>RRAY_REDUCE()</code> does.</p>
+</li>
+</ul>
+<p><strong>Cleanup after those four move:</strong></p>
+<ul>
+<li>
+<p>Delete <code>src/strided-iterator.h</code>. <code>src/reduce.h</code> would then no longer need to include it.</p>
+</li>
+<li>
+<p>Possibly rename <code>src/strided-iterator2.h</code> to something like <code>run-iterator.h</code>, since it would be the only iterator left. The &quot;2&quot; only made sense while both existed.</p>
+</li>
+<li>
+<p><code>src/point-iterator.h</code> isn't included anywhere. It looks like dead code you could delete.</p>
+</li>
+</ul>
+<p><strong>Already done:</strong> broadcast, every binary op (<code>RRAY_BINARY()</code>), the non-mean reducers (<code>RRAY_REDUCE()</code>), <code>index.c</code> and <code>combine.c</code>.</p>
+<p><strong>Not part of this move:</strong> <code>src/slice-iterator.h</code>, used by <code>slice.c</code> and <code>slice-assign.c</code>. It walks slice subscripts rather than strides, so it isn't the same kind of iterator.</p>
+<p><strong>Still open in <code>plans/iterators.md</code>:</strong> whether the loops should come out of the <code>RRAY_BINARY()</code> and <code>RRAY_REDUCE()</code> macros and be written in each function, and how to handle the repetition across types if they do. The current work changed the iterator underneath the macros, but the macros are still there. The plan also notes nothing has been benchmarked with GCC or on x86_64.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create feature/permute-iterator<br />
+Read the plan/iterator and the last few commits<br />
+Move the permute functions to the new iterator design following the style of add closely<br />
+Run benchmarks to ensure we didn’t regress against the previous implementation<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat src/permute-axes.c src/decl/permute-axes-decl.h src/permute-axes.h</summary>
+<pre>cat src/permute-axes.c src/decl/permute-axes-decl.h src/permute-axes.h</pre><pre class="output">#include &quot;permute-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/permute-axes-decl.h&quot;
+
+r_obj* ffi_rray_permute_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_permute_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_permute_axes(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  axes = KEEP(
+    arg_as_axes_permutation(axes, dimensionality, rray_args.axes, error_call)
+  );
+  const int* v_axes = r_int_cbegin(axes);
+
+  r_obj* dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_dimensions = r_int_begin(dimensions);
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int axis = v_axes[i] - 1;
+    v_dimensions[i] = v_x_dimensions[axis];
+    v_strides[i] = v_x_strides[axis];
+  }
+
+  struct rray_strided_iterator_plan plan =
+    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_permute_axes_lgl(x, &amp;plan);
+    break;
+  case R_TYPE_integer:
+    out = rray_permute_axes_int(x, &amp;plan);
+    break;
+  case R_TYPE_double:
+    out = rray_permute_axes_dbl(x, &amp;plan);
+    break;
+  case R_TYPE_complex:
+    out = rray_permute_axes_cpl(x, &amp;plan);
+    break;
+  case R_TYPE_raw:
+    out = rray_permute_axes_raw(x, &amp;plan);
+    break;
+  case R_TYPE_character:
+    out = rray_permute_axes_chr(x, &amp;plan);
+    break;
+  case R_TYPE_list:
+    out = rray_permute_axes_list(x, &amp;plan);
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP(out);
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* names = KEEP(rray_permute_axes_names(x, v_axes, dimensionality));
+
+  if (names != r_null) {
+    r_attrib_poke_dim_names(out, names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+  CTYPE* v_out = DEREF(out);                                                   \
+                                                                               \
+  const CTYPE* v_x = CONST_DEREF(x);                                           \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    if (x_run_stride == 0) {                                                   \
+      const CTYPE x_elt = v_x[x_loc];                                          \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[i] = x_elt;                                                      \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[i] = v_x[x_loc];                                                 \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    if (x_run_stride == 0) {                                                   \
+      r_obj* const x_elt = v_x[x_loc];                                         \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        POKE(out, i, x_elt);                                                   \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        POKE(out, i, v_x[x_loc]);                                              \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+static r_obj* rray_permute_axes_lgl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_PERMUTE_AXES_ATOMIC(R_TYPE_logical, int, r_lgl_cbegin, r_lgl_begin);
+}
+
+static r_obj* rray_permute_axes_int(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_PERMUTE_AXES_ATOMIC(R_TYPE_integer, int, r_int_cbegin, r_int_begin);
+}
+
+static r_obj* rray_permute_axes_dbl(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_PERMUTE_AXES_ATOMIC(R_TYPE_double, double, r_dbl_cbegin, r_dbl_begin);
+}
+
+static r_obj* rray_permute_axes_cpl(
+  r_obj* x,</pre><p class="cut">105 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/strided-iterator2.h</summary>
+<pre>cat src/strided-iterator2.h</pre><pre class="output">#ifndef RRAY_STRIDED_ITERATOR2_H
+#define RRAY_STRIDED_ITERATOR2_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator2-decl.h&quot;
+
+// Strided iterator
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates the current `loc`ations in one or
+// more alternate subspaces defined by `v_v_strides`.
+//
+// We've carefully tuned this iterator for both performance and flexibility. The
+// caller MUST create the iterator INSIDE the function that utilizes it. If a
+// pointer to the iterator is passed around, it can destroy performance due to
+// the way the result is compiled.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+// This loop is typically what the caller writes.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// Note that all sets of strides must be coalescible, as coalescing changes the
+// output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+//
+// --------------------------------------------------------------------------
+// Optimization - Next specialization
+//
+// The loops that callers write seem to be particularly sensitive to whether or
+// not the &quot;next&quot; loop is unrolled on `n`. For the generic &quot;next&quot; function with
+// a runtime `n`, it usually isn't unrolled. But most of the time you have
+// either one or two inputs, so we manually unroll in next1() and next2(), and
+// those should be used where possible.
+struct rray_run_iterator {
+  r_ssize size;
+
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize start;
+  r_ssize end;
+  r_ssize v_loc[RRAY_MAX_INPUTS];
+
+  // Strides for all `n` arrays, laid out axis-major in a flat array as
+  // [dimensionality][n], allowing contiguous access when doing &quot;next&quot; calls.
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_INPUTS];
+  r_ssize n;
+};
+
+static inline struct rray_run_iterator rray_run_iterator(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* const* v_v_strides,
+  r_ssize n
+) {
+  check_dimensionality(dimensionality);
+
+  if (n &lt; 1 || n &gt; RRAY_MAX_INPUTS) {
+    r_stop_internal(
+      &quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be between 1 and %d.&quot;,
+      n,
+      RRAY_MAX_INPUTS
+    );
+  }
+
+  struct rray_run_iterator it;
+
+  it.size = rray_size_from_dimensions_checked(
+    v_dimensions,
+    dimensionality,
+    r_lazy_null
+  );
+
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    it.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+  }
+
+  // Reorder strides to be contiguous during next() calls
+  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+    r_ssize* v_strides = it.v_strides + axis * n;
+    for (r_ssize i = 0; i &lt; n; ++i) {
+      v_strides[i] = v_v_strides[i][axis];
+    }</pre><p class="cut">302 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show --stat HEAD~4 HEAD~3 HEAD~2 HEAD~1 HEAD | grep -v &quot;^ \|^$&quot; ; git show --stat HEAD~5 …</summary>
+<pre>git show --stat HEAD~4 HEAD~3 HEAD~2 HEAD~1 HEAD | grep -v &quot;^ \|^$&quot; ; git show --stat HEAD~5 | head -30</pre><pre class="output">commit 359fe6bce8cef3f2dc56829ba01e328a8768669c
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Fri Oct 2 21:22:38 2026 -0400
+commit c63287620f5f41550089bb3a4b62f6376bb38a85
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sat Oct 3 06:03:04 2026 -0400
+commit 65d16a455f8b5841d6c17475a63099459da5d4b3
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sat Oct 3 06:51:48 2026 -0400
+commit 26f06bdc3ae77b4451105ef75656265f1fa6eb81
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sat Oct 3 09:25:50 2026 -0400
+commit f52cd05d61f2eebf27d9705849bf98d09fd02203
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sat Oct 3 12:42:58 2026 -0400
+commit 2a3f2d62346971be9abb14c598fc3fac7a5b21a8
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Fri Oct 2 19:49:13 2026 -0400
+
+    Iterator as a struct idea (#112)
+
+ src/arithmetic-add.c              | 116 ++++++++---
+ src/arithmetic.c                  |  79 +++++++
+ src/arithmetic.h                  |  27 +++
+ src/binary.h                      |  71 +++++++
+ src/broadcast.c                   | 179 +++++++++-------
+ src/decl/arithmetic-add-decl.h    |  82 ++++++--
+ src/decl/broadcast-decl.h         |  28 ++-
+ src/decl/reduce-sum-decl.h        |  34 ++-
+ src/decl/strided-iterator2-decl.h |  13 ++
+ src/dimensionality.h              |   1 +
+ src/reduce-sum.c                  |  52 +++--
+ src/reduce.c                      |  61 ++++++
+ src/reduce.h                      |  70 +++++++
+ src/strided-iterator2.h           | 423 ++++++++++++++++++++++++++++++++++++++
+ 14 files changed, 1074 insertions(+), 162 deletions(-)</pre></details>
+<details class="tool tool-error"><summary>Bash: cat src/arithmetic-add.c | head -250; echo ======; cat src/binary.h</summary>
+<pre>cat src/arithmetic-add.c | head -250; echo ======; cat src/binary.h</pre><pre class="output">Exit code 1
+#include &quot;arithmetic-add.h&quot;
+
+#include &quot;arithmetic.h&quot;
+#include &quot;binary.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;one-add.h&quot;
+#include &quot;type.h&quot;
+#include &quot;typeof2.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/arithmetic-add-decl.h&quot;
+
+r_obj* ffi_rray_add(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_add(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_add(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_binary_arithmetic(
+    x,
+    y,
+    rray_add_switch,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+static rray_binary_arithmetic_fn rray_add_switch(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  const enum rray_type x_type = rray_typeof(x);
+  const enum rray_type y_type = rray_typeof(y);
+
+  enum rray_side side;
+
+  switch (rray_typeof2(x_type, y_type, &amp;side)) {
+  case RRAY_TYPE2_logical_logical:
+    return rray_add_lgl_lgl;
+  case RRAY_TYPE2_logical_integer:
+    return (side == RRAY_SIDE_right) ? rray_add_lgl_int : rray_add_int_lgl;
+  case RRAY_TYPE2_logical_double:
+    return (side == RRAY_SIDE_right) ? rray_add_lgl_dbl : rray_add_dbl_lgl;
+  case RRAY_TYPE2_logical_complex:
+    return (side == RRAY_SIDE_right) ? rray_add_lgl_cpl : rray_add_cpl_lgl;
+  case RRAY_TYPE2_integer_integer:
+    return rray_add_int_int;
+  case RRAY_TYPE2_integer_double:
+    return (side == RRAY_SIDE_right) ? rray_add_int_dbl : rray_add_dbl_int;
+  case RRAY_TYPE2_integer_complex:
+    return (side == RRAY_SIDE_right) ? rray_add_int_cpl : rray_add_cpl_int;
+  case RRAY_TYPE2_double_double:
+    return rray_add_dbl_dbl;
+  case RRAY_TYPE2_double_complex:
+    return (side == RRAY_SIDE_right) ? rray_add_dbl_cpl : rray_add_cpl_dbl;
+  case RRAY_TYPE2_complex_complex:
+    return rray_add_cpl_cpl;
+
+  case RRAY_TYPE2_logical_character:
+  case RRAY_TYPE2_logical_raw:
+  case RRAY_TYPE2_logical_list:
+  case RRAY_TYPE2_integer_character:
+  case RRAY_TYPE2_integer_raw:
+  case RRAY_TYPE2_integer_list:
+  case RRAY_TYPE2_double_character:
+  case RRAY_TYPE2_double_raw:
+  case RRAY_TYPE2_double_list:
+  case RRAY_TYPE2_complex_character:
+  case RRAY_TYPE2_complex_raw:
+  case RRAY_TYPE2_complex_list:
+  case RRAY_TYPE2_character_character:
+  case RRAY_TYPE2_character_raw:
+  case RRAY_TYPE2_character_list:
+  case RRAY_TYPE2_raw_raw:
+  case RRAY_TYPE2_raw_list:
+  case RRAY_TYPE2_list_list:
+    stop_unsupported_arithmetic(&quot;+&quot;, x, y, x_arg, y_arg, error_call);
+
+  case RRAY_TYPE2_logical_scalar:
+  case RRAY_TYPE2_integer_scalar:
+  case RRAY_TYPE2_double_scalar:
+  case RRAY_TYPE2_complex_scalar:
+  case RRAY_TYPE2_character_scalar:
+  case RRAY_TYPE2_raw_scalar:
+  case RRAY_TYPE2_list_scalar:
+  case RRAY_TYPE2_scalar_scalar:
+    if (x_type == RRAY_TYPE_scalar) {
+      stop_scalar_input(x, x_arg, error_call);
+    } else {
+      stop_scalar_input(y, y_arg, error_call);
+    }
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_add_lgl_lgl(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides,
+  const r_ssize* v_y_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_BINARY(
+    int,
+    r_lgl_cbegin,
+    rray_cast_lgl_to_int_one,
+    int,
+    r_lgl_cbegin,
+    rray_cast_lgl_to_int_one,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    rray_add_int_one,
+    RRAY_BINARY_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_add_lgl_int(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides,
+  const r_ssize* v_y_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_BINARY(
+    int,
+    r_lgl_cbegin,
+    rray_cast_lgl_to_int_one,
+    int,
+    r_int_cbegin,
+    rray_cast_int_to_int_one,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    rray_add_int_one,
+    RRAY_BINARY_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_add_int_lgl(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides,
+  const r_ssize* v_y_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_BINARY(
+    int,
+    r_int_cbegin,
+    rray_cast_int_to_int_one,
+    int,
+    r_lgl_cbegin,
+    rray_cast_lgl_to_int_one,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    rray_add_int_one,
+    RRAY_BINARY_ARGS(error_call)
+  );
+}
+
+static r_obj* rray_add_lgl_dbl(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides,
+  const r_ssize* v_y_broadcast_strides,
+  struct r_lazy error_call
+) {
+  RRAY_BINARY(
+    int,
+    r_lgl_cbegin,
+    rray_cast_lgl_to_dbl_one,
+    double,
+    r_dbl_cbegin,
+    rray_cast_dbl_to_dbl_one,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    rray_add_dbl_one,
+    RRAY_BINARY_NO_ARGS</pre><p class="cut">52 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/broadcast.c | sed -n 1,280p</summary>
+<pre>cat src/broadcast.c | sed -n 1,280p</pre><pre class="output">#include &quot;broadcast.h&quot;
+
+#include &quot;broadcast-names.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator2.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/broadcast-decl.h&quot;
+
+r_obj* ffi_rray_broadcast(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_broadcast(ffi_x, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_broadcast(
+  r_obj* x,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  dimensions =
+    KEEP(arg_as_dimensions(dimensions, rray_args.dimensions, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  if (
+    rray_dimensions_are_equal(
+      v_x_dimensions,
+      x_dimensionality,
+      v_dimensions,
+      dimensionality
+    )
+  ) {
+    FREE(3);
+    return x;
+  }
+
+  check_broadcastable(
+    v_x_dimensions,
+    x_dimensionality,
+    v_dimensions,
+    dimensionality,
+    arg,
+    error_call
+  );
+
+  r_ssize v_x_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_x_dimensions,
+    x_dimensionality,
+    dimensionality,
+    v_x_broadcast_strides
+  );
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_broadcast_lgl(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  case R_TYPE_integer:
+    out = rray_broadcast_int(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  case R_TYPE_double:
+    out = rray_broadcast_dbl(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  case R_TYPE_complex:
+    out = rray_broadcast_cpl(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  case R_TYPE_raw:
+    out = rray_broadcast_raw(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  case R_TYPE_character:
+    out = rray_broadcast_chr(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  case R_TYPE_list:
+    out = rray_broadcast_list(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_broadcast_strides
+    );
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP(out);
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names(x, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+#define RRAY_BROADCAST_LOOP(CTYPE, POKE)                                       \
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+                                                                               \
+    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+                                                                               \
+    if (x_stride == 0) {                                                       \
+      CTYPE const x_elt = v_x[x_loc];                                          \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        POKE(out, i, x_elt);                                                   \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        POKE(out, i, v_x[x_loc]);                                              \
+        x_loc += x_stride;                                                     \
+      }                                                                        \
+    }                                                                          \
+  }
+
+#define RRAY_BROADCAST_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+
+#define RRAY_BROADCAST_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)                \
+  struct rray_run_iterator it =                                                \
+    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+  CTYPE* v_out = DEREF(out);                                                   \
+                                                                               \
+  const CTYPE* v_x = CONST_DEREF(x);                                           \
+                                                                               \
+  RRAY_BROADCAST_LOOP(CTYPE, RRAY_BROADCAST_ATOMIC_POKE);                      \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#define RRAY_BROADCAST_BARRIER(RTYPE, CONST_DEREF, POKE)                       \
+  struct rray_run_iterator it =                                                \
+    rray_run_iterator1(v_dimensions, dimensionality, v_x_broadcast_strides);   \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \
+                                                                               \
+  RRAY_BROADCAST_LOOP(r_obj*, POKE);                                           \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+static r_obj* rray_broadcast_lgl(
+  r_obj* x,
+  const int* v_dimensions,</pre><p class="cut">80 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/binary.h; git show HEAD --stat; git show HEAD -- src/combine.c | head -200</summary>
+<pre>cat src/binary.h; git show HEAD --stat; git show HEAD -- src/combine.c | head -200</pre><pre class="output">#ifndef RRAY_BINARY_H
+#define RRAY_BINARY_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;strided-iterator2.h&quot;
+
+#define RRAY_BINARY_ARGS(...) , __VA_ARGS__
+#define RRAY_BINARY_NO_ARGS
+
+#define RRAY_BINARY(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  X_CAST,                                                                      \
+  Y_CTYPE,                                                                     \
+  Y_CONST_DEREF,                                                               \
+  Y_CAST,                                                                      \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  ONE,                                                                         \
+  ONE_ARGS                                                                     \
+)                                                                              \
+  struct rray_run_iterator it = rray_run_iterator2(                            \
+    v_dimensions,                                                              \
+    dimensionality,                                                            \
+    v_x_broadcast_strides,                                                     \
+    v_y_broadcast_strides                                                      \
+  );                                                                           \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, rray_run_iterator_size(&amp;it)));   \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+  const Y_CTYPE* v_y = Y_CONST_DEREF(y);                                       \
+                                                                               \
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next2(&amp;it)) {         \
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \
+                                                                               \
+    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \
+    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \
+                                                                               \
+    r_ssize y_loc = rray_run_iterator_loc(&amp;it, 1);                             \
+    const r_ssize y_stride = rray_run_iterator_stride(&amp;it, 1);                 \
+                                                                               \
+    if (x_stride == 0 &amp;&amp; y_stride == 0) {                                      \
+      const X_CTYPE x_elt = v_x[x_loc];                                        \
+      const Y_CTYPE y_elt = v_y[y_loc];                                        \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+      }                                                                        \
+    } else if (x_stride == 0) {                                                \
+      const X_CTYPE x_elt = v_x[x_loc];                                        \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const Y_CTYPE y_elt = v_y[y_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        y_loc += y_stride;                                                     \
+      }                                                                        \
+    } else if (y_stride == 0) {                                                \
+      const Y_CTYPE y_elt = v_y[y_loc];                                        \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        x_loc += x_stride;                                                     \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = start; i &lt; end; ++i) {                                  \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        const Y_CTYPE y_elt = v_y[y_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        x_loc += x_stride;                                                     \
+        y_loc += y_stride;                                                     \
+      }                                                                        \
+    }                                                                          \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#endif
+commit f52cd05d61f2eebf27d9705849bf98d09fd02203
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sat Oct 3 12:42:58 2026 -0400
+
+    Move rray_combine() to the run iterator (#117)
+
+ bench/combine.R                  | 232 +++++++++++++++++++++++++++++++++++++++
+ plans/combine-fixed.md           |  83 ++++++++++++++
+ src/combine.c                    | 210 +++++++++++++++++++++++------------
+ src/decl/combine-decl.h          |  40 +++++--
+ src/decl/strided-iterator-decl.h |   7 --
+ src/strided-iterator.h           | 137 -----------------------
+ 6 files changed, 485 insertions(+), 224 deletions(-)
+commit f52cd05d61f2eebf27d9705849bf98d09fd02203
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sat Oct 3 12:42:58 2026 -0400
+
+    Move rray_combine() to the run iterator (#117)
+
+diff --git a/src/combine.c b/src/combine.c
+index 521c86a..8863c89 100644
+--- a/src/combine.c
++++ b/src/combine.c
+@@ -9,7 +9,7 @@
+ #include &quot;dimensions.h&quot;
+ #include &quot;ptype-common.h&quot;
+ #include &quot;size.h&quot;
+-#include &quot;strided-iterator.h&quot;
++#include &quot;strided-iterator2.h&quot;
+ #include &quot;strides.h&quot;
+ #include &quot;utils.h&quot;
+ 
+@@ -122,15 +122,18 @@ r_obj* rray_combine(
+       v_x_strides
+     );
+ 
+-    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
++    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
++
++    rray_combine_fill(
++      x,
++      out,
++      out_start,
+       v_x_broadcast_dimensions,
+       out_dimensionality,
+       v_out_strides,
+       v_x_strides
+     );
+ 
+-    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+-    rray_combine_fill(x, out, out_start, &amp;plan);
+     axis_offset += x_axis_dimension;
+   }
+ 
+@@ -217,105 +220,148 @@ static void rray_combine_fill(
+   r_obj* x,
+   r_obj* out,
+   r_ssize out_start,
+-  const struct rray_strided_iterator2_plan* plan
++  const int* v_x_broadcast_dimensions,
++  int out_dimensionality,
++  const r_ssize* v_out_strides,
++  const r_ssize* v_x_strides
+ ) {
+   switch (r_typeof(x)) {
+   case R_TYPE_logical:
+-    rray_combine_fill_lgl(x, out, out_start, plan);
++    rray_combine_fill_lgl(
++      x,
++      out,
++      out_start,
++      v_x_broadcast_dimensions,
++      out_dimensionality,
++      v_out_strides,
++      v_x_strides
++    );
+     break;
+   case R_TYPE_integer:
+-    rray_combine_fill_int(x, out, out_start, plan);
++    rray_combine_fill_int(
++      x,
++      out,
++      out_start,
++      v_x_broadcast_dimensions,
++      out_dimensionality,
++      v_out_strides,
++      v_x_strides
++    );
+     break;
+   case R_TYPE_double:
+-    rray_combine_fill_dbl(x, out, out_start, plan);
++    rray_combine_fill_dbl(
++      x,
++      out,
++      out_start,
++      v_x_broadcast_dimensions,
++      out_dimensionality,
++      v_out_strides,
++      v_x_strides
++    );
+     break;
+   case R_TYPE_complex:
+-    rray_combine_fill_cpl(x, out, out_start, plan);
++    rray_combine_fill_cpl(
++      x,
++      out,
++      out_start,
++      v_x_broadcast_dimensions,
++      out_dimensionality,
++      v_out_strides,
++      v_x_strides
++    );
+     break;
+   case R_TYPE_raw:
+-    rray_combine_fill_raw(x, out, out_start, plan);
++    rray_combine_fill_raw(
++      x,
++      out,
++      out_start,</pre><p class="cut">94 more lines cut</p></details>
+<details class="tool"><summary>Bash: ls bench; grep -n &quot;rray_fill_strides_from_dimensions&quot; -A22 src/strides.c | head -40; cat src/…</summary>
+<pre>ls bench; grep -n &quot;rray_fill_strides_from_dimensions&quot; -A22 src/strides.c | head -40; cat src/decl/broadcast-decl.h; cat ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_benchmarking_against_main.md</pre><pre class="output">binary.R
+broadcast.R
+combine.R
+extremum.R
+index.R
+iterator.R
+matrix-stats.R
+mean.R
+reduce-logical.R
+reduce.R
+slice.R
+stride-zero.R
+3:void rray_fill_strides_from_dimensions(
+4-  const int* v_dimensions,
+5-  int dimensionality,
+6-  r_ssize* v_out
+7-) {
+8-  r_ssize stride = 1;
+9-
+10-  for (int i = 0; i &lt; dimensionality; ++i) {
+11-    v_out[i] = stride;
+12-    stride *= v_dimensions[i];
+13-  }
+14-}
+15-
+16-void rray_fill_broadcast_strides_from_dimensions(
+17-  const int* v_from_dimensions,
+18-  int from_dimensionality,
+19-  int to_dimensionality,
+20-  r_ssize* v_out
+21-) {
+22-  r_ssize stride = 1;
+23-
+24-  for (int i = 0; i &lt; to_dimensionality; ++i) {
+25-    const int dimension = (i &lt; from_dimensionality) ? v_from_dimensions[i] : 1;
+static r_obj* rray_broadcast_lgl(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+static r_obj* rray_broadcast_int(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+static r_obj* rray_broadcast_dbl(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+static r_obj* rray_broadcast_cpl(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+static r_obj* rray_broadcast_raw(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+static r_obj* rray_broadcast_chr(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+static r_obj* rray_broadcast_list(
+  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides
+);
+---
+name: project-benchmarking-against-main
+description: &quot;How to benchmark a branch against main in rray4, load_all() builds at -O2 and single runs are noisy&quot;
+metadata:
+  node_type: memory
+  type: project
+  originSessionId: 2a9cbc29-1592-4574-bc74-a3aa4b006537
+  modified: 2026-10-03T10:17:19.736Z
+---
+
+`devtools::load_all()` compiles at `-O2` here, because `~/.R/Makevars` sets `CFLAGS=-O2`, so it is fine for benchmarks. To compare against main, use `git worktree add --detach /tmp/rray4-main main` and run the same `bench/*.R` script from both roots, alternating between them for 3 rounds.
+
+**Why:** with 20 iterations, single cases on 16M-element binary ops swung from 0.64x to 1.40x by noise alone. Rerunning with 60 iterations brought every one to within about 2%.
+
+**How to apply:** treat any single-case gap above about 10% as unconfirmed until a focused rerun with more iterations backs it up.</pre></details>
+<details class="tool"><summary>Bash: head -60 bench/combine.R; grep -n &quot;permute&quot; bench/*.R | head</summary>
+<pre>head -60 bench/combine.R; grep -n &quot;permute&quot; bench/*.R | head</pre><pre class="output">devtools::load_all(quiet = TRUE)
+
+cat(&quot;\nRows\n&quot;)
+
+local({
+  x &lt;- array(runif(1e6L), c(1000L, 1000L))
+  y &lt;- array(runif(1e6L), c(1000L, 1000L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_combine(x, y, .axis = 1L),
+    base = rbind(x, y),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nColumns\n&quot;)
+
+local({
+  x &lt;- array(runif(1e6L), c(1000L, 1000L))
+  y &lt;- array(runif(1e6L), c(1000L, 1000L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_combine(x, y, .axis = 2L),
+    base = cbind(x, y),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nRows with short runs\n&quot;)
+
+local({
+  x &lt;- array(runif(1e6L), c(10L, 100000L))
+  y &lt;- array(runif(1e6L), c(10L, 100000L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_combine(x, y, .axis = 1L),
+    base = rbind(x, y),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nUnit rows\n&quot;)
+
+local({
+  x &lt;- array(runif(1e6L), c(1L, 1e6L))
+  y &lt;- array(runif(1e6L), c(1L, 1e6L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_combine(x, y, .axis = 1L),
+    base = rbind(x, y),</pre></details>
+<p>I've read the code and have a few questions before I start.</p>
+
+<details class="tool"><summary>Question: The permute kernels do exactly what the broadcast kernels in src/broadcast.c do: walk the…</summary>
+<p>The permute kernels do exactly what the broadcast kernels in src/broadcast.c do: walk the output and read x through a set of strides. Should permute reuse them, or keep its own kernels in permute-axes.c that mirror broadcast.c?</p>
+<ul>
+<li>Own kernels, mirror broadcast (Recommended)</li>
+<li>Share broadcast's kernels</li>
+</ul>
+<p>For a non-empty array, permute's strides can never be 0 (they are cumulative products of nonzero dimensions, and coalescing never introduces a 0). That makes the <code>x_stride == 0</code> branch dead code. Drop it?</p>
+<ul>
+<li>Drop it (Recommended)</li>
+<li>Keep it</li>
+</ul>
+<p>There's no permute benchmark yet. Should I add bench/permute-axes.R (like bench/combine.R) and commit it with the change?</p>
+<ul>
+<li>Add and commit it (Recommended)</li>
+<li>Run it, don't commit</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;The permute kernels do exactly what the broadcast kernels in src/broadcast.c do: walk the output and read x through a set of strides. Should permute reuse them, or keep its own kernels in permute-axes.c that mirror broadcast.c?&quot;=&quot;Own kernels, mirror broadcast (Recommended)&quot;, &quot;For a non-empty array, permute's strides can never be 0 (they are cumulative products of nonzero dimensions, and coalescing never introduces a 0). That makes the `x_stride == 0` branch dead code. Drop it?&quot;=&quot;Drop it (Recommended)&quot;, &quot;There's no permute benchmark yet. Should I add bench/permute-axes.R (like bench/combine.R) and commit it with the change?&quot;=&quot;Add and commit it (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/permute-iterator &amp;&amp; git worktree list</summary>
+<pre>git checkout -b feature/permute-iterator &amp;&amp; git worktree list</pre><pre class="output">Switched to a new branch 'feature/permute-iterator'
+~/files/r/packages/rray4  f52cd05 [feature/permute-iterator]</pre></details>
+<p>Now rewriting the kernels in <code>src/permute-axes.c</code>.</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+p='src/permute-axes.c'
+s=open(p).read()
+s=s.replace('#include &quot;strided-iterator.h&quot;\n#include &quot;strides.h&quot;','#include &quot;strided-iterator2.h&quot;\n#include &quot;strides.h&quot;')
+s=s.replace('''  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int axis = v_axes[i] - 1;
+    v_dimensions[i] = v_x_dimensions[axis];
+    v_strides[i] = v_x_strides[axis];
+  }
+
+  struct rray_strided_iterator_plan plan =
+    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);
+
+''','''  r_ssize v_x_permuted_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int axis = v_axes[i] - 1;
+    v_dimensions[i] = v_x_dimensions[axis];
+    v_x_permuted_strides[i] = v_x_strides[axis];
+  }
+
+''')
+for t in ['lgl','int','dbl','cpl','raw','chr','list']:
+    s=s.replace(f'''    out = rray_permute_axes_{t}(x, &amp;plan);''',f'''    out = rray_permute_axes_{t}(
+      x,
+      v_dimensions,
+      dimensionality,
+      v_x_permuted_strides
+    );''')
+start=s.index('#define RRAY_PERMUTE_AXES_ATOMIC')
+end=s.index('static r_obj* rray_permute_axes_lgl(')
+s=s[:start]+'''#define RRAY_PERMUTE_AXES_LOOP(POKE)                                           \\
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \\
+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \\
+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \\
+                                                                               \\
+    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \\
+    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \\
+                                                                               \\
+    for (r_ssize i = start; i &lt; end; ++i) {                                    \\
+      POKE(out, i, v_x[x_loc]);                                                \\
+      x_loc += x_stride;                                                       \\
+    }                                                                          \\
+  }
+
+#define RRAY_PERMUTE_AXES_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)
+
+#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \\
+  struct rray_run_iterator it =                                                \\
+    rray_run_iterator1(v_dimensions, dimensionality, v_x_permuted_strides);    \\
+                                                                               \\
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \\
+  CTYPE* v_out = DEREF(out);                                                   \\
+                                                                               \\
+  const CTYPE* v_x = CONST_DEREF(x);                                           \\
+                                                                               \\
+  RRAY_PERMUTE_AXES_LOOP(RRAY_PERMUTE_AXES_ATOMIC_POKE);                       \\
+                                                                               \\
+  FREE(1);                                                                     \\
+  return out;
+
+#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \\
+  struct rray_run_iterator it =                                                \\
+    rray_run_iterator1(v_dimensions, dimensionality, v_x_permuted_strides);    \\
+                                                                               \\
+  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \\
+                                                                               \\
+  r_obj* const* v_x = CONST_DEREF(x);                                          \\
+                                                                               \\
+  RRAY_PERMUTE_AXES_LOOP(POKE);                                                \\
+                                                                               \\
+  FREE(1);                                                                     \\
+  return out;
+
+'''+s[end:]
+sig_old='''  r_obj* x,
+  const struct rray_strided_iterator_plan* plan
+)'''
+sig_new='''  r_obj* x,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_permuted_strides
+)'''
+s=s.replace(sig_old,sig_new)
+s=s.replace('#undef RRAY_PERMUTE_AXES_ATOMIC\n','#undef RRAY_PERMUTE_AXES_LOOP\n#undef RRAY_PERMUTE_AXES_ATOMIC_POKE\n#undef RRAY_PERMUTE_AXES_ATOMIC\n')
+open(p,'w').write(s)
+d='src/decl/permute-axes-decl.h'
+t=open(d).read().replace(sig_old,sig_new)
+open(d,'w').write(t)
+EOF
+grep -n &quot;plan&quot; src/permute-axes.c src/decl/permute-axes-decl.h; clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/permute-axes.c</summary>
+<pre class="output">1	#include &quot;permute-axes.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;</pre></details>
+<details class="tool"><summary>Read src/decl/permute-axes-decl.h</summary>
+<pre class="output">1	static r_obj* rray_permute_axes_lgl(
+2	  r_obj* x,
+3	  const struct rray_strided_iterator_plan* plan
+4	);
+5	static r_obj* rray_permute_axes_int(
+6	  r_obj* x,
+7	  const struct rray_strided_iterator_plan* plan
+8	);
+9	static r_obj* rray_permute_axes_dbl(
+10	  r_obj* x,
+11	  const struct rray_strided_iterator_plan* plan
+12	);
+13	static r_obj* rray_permute_axes_cpl(
+14	  r_obj* x,
+15	  const struct rray_strided_iterator_plan* plan
+16	);
+17	static r_obj* rray_permute_axes_raw(
+18	  r_obj* x,
+19	  const struct rray_strided_iterator_plan* plan
+20	);
+21	static r_obj* rray_permute_axes_chr(
+22	  r_obj* x,
+23	  const struct rray_strided_iterator_plan* plan
+24	);
+25	static r_obj* rray_permute_axes_list(
+26	  r_obj* x,
+27	  const struct rray_strided_iterator_plan* plan
+28	);
+29	
+30	static r_obj* rray_permute_axes_names(
+31	  r_obj* x,
+32	  const int* v_axes,
+33	  int dimensionality
+34	);
+35	</pre></details>
+<details class="tool"><summary>Edit src/decl/permute-axes-decl.h</summary>
+<pre class="diff"><span class="del">-  r_obj* x,</span>
+<span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-);</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  const int* v_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_x_permuted_strides</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/permute-axes-decl.h has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/permute-axes.c</summary>
+<pre class="diff"><span class="del">-  r_obj* x,</span>
+<span class="del">-  const struct rray_strided_iterator_plan* plan</span>
+<span class="del">-) {</span>
+<span class="ins">+  r_obj* x,</span>
+<span class="ins">+  const int* v_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const r_ssize* v_x_permuted_strides</span>
+<span class="ins">+) {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/permute-axes.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/permute-axes.c</summary>
+<pre class="diff"><span class="del">-#include &quot;strided-iterator.h&quot;</span>
+<span class="ins">+#include &quot;strided-iterator2.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/permute-axes.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/permute-axes.c</summary>
+<pre class="diff"><span class="del">-  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-</span>
+<span class="del">-  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-    const int axis = v_axes[i] - 1;</span>
+<span class="del">-    v_dimensions[i] = v_x_dimensions[axis];</span>
+<span class="del">-    v_strides[i] = v_x_strides[axis];</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  struct rray_strided_iterator_plan plan =</span>
+<span class="del">-    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out;</span>
+<span class="del">-</span>
+<span class="del">-  switch (r_typeof(x)) {</span>
+<span class="del">-  case R_TYPE_logical:</span>
+<span class="del">-    out = rray_permute_axes_lgl(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="del">-  case R_TYPE_integer:</span>
+<span class="del">-    out = rray_permute_axes_int(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="del">-  case R_TYPE_double:</span>
+<span class="del">-    out = rray_permute_axes_dbl(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="del">-  case R_TYPE_complex:</span>
+<span class="del">-    out = rray_permute_axes_cpl(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="del">-  case R_TYPE_raw:</span>
+<span class="del">-    out = rray_permute_axes_raw(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="del">-  case R_TYPE_character:</span>
+<span class="del">-    out = rray_permute_axes_chr(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="del">-  case R_TYPE_list:</span>
+<span class="del">-    out = rray_permute_axes_list(x, &amp;plan);</span>
+<span class="del">-    break;</span>
+<span class="ins">+  r_ssize v_x_permuted_strides[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="ins">+    const int axis = v_axes[i] - 1;</span>
+<span class="ins">+    v_dimensions[i] = v_x_dimensions[axis];</span>
+<span class="ins">+    v_x_permuted_strides[i] = v_x_strides[axis];</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out;</span>
+<span class="ins">+</span>
+<span class="ins">+  switch (r_typeof(x)) {</span>
+<span class="ins">+  case R_TYPE_logical:</span>
+<span class="ins">+    out = rray_permute_axes_lgl(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span>
+<span class="ins">+  case R_TYPE_integer:</span>
+<span class="ins">+    out = rray_permute_axes_int(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span>
+<span class="ins">+  case R_TYPE_double:</span>
+<span class="ins">+    out = rray_permute_axes_dbl(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span>
+<span class="ins">+  case R_TYPE_complex:</span>
+<span class="ins">+    out = rray_permute_axes_cpl(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span>
+<span class="ins">+  case R_TYPE_raw:</span>
+<span class="ins">+    out = rray_permute_axes_raw(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span>
+<span class="ins">+  case R_TYPE_character:</span>
+<span class="ins">+    out = rray_permute_axes_chr(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span>
+<span class="ins">+  case R_TYPE_list:</span>
+<span class="ins">+    out = rray_permute_axes_list(</span>
+<span class="ins">+      x,</span>
+<span class="ins">+      v_dimensions,</span>
+<span class="ins">+      dimensionality,</span>
+<span class="ins">+      v_x_permuted_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+    break;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/permute-axes.c has been updated successfully.</pre></details>
+<p>Those diagnostics are expected, since decl headers have no includes by design. Now the macros:</p>
+
+<details class="tool"><summary>Read src/permute-axes.c</summary>
+<pre class="output">120	
+121	  r_obj* names = KEEP(rray_permute_axes_names(x, v_axes, dimensionality));
+122	
+123	  if (names != r_null) {
+124	    r_attrib_poke_dim_names(out, names);
+125	  }
+126	
+127	  FREE(6);
+128	  return out;
+129	}
+130	
+131	#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \
+132	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+133	                                                                               \
+134	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+135	  CTYPE* v_out = DEREF(out);                                                   \
+136	                                                                               \
+137	  const CTYPE* v_x = CONST_DEREF(x);                                           \
+138	                                                                               \
+139	  r_ssize run_start = 0;                                                       \
+140	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+141	                                                                               \
+142	  r_ssize x_start = 0;                                                         \
+143	  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+144	                                                                               \
+145	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+146	  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+147	                                                                               \
+148	  while (run_start != size) {                                                  \
+149	    const r_ssize run_end = run_start + run_size;                              \
+150	    r_ssize x_loc = x_start;                                                   \
+151	                                                                               \
+152	    if (x_run_stride == 0) {                                                   \
+153	      const CTYPE x_elt = v_x[x_loc];                                          \
+154	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+155	        v_out[i] = x_elt;                                                      \
+156	      }                                                                        \
+157	    } else {                                                                   \
+158	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+159	        v_out[i] = v_x[x_loc];                                                 \
+160	        x_loc += x_run_stride;                                                 \
+161	      }                                                                        \
+162	    }                                                                          \
+163	                                                                               \
+164	    run_start = run_end;                                                       \
+165	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+166	  }                                                                            \
+167	                                                                               \
+168	  FREE(1);                                                                     \
+169	  return out;
+170	
+171	#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \
+172	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+173	                                                                               \
+174	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+175	                                                                               \
+176	  r_obj* const* v_x = CONST_DEREF(x);                                          \
+177	                                                                               \
+178	  r_ssize run_start = 0;                                                       \
+179	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+180	                                                                               \
+181	  r_ssize x_start = 0;                                                         \
+182	  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+183	                                                                               \
+184	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+185	  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+186	                                                                               \
+187	  while (run_start != size) {                                                  \
+188	    const r_ssize run_end = run_start + run_size;                              \
+189	    r_ssize x_loc = x_start;                                                   \
+190	                                                                               \
+191	    if (x_run_stride == 0) {                                                   \
+192	      r_obj* const x_elt = v_x[x_loc];                                         \
+193	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+194	        POKE(out, i, x_elt);                                                   \
+195	      }                                                                        \
+196	    } else {                                                                   \
+197	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+198	        POKE(out, i, v_x[x_loc]);                                              \
+199	        x_loc += x_run_stride;                                                 \
+200	      }                                                                        \
+201	    }                                                                          \
+202	                                                                               \
+203	    run_start = run_end;                                                       \
+204	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+205	  }                                                                            \
+206	                                                                               \
+207	  FREE(1);                                                                     \
+208	  return out;
+209	</pre></details>
+<details class="tool"><summary>Edit src/permute-axes.c</summary>
+<pre class="diff"><span class="del">-#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \</span>
+<span class="del">-  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \</span>
+<span class="del">-  CTYPE* v_out = DEREF(out);                                                   \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  const CTYPE* v_x = CONST_DEREF(x);                                           \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize run_start = 0;                                                       \</span>
+<span class="del">-  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize x_start = 0;                                                         \</span>
+<span class="del">-  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \</span>
+<span class="del">-  rray_strided_iterator_plan_point_init(plan, v_point);                        \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  while (run_start != size) {                                                  \</span>
+<span class="del">-    const r_ssize run_end = run_start + run_size;                              \</span>
+<span class="del">-    r_ssize x_loc = x_start;                                                   \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    if (x_run_stride == 0) {                                                   \</span>
+<span class="del">-      const CTYPE x_elt = v_x[x_loc];                                          \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        v_out[i] = x_elt;                                                      \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        v_out[i] = v_x[x_loc];                                                 \</span>
+<span class="del">-        x_loc += x_run_stride;                                                 \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    run_start = run_end;                                                       \</span>
+<span class="del">-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  FREE(1);                                                                     \</span>
+<span class="del">-  return out;</span>
+<span class="del">-</span>
+<span class="del">-#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \</span>
+<span class="del">-  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_obj* const* v_x = CONST_DEREF(x);                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize run_start = 0;                                                       \</span>
+<span class="del">-  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize x_start = 0;                                                         \</span>
+<span class="del">-  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \</span>
+<span class="del">-  rray_strided_iterator_plan_point_init(plan, v_point);                        \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  while (run_start != size) {                                                  \</span>
+<span class="del">-    const r_ssize run_end = run_start + run_size;                              \</span>
+<span class="del">-    r_ssize x_loc = x_start;                                                   \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    if (x_run_stride == 0) {                                                   \</span>
+<span class="del">-      r_obj* const x_elt = v_x[x_loc];                                         \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        POKE(out, i, x_elt);                                                   \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    } else {                                                                   \</span>
+<span class="del">-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \</span>
+<span class="del">-        POKE(out, i, v_x[x_loc]);                                              \</span>
+<span class="del">-        x_loc += x_run_stride;                                                 \</span>
+<span class="del">-      }                                                                        \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    run_start = run_end;                                                       \</span>
+<span class="del">-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  FREE(1);                                                                     \</span>
+<span class="del">-  return out;</span>
+<span class="ins">+#define RRAY_PERMUTE_AXES_LOOP(POKE)                                           \</span>
+<span class="ins">+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {         \</span>
+<span class="ins">+    const r_ssize start = rray_run_iterator_start(&amp;it);                        \</span>
+<span class="ins">+    const r_ssize end = rray_run_iterator_end(&amp;it);                            \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_ssize x_loc = rray_run_iterator_loc(&amp;it, 0);                             \</span>
+<span class="ins">+    const r_ssize x_stride = rray_run_iterator_stride(&amp;it, 0);                 \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    for (r_ssize i = start; i &lt; end; ++i) {                                    \</span>
+<span class="ins">+      POKE(out, i, v_x[x_loc]);                                                \</span>
+<span class="ins">+      x_loc += x_stride;                                                       \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+#define RRAY_PERMUTE_AXES_ATOMIC_POKE(OUT, I, VALUE) v_out[I] = (VALUE)</span>
+<span class="ins">+</span>
+<span class="ins">+#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \</span>
+<span class="ins">+  struct rray_run_iterator it =                                                \</span>
+<span class="ins">+    rray_run_iterator1(v_dimensions, dimensionality, v_x_permuted_strides);    \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \</span>
+<span class="ins">+  CTYPE* v_out = DEREF(out);                                                   \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  const CTYPE* v_x = CONST_DEREF(x);                                           \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  RRAY_PERMUTE_AXES_LOOP(RRAY_PERMUTE_AXES_ATOMIC_POKE);                       \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  FREE(1);                                                                     \</span>
+<span class="ins">+  return out;</span>
+<span class="ins">+</span>
+<span class="ins">+#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \</span>
+<span class="ins">+  struct rray_run_iterator it =                                                \</span>
+<span class="ins">+    rray_run_iterator1(v_dimensions, dimensionality, v_x_permuted_strides);    \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_vector(RTYPE, rray_run_iterator_size(&amp;it)));       \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  r_obj* const* v_x = CONST_DEREF(x);                                          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  RRAY_PERMUTE_AXES_LOOP(POKE);                                                \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+  FREE(1);                                                                     \</span>
+<span class="ins">+  return out;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/permute-axes.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/permute-axes.c</summary>
+<pre class="diff"><span class="del">-#undef RRAY_PERMUTE_AXES_ATOMIC</span>
+<span class="ins">+#undef RRAY_PERMUTE_AXES_LOOP</span>
+<span class="ins">+#undef RRAY_PERMUTE_AXES_ATOMIC_POKE</span>
+<span class="ins">+#undef RRAY_PERMUTE_AXES_ATOMIC</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/permute-axes.c has been updated successfully.</pre></details>
+<p>Now formatting and running the tests.</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | ta…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output"> src/decl/permute-axes-decl.h |  28 +++++--
+ src/permute-axes.c           | 172 +++++++++++++++++++++++--------------------
+ 2 files changed, 113 insertions(+), 87 deletions(-)
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 3497 ]</pre></details>
+<p>All 3497 tests pass. Checking what the permute tests already cover:</p>
+
+<details class="tool"><summary>Bash: ls tests/testthat | grep -i permut; grep -n &quot;test_that&quot; tests/testthat/test-permute-axes.R</summary>
+<pre>ls tests/testthat | grep -i permut; grep -n &quot;test_that&quot; tests/testthat/test-permute-axes.R</pre><pre class="output">test-permute-axes.R
+1:test_that(&quot;transposes a matrix&quot;, {
+8:test_that(&quot;axis `i` of the result comes from axis `axes[i]` of `x`&quot;, {
+16:test_that(&quot;an identity permutation returns the input&quot;, {
+21:test_that(&quot;matches `aperm()` for every permutation of a 3D array&quot;, {
+38:test_that(&quot;matches `aperm()` for a 4D array&quot;, {
+51:test_that(&quot;names travel with their axis&quot;, {
+62:test_that(&quot;unnamed axes remain unnamed&quot;, {
+69:test_that(&quot;outer names of `dimnames()` are dropped&quot;, {
+79:test_that(&quot;works with every native type&quot;, {
+95:test_that(&quot;works with zero-size arrays&quot;, {
+109:test_that(&quot;1D arrays come back unchanged&quot;, {
+116:test_that(&quot;errors on invalid `axes`&quot;, {
+133:test_that(&quot;errors on non-array input&quot;, {
+140:test_that(&quot;errors on classed input&quot;, {</pre></details>
+<p>The existing tests cover every type, zero size, 1D, and all 3D permutations. As an extra check, I'll compare against <code>aperm()</code> on random shapes that include dimension 1 axes:</p>
+
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+set.seed(1)
+ok &lt;- 0L
+for (k in 1:3000) {
+  d &lt;- sample(4L, 1L)
+  dims &lt;- sample(0:4, d, replace = TRUE, prob = c(.05, .3, .25, .2, .2))
+  n &lt;- prod(dims)
+  x &lt;- switch(sample(7, 1),
+    array(sample(c(TRUE, FALSE, NA), n, TRUE), dims),
+    array(sample(n), dims), array(runif(n), dims),
+    array(complex(real = runif(n), imaginary = runif(n)), dims),
+    array(as.raw(sample(0:255, n, TRUE)), dims),
+    array(as.character(seq_len(n)), dims), array(as.list(seq_len(n)), dims))
+  p &lt;- if (d == 1L) 1L else sample(d)
+  stopifnot(identical(rray_permute_axes(x, p), aperm(x, p)))
+  ok &lt;- ok + 1L
+}
+cat(ok, &quot;ok\n&quot;)'</pre><pre class="output">3000 ok</pre></details>
+<p>Correct on all 3000 random cases. Now the benchmark script:</p>
+
+<details class="tool"><summary>Write bench/permute-axes.R</summary>
+<pre>devtools::load_all(quiet = TRUE)
+
+cat(&quot;\nTranspose\n&quot;)
+
+local({
+  x &lt;- array(runif(16e6L), c(4000L, 4000L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L)),
+    base = aperm(x, c(2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nTranspose, short runs\n&quot;)
+
+local({
+  x &lt;- array(runif(1e7L), c(1e6L, 10L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L)),
+    base = aperm(x, c(2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nTranspose, long runs\n&quot;)
+
+local({
+  x &lt;- array(runif(1e7L), c(10L, 1e6L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L)),
+    base = aperm(x, c(2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nTranspose, integer\n&quot;)
+
+local({
+  x &lt;- array(sample(16e6L), c(4000L, 4000L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L)),
+    base = aperm(x, c(2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nTranspose, character\n&quot;)
+
+local({
+  x &lt;- array(as.character(sample(1000L, 1e6L, TRUE)), c(1000L, 1000L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L)),
+    base = aperm(x, c(2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nKeep the first axis\n&quot;)
+
+local({
+  x &lt;- array(runif(8e6L), c(200L, 200L, 200L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(1L, 3L, 2L)),
+    base = aperm(x, c(1L, 3L, 2L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nSwap the first two axes\n&quot;)
+
+local({
+  x &lt;- array(runif(8e6L), c(200L, 200L, 200L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L, 3L)),
+    base = aperm(x, c(2L, 1L, 3L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nReverse the axes\n&quot;)
+
+local({
+  x &lt;- array(runif(8e6L), c(200L, 200L, 200L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(3L, 2L, 1L)),
+    base = aperm(x, c(3L, 2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nReverse the axes, short runs\n&quot;)
+
+local({
+  x &lt;- array(runif(8e6L), c(2000L, 2000L, 2L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(3L, 2L, 1L)),
+    base = aperm(x, c(3L, 2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})
+
+cat(&quot;\nUnit axes\n&quot;)
+
+local({
+  x &lt;- array(runif(1e7L), c(1e7L, 1L))
+
+  gc()
+  print(bench::mark(
+    rray = rray_permute_axes(x, c(2L, 1L)),
+    base = aperm(x, c(2L, 1L)),
+    iterations = 20L,
+    check = TRUE,
+    memory = FALSE
+  ))
+})</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/bench/permute-axes.R (file state is current in your context — no need to Read it back)</pre></details>
+<p>Setting up a <code>main</code> worktree and running 3 alternating rounds:</p>
+
+<details class="tool"><summary>Bash: air format bench/permute-axes.R &amp;&amp; git worktree add --detach /tmp/rray4-main main &gt;/dev/null …</summary>
+<pre>air format bench/permute-axes.R &amp;&amp; git worktree add --detach /tmp/rray4-main main &gt;/dev/null 2&gt;&amp;1; cp bench/permute-axes.R /tmp/rray4-main/bench/ &amp;&amp; (cd /tmp/rray4-main &amp;&amp; Rscript -e 'devtools::load_all(quiet=TRUE)' &gt;/dev/null 2&gt;&amp;1) &amp;&amp; echo ready</pre><pre class="output">ready</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; for r in 1 2 3; do for root in /tmp/rray4-main ~/files/r/packages/rray4…</summary>
+<pre>cd /tmp &amp;&amp; for r in 1 2 3; do for root in /tmp/rray4-main ~/files/r/packages/rray4; do (cd $root &amp;&amp; Rscript bench/permute-axes.R 2&gt;&amp;1 | awk -v tag=&quot;$(basename $root) r$r&quot; '/^[A-Z]/{c=$0} /^1 rray/{print tag &quot; | &quot; c &quot; | &quot; $4}'); done; done &gt; /tmp/permute-bench.txt; cat /tmp/permute-bench.txt</pre><pre class="output">rray4-main r1 | Transpose | 37.5ms
+rray4-main r1 | Transpose, short runs | 9.26ms
+rray4-main r1 | Transpose, long runs | 16.9ms
+rray4-main r1 | Transpose, integer | 39.1ms
+rray4-main r1 | Transpose, character | 3.27ms
+rray4-main r1 | Keep the first axis | 7.62ms
+rray4-main r1 | Swap the first two axes | 7.66ms
+rray4-main r1 | Reverse the axes | 12.2ms
+rray4-main r1 | Reverse the axes, short runs | 28.6ms
+rray4-main r1 | Unit axes | 5.9ms
+rray4 r1 | Transpose | 37.3ms
+rray4 r1 | Transpose, short runs | 9.45ms
+rray4 r1 | Transpose, long runs | 17ms
+rray4 r1 | Transpose, integer | 39ms
+rray4 r1 | Transpose, character | 3.29ms
+rray4 r1 | Keep the first axis | 7.66ms
+rray4 r1 | Swap the first two axes | 7.65ms
+rray4 r1 | Reverse the axes | 12.1ms
+rray4 r1 | Reverse the axes, short runs | 27.9ms
+rray4 r1 | Unit axes | 6.31ms
+rray4-main r2 | Transpose | 37.6ms
+rray4-main r2 | Transpose, short runs | 9.35ms
+rray4-main r2 | Transpose, long runs | 17ms
+rray4-main r2 | Transpose, integer | 39.1ms
+rray4-main r2 | Transpose, character | 3.26ms
+rray4-main r2 | Keep the first axis | 7.57ms
+rray4-main r2 | Swap the first two axes | 7.58ms
+rray4-main r2 | Reverse the axes | 12.1ms
+rray4-main r2 | Reverse the axes, short runs | 28.9ms
+rray4-main r2 | Unit axes | 6.09ms
+rray4 r2 | Transpose | 37.8ms
+rray4 r2 | Transpose, short runs | 9.36ms
+rray4 r2 | Transpose, long runs | 17ms
+rray4 r2 | Transpose, integer | 39.2ms
+rray4 r2 | Transpose, character | 3.26ms
+rray4 r2 | Keep the first axis | 7.58ms
+rray4 r2 | Swap the first two axes | 7.74ms
+rray4 r2 | Reverse the axes | 12.1ms
+rray4 r2 | Reverse the axes, short runs | 27.6ms
+rray4 r2 | Unit axes | 6.01ms
+rray4-main r3 | Transpose | 37.6ms
+rray4-main r3 | Transpose, short runs | 9.34ms
+rray4-main r3 | Transpose, long runs | 17ms
+rray4-main r3 | Transpose, integer | 39.2ms
+rray4-main r3 | Transpose, character | 3.25ms
+rray4-main r3 | Keep the first axis | 7.65ms
+rray4-main r3 | Swap the first two axes | 7.77ms
+rray4-main r3 | Reverse the axes | 12.1ms
+rray4-main r3 | Reverse the axes, short runs | 28.5ms
+rray4-main r3 | Unit axes | 6.17ms
+rray4 r3 | Transpose | 38.3ms
+rray4 r3 | Transpose, short runs | 9.47ms
+rray4 r3 | Transpose, long runs | 17.1ms
+rray4 r3 | Transpose, integer | 39.3ms
+rray4 r3 | Transpose, character | 3.25ms
+rray4 r3 | Keep the first axis | 7.56ms
+rray4 r3 | Swap the first two axes | 7.62ms
+rray4 r3 | Reverse the axes | 12.2ms
+rray4 r3 | Reverse the axes, short runs | 27.6ms
+rray4 r3 | Unit axes | 6.17ms
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>No regressions found—results stay within 2% of main across all rounds, with the shortest-run case even 3% faster. I'll clean up and review the final diff now.</p>
+</details>
+<details class="tool"><summary>Bash: git worktree remove --force /tmp/rray4-main &amp;&amp; git status --short &amp;&amp; git diff src/permute-axe…</summary>
+<pre>git worktree remove --force /tmp/rray4-main &amp;&amp; git status --short &amp;&amp; git diff src/permute-axes.c | head -80</pre><pre class="output"> M src/decl/permute-axes-decl.h
+ M src/permute-axes.c
+?? bench/permute-axes.R
+diff --git a/src/permute-axes.c b/src/permute-axes.c
+index 862da93..6e41278 100644
+--- a/src/permute-axes.c
++++ b/src/permute-axes.c
+@@ -3,7 +3,7 @@
+ #include &quot;axes.h&quot;
+ #include &quot;dimensionality.h&quot;
+ #include &quot;dimensions.h&quot;
+-#include &quot;strided-iterator.h&quot;
++#include &quot;strided-iterator2.h&quot;
+ #include &quot;strides.h&quot;
+ #include &quot;utils.h&quot;
+ 
+@@ -44,40 +44,72 @@ r_obj* rray_permute_axes(
+   r_obj* dimensions = KEEP(r_alloc_integer(dimensionality));
+   int* v_dimensions = r_int_begin(dimensions);
+ 
+-  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
++  r_ssize v_x_permuted_strides[RRAY_MAX_DIMENSIONALITY];
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     const int axis = v_axes[i] - 1;
+     v_dimensions[i] = v_x_dimensions[axis];
+-    v_strides[i] = v_x_strides[axis];
++    v_x_permuted_strides[i] = v_x_strides[axis];
+   }
+ 
+-  struct rray_strided_iterator_plan plan =
+-    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);
+-
+   r_obj* out;
+ 
+   switch (r_typeof(x)) {
+   case R_TYPE_logical:
+-    out = rray_permute_axes_lgl(x, &amp;plan);
++    out = rray_permute_axes_lgl(
++      x,
++      v_dimensions,
++      dimensionality,
++      v_x_permuted_strides
++    );
+     break;
+   case R_TYPE_integer:
+-    out = rray_permute_axes_int(x, &amp;plan);
++    out = rray_permute_axes_int(
++      x,
++      v_dimensions,
++      dimensionality,
++      v_x_permuted_strides
++    );
+     break;
+   case R_TYPE_double:
+-    out = rray_permute_axes_dbl(x, &amp;plan);
++    out = rray_permute_axes_dbl(
++      x,
++      v_dimensions,
++      dimensionality,
++      v_x_permuted_strides
++    );
+     break;
+   case R_TYPE_complex:
+-    out = rray_permute_axes_cpl(x, &amp;plan);
++    out = rray_permute_axes_cpl(
++      x,
++      v_dimensions,
++      dimensionality,
++      v_x_permuted_strides
++    );
+     break;
+   case R_TYPE_raw:
+-    out = rray_permute_axes_raw(x, &amp;plan);
++    out = rray_permute_axes_raw(
++      x,
++      v_dimensions,
++      dimensionality,
++      v_x_permuted_strides
++    );
+     break;
+   case R_TYPE_character:
+-    out = rray_permute_axes_chr(x, &amp;plan);</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Protection check looks correct: each kernel calls KEEP() on <code>out</code> right after allocation, <code>x</code>/<code>dimensions</code> are already protected by the caller, and the FREE(6) count in <code>rray_permute_axes()</code> stays unchanged. I'll commit and push these changes now.</p>
+</details>
+<details class="tool"><summary>Bash: git add src/permute-axes.c src/decl/permute-axes-decl.h bench/permute-axes.R &amp;&amp; git commit -q…</summary>
+<pre>git add src/permute-axes.c src/decl/permute-axes-decl.h bench/permute-axes.R &amp;&amp; git commit -q -m &quot;Move rray_permute_axes() to the run iterator&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/permute-iterator 2&gt;&amp;1 | tail -3</pre><pre class="output">2649be4 Move rray_permute_axes() to the run iterator
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/permute-iterator -&gt; feature/permute-iterator
+branch 'feature/permute-iterator' set up to track 'origin/feature/permute-iterator'.</pre></details>
+<p><code>rray_permute_axes()</code> now uses the run iterator, with no speed regression. It's committed as <code>2649be4</code> and pushed to <code>feature/permute-iterator</code>. I didn't open a PR.</p>
+<p><strong>What changed</strong></p>
+<ul>
+<li>
+<p><strong><code>src/permute-axes.c</code></strong>: the kernels mirror <code>src/broadcast.c</code>. There are four macros: <code>RRAY_PERMUTE_AXES_LOOP()</code>, <code>RRAY_PERMUTE_AXES_ATOMIC_POKE()</code>, <code>RRAY_PERMUTE_AXES_ATOMIC()</code> and <code>RRAY_PERMUTE_AXES_BARRIER()</code>.</p>
+</li>
+<li>
+<p><strong>Iterator built in each kernel</strong>: each typed kernel now takes <code>(v_dimensions, dimensionality, v_x_permuted_strides)</code> and builds its own <code>rray_run_iterator1()</code>, as <code>combine.c</code> and <code>broadcast.c</code> do. Previously one plan was built in the caller and passed down by pointer.</p>
+</li>
+<li>
+<p><strong>Dead branch removed</strong>: the <code>x_stride == 0</code> path is gone, as you agreed. Each run is now one loop.</p>
+</li>
+<li>
+<p><strong>Renames</strong>: the local <code>v_strides</code> is now <code>v_x_permuted_strides</code>, to match <code>v_x_broadcast_strides</code>. The decl header signatures are updated to match.</p>
+</li>
+<li>
+<p><strong><code>bench/permute-axes.R</code></strong>: new script with 10 cases, each also timed against <code>aperm()</code>.</p>
+</li>
+</ul>
+<p><strong>Checks</strong></p>
+<ul>
+<li>
+<p>All 3497 tests pass.</p>
+</li>
+<li>
+<p>A one-off check outside the test suite compared against <code>aperm()</code> on 3000 random arrays. They covered all 7 types, 1 to 4 dimensions, and dimensions of 0 and 1. All matched with <code>identical()</code>.</p>
+</li>
+<li>
+<p>I ran clang-format on all C files and air on the new bench script.</p>
+</li>
+</ul>
+<p><strong>Benchmarks</strong> (median ms, 3 alternating rounds against a <code>main</code> worktree):</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>main</th>
+<th>branch</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Transpose <code>[4000, 4000]</code></td>
+<td>37.5 to 37.6</td>
+<td>37.3 to 38.3</td>
+</tr>
+<tr>
+<td>Transpose, short runs <code>[1e6, 10]</code></td>
+<td>9.26 to 9.35</td>
+<td>9.36 to 9.47</td>
+</tr>
+<tr>
+<td>Transpose, long runs <code>[10, 1e6]</code></td>
+<td>16.9 to 17.0</td>
+<td>17.0 to 17.1</td>
+</tr>
+<tr>
+<td>Transpose, integer</td>
+<td>39.1 to 39.2</td>
+<td>39.0 to 39.3</td>
+</tr>
+<tr>
+<td>Transpose, character</td>
+<td>3.25 to 3.27</td>
+<td>3.25 to 3.29</td>
+</tr>
+<tr>
+<td><code>[200, 200, 200]</code>, <code>c(1, 3, 2)</code></td>
+<td>7.57 to 7.65</td>
+<td>7.56 to 7.66</td>
+</tr>
+<tr>
+<td><code>[200, 200, 200]</code>, <code>c(2, 1, 3)</code></td>
+<td>7.58 to 7.77</td>
+<td>7.62 to 7.74</td>
+</tr>
+<tr>
+<td><code>[200, 200, 200]</code>, <code>c(3, 2, 1)</code></td>
+<td>12.1 to 12.2</td>
+<td>12.1 to 12.2</td>
+</tr>
+<tr>
+<td><code>[2000, 2000, 2]</code>, <code>c(3, 2, 1)</code></td>
+<td>28.5 to 28.9</td>
+<td>27.6 to 27.9</td>
+</tr>
+<tr>
+<td>Unit axes <code>[1e7, 1]</code></td>
+<td>5.9 to 6.17</td>
+<td>6.01 to 6.31</td>
+</tr>
+</tbody>
+</table>
+<p>Every case overlaps or sits within about 2% of <code>main</code>. The shortest-run case (4 million runs of 2) is about 3% faster.</p>
+<p><code>split.c</code> and the mean path (<code>reduce.c</code>, <code>reduce-mean.c</code>, <code>reduce.h</code>) still use <code>src/strided-iterator.h</code>, so it stays for now.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p class="command"><code>/pr-finish</code></p>
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git branch --show-current &amp;&amp; git status --porcelain &amp;&amp; gh pr view --json number,state,headRef…</summary>
+<pre>git branch --show-current &amp;&amp; git status --porcelain &amp;&amp; gh pr view --json number,state,headRefName,headRefOid,baseRefName &amp;&amp; git rev-parse HEAD</pre><pre class="output">feature/permute-iterator
+{&quot;baseRefName&quot;:&quot;main&quot;,&quot;headRefName&quot;:&quot;feature/permute-iterator&quot;,&quot;headRefOid&quot;:&quot;2649be46ce57d25a925a0b224a09b45c1273c218&quot;,&quot;number&quot;:118,&quot;state&quot;:&quot;MERGED&quot;}
+2649be46ce57d25a925a0b224a09b45c1273c218</pre></details>
+<p>All checks pass. Cleaning up:</p>
+
+<details class="tool"><summary>Bash: git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/permute-iterator…</summary>
+<pre>git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/permute-iterator &amp;&amp; git fetch --prune origin &amp;&amp; git log --oneline -1</pre><pre class="output">Switched to branch 'main'
+Your branch is up to date with 'origin/main'.
+From https://github.com/DavisVaughan/rray4
+ * branch            main       -&gt; FETCH_HEAD
+   f52cd05..1cab9ec  main       -&gt; origin/main
+Updating f52cd05..1cab9ec
+Fast-forward
+ bench/permute-axes.R         | 151 +++++++++++++++++++++++++++++++++++++
+ src/decl/permute-axes-decl.h |  28 +++++--
+ src/permute-axes.c           | 172 +++++++++++++++++++++++--------------------
+ 3 files changed, 264 insertions(+), 87 deletions(-)
+ create mode 100644 bench/permute-axes.R
+Deleted branch feature/permute-iterator (was 2649be4).
+From https://github.com/DavisVaughan/rray4
+ - [deleted]         (none)     -&gt; origin/feature/permute-iterator
+1cab9ec Move rray_permute_axes() to the run iterator (#118)</pre></details>
+<p>Cleanup after PR #118 is done.</p>
+<ul>
+<li>
+<p><strong>Checks:</strong> all four passed. PR #118 was <code>MERGED</code>, the working tree was clean, and local <code>HEAD</code> matched the PR head (<code>2649be4</code>).</p>
+</li>
+<li>
+<p><strong>Checkout:</strong> switched to <code>main</code>.</p>
+</li>
+<li>
+<p><strong>Pull:</strong> fast-forwarded <code>main</code> from <code>f52cd05</code> to <code>1cab9ec</code>.</p>
+</li>
+<li>
+<p><strong>Delete:</strong> removed local branch <code>feature/permute-iterator</code>.</p>
+</li>
+<li>
+<p><strong>Prune:</strong> removed the stale <code>origin/feature/permute-iterator</code> ref.</p>
+</li>
+</ul>
+<p><code>main</code> is now on <code>1cab9ec</code> (&quot;Move rray_permute_axes() to the run iterator (#118)&quot;).</p>
+
+</section>
+</main>
+</body>
+</html>

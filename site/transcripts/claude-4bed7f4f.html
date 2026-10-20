@@ -1,0 +1,959 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How NumPy sums a list of arrays, and the case for variadic rray_add()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../">rray timeline</a>
+<h1>How NumPy sums a list of arrays, and the case for variadic <code>rray_add()</code></h1>
+<p class="facts">Claude · Sep 20, 2026 · 4 prompts · 4 replies · didn't ship</p>
+</header>
+<main>
+<p class="divider">Sep 20, 2026, 13:52 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Does a numpy sum of a list of arrays allocate multiple intermediate outputs or just one</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool tool-error"><summary>Bash: python3 -c &quot;import numpy; print(numpy.__version__)&quot; 2&gt;&amp;1 | head -5</summary>
+<pre>python3 -c &quot;import numpy; print(numpy.__version__)&quot; 2&gt;&amp;1 | head -5</pre><pre class="output">Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool tool-error"><summary>Bash: python3 -c 2&gt;&amp;1 | head -2; ls /opt/homebrew/lib/python3*/site-packages 2&gt;/dev/null | grep -i …</summary>
+<pre>python3 -c 2&gt;&amp;1 | head -2; ls /opt/homebrew/lib/python3*/site-packages 2&gt;/dev/null | grep -i numpy | head</pre><pre class="output">Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>Depends which <code>sum</code> you write.</p>
+<p><strong><code>np.sum(list_of_arrays, axis=0)</code></strong> — one big intermediate, then one output. numpy cannot reduce a Python list directly, so it first calls <code>np.asanyarray(list)</code>, which allocates a single stacked array of shape <code>(n,) + shape</code> and copies every input into it. Then <code>np.add.reduce</code> runs over that stack and allocates only the result. Peak memory is roughly <code>(n + 1) * size</code>.</p>
+<p>The reduce itself does not make pairwise temporaries. It allocates the output once and accumulates row by row into it with a strided inner loop. (There is a fixed casting buffer, 8192 elements by default, but that is not per-operand.)</p>
+<p><strong><code>sum(list_of_arrays)</code></strong> (the builtin) — <code>n - 1</code> intermediates, each the size of one array, since it is just <code>0 + a + b + c ...</code>. More allocations, but peak memory is only about <code>2 * size</code> because each temporary is freed as the next is made.</p>
+<p><strong>One allocation total</strong> looks like this:</p>
+<pre><code class="language-python">out = arrays[0].copy()
+for a in arrays[1:]:
+    np.add(out, a, out=out)
+</code></pre>
+<p>Or, if you already have a stacked array (not a list), <code>np.add.reduce(stacked, axis=0)</code> allocates just the output.</p>
+<p>So the tradeoff is peak memory versus number of passes: <code>np.sum</code> on a list pays one large copy up front and then reads it once, the builtin <code>sum</code> never copies everything but touches the result <code>n - 1</code> times.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Oooh interesting show me the stacking code for the list case</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls -d /opt/homebrew/lib/python3*/site-packages/numpy /Library/Frameworks/Python.framework/Ver…</summary>
+<pre>ls -d /opt/homebrew/lib/python3*/site-packages/numpy /Library/Frameworks/Python.framework/Versions/*/lib/python3*/site-packages/numpy ~/Library/Python/*/lib/python/site-packages/numpy 2&gt;/dev/null; find ~/files -maxdepth 4 -type d -name numpy 2&gt;/dev/null | head</pre><pre class="output">(eval):1: no matches found: /Library/Frameworks/Python.framework/Versions/*/lib/python3*/site-packages/numpy</pre></details>
+<details class="tool"><summary>Bash: curl -sL -o /tmp/array_coercion.c https://raw.githubusercontent.com/numpy/numpy/main/numpy/_c…</summary>
+<pre>curl -sL -o /tmp/array_coercion.c https://raw.githubusercontent.com/numpy/numpy/main/numpy/_core/src/multiarray/array_coercion.c &amp;&amp; wc -l /tmp/array_coercion.c</pre><pre class="output">    1468 /tmp/array_coercion.c</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;^PyArray_\|^NPY_NO_EXPORT\|^static &quot; /tmp/array_coercion.c | sed -n '1,200p'</summary>
+<pre>grep -n &quot;^PyArray_\|^NPY_NO_EXPORT\|^static &quot; /tmp/array_coercion.c | sed -n '1,200p'</pre><pre class="output">115:static int
+152:NPY_NO_EXPORT int
+223:static inline PyArray_DTypeMeta *
+254:NPY_NO_EXPORT PyObject *
+255:PyArray_DiscoverDTypeFromScalarType(PyTypeObject *pytype)
+279:static inline PyArray_DTypeMeta *
+363:static inline PyArray_Descr *
+402:NPY_NO_EXPORT int
+480:NPY_NO_EXPORT int
+481:PyArray_Pack(PyArray_Descr *descr, void *item, PyObject *value)
+561:static int
+616:static int _coercion_cache_num = 0;
+617:static coercion_cache_obj *_coercion_cache_cache[COERCION_CACHE_CACHE_SIZE];
+625:static inline int
+662:NPY_NO_EXPORT coercion_cache_obj *
+680:NPY_NO_EXPORT void
+701:static inline int
+746:static inline int
+791:static int
+924:NPY_NO_EXPORT PyArray_Descr *
+925:PyArray_AdaptDescriptorToArray(
+984:NPY_NO_EXPORT int
+985:PyArray_DiscoverDTypeAndShape_Recursive(
+1270:NPY_NO_EXPORT int
+1271:PyArray_DiscoverDTypeAndShape(
+1424:NPY_NO_EXPORT PyObject *</pre></details>
+<details class="tool"><summary>Bash: sed -n '596,700p' /tmp/array_coercion.c</summary>
+<pre>sed -n '596,700p' /tmp/array_coercion.c</pre><pre class="output">            if (!sequence) {
+                /* Remove dimensions that we cannot use: */
+                *max_ndim -= new_ndim - i;
+            }
+            else {
+                assert(i == 0);
+                /* max_ndim is usually not updated for sequences, so set now: */
+                *max_ndim = curr_ndim;
+            }
+            break;
+        }
+    }
+    if (!sequence) {
+        *flags |= MAX_DIMS_WAS_REACHED;
+    }
+    return success;
+}
+
+#ifndef Py_GIL_DISABLED
+#define COERCION_CACHE_CACHE_SIZE 5
+static int _coercion_cache_num = 0;
+static coercion_cache_obj *_coercion_cache_cache[COERCION_CACHE_CACHE_SIZE];
+#else
+#define COERCION_CACHE_CACHE_SIZE 0
+#endif
+
+/*
+ * Steals a reference to the object.
+ */
+static inline int
+npy_new_coercion_cache(
+        PyObject *converted_obj, PyObject *arr_or_sequence, npy_bool sequence,
+        coercion_cache_obj ***next_ptr, int ndim)
+{
+    coercion_cache_obj *cache;
+#if COERCION_CACHE_CACHE_SIZE &gt; 0
+    if (_coercion_cache_num &gt; 0) {
+        _coercion_cache_num--;
+        cache = _coercion_cache_cache[_coercion_cache_num];
+    }
+    else
+#endif
+    {
+        cache = PyMem_Malloc(sizeof(coercion_cache_obj));
+    }
+    if (cache == NULL) {
+        Py_DECREF(arr_or_sequence);
+        PyErr_NoMemory();
+        return -1;
+    }
+    cache-&gt;converted_obj = converted_obj;
+    cache-&gt;arr_or_sequence = arr_or_sequence;
+    cache-&gt;sequence = sequence;
+    cache-&gt;depth = ndim;
+    cache-&gt;next = NULL;
+    **next_ptr = cache;
+    *next_ptr = &amp;(cache-&gt;next);
+    return 0;
+}
+
+/**
+ * Unlink coercion cache item.
+ *
+ * @param current This coercion cache object
+ * @return next Next coercion cache object (or NULL)
+ */
+NPY_NO_EXPORT coercion_cache_obj *
+npy_unlink_coercion_cache(coercion_cache_obj *current)
+{
+    coercion_cache_obj *next = current-&gt;next;
+    Py_DECREF(current-&gt;arr_or_sequence);
+#if COERCION_CACHE_CACHE_SIZE &gt; 0
+    if (_coercion_cache_num &lt; COERCION_CACHE_CACHE_SIZE) {
+        _coercion_cache_cache[_coercion_cache_num] = current;
+        _coercion_cache_num++;
+    }
+    else
+#endif
+    {
+        PyMem_Free(current);
+    }
+    return next;
+}
+
+NPY_NO_EXPORT void
+npy_free_coercion_cache(coercion_cache_obj *next) {
+    /* We only need to check from the last used cache pos */
+    while (next != NULL) {
+        next = npy_unlink_coercion_cache(next);
+    }
+}
+
+#undef COERCION_CACHE_CACHE_SIZE
+
+/**
+ * Do the promotion step and possible casting. This function should
+ * never be called if a descriptor was requested. In that case the output
+ * dtype is not of importance, so we must not risk promotion errors.
+ *
+ * @param out_descr The current descriptor.
+ * @param descr The newly found descriptor to promote with
+ * @param fixed_DType The user provided (fixed) DType or NULL
+ * @param flags dtype discover flags to signal failed promotion.
+ * @return -1 on error, 0 on success.
+ */</pre></details>
+<details class="tool"><summary>Bash: sed -n '984,1120p' /tmp/array_coercion.c</summary>
+<pre>sed -n '984,1120p' /tmp/array_coercion.c</pre><pre class="output">NPY_NO_EXPORT int
+PyArray_DiscoverDTypeAndShape_Recursive(
+        PyObject *obj, int curr_dims, int max_dims, PyArray_Descr**out_descr,
+        npy_intp out_shape[NPY_MAXDIMS],
+        coercion_cache_obj ***coercion_cache_tail_ptr,
+        PyArray_DTypeMeta *fixed_DType, enum _dtype_discovery_flags *flags,
+        int copy)
+{
+    PyArrayObject *arr = NULL;
+    PyObject *seq;
+
+    /*
+     * The first step is to find the DType class if it was not provided,
+     * alternatively we have to find out that this is not a scalar at all
+     * (which could fail and lead us to `object` dtype).
+     */
+    PyArray_DTypeMeta *DType = NULL;
+
+    if (NPY_UNLIKELY(*flags &amp; DISCOVER_STRINGS_AS_SEQUENCES)) {
+        /*
+         * We currently support that bytes/strings are considered sequences,
+         * if the dtype is np.dtype('c'), this should be deprecated probably,
+         * but requires hacks right now.
+         */
+        if (PyBytes_Check(obj) &amp;&amp; PyBytes_Size(obj) != 1) {
+            goto force_sequence_due_to_char_dtype;
+        }
+        else if (PyUnicode_Check(obj) &amp;&amp; PyUnicode_GetLength(obj) != 1) {
+            goto force_sequence_due_to_char_dtype;
+        }
+    }
+
+    /* If this is a known scalar, find the corresponding DType class */
+    DType = discover_dtype_from_pyobject(obj, flags, fixed_DType);
+    if (DType == NULL) {
+        return -1;
+    }
+    else if (DType == (PyArray_DTypeMeta *)Py_None) {
+        Py_DECREF(Py_None);
+    }
+    else {
+        max_dims = handle_scalar(
+                obj, curr_dims, &amp;max_dims, out_descr, out_shape, fixed_DType,
+                flags, DType);
+        Py_DECREF(DType);
+        return max_dims;
+    }
+
+    /*
+     * At this point we expect to find either a sequence, or an array-like.
+     * Although it is still possible that this fails and we have to use
+     * `object`.
+     */
+    if (PyArray_Check(obj)) {
+        arr = (PyArrayObject *)obj;
+        Py_INCREF(arr);
+    }
+    else {
+        PyArray_Descr *requested_descr = NULL;
+        if (*flags &amp; DESCRIPTOR_WAS_SET) {
+            /* __array__ may be passed the requested descriptor if provided */
+            requested_descr = *out_descr;
+        }
+        int was_copied_by__array__ = 0;
+        arr = (PyArrayObject *)_array_from_array_like(obj,
+                requested_descr, 0, copy, &amp;was_copied_by__array__);
+        if (arr == NULL) {
+            return -1;
+        }
+        else if (arr == (PyArrayObject *)Py_NotImplemented) {
+            Py_DECREF(arr);
+            arr = NULL;
+        }
+        if (was_copied_by__array__ == 1) {
+            *flags |= COPY_WAS_CREATED_BY__ARRAY__;
+        }
+    }
+    if (arr != NULL) {
+        /*
+         * This is an array object which will be added to the cache, keeps
+         * the reference to the array alive (takes ownership).
+         */
+        if (npy_new_coercion_cache(obj, (PyObject *)arr,
+                0, coercion_cache_tail_ptr, curr_dims) &lt; 0) {
+            return -1;
+        }
+
+        if (curr_dims == 0) {
+            /*
+             * Special case for reverse broadcasting, ignore max_dims if this
+             * is a single array-like object; needed for PyArray_CopyObject.
+             */
+            memcpy(out_shape, PyArray_SHAPE(arr),
+                   PyArray_NDIM(arr) * sizeof(npy_intp));
+            max_dims = PyArray_NDIM(arr);
+        }
+        else if (update_shape(curr_dims, &amp;max_dims, out_shape,
+                PyArray_NDIM(arr), PyArray_SHAPE(arr), NPY_FALSE, flags) &lt; 0) {
+            *flags |= FOUND_RAGGED_ARRAY;
+            return max_dims;
+        }
+
+        if (*flags &amp; DESCRIPTOR_WAS_SET) {
+            return max_dims;
+        }
+        /*
+         * For arrays we may not just need to cast the dtype to the user
+         * provided fixed_DType. If this is an object array, the elements
+         * may need to be inspected individually.
+         * Note, this finds the descriptor of the array first and only then
+         * promotes here (different associativity).
+         */
+        PyArray_Descr *cast_descr;
+        if (find_descriptor_from_array(arr, fixed_DType, &amp;cast_descr) &lt; 0) {
+            return -1;
+        }
+        if (cast_descr == NULL) {
+            /* object array with no elements, no need to promote/adjust. */
+            return max_dims;
+        }
+        if (handle_promotion(out_descr, cast_descr, fixed_DType, flags) &lt; 0) {
+            Py_DECREF(cast_descr);
+            return -1;
+        }
+        Py_DECREF(cast_descr);
+        return max_dims;
+    }
+
+    /*
+     * The last step is to assume the input should be handled as a sequence
+     * and to handle it recursively. That is, unless we have hit the
+     * dimension limit.
+     */
+    npy_bool is_sequence = PySequence_Check(obj);
+    if (is_sequence) {
+        is_sequence = PySequence_Size(obj) &gt;= 0;
+        if (NPY_UNLIKELY(!is_sequence)) {</pre></details>
+<details class="tool"><summary>Bash: curl -sL -o /tmp/ctors.c https://raw.githubusercontent.com/numpy/numpy/main/numpy/_core/src/m…</summary>
+<pre>curl -sL -o /tmp/ctors.c https://raw.githubusercontent.com/numpy/numpy/main/numpy/_core/src/multiarray/ctors.c &amp;&amp; grep -n &quot;AssignFromCache\|PyArray_FromAny_int\|DiscoverDTypeAndShape(&quot; /tmp/ctors.c</pre><pre class="output">428:PyArray_AssignFromCache_Recursive(
+500:                if (PyArray_AssignFromCache_Recursive(view, ndim, cache) &lt; 0) {
+536:PyArray_AssignFromCache(PyArrayObject *self, coercion_cache_obj *cache) {
+548:    if (PyArray_AssignFromCache_Recursive(self, ndim, &amp;cache) &lt; 0) {
+1487:    PyObject* ret =  PyArray_FromAny_int(
+1509:PyArray_FromAny_int(PyObject *op, PyArray_Descr *in_descr,
+1544:    ndim = PyArray_DiscoverDTypeAndShape(
+1701:    int succeed = PyArray_AssignFromCache(ret, cache);
+1817:    obj = PyArray_FromAny_int(op, in_descr, in_DType, min_depth,</pre></details>
+<details class="tool"><summary>Bash: sed -n '1660,1712p' /tmp/ctors.c; echo '--- AssignFromCache_Recursive ---'; sed -n '420,520p'…</summary>
+<pre>sed -n '1660,1712p' /tmp/ctors.c; echo '--- AssignFromCache_Recursive ---'; sed -n '420,520p' /tmp/ctors.c</pre><pre class="output">    /* Create a new array and copy the data */
+    Py_INCREF(dtype);  /* hold on in case of a subarray that is replaced */
+    ret = (PyArrayObject *)PyArray_NewFromDescr(
+            &amp;PyArray_Type, dtype, ndim, dims, NULL, NULL,
+            flags&amp;NPY_ARRAY_F_CONTIGUOUS, NULL);
+    if (ret == NULL) {
+        npy_free_coercion_cache(cache);
+        goto cleanup;
+    }
+    if (ndim == PyArray_NDIM(ret)) {
+        /*
+         * Appending of dimensions did not occur, so use the actual dtype
+         * below. This is relevant for S0 or U0 which can be replaced with
+         * S1 or U1, although that should likely change.
+         */
+        Py_SETREF(dtype, PyArray_DESCR(ret));
+        Py_INCREF(dtype);
+    }
+
+    if (cache == NULL) {
+        /* This is a single item. Set it directly. */
+        assert(ndim == 0);
+
+        if (PyArray_Pack(dtype, PyArray_BYTES(ret), op) &lt; 0) {
+            Py_CLEAR(ret);
+            goto cleanup;
+        }
+        goto cleanup;
+    }
+    assert(ndim != 0);
+    assert(op == cache-&gt;converted_obj);
+
+    /* Decrease the number of dimensions to the detected ones */
+    int out_ndim = PyArray_NDIM(ret);
+    PyArray_Descr *out_descr = PyArray_DESCR(ret);
+    if (out_ndim != ndim) {
+        ((PyArrayObject_fields *)ret)-&gt;nd = ndim;
+        ((PyArrayObject_fields *)ret)-&gt;descr = dtype;
+    }
+
+    int succeed = PyArray_AssignFromCache(ret, cache);
+
+    ((PyArrayObject_fields *)ret)-&gt;nd = out_ndim;
+    ((PyArrayObject_fields *)ret)-&gt;descr = out_descr;
+    if (succeed &lt; 0) {
+        Py_CLEAR(ret);
+    }
+
+cleanup:;
+
+    Py_XDECREF(dtype);
+    return (PyObject *)ret;
+--- AssignFromCache_Recursive ---
+}
+
+/*
+ * Recursive helper to assign using a coercion cache. This function
+ * must consume the cache depth first, just as the cache was originally
+ * produced.
+ */
+NPY_NO_EXPORT int
+PyArray_AssignFromCache_Recursive(
+        PyArrayObject *self, const int ndim, coercion_cache_obj **cache)
+{
+    int ret = -1;
+    /* Consume first cache element by extracting information and freeing it */
+    PyObject *obj = (*cache)-&gt;arr_or_sequence;
+    Py_INCREF(obj);
+    npy_bool is_sequence = (*cache)-&gt;sequence;
+    /*
+      If it is a sequence, this object is the argument to PySequence_Fast, e.g.
+      the iterable that the user wants to coerce into an array
+    */
+    PyObject *orig_seq = (*cache)-&gt;converted_obj;
+    /* Owned reference to an item in the sequence */
+    PyObject *item_pyvalue = NULL;
+    int depth = (*cache)-&gt;depth;
+    *cache = npy_unlink_coercion_cache(*cache);
+
+    /* The element is either a sequence or an array */
+    if (!is_sequence) {
+        /* Straight forward array assignment */
+        assert(PyArray_Check(obj));
+        if (PyArray_CopyInto(self, (PyArrayObject *)obj) &lt; 0) {
+            goto finish;
+        }
+    }
+    else {
+        assert(depth != ndim);
+        npy_intp orig_length = PyArray_DIMS(self)[0];
+        int err = 1;
+        NPY_BEGIN_CRITICAL_SECTION_SEQUENCE_FAST(orig_seq);
+        for (npy_intp i = 0; i &lt; orig_length; i++) {
+            // this macro takes *the argument* of PySequence_Fast, which is orig_seq;
+            // not the object returned by PySequence_Fast, which is a proxy object
+            // with its own per-object PyMutex lock.
+            // We want to lock the list object exposed to users, not the proxy.
+            npy_intp length = PySequence_Fast_GET_SIZE(obj);
+            if (length != orig_length) {
+                PyErr_SetString(PyExc_RuntimeError,
+                                &quot;Inconsistent object during array creation? &quot;
+                                &quot;Content of sequences changed (length inconsistent).&quot;);
+                goto finish_critical_section;
+            }
+            else {
+                Py_XSETREF(item_pyvalue, Py_NewRef(PySequence_Fast_GET_ITEM(obj, i)));
+            }
+
+            if (ndim == depth + 1) {
+                /*
+                 * Straight forward assignment of elements.  Note that it is
+                 * possible for such an element to be a 0-D array or array-like.
+                 * `PyArray_Pack` supports arrays as well as we want: We
+                 * support exact NumPy arrays, but at this point ignore others.
+                 * (Please see the `PyArray_Pack` function comment if this
+                 * rightly confuses you.)
+                 */
+                char *item;
+                item = (PyArray_BYTES(self) + i * PyArray_STRIDES(self)[0]);
+                if (PyArray_Pack(PyArray_DESCR(self), item, item_pyvalue) &lt; 0) {
+                    goto finish_critical_section;
+                }
+                /* If this was an array(-like) we still need to unlike int: */
+                if (*cache != NULL &amp;&amp; (*cache)-&gt;converted_obj == item_pyvalue) {
+                    *cache = npy_unlink_coercion_cache(*cache);
+                }
+            }
+            else {
+                PyArrayObject *view;
+                view = (PyArrayObject *)array_item_asarray(self, i);
+                if (view == NULL) {
+                    goto finish_critical_section;
+                }
+                if (PyArray_AssignFromCache_Recursive(view, ndim, cache) &lt; 0) {
+                    Py_DECREF(view);
+                    goto finish_critical_section;
+                }
+                Py_DECREF(view);
+            }
+        }
+    err = 0;
+      finish_critical_section:;
+
+        NPY_END_CRITICAL_SECTION_SEQUENCE_FAST();
+        if (err) {
+            goto finish;
+        }
+
+    }
+    ret = 0;
+
+  finish:;
+    Py_XDECREF(item_pyvalue);
+    Py_DECREF(obj);</pre></details>
+<p>Pulled from numpy <code>main</code> (nothing local). Two files do the work: <code>numpy/_core/src/multiarray/array_coercion.c</code> and <code>ctors.c</code>.</p>
+<p>The key design point: discovery never copies. It walks the nested sequence, records each leaf in a linked list, and computes the final shape. Only then does one allocation happen, and each input is copied straight into its slot.</p>
+<h2>Phase 1: discover shape, cache the leaves</h2>
+<p><code>PyArray_DiscoverDTypeAndShape_Recursive()</code> hits your arrays and just increfs them into a cache node:</p>
+<pre><code class="language-c">if (PyArray_Check(obj)) {
+    arr = (PyArrayObject *)obj;
+    Py_INCREF(arr);
+}
+...
+if (arr != NULL) {
+    /*
+     * This is an array object which will be added to the cache, keeps
+     * the reference to the array alive (takes ownership).
+     */
+    if (npy_new_coercion_cache(obj, (PyObject *)arr,
+            0, coercion_cache_tail_ptr, curr_dims) &lt; 0) {
+        return -1;
+    }
+    ...
+    else if (update_shape(curr_dims, &amp;max_dims, out_shape,
+            PyArray_NDIM(arr), PyArray_SHAPE(arr), NPY_FALSE, flags) &lt; 0) {
+</code></pre>
+<p><code>update_shape()</code> is what turns a list of three <code>(2, 3)</code> arrays into <code>(3, 2, 3)</code>, and what raises the ragged-array error when they disagree. The cache node is tiny:</p>
+<pre><code class="language-c">cache-&gt;converted_obj = converted_obj;
+cache-&gt;arr_or_sequence = arr_or_sequence;
+cache-&gt;sequence = sequence;
+cache-&gt;depth = ndim;
+cache-&gt;next = NULL;
+</code></pre>
+<p>There is even a freelist of 5 of these so the nodes themselves usually cost no malloc:</p>
+<pre><code class="language-c">#define COERCION_CACHE_CACHE_SIZE 5
+static int _coercion_cache_num = 0;
+static coercion_cache_obj *_coercion_cache_cache[COERCION_CACHE_CACHE_SIZE];
+</code></pre>
+<p>So after phase 1 you have a linked list <code>[seq(the list, depth 0), arr(a, depth 1), arr(b, 1), arr(c, 1)]</code> and a shape, and not one byte of array data has moved.</p>
+<h2>Phase 2: one allocation, then copy in place</h2>
+<p>In <code>PyArray_FromAny_int()</code> (<code>ctors.c:1660</code>):</p>
+<pre><code class="language-c">/* Create a new array and copy the data */
+Py_INCREF(dtype);  /* hold on in case of a subarray that is replaced */
+ret = (PyArrayObject *)PyArray_NewFromDescr(
+        &amp;PyArray_Type, dtype, ndim, dims, NULL, NULL,
+        flags&amp;NPY_ARRAY_F_CONTIGUOUS, NULL);
+...
+int succeed = PyArray_AssignFromCache(ret, cache);
+</code></pre>
+<p>That <code>PyArray_NewFromDescr()</code> is the single big allocation, the whole <code>(n,) + shape</code> stack. Then <code>PyArray_AssignFromCache_Recursive()</code> drains the cache. For the outer list it takes a view per slot, no copy:</p>
+<pre><code class="language-c">PyArrayObject *view;
+view = (PyArrayObject *)array_item_asarray(self, i);
+...
+if (PyArray_AssignFromCache_Recursive(view, ndim, cache) &lt; 0) {
+</code></pre>
+<p>and for each array leaf it copies directly into that view:</p>
+<pre><code class="language-c">/* The element is either a sequence or an array */
+if (!is_sequence) {
+    /* Straight forward array assignment */
+    assert(PyArray_Check(obj));
+    if (PyArray_CopyInto(self, (PyArrayObject *)obj) &lt; 0) {
+        goto finish;
+    }
+}
+</code></pre>
+<p><code>PyArray_CopyInto()</code> also handles the cast when an input's dtype differs from the promoted result, and it does that through the nditer's fixed-size buffer, so a mixed <code>[int32, float64]</code> list still does not allocate a full-size temporary per input.</p>
+<h2>Why it matters for rray4</h2>
+<p>The shape worth stealing is the two-pass split: a cheap pass that computes the output dimensions and the common type while only recording pointers, then one allocation, then <code>n</code> copies into offsets of the result. It is the same structure as <code>vctrs</code>'s size/ptype discovery before <code>vec_c()</code> fills the output, and it is what lets the error for ragged input fire before anything is allocated.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>And so is that the most efficient way to add 3 arrays together?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: curl -sL -o /tmp/temp_elide.c https://raw.githubusercontent.com/numpy/numpy/main/numpy/_core/…</summary>
+<pre>curl -sL -o /tmp/temp_elide.c https://raw.githubusercontent.com/numpy/numpy/main/numpy/_core/src/multiarray/temp_elide.c &amp;&amp; grep -n &quot;MIN_ELIDE\|BACKTRACE\|define\|^ \* \|can_elide&quot; /tmp/temp_elide.c | sed -n '1,60p'</pre><pre class="output">1:#define NPY_NO_DEPRECATED_API NPY_API_VERSION
+2:#define _MULTIARRAYMODULE
+4:#define PY_SSIZE_T_CLEAN
+11:#define NPY_NUMBER_MAX(a, b) ((a) &gt; (b) ? (a) : (b))
+12:#define ARRAY_SIZE(a) (sizeof(a)/sizeof(a[0]))
+15: * Functions used to try to avoid/elide temporaries in python expressions
+16: * of type a + b + b by translating some operations into in-place operations.
+17: * This example translates to this bytecode:
+19: *        0 LOAD_FAST                0 (a)
+20: *        3 LOAD_FAST                1 (b)
+21: *        6 BINARY_ADD
+22: *        7 LOAD_FAST                1 (b)
+23: *       10 BINARY_ADD
+25: * The two named variables get their reference count increased by the load
+26: * instructions so they always have a reference count larger than 1.
+27: * The temporary of the first BINARY_ADD on the other hand only has a count of
+28: * 1. Only temporaries can have a count of 1 in python so we can use this to
+29: * transform the second operation into an in-place operation and not affect the
+30: * output of the program.
+31: * CPython does the same thing to resize memory instead of copying when doing
+32: * string concatenation.
+33: * The gain can be very significant (4x-6x) when avoiding the temporary allows
+34: * the operation to remain in the cpu caches and can still be 50% faster for
+35: * array larger than cpu cache size.
+37: * A complication is that a DSO (dynamic shared object) module (e.g. cython)
+38: * could call the PyNumber functions directly on arrays with reference count of
+39: * 1.
+40: * This is handled by checking the call stack to verify that we have been
+41: * called directly from the cpython interpreter.
+42: * To achieve this we check that all functions in the callstack until the
+43: * cpython frame evaluation function are located in cpython or numpy.
+44: * This is an expensive operation so temporaries are only avoided for rather
+45: * large arrays.
+47: * A possible future improvement would be to change cpython to give us access
+48: * to the top of the stack. Then we could just check that the objects involved
+49: * are on the cpython stack instead of checking the function callstack.
+51: * Elision can be applied to all operations that do have in-place variants and
+52: * do not change types (addition, subtraction, multiplication, float division,
+53: * logical and bitwise operations ...)
+54: * For commutative operations (addition, multiplication, ...) if eliding into
+55: * the lefthand side fails it can succeed on the righthand side by swapping the
+56: * arguments. E.g. b * (a * 2) can be elided by changing it to (2 * a) * b.
+58: * TODO only supports systems with backtrace(), Windows can probably be
+59: * supported too by using the appropriate Windows APIs.
+62:#if defined HAVE_BACKTRACE &amp;&amp; defined HAVE_DLFCN_H
+67:#define NPY_ELIDE_DEBUG 0
+68:#define NPY_MAX_STACKSIZE 10
+71:#define PYFRAMEEVAL_FUNC &quot;_PyEval_EvalFrameDefault&quot;
+73: * Heuristic size of the array in bytes at which backtrace overhead generation
+74: * becomes less than speed gained by in-place operations. Depends on stack depth
+75: * being checked.  Measurements with 10 stacks show it getting worthwhile
+76: * around 100KiB but to be conservative put it higher around where the L2 cache
+77: * spills.
+80:#define NPY_MIN_ELIDE_BYTES (256 * 1024)
+83: * in debug mode always elide but skip scalars as these can convert to 0d array
+84: * during in-place operations
+86:#define NPY_MIN_ELIDE_BYTES (32)
+90:#if defined HAVE_EXECINFO_H
+92:#elif defined HAVE_LIBUNWIND_H
+97: * linear search pointer in table</pre></details>
+<p>No. For three already-separate arrays, <code>np.sum([a, b, c], axis=0)</code> is the worst of the usual options. You pay to build the stack (read 3n, write 3n) before the reduce has read a single byte.</p>
+<p>Counting passes over memory, for arrays of n elements each:</p>
+<table>
+<thead>
+<tr>
+<th>Approach</th>
+<th>Traffic</th>
+<th>Allocations</th>
+<th>Peak extra</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>np.sum([a,b,c], axis=0)</code></td>
+<td>~6n read, 4n write</td>
+<td>2</td>
+<td>4n</td>
+</tr>
+<tr>
+<td><code>a + b + c</code></td>
+<td>4n read, 2n write</td>
+<td>1 (with elision)</td>
+<td>n</td>
+</tr>
+<tr>
+<td><code>np.add(a,b,out=o); np.add(o,c,out=o)</code></td>
+<td>4n read, 2n write</td>
+<td>1</td>
+<td>n</td>
+</tr>
+<tr>
+<td>fused <code>o[i] = a[i]+b[i]+c[i]</code></td>
+<td>3n read, n write</td>
+<td>1</td>
+<td>n</td>
+</tr>
+</tbody>
+</table>
+<p>This is memory-bandwidth-bound work, so passes over memory is the number that matters, not allocation count.</p>
+<h2><code>a + b + c</code> is better than it looks</h2>
+<p>numpy rewrites the second add in place. From <code>temp_elide.c</code>:</p>
+<blockquote>
+<p>The temporary of the first BINARY_ADD on the other hand only has a count of 1. Only temporaries can have a count of 1 in python so we can use this to transform the second operation into an in-place operation and not affect the output of the program.</p>
+<p>The gain can be very significant (4x-6x) when avoiding the temporary allows the operation to remain in the cpu caches and can still be 50% faster for array larger than cpu cache size.</p>
+</blockquote>
+<p>So <code>a + b + c</code> allocates one temporary, not two. Three catches, all in that file:</p>
+<ul>
+<li>
+<p>It needs <code>HAVE_BACKTRACE &amp;&amp; HAVE_DLFCN_H</code>. Fine on macOS and Linux, not on Windows (&quot;TODO only supports systems with backtrace()&quot;).</p>
+</li>
+<li>
+<p>It only applies at <code>NPY_MIN_ELIDE_BYTES (256 * 1024)</code> and above, because the stack check is expensive.</p>
+</li>
+<li>
+<p>It verifies the call came straight from <code>_PyEval_EvalFrameDefault</code>. Call <code>PyNumber_Add</code> from Cython and you get no elision.</p>
+</li>
+</ul>
+<p>The explicit <code>out=</code> version gets the same traffic with none of those conditions, which is why it is the one to write if you care.</p>
+<h2>The fused loop is the real answer</h2>
+<p>Nothing in numpy expresses <code>a + b + c</code> as one pass. Each ufunc call reads two inputs and writes one output, so three arrays cost two passes minimum. <code>numexpr</code> exists mostly to close this gap: it blocks the expression into cache-sized chunks and evaluates the whole thing per chunk.</p>
+<p>Which is the useful bit for rray4. A variadic <code>rray_sum(...)</code> in C can do what numpy cannot: discover the common shape and type, allocate the output once, then run one loop that reads all three inputs and writes the result. 3n reads, n writes, no temporaries at any arity. The two-pass coercion structure from the last answer is what gets you there, since you know every input's shape and type before you allocate anything.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Is it variadic sum or add?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls R/ &amp;&amp; echo '--- plans ---' &amp;&amp; ls plans/ 2&gt;/dev/null</summary>
+<pre>ls R/ &amp;&amp; echo '--- plans ---' &amp;&amp; ls plans/ 2&gt;/dev/null</pre><pre class="output">arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+insert-axes.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+rray4-package.R
+size.R
+split.R
+stack.R
+unstack.R
+zzz.R
+--- plans ---
+extensions.md
+implementation.md
+mod-and-idiv.md
+n-ary.md
+null.md</pre></details>
+<details class="tool"><summary>Bash: cat plans/n-ary.md</summary>
+<pre>cat plans/n-ary.md</pre><pre class="output"># N-ary addition with single-location iterator passes
+
+## Status
+
+This document is an implementation plan. It does not describe code that is
+already present.
+
+The plan branch is based on `main`, at the iterator-performance merge. A future
+implementation should first incorporate the adjacent-axis coalescing work if it
+has landed separately. The design below benefits from that work but does not
+depend on it for correctness.
+
+## Goal
+
+Extend `rray_add()` from a binary operation to an operation that accepts two or
+more arrays:
+
+```r
+rray_add(x, y, ...)
+```
+
+Keep the existing binary path unchanged when `...` is empty. For three or more
+inputs, allocate one result, seed it from the first input, and accumulate each
+remaining input into it in a separate pass. Every pass uses its own optimized
+`rray_iterator`.
+
+The goals are:
+
+- preserve the current two-input throughput and small-call overhead;
+- support an arbitrary number of broadcastable inputs;
+- avoid a runtime operand loop inside the innermost element loop;
+- avoid materialized broadcast inputs and full-size cast intermediates;
+- allocate only the final output vector, apart from small setup objects;
+- preserve deterministic left-to-right floating-point and integer arithmetic;
+- reuse the existing common-dimension, common-type, and common-name machinery;
+- leave `rray_iterator2` available for operations that intrinsically require
+  two simultaneous locations, notably `rray_combine()`.
+
+This is intentionally limited to addition. Subtraction, division, and
+exponentiation have less natural N-ary APIs. Multiplication could adopt the
+same architecture later, but should not be included merely to make the first
+implementation more generic.
+
+## Summary of the design
+
+The public wrapper keeps `x` and `y` as required arguments and adds `...`:
+
+```r
+rray_add &lt;- function(x, y, ...) {
+  if (nargs() == 2L) {
+    return(.Call(ffi_rray_add, x, y, environment()))
+  }
+
+  .Call(ffi_rray_add_n, list2(x, y, ...), environment())
+}
+```
+
+The exact wrapper may need adjustment for project style and missing-argument
+behavior, but the important property is that the binary call does not build a
+list and reaches the existing native entry point unchanged.
+
+The N-ary native path performs these phases:
+
+1. Normalize and validate every input as an unclassed array.
+2. Determine the final arithmetic output type across all inputs.
+3. Determine the common broadcast dimensions across all inputs.
+4. Allocate one output vector of the final type.
+5. Copy and cast the first input into the output through one `rray_iterator`.
+6. For each later input, add and cast it into the output through a fresh
+   `rray_iterator`.
+7. Attach the common dimensions and coalesced names.
+
+In pseudocode:
+
+```text
+xs = normalize(x, y, ...)
+output_type = add_common_type(xs)
+dimensions = dimensions_common(xs)
+out = allocate(output_type, size(dimensions))
+
+copy_cast_pass(out, xs[0], dimensions)
+
+for input in xs[1:]:
+    add_cast_pass(out, input, dimensions)
+
+set dimensions(out)
+set names(out, broadcast_names_common(xs, dimensions))
+```
+
+Every pass writes the output with the flat iterator index and uses the mapped
+location only to read its input. Because passes are independent, they do not
+need synchronized point state or an N-location iterator.
+
+## Why not a runtime-N iterator inner loop
+
+A natural alternative is one iterator containing a runtime-sized array of
+locations and strides:
+
+```text
+for each output element:
+    combine values at locations[0:n]
+    for location in locations[0:n]:
+        advance location
+```
+
+That representation is logically general, but the dynamic location loop sits
+inside the hottest loop. It prevents the compiler from seeing two scalar
+locations and two fixed strides in the binary case.
+
+A temporary experiment replaced the two scalar location fields with a runtime
+location collection while leaving the arithmetic operation and type-specific
+cores unchanged. The runtime location count was still exactly two. On an Apple
+M2 Pro with R 4.6.0 alpha, Apple Clang 17, normal package flags including
+`-O2`, and one million output elements, it produced these medians:
+
+| Case | Fixed two locations | Runtime location collection | Slowdown |
+|---|---:|---:|---:|
+| Double identity shapes | 0.707 ns/element | 2.561 ns/element | 3.62 times |
+| Double plus scalar | 0.725 ns/element | 2.569 ns/element | 3.54 times |
+| Integer identity shapes | 1.027 ns/element | 2.549 ns/element | 2.48 times |
+| First axis size one | 2.219 ns/element | 7.802 ns/element | 3.52 times |
+| Crossed broadcast | 0.739 ns/element | 2.608 ns/element | 3.53 times |
+
+This does not prove that every N-location iterator design must be slow. A
+generic traversal plan that exposes runs to fixed-arity inner kernels can be
+fast. It does show that a literal runtime operand loop must not replace the
+current fixed-arity inner loop.
+
+The accumulator design avoids that problem. Each pass has one location, one
+fixed row stride, and one typed operation.
+
+## Why not run two ordinary iterators in lockstep
+
+Two `rray_iterator` instances cannot simply be nested or independently stepped
+inside the current iterator macros. Each instance owns a complete traversal of
+the point space. Coordinating them element by element would duplicate carry
+work or require a new zip loop, which recreates the role of `rray_iterator2`.
+
+It also complicates coalescing. Two independently initialized iterators can
+choose different private computation shapes because coalescing depends on the
+location mapping. A genuinely fused N-operand iterator must choose a shape
+approved by every operand.
+
+The accumulator avoids synchronization entirely. It completes one input pass
+before starting the next, so each single-location iterator can use the best
+private computation shape for that input alone.
+
+## Do not initialize the result by adding to zero
+
+The conceptual description may sound like this:
+
+```text
+fill output with zero
+output += x
+output += y
+output += z
+```
+
+Do not implement it literally. Instead use:
+
+```text
+output = cast(x)
+output += y
+output += z
+```
+
+Seeding from the first input is important for both performance and semantics.
+
+### Performance
+
+A zero fill adds a complete output write. Adding the first input then requires
+another output read and write. For integer addition it also performs an
+unnecessary checked addition for `0 + x`.
+
+In a temporary prototype, the seeded integer accumulator took about 1.19
+nanoseconds per element for two identity-shaped integer inputs. The literal
+zero accumulator took about 1.94 nanoseconds per element, versus about 1.03 for
+the fused binary implementation.
+
+### Signed zero
+
+IEEE floating-point addition distinguishes positive and negative zero. The
+existing binary implementation preserves the result of the actual binary
+operation:
+
+```r
+rray_add(array(-0, 1L), array(-0, 1L))
+# negative zero
+```
+
+Starting the accumulator from positive zero changes that result to positive
+zero. Copying the first input and then adding the second preserves the binary
+operation. The same caution applies to complex signed-zero components and may
+also matter for NaN payload behavior.
+
+### Empty input list
+
+The public API continues to require `x` and `y`. There is therefore no need to
+invent dimensions, type, or names for a zero-input additive identity.
+</pre><p class="cut">493 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;^rray_[a-z_]* &lt;- function&quot; R/reduce.R R/arithmetic.R | head -40</summary>
+<pre>grep -n &quot;^rray_[a-z_]* &lt;- function&quot; R/reduce.R R/arithmetic.R | head -40</pre><pre class="output">R/reduce.R:69:rray_sum_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:76:rray_product_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:83:rray_mean_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:90:rray_all_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:97:rray_any_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/arithmetic.R:70:rray_add &lt;- function(x, y) {
+R/arithmetic.R:76:rray_subtract &lt;- function(x, y) {
+R/arithmetic.R:82:rray_multiply &lt;- function(x, y) {
+R/arithmetic.R:88:rray_divide &lt;- function(x, y) {
+R/arithmetic.R:94:rray_exponentiate &lt;- function(x, y) {</pre></details>
+<p>Add. I wrote <code>rray_sum(...)</code> last message; the name is wrong for this package.</p>
+<p>The two are different operations here:</p>
+<ul>
+<li>
+<p><code>rray_add(x, y)</code> in <code>R/arithmetic.R:70</code> is elementwise across separate arrays. That is the one <code>plans/n-ary.md</code> proposes growing a <code>...</code> so it takes three or more inputs. The plan is explicit: &quot;Extend <code>rray_add()</code> from a binary operation to an operation that accepts two or more arrays&quot;, and &quot;This is intentionally limited to addition.&quot;</p>
+</li>
+<li>
+<p><code>rray_sum_along(x, axes)</code> in <code>R/reduce.R:69</code> is a reduction over axes of one array. <code>sum</code> is already taken by that family, and it means something else.</p>
+</li>
+</ul>
+<p>So the numpy comparison maps like this: <code>np.sum([a, b, c], axis=0)</code> is spelled <code>rray_add(a, b, c)</code>, and <code>np.sum(a, axis=0)</code> is <code>rray_sum_along(a, 1)</code>.</p>
+<p>One correction to the traffic claim I made, since the plan already measured it. I said a fused loop gets 3n reads and n writes at arity 3. The plan deliberately does not do that. It seeds from the first input and accumulates, giving <code>(3 * N - 1) * B</code> traffic instead of the fused <code>(N + 1) * B</code>, because a runtime operand loop in the inner loop measured 2.5 to 3.6 times slower than fixed-arity two-location code:</p>
+<blockquote>
+<p>That representation is logically general, but the dynamic location loop sits inside the hottest loop. It prevents the compiler from seeing two scalar locations and two fixed strides in the binary case.</p>
+</blockquote>
+<p>So the answer to &quot;is fused the most efficient&quot; is: fused wins on paper, loses on the benchmark, and the accumulator still meets the real goal of one allocation and no full-size intermediates.</p>
+
+</section>
+</main>
+</body>
+</html>

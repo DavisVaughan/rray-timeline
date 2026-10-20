@@ -1,0 +1,2995 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How base R picks dimnames and what a natural names rule would be</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-45">rray timeline</a>
+<h1>How base R picks <code>dimnames</code> and what a natural names rule would be</h1>
+<p class="facts">Codex · Sep 9, 2026 · 2 prompts · 4 replies · <a href="https://github.com/r-lib/rray/pull/45">#45</a></p>
+</header>
+<main>
+<p class="divider">Sep 9, 2026, 20:51 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Let’s chat about rray’s coalesce names handling. I don’t think this is how R handles names. I think it’s either all x or all y, but the rules are complicated. Do some research on how R works, and advocate for a method that feels most natural to users even if it’s a new 3rd idea</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll trace rray’s current coalesce implementation and tests, then compare it against actual R behavior across the awkward cases: partial names, recycling, <code>NA</code> replacement, and type/shape differences. I’ll finish with a concrete recommendation optimized for what users are likely to expect, even if it departs from both current options.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;coalesce|names&quot; R tests man vignettes DESCRIPTION NAMESPACE 2&gt;/dev/null | head -n 240</summary>
+<pre>$ rg -n &quot;coalesce|names&quot; R tests man vignettes DESCRIPTION NAMESPACE 2&gt;/dev/null | head -n 240</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+NAMESPACE:4:export(rray_axis_names)
+NAMESPACE:7:export(rray_col_names)
+NAMESPACE:14:export(rray_names)
+NAMESPACE:16:export(rray_row_names)
+NAMESPACE:17:export(rray_set_axis_names)
+NAMESPACE:18:export(rray_set_col_names)
+NAMESPACE:20:export(rray_set_names)
+NAMESPACE:21:export(rray_set_row_names)
+R/rray4-package.R:6:## usethis namespace: start
+R/rray4-package.R:9:## usethis namespace: end
+tests/testthat/test-reduce-prod.R:50:test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+tests/testthat/test-reduce-prod.R:51:  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], c(&quot;c1&quot;, &quot;c2&quot;)))
+tests/testthat/test-reduce-prod.R:52:  expect_identical(dimnames(rray_prod(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+tests/testthat/test-reduce-prod.R:53:  expect_identical(dimnames(rray_prod(x, 2L)), list(letters[1:5], NULL))
+tests/testthat/test-reduce-prod.R:56:test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+tests/testthat/test-reduce-prod.R:57:  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], NULL))
+tests/testthat/test-reduce-prod.R:58:  expect_null(dimnames(rray_prod(x, 1L)))
+R/arithmetic.R:58:#' rows &lt;- array(1:3, c(3L, 1L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;)))
+R/arithmetic.R:59:#' cols &lt;- array(c(10L, 20L), c(1L, 2L), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+R/arithmetic.R:62:#' # A broadcast axis loses its names, because they no longer describe the
+R/arithmetic.R:63:#' # result. `only` names a single row, but the result has three.
+R/arithmetic.R:64:#' cols &lt;- array(c(10L, 20L), c(1L, 2L), dimnames = list(&quot;only&quot;, c(&quot;c1&quot;, &quot;c2&quot;)))
+R/split-names.R:2:rray_split_names &lt;- function(x, axes) {
+R/split-names.R:3:  .Call(ffi_rray_split_names, x, axes)
+tests/testthat/test-names.R:2:# rray_names()
+tests/testthat/test-names.R:5:  expect_null(rray_names(1:3))
+tests/testthat/test-names.R:6:  expect_null(rray_names(&quot;a&quot;))
+tests/testthat/test-names.R:9:test_that(&quot;returns names for named plain vectors&quot;, {
+tests/testthat/test-names.R:10:  expect_identical(rray_names(c(a = 1, b = 2)), list(c(&quot;a&quot;, &quot;b&quot;)))
+tests/testthat/test-names.R:11:  expect_identical(rray_names(c(x = 1L)), list(&quot;x&quot;))
+tests/testthat/test-names.R:14:test_that(&quot;returns dimnames for arrays&quot;, {
+tests/testthat/test-names.R:15:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:17:    rray_names(x),
+tests/testthat/test-names.R:23:  expect_null(rray_names(array(1:6, c(2, 3))))
+tests/testthat/test-names.R:24:  expect_null(rray_names(array(1:24, c(2, 3, 4))))
+tests/testthat/test-names.R:27:test_that(&quot;handles partially named dimnames&quot;, {
+tests/testthat/test-names.R:28:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:29:  expect_identical(rray_names(x), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:33:  expect_snapshot(rray_names(NULL), error = TRUE)
+tests/testthat/test-names.R:34:  expect_snapshot(rray_names(mean), error = TRUE)
+tests/testthat/test-names.R:39:  expect_snapshot(rray_names(x), error = TRUE)
+tests/testthat/test-names.R:43:# rray_axis_names()
+tests/testthat/test-names.R:45:test_that(&quot;rray_axis_names() gets names for a single axis&quot;, {
+tests/testthat/test-names.R:46:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:47:  expect_identical(rray_axis_names(x, 1), c(&quot;r1&quot;, &quot;r2&quot;))
+tests/testthat/test-names.R:48:  expect_identical(rray_axis_names(x, 2), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-names.R:51:test_that(&quot;rray_axis_names() works with 3+ dimensional arrays&quot;, {
+tests/testthat/test-names.R:53:  expect_null(rray_axis_names(x, 3))
+tests/testthat/test-names.R:55:  x &lt;- rray_set_axis_names(x, 3, letters[1:4])
+tests/testthat/test-names.R:56:  expect_identical(rray_axis_names(x, 3), letters[1:4])
+tests/testthat/test-names.R:59:test_that(&quot;rray_axis_names() returns NULL for an unnamed axis&quot;, {
+tests/testthat/test-names.R:60:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:61:  expect_null(rray_axis_names(x, 2))
+tests/testthat/test-names.R:64:test_that(&quot;rray_axis_names() returns NULL when there are no names at all&quot;, {
+tests/testthat/test-names.R:65:  expect_null(rray_axis_names(array(1:6, c(2, 3)), 1))
+tests/testthat/test-names.R:68:test_that(&quot;rray_axis_names() coerces axis to integer&quot;, {
+tests/testthat/test-names.R:69:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:70:  expect_identical(rray_axis_names(x, 1), rray_axis_names(x, 1L))
+tests/testthat/test-names.R:73:test_that(&quot;rray_axis_names() errors on an invalid axis&quot;, {
+tests/testthat/test-names.R:75:  expect_snapshot(rray_axis_names(x, 0), error = TRUE)
+tests/testthat/test-names.R:76:  expect_snapshot(rray_axis_names(x, 3), error = TRUE)
+tests/testthat/test-names.R:77:  expect_snapshot(rray_axis_names(x, NA_integer_), error = TRUE)
+tests/testthat/test-names.R:78:  expect_snapshot(rray_axis_names(x, c(1, 2)), error = TRUE)
+tests/testthat/test-names.R:79:  expect_snapshot(rray_axis_names(x, integer()), error = TRUE)
+tests/testthat/test-names.R:82:test_that(&quot;rray_axis_names() errors on classed input&quot;, {
+tests/testthat/test-names.R:84:  expect_snapshot(rray_axis_names(x, 1), error = TRUE)
+tests/testthat/test-names.R:87:test_that(&quot;rray_row_names() and rray_col_names() are axis shortcuts&quot;, {
+tests/testthat/test-names.R:88:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:89:  expect_identical(rray_row_names(x), rray_axis_names(x, 1))
+tests/testthat/test-names.R:90:  expect_identical(rray_col_names(x), rray_axis_names(x, 2))
+tests/testthat/test-names.R:93:test_that(&quot;rray_col_names() errors if `x` doesn't have a second axis&quot;, {
+tests/testthat/test-names.R:94:  expect_snapshot(rray_col_names(1:5), error = TRUE)
+tests/testthat/test-names.R:97:test_that(&quot;rray_row_names() and rray_col_names() error on classed input&quot;, {
+tests/testthat/test-names.R:99:  expect_snapshot(rray_row_names(x), error = TRUE)
+tests/testthat/test-names.R:100:  expect_snapshot(rray_col_names(x), error = TRUE)
+tests/testthat/test-names.R:104:# rray_set_names()
+tests/testthat/test-names.R:106:test_that(&quot;rray_set_names() sets names for every axis&quot;, {
+tests/testthat/test-names.R:108:  out &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:110:    dimnames(out),
+tests/testthat/test-names.R:115:test_that(&quot;rray_set_names() allows some axes to be unnamed&quot;, {
+tests/testthat/test-names.R:117:  out &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:118:  expect_identical(dimnames(out), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:121:test_that(&quot;rray_set_names() with `NULL` clears all names&quot;, {
+tests/testthat/test-names.R:125:    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-names.R:127:  out &lt;- rray_set_names(x, NULL)
+tests/testthat/test-names.R:128:  expect_null(dimnames(out))
+tests/testthat/test-names.R:131:test_that(&quot;rray_set_names() doesn't touch the data&quot;, {
+tests/testthat/test-names.R:133:  out &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:137:test_that(&quot;rray_set_names() works with zero-size axes&quot;, {
+tests/testthat/test-names.R:140:  out &lt;- rray_set_names(x, list(character(), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:141:  expect_identical(dimnames(out), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:144:test_that(&quot;rray_set_names() errors if `names` isn't a list or `NULL`&quot;, {
+tests/testthat/test-names.R:146:  expect_snapshot(rray_set_names(x, c(&quot;r1&quot;, &quot;r2&quot;)), error = TRUE)
+tests/testthat/test-names.R:149:test_that(&quot;rray_set_names() errors if length doesn't match dimensionality&quot;, {
+tests/testthat/test-names.R:151:  expect_snapshot(rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;))), error = TRUE)
+tests/testthat/test-names.R:153:    rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL, NULL)),
+tests/testthat/test-names.R:158:test_that(&quot;rray_set_names() errors if an axis' names aren't character&quot;, {
+tests/testthat/test-names.R:160:  expect_snapshot(rray_set_names(x, list(1:2, NULL)), error = TRUE)
+tests/testthat/test-names.R:163:test_that(&quot;rray_set_names() errors if an axis' names are the wrong length&quot;, {
+tests/testthat/test-names.R:165:  expect_snapshot(rray_set_names(x, list(&quot;r1&quot;, NULL)), error = TRUE)
+tests/testthat/test-names.R:168:test_that(&quot;rray_set_names() errors on classed input&quot;, {
+tests/testthat/test-names.R:170:  expect_snapshot(rray_set_names(x, NULL), error = TRUE)
+tests/testthat/test-names.R:174:# rray_set_axis_names()
+tests/testthat/test-names.R:176:test_that(&quot;rray_set_axis_names() sets names for a single axis&quot;, {
+tests/testthat/test-names.R:178:  out &lt;- rray_set_axis_names(x, 1, c(&quot;r1&quot;, &quot;r2&quot;))
+tests/testthat/test-names.R:179:  expect_identical(dimnames(out), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-names.R:182:test_that(&quot;rray_set_axis_names() leaves other axes untouched&quot;, {
+tests/testthat/test-names.R:186:    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-names.R:188:  out &lt;- rray_set_axis_names(x, 1, c(&quot;a&quot;, &quot;b&quot;))
+tests/testthat/test-names.R:189:  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:192:test_that(&quot;rray_set_axis_names() with `NULL` clears just that axis&quot;, {
+tests/testthat/test-names.R:196:    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-names.R:198:  out &lt;- rray_set_axis_names(x, 1, NULL)
+tests/testthat/test-names.R:199:  expect_identical(dimnames(out), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-names.R:202:test_that(&quot;rray_set_axis_names() coerces axis to integer&quot;, {
+tests/testthat/test-names.R:205:    rray_set_axis_names(x, 1, c(&quot;r1&quot;, &quot;r2&quot;)),
+tests/testthat/test-names.R:206:    rray_set_axis_names(x, 1L, c(&quot;r1&quot;, &quot;r2&quot;))
+tests/testthat/test-names.R:210:test_that(&quot;rray_set_axis_names() errors on an invalid axis&quot;, {
+tests/testthat/test-names.R:212:  expect_snapshot(rray_set_axis_names(x, 0, &quot;a&quot;), error = TRUE)
+tests/testthat/test-names.R:213:  expect_snapshot(rray_set_axis_names(x, 3, &quot;a&quot;), error = TRUE)
+tests/testthat/test-names.R:216:test_that(&quot;rray_set_axis_names() errors if names aren't character or NULL&quot;, {
+tests/testthat/test-names.R:218:  expect_snapshot(rray_set_axis_names(x, 1, 1:2), error = TRUE)
+tests/testthat/test-names.R:221:test_that(&quot;rray_set_axis_names() errors if names are the wrong length&quot;, {
+tests/testthat/test-names.R:223:  expect_snapshot(rray_set_axis_names(x, 1, &quot;r1&quot;), error = TRUE)
+tests/testthat/test-names.R:226:test_that(&quot;rray_set_axis_names() errors on classed input&quot;, {
+tests/testthat/test-names.R:228:  expect_snapshot(rray_set_axis_names(x, 1, NULL), error = TRUE)
+tests/testthat/test-names.R:231:test_that(&quot;rray_set_row_names() and rray_set_col_names() are axis shortcuts&quot;, {
+tests/testthat/test-names.R:234:    rray_set_row_names(x, c(&quot;r1&quot;, &quot;r2&quot;)),
+tests/testthat/test-names.R:235:    rray_set_axis_names(x, 1, c(&quot;r1&quot;, &quot;r2&quot;))
+tests/testthat/test-names.R:238:    rray_set_col_names(x, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)),
+tests/testthat/test-names.R:239:    rray_set_axis_names(x, 2, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-names.R:243:test_that(&quot;rray_set_row_names() and rray_set_col_names() error on classed input&quot;, {
+tests/testthat/test-names.R:245:  expect_snapshot(rray_set_row_names(x, NULL), error = TRUE)
+tests/testthat/test-names.R:246:  expect_snapshot(rray_set_col_names(x, NULL), error = TRUE)
+R/squeeze.R:6:#' Squeezed axes lose their names.
+R/squeeze.R:7:#' Surviving axes keep their names and carry them to their new positions.
+tests/testthat/test-dimensions.R:148:  names(args) &lt;- strrep(&quot;a&quot;, 150)
+tests/testthat/test-dimensions.R:255:test_that(&quot;drops dimension names&quot;, {
+tests/testthat/test-dimensions.R:260:    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-dimensions.R:263:  expect_null(dimnames(out))
+tests/testthat/test-dimensions.R:266:test_that(&quot;drops names from a named vector&quot;, {
+tests/testthat/test-dimensions.R:269:  expect_null(dimnames(out))
+man/arithmetic.Rd:74:rows &lt;- array(1:3, c(3L, 1L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;)))
+man/arithmetic.Rd:75:cols &lt;- array(c(10L, 20L), c(1L, 2L), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+man/arithmetic.Rd:78:# A broadcast axis loses its names, because they no longer describe the
+man/arithmetic.Rd:79:# result. `only` names a single row, but the result has three.
+man/arithmetic.Rd:80:cols &lt;- array(c(10L, 20L), c(1L, 2L), dimnames = list(&quot;only&quot;, c(&quot;c1&quot;, &quot;c2&quot;)))
+tests/testthat/test-split.R:49:test_that(&quot;coalesces split axes&quot;, {
+tests/testthat/test-split.R:76:  dimnames(x) &lt;- list(&quot;a&quot;, letters[1:3], LETTERS[1:2], paste0(&quot;x&quot;, 1:4))
+tests/testthat/test-split.R:88:test_that(&quot;dimension names on non-split axes are preserved&quot;, {
+tests/testthat/test-split.R:89:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+tests/testthat/test-split.R:92:  expect_equal(dimnames(out[[1]]), list(&quot;a&quot;, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+tests/testthat/test-split.R:93:  expect_equal(dimnames(out[[2]]), list(&quot;b&quot;, c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+tests/testthat/test-split.R:96:  expect_equal(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;x&quot;))
+tests/testthat/test-split.R:97:  expect_equal(dimnames(out[[2]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;y&quot;))
+tests/testthat/test-split.R:98:  expect_equal(dimnames(out[[3]]), list(c(&quot;a&quot;, &quot;b&quot;), &quot;z&quot;))
+tests/testthat/test-split.R:101:test_that(&quot;dimension names on split axes are subset&quot;, {
+tests/testthat/test-split.R:102:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+tests/testthat/test-split.R:105:  expect_equal(dimnames(out[[1]]), list(&quot;a&quot;, &quot;x&quot;))
+tests/testthat/test-split.R:106:  expect_equal(dimnames(out[[2]]), list(&quot;b&quot;, &quot;x&quot;))
+tests/testthat/test-split.R:107:  expect_equal(dimnames(out[[3]]), list(&quot;a&quot;, &quot;y&quot;))
+tests/testthat/test-split.R:108:  expect_equal(dimnames(out[[4]]), list(&quot;b&quot;, &quot;y&quot;))
+tests/testthat/test-split.R:109:  expect_equal(dimnames(out[[5]]), list(&quot;a&quot;, &quot;z&quot;))
+tests/testthat/test-split.R:110:  expect_equal(dimnames(out[[6]]), list(&quot;b&quot;, &quot;z&quot;))
+tests/testthat/test-split.R:113:test_that(&quot;NULL dimension names are handled&quot;, {
+tests/testthat/test-split.R:117:  expect_null(dimnames(out[[1]]))
+tests/testthat/test-split.R:120:test_that(&quot;dimension names that are all `NULL` are dropped&quot;, {
+tests/testthat/test-split.R:121:  x &lt;- array(1:6, c(2, 3), dimnames = list(NULL, NULL))
+tests/testthat/test-split.R:124:  expect_null(dimnames(out[[1]]))
+tests/testthat/test-split.R:127:test_that(&quot;partial dimension names are handled&quot;, {
+tests/testthat/test-split.R:128:  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+tests/testthat/test-split.R:131:  expect_equal(dimnames(out[[1]]), list(&quot;a&quot;, NULL))
+tests/testthat/test-split.R:132:  expect_equal(dimnames(out[[2]]), list(&quot;b&quot;, NULL))
+tests/testthat/test-split.R:135:  expect_equal(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+tests/testthat/test-arithmetic-subtract.R:140:test_that(&quot;names are kept for axes that aren't broadcast&quot;, {
+tests/testthat/test-arithmetic-subtract.R:141:  x &lt;- array(1:6, c(3L, 2L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL))
+tests/testthat/test-arithmetic-subtract.R:142:  y &lt;- array(1:2, c(1L, 2L), dimnames = list(&quot;z&quot;, c(&quot;c1&quot;, &quot;c2&quot;)))
+tests/testthat/test-arithmetic-subtract.R:144:    rray_names(rray_subtract(x, y)),
+tests/testthat/test-arithmetic-subtract.R:150:  x &lt;- array(1:3, 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+tests/testthat/test-arithmetic-subtract.R:151:  y &lt;- array(1:3, 3L, dimnames = list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+tests/testthat/test-arithmetic-subtract.R:152:  expect_identical(rray_names(rray_subtract(x, y)), list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+tests/testthat/test-arithmetic-subtract.R:155:test_that(&quot;names are dropped for a broadcast axis&quot;, {
+tests/testthat/test-arithmetic-subtract.R:156:  x &lt;- array(1L, c(1L, 2L), dimnames = list(&quot;z&quot;, NULL))
+tests/testthat/test-arithmetic-subtract.R:158:  expect_null(rray_names(rray_subtract(x, y)))
+tests/testthat/test-arithmetic-subtract.R:161:test_that(&quot;names travel to a new axis of a larger input&quot;, {
+tests/testthat/test-arithmetic-subtract.R:162:  x &lt;- array(1:3, 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+tests/testthat/test-arithmetic-subtract.R:165:    rray_names(rray_subtract(x, y)),
+tests/testthat/test-arithmetic-subtract.R:172:  expect_null(rray_names(rray_subtract(x, x)))
+tests/testthat/test-wrapper.R:49:    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+tests/testthat/test-wrapper.R:53:  expect_identical(dimnames(w), dimnames(x))
+tests/testthat/test-wrapper.R:59:  names(w) &lt;- c(&quot;x&quot;, &quot;y&quot;)
+tests/testthat/test-wrapper.R:60:  expect_identical(names(x), c(&quot;a&quot;, &quot;b&quot;))
+tests/testthat/test-wrapper.R:61:  expect_identical(names(w), c(&quot;x&quot;, &quot;y&quot;))
+tests/testthat/test-wrapper.R:248:  names(w1) &lt;- c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)
+tests/testthat/test-wrapper.R:249:  expect_identical(names(w2), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+R/reduce-names.R:2:rray_reduce_names &lt;- function(x, axes) {</pre><p class="cut">44 more lines cut</p></details>
+<details class="tool"><summary>Bash: rg -n &quot;rray_coalesce|coalesce&quot; . --glob '!docs/**' --glob '!*.html'</summary>
+<pre>$ rg -n &quot;rray_coalesce|coalesce&quot; . --glob '!docs/**' --glob '!*.html'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+./src/decl/iterator-decl.h:17:static inline int rray__iterator_axes_coalesce(
+./src/decl/iterator-decl.h:23:static inline int rray__iterator_axes_coalesce2(
+./src/iterator.h:126:  it-&gt;point_dimensionality = rray__iterator_axes_coalesce(
+./src/iterator.h:248:  it-&gt;point_dimensionality = rray__iterator_axes_coalesce2(
+./src/iterator.h:355://   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+./src/iterator.h:360://   Both coalesce completely, producing a [40] loop with array stride [1] and
+./src/iterator.h:365://   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+./src/iterator.h:376://   third axis also coalesces. The result is one dimension [12] with stride
+./src/iterator.h:382:static inline int rray__iterator_axes_coalesce(
+./src/iterator.h:417:static inline int rray__iterator_axes_coalesce2(
+./src/rlang/env.h:99:void r_env_coalesce(r_obj* env, r_obj* from);
+./src/rlang/env.c:55:    r_env_coalesce(out, env);
+./src/rlang/env.c:61:void r_env_coalesce(r_obj* env, r_obj* from) {
+./src/rlang/env.c:66:        env_coalesce_plain(env, from, syms);
+./src/rlang/env.c:131:static void env_coalesce_plain(r_obj* env, r_obj* from, r_obj* syms) {
+./src/rlang/decl/env-decl.h:23:static void env_coalesce_plain(r_obj* env, r_obj* from, r_obj* nms);
+./plans/n-ary.md:71:7. Attach the common dimensions and coalesced names.
+./plans/n-ary.md:326:If adjacent-axis coalescing is available, each pass may coalesce based solely
+./plans/n-ary.md:539:A more sophisticated future iterator could own arbitrary operands, coalesce
+./plans/implementation.md:802:API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and
+./plans/implementation.md:823:**Names rule**, from 2.3: follow the axis, reduce, coalesce, subset, or
+./plans/implementation.md:958:Names: coalesce. Type: promoted.
+./plans/implementation.md:989:Names: coalesce. Type: common, errors on `cpl`. Ops `maximum` and `minimum`,
+./plans/implementation.md:1018:does not coalesce.
+./plans/implementation.md:1089:Names: coalesce. Type: fixed, logical output.
+./plans/implementation.md:1273:Names: coalesce on the axes that are not bound. The bound axis concatenates its
+./tests/testthat/test-reduce-sum.R:46:test_that(&quot;coalesces reduction axes&quot;, {
+./tests/testthat/test-arithmetic-add.R:139:test_that(&quot;coalesces compatible iterator axes&quot;, {
+./tests/testthat/test-arithmetic-add.R:161:test_that(&quot;coalesces the maximum number of axes&quot;, {
+./tests/testthat/test-split.R:49:test_that(&quot;coalesces split axes&quot;, {
+./tests/testthat/test-broadcast.R:38:test_that(&quot;coalesces broadcast axes&quot;, {
+./tests/testthat/test-broadcast.R:53:test_that(&quot;coalesces zero-size broadcast axes&quot;, {</pre></details>
+<details class="tool"><summary>Bash: sed -n '760,845p' plans/implementation.md; sed -n '930,1010p' plans/implementation.md; rg -n …</summary>
+<pre>$ sed -n '760,845p' plans/implementation.md; sed -n '930,1010p' plans/implementation.md; rg -n &quot;names.*coales|coales.*names|coalesce names&quot; src R tests plans README.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+- **Zero size arrays.** A dimension of 0 on some axis, and on every axis.
+
+- **Dimensionality 1, 2, and 3 or more.** One dimensional arrays are the case
+  people forget.
+
+- **Names.** Kept where the rule says kept, dropped where the rule says dropped.
+  Include the case where only some axes have names.
+
+- **Errors.** Every error path, with `expect_snapshot(error = TRUE)`, so the
+  full message is reviewable. That includes classed input being refused.
+
+Mechanics:
+
+- Tests for `R/{name}.R` go in `tests/testthat/test-{name}.R`, helpers in
+  `tests/testthat/helper-{name}.R`.
+
+- The arithmetic family splits one operator per file in `src/` and in the tests,
+  so `rray_add()` is `src/arithmetic-add.c` and `test-arithmetic-add.R`.
+  Snapshot names are file wide, so this lets every operator say &quot;errors on
+  integer overflow&quot; without colliding. No `# ----` header, since each file
+  covers one function.
+
+- The R side does not split. Every operator's binding lives in `R/arithmetic.R`,
+  and they share one documentation page, because the page has one thing to say
+  and repeating it per operator would be seven copies of it.
+
+- Never put code outside a `test_that()` block.
+
+- No section header comments.
+
+- Prefer a specific expectation over `expect_true()`.
+
+- Use `expect_snapshot(error = TRUE)` for errors and `expect_snapshot()` for
+  warnings, never `expect_error()` or `expect_warning()`.
+
+- Place new tests next to similar existing ones.
+
+---
+
+# Part 4: The pull requests
+
+What exists today: the argument tags, the argument checking helpers, the names
+API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and
+shape helpers, the type rules as the `rray_ptype2()` and `rray_cast()` families,
+the scalar casts as `static inline` functions in `src/cast.h`, and
+`rray_broadcast()`, `rray_broadcast_common()`, `rray_split()`, `rray_sum()`,
+`rray_add()`, `rray_multiply()`, `rray_subtract()`, `rray_divide()` and
+`rray_exponentiate()`. The array functions all follow the shell and core
+pattern in Part 1, and no templates are left in `src/`.
+
+`rray_modulo()` and `rray_integer_divide()` (`%%` and `%/%`) are deferred. See
+`plans/mod-and-idiv.md`.
+
+Every pull request that was tracked here has landed. Work through Part 5 next,
+in any order that respects the dependencies noted there.
+
+---
+
+# Part 5: Function reference
+
+Each entry gives what the function does, what the original rray did, the
+proposed signature, the files it touches, and two rules.
+
+**Names rule**, from 2.3: follow the axis, reduce, coalesce, subset, or
+dropped.
+
+**Type rule**, from 2.4:
+
+- *Preserved.* The output has `x`'s type. Any other array argument is cast to
+  it, rather than being given a say in the result.
+
+- *Common.* Every input has a say. They are cast to a common type with
+  `rray_ptype2()`.
+
+- *Promoted.* The common type, then pushed through the operator's promotion
+  table.
+
+- *Fixed.* Output type is fixed regardless of input.
+
+## 5.1 Shape
+
+### `rray_flatten()`
+
+Collapse to one dimension.
+
+```r
+lose their names, untiled axes keep theirs.
+
+Signature: `rray_tile(x, times)`.
+
+Files: `R/tile.R`, `src/tile.c`, `src/tile.h`.
+
+### `rray_flip()`
+
+Reverse the order along an axis.
+
+```r
+x &lt;- array(1:10, c(5, 2))
+rray_flip(x, 1)      # reverse the rows
+rray_flip(x, 2)      # reverse the columns
+```
+
+Names: follow the axis, with one exception. The flipped axis keeps its dimension,
+so it keeps its names, but they must be **reversed** alongside the data rather
+than copied across.
+
+Type: preserved.
+
+Signature: `rray_flip(x, axis)`. Single axis.
+
+Files: `R/flip.R`, `src/flip.c`, `src/flip.h`.
+
+## 5.2 Elementwise arithmetic
+
+Names: coalesce. Type: promoted.
+
+All binary, all sharing the loop and the pipeline from 2.4: pick a core from the
+type pair, find common dimensions, loop with an `rray_iterator2` converting as
+you go.
+
+| function | op |
+|---|---|
+| `rray_add(x, y)` | `+` |
+| `rray_subtract(x, y)` | `-` |
+| `rray_multiply(x, y)` | `*` |
+| `rray_divide(x, y)` | `/` |
+| `rray_exponentiate(x, y)` | `^` |
+
+There is no unary negation. `-x` already works on a bare array, so a function
+for it would add nothing.
+
+Match R's own semantics for missing values, `NaN`, and division by zero. Check
+`~/files/r/r-svn` when a case is unclear rather than guessing.
+
+Files: one `src/arithmetic-{op}.c` per operator, over the shared
+`src/arithmetic.c` and `src/arithmetic.h`. All the R bindings share
+`R/arithmetic.R` and one documentation page.
+
+## 5.3 Other elementwise numeric
+
+### `rray_maximum()` and `rray_minimum()`
+
+Elementwise maximum and minimum of two arrays, with broadcasting. Not to be
+confused with `rray_max()` and `rray_min()`, which reduce.
+
+Names: coalesce. Type: common, errors on `cpl`. Ops `maximum` and `minimum`,
+which promote nothing, as 2.4 explains.
+
+Signature: `rray_maximum(x, y, ..., na_rm = FALSE)`.
+
+Files: `R/extremum.R`, `src/extremum.c`, `src/extremum.h`.
+
+### `rray_clip()`
+
+Bound values between a low and a high, elementwise.
+
+```r
+x &lt;- matrix(1:10, ncol = 2)
+rray_clip(x, 1, 5)
+```
+
+`low` and `high` are broadcast to `x`'s dimensions. They do not have to be
+scalars, so each element can have its own bounds. `x` itself is never broadcast,
+so the output always has `x`'s dimensions.
+
+It is an error for any `low` to be greater than its matching `high`.
+
+rg: README.md: No such file or directory (os error 2)
+plans/n-ary.md:71:7. Attach the common dimensions and coalesced names.
+plans/implementation.md:802:API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and</pre></details>
+<details class="tool"><summary>Bash: rg -n &quot;broadcast_names|common_names|names2|names_common&quot; src R tests; rg --files src | sort |…</summary>
+<pre>$ rg -n &quot;broadcast_names|common_names|names2|names_common&quot; src R tests; rg --files src | sort | sed -n '1,200p'; git status --short; git log -8 --oneline</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+tests/testthat/test-broadcast-names.R:2:# rray_broadcast_names()
+tests/testthat/test-broadcast-names.R:4:test_that(&quot;rray_broadcast_names() keeps names of axes that don't change&quot;, {
+tests/testthat/test-broadcast-names.R:11:    rray_broadcast_names(x, c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:16:test_that(&quot;rray_broadcast_names() drops names of axes that change&quot;, {
+tests/testthat/test-broadcast-names.R:19:    rray_broadcast_names(x, c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:24:test_that(&quot;rray_broadcast_names() keeps names of an axis broadcast from 1 to 1&quot;, {
+tests/testthat/test-broadcast-names.R:26:  expect_identical(rray_broadcast_names(x, c(1L, 3L)), list(&quot;a&quot;, NULL))
+tests/testthat/test-broadcast-names.R:29:test_that(&quot;rray_broadcast_names() returns NULL when `x` has no names&quot;, {
+tests/testthat/test-broadcast-names.R:31:  expect_null(rray_broadcast_names(x, c(2L, 3L)))
+tests/testthat/test-broadcast-names.R:34:test_that(&quot;rray_broadcast_names() returns NULL when every named axis changes&quot;, {
+tests/testthat/test-broadcast-names.R:36:  expect_null(rray_broadcast_names(x, c(2L, 2L)))
+tests/testthat/test-broadcast-names.R:39:test_that(&quot;rray_broadcast_names() leaves new trailing axes unnamed&quot;, {
+tests/testthat/test-broadcast-names.R:46:    rray_broadcast_names(x, c(2L, 3L, 4L)),
+tests/testthat/test-broadcast-names.R:51:test_that(&quot;rray_broadcast_names() works with 1 dimensional arrays&quot;, {
+tests/testthat/test-broadcast-names.R:53:  expect_identical(rray_broadcast_names(x, 2L), list(c(&quot;a&quot;, &quot;b&quot;)))
+tests/testthat/test-broadcast-names.R:54:  expect_identical(rray_broadcast_names(x, c(2L, 3L)), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+tests/testthat/test-broadcast-names.R:57:test_that(&quot;rray_broadcast_names() works with zero-size axes&quot;, {
+tests/testthat/test-broadcast-names.R:60:    rray_broadcast_names(x, c(0L, 3L)),
+tests/testthat/test-broadcast-names.R:66:# rray_broadcast_names2()
+tests/testthat/test-broadcast-names.R:68:test_that(&quot;rray_broadcast_names2() prefers `x` where its dimension is kept&quot;, {
+tests/testthat/test-broadcast-names.R:76:    rray_broadcast_names2(x, y, c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:81:test_that(&quot;rray_broadcast_names2() falls through to `y` where `x` broadcasts&quot;, {
+tests/testthat/test-broadcast-names.R:85:    rray_broadcast_names2(x, y, c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:90:test_that(&quot;rray_broadcast_names2() falls through to `y` on an unnamed axis&quot;, {
+tests/testthat/test-broadcast-names.R:94:    rray_broadcast_names2(x, y, c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:99:test_that(&quot;rray_broadcast_names2() takes each axis from a different input&quot;, {
+tests/testthat/test-broadcast-names.R:103:    rray_broadcast_names2(x, y, c(3L, 2L)),
+tests/testthat/test-broadcast-names.R:108:test_that(&quot;rray_broadcast_names2() returns NULL when neither input has names&quot;, {
+tests/testthat/test-broadcast-names.R:111:  expect_null(rray_broadcast_names2(x, y, c(2L, 3L)))
+tests/testthat/test-broadcast-names.R:114:test_that(&quot;rray_broadcast_names2() returns NULL when every axis broadcasts&quot;, {
+tests/testthat/test-broadcast-names.R:117:  expect_null(rray_broadcast_names2(x, y, c(2L, 2L)))
+tests/testthat/test-broadcast-names.R:120:test_that(&quot;rray_broadcast_names2() works with differing dimensionality&quot;, {
+tests/testthat/test-broadcast-names.R:125:    rray_broadcast_names2(x, y, c(2L, 3L, 4L)),
+tests/testthat/test-broadcast-names.R:131:# rray_broadcast_names_common()
+tests/testthat/test-broadcast-names.R:133:test_that(&quot;rray_broadcast_names_common() lets the first input to keep an axis win&quot;, {
+tests/testthat/test-broadcast-names.R:141:    rray_broadcast_names_common(x, y, .dimensions = c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:146:test_that(&quot;rray_broadcast_names_common() takes each axis from a different input&quot;, {
+tests/testthat/test-broadcast-names.R:151:    rray_broadcast_names_common(x, y, z, .dimensions = c(1L, 2L, 3L)),
+tests/testthat/test-broadcast-names.R:156:test_that(&quot;rray_broadcast_names_common() skips inputs whose dimension changed&quot;, {
+tests/testthat/test-broadcast-names.R:160:    rray_broadcast_names_common(x, y, .dimensions = c(2L, 2L)),
+tests/testthat/test-broadcast-names.R:165:test_that(&quot;rray_broadcast_names_common() returns NULL when no input has names&quot;, {
+tests/testthat/test-broadcast-names.R:168:  expect_null(rray_broadcast_names_common(x, y, .dimensions = c(2L, 3L)))
+tests/testthat/test-broadcast-names.R:171:test_that(&quot;rray_broadcast_names_common() with one input matches rray_broadcast_names()&quot;, {
+tests/testthat/test-broadcast-names.R:174:    rray_broadcast_names_common(x, .dimensions = c(2L, 3L)),
+tests/testthat/test-broadcast-names.R:175:    rray_broadcast_names(x, c(2L, 3L))
+tests/testthat/test-broadcast-names.R:179:test_that(&quot;rray_broadcast_names_common() returns NULL for empty dots&quot;, {
+tests/testthat/test-broadcast-names.R:180:  expect_null(rray_broadcast_names_common(.dimensions = c(2L, 3L)))
+R/broadcast-names.R:2:rray_broadcast_names &lt;- function(x, dimensions) {
+R/broadcast-names.R:3:  .Call(ffi_rray_broadcast_names, x, dimensions)
+R/broadcast-names.R:6:rray_broadcast_names2 &lt;- function(x, y, dimensions) {
+R/broadcast-names.R:7:  .Call(ffi_rray_broadcast_names2, x, y, dimensions)
+R/broadcast-names.R:10:rray_broadcast_names_common &lt;- function(..., .dimensions) {
+R/broadcast-names.R:11:  .Call(ffi_rray_broadcast_names_common, list2(...), .dimensions)
+src/decl/broadcast-names-decl.h:1:static r_obj* rray_broadcast_names_fill(
+src/arithmetic.c:67:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/reduce-names.c:18:// Mimics `rray_broadcast_names()` ideas, but reduction only ever has 1 input
+src/broadcast-names.c:9:r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions) {
+src/broadcast-names.c:10:  return rray_broadcast_names(ffi_x, ffi_dimensions);
+src/broadcast-names.c:13:r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions) {
+src/broadcast-names.c:14:  return rray_broadcast_names_fill(r_null, x, dimensions);
+src/broadcast-names.c:17:r_obj* ffi_rray_broadcast_names2(
+src/broadcast-names.c:22:  return rray_broadcast_names2(ffi_x, ffi_y, ffi_dimensions);
+src/broadcast-names.c:25:r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions) {
+src/broadcast-names.c:26:  r_obj* out = KEEP(rray_broadcast_names_fill(r_null, x, dimensions));
+src/broadcast-names.c:27:  out = rray_broadcast_names_fill(out, y, dimensions);
+src/broadcast-names.c:32:r_obj* ffi_rray_broadcast_names_common(r_obj* ffi_xs, r_obj* ffi_dimensions) {
+src/broadcast-names.c:33:  return rray_broadcast_names_common(ffi_xs, ffi_dimensions);
+src/broadcast-names.c:36:r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions) {
+src/broadcast-names.c:45:    out = rray_broadcast_names_fill(out, v_xs[i], dimensions);
+src/broadcast-names.c:57:static r_obj* rray_broadcast_names_fill(
+src/init.c:48:extern r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions);
+src/init.c:49:extern r_obj* ffi_rray_broadcast_names2(
+src/init.c:54:extern r_obj* ffi_rray_broadcast_names_common(
+src/init.c:131:  {&quot;ffi_rray_broadcast_names&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names, 2},
+src/init.c:132:  {&quot;ffi_rray_broadcast_names2&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names2, 3},
+src/init.c:133:  {&quot;ffi_rray_broadcast_names_common&quot;,
+src/init.c:134:   (DL_FUNC) &amp;ffi_rray_broadcast_names_common,
+src/split-names.c:21:// Mimics `rray_broadcast_names()` ideas, but splitting returns one set of names
+src/broadcast-names.h:6:r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions);
+src/broadcast-names.h:7:r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions);
+src/broadcast-names.h:8:r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions);
+src/broadcast.c:106:  r_obj* out_names = KEEP(rray_broadcast_names(x, dimensions));
+src/Makevars
+src/arg.c
+src/arg.h
+src/arithmetic-add.c
+src/arithmetic-add.h
+src/arithmetic-divide.c
+src/arithmetic-divide.h
+src/arithmetic-exponentiate.c
+src/arithmetic-exponentiate.h
+src/arithmetic-multiply.c
+src/arithmetic-multiply.h
+src/arithmetic-subtract.c
+src/arithmetic-subtract.h
+src/arithmetic.c
+src/arithmetic.h
+src/axes.c
+src/axes.h
+src/broadcast-names.c
+src/broadcast-names.h
+src/broadcast.c
+src/broadcast.h
+src/cast-common.c
+src/cast-common.h
+src/cast.c
+src/cast.h
+src/decl/arg-decl.h
+src/decl/arithmetic-add-decl.h
+src/decl/arithmetic-divide-decl.h
+src/decl/arithmetic-exponentiate-decl.h
+src/decl/arithmetic-multiply-decl.h
+src/decl/arithmetic-subtract-decl.h
+src/decl/broadcast-decl.h
+src/decl/broadcast-names-decl.h
+src/decl/cast-decl.h
+src/decl/dimensions-decl.h
+src/decl/iterator-decl.h
+src/decl/names-decl.h
+src/decl/ptype-decl.h
+src/decl/reduce-names-decl.h
+src/decl/reduce-prod-decl.h
+src/decl/reduce-sum-decl.h
+src/decl/split-decl.h
+src/decl/split-names-decl.h
+src/decl/utils-decl.h
+src/decl/wrapper-decl.h
+src/dimensionality.c
+src/dimensionality.h
+src/dimensions.c
+src/dimensions.h
+src/init.c
+src/iterator.h
+src/names.c
+src/names.h
+src/ptype-common.c
+src/ptype-common.h
+src/ptype.c
+src/ptype.h
+src/reduce-names.c
+src/reduce-names.h
+src/reduce-prod.c
+src/reduce-prod.h
+src/reduce-sum.c
+src/reduce-sum.h
+src/reduce.c
+src/reduce.h
+src/rlang.c
+src/rlang/arg.c
+src/rlang/arg.h
+src/rlang/attrib.c
+src/rlang/attrib.h
+src/rlang/c-utils.c
+src/rlang/c-utils.h
+src/rlang/call.c
+src/rlang/call.h
+src/rlang/cnd.c
+src/rlang/cnd.h
+src/rlang/cpp/rlang.cpp
+src/rlang/cpp/vec.cpp
+src/rlang/debug.c
+src/rlang/debug.h
+src/rlang/decl/cnd-decl.h
+src/rlang/decl/df-decl.h
+src/rlang/decl/dict-decl.h
+src/rlang/decl/dyn-list-of-decl.h
+src/rlang/decl/env-binding-decl.h
+src/rlang/decl/env-decl.h
+src/rlang/decl/obj-decl.h
+src/rlang/decl/stack-decl.h
+src/rlang/decl/walk-decl.h
+src/rlang/df.c
+src/rlang/df.h
+src/rlang/dict.c
+src/rlang/dict.h
+src/rlang/dots-info.c
+src/rlang/dots-info.h
+src/rlang/dyn-array.c
+src/rlang/dyn-array.h
+src/rlang/dyn-list-of.c
+src/rlang/dyn-list-of.h
+src/rlang/env-binding.c
+src/rlang/env-binding.h
+src/rlang/env.c
+src/rlang/env.h
+src/rlang/eval.c
+src/rlang/eval.h
+src/rlang/export.c
+src/rlang/export.h
+src/rlang/fn.c
+src/rlang/fn.h
+src/rlang/formula.c
+src/rlang/formula.h
+src/rlang/globals.c
+src/rlang/globals.h
+src/rlang/node.c</pre><p class="cut">54 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,240p' src/broadcast-names.c; sed -n '1,230p' tests/testthat/test-broadcast-names.R;…</summary>
+<pre>$ sed -n '1,240p' src/broadcast-names.c; sed -n '1,230p' tests/testthat/test-broadcast-names.R; sed -n '120,190p' tests/testthat/test-arithmetic-add.R; sed -n '135,190p' tests/testthat/test-arithmetic-subtract.R</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;broadcast-names.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;names.h&quot;
+
+#include &quot;decl/broadcast-names-decl.h&quot;
+
+r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions) {
+  return rray_broadcast_names(ffi_x, ffi_dimensions);
+}
+
+r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions) {
+  return rray_broadcast_names_fill(r_null, x, dimensions);
+}
+
+r_obj* ffi_rray_broadcast_names2(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_dimensions
+) {
+  return rray_broadcast_names2(ffi_x, ffi_y, ffi_dimensions);
+}
+
+r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions) {
+  r_obj* out = KEEP(rray_broadcast_names_fill(r_null, x, dimensions));
+  out = rray_broadcast_names_fill(out, y, dimensions);
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_broadcast_names_common(r_obj* ffi_xs, r_obj* ffi_dimensions) {
+  return rray_broadcast_names_common(ffi_xs, ffi_dimensions);
+}
+
+r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions) {
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* out = r_null;
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  for (r_ssize i = 0; i &lt; n; ++i) {
+    out = rray_broadcast_names_fill(out, v_xs[i], dimensions);
+    KEEP_AT(out, out_loc);
+  }
+
+  FREE(1);
+  return out;
+}
+
+// Broadcasting of array names
+//
+// Assumes the inputs are validated arrays and are broadcastable to the
+// `dimensions`. The caller typically checks all of this already.
+static r_obj* rray_broadcast_names_fill(
+  r_obj* out,
+  r_obj* x,
+  r_obj* dimensions
+) {
+  r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+  if (x_names == r_null) {
+    return out;
+  }
+  KEEP(x_names);
+
+  r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, rray_args.x, r_lazy_null));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    if (v_x_names[i] == r_null) {
+      // No names to contribute on this axis
+      continue;
+    }
+    if (v_x_dimensions[i] != v_dimensions[i]) {
+      // No names to contribute when axis is broadcast
+      continue;
+    }
+    if (out != r_null &amp;&amp; r_list_get(out, i) != r_null) {
+      // Names already exist on this axis
+      continue;
+    }
+    if (out == r_null) {
+      out = r_alloc_list(dimensionality);
+      KEEP_AT(out, out_loc);
+    }
+    r_list_poke(out, i, v_x_names[i]);
+  }
+
+  FREE(3);
+  return out;
+}
+# ------------------------------------------------------------------------------
+# rray_broadcast_names()
+
+test_that(&quot;rray_broadcast_names() keeps names of axes that don't change&quot;, {
+  x &lt;- array(
+    1:6,
+    c(2L, 3L),
+    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+  expect_identical(
+    rray_broadcast_names(x, c(2L, 3L)),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+test_that(&quot;rray_broadcast_names() drops names of axes that change&quot;, {
+  x &lt;- array(1:3, c(1L, 3L), dimnames = list(&quot;only&quot;, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  expect_identical(
+    rray_broadcast_names(x, c(2L, 3L)),
+    list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+test_that(&quot;rray_broadcast_names() keeps names of an axis broadcast from 1 to 1&quot;, {
+  x &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;a&quot;, &quot;b&quot;))
+  expect_identical(rray_broadcast_names(x, c(1L, 3L)), list(&quot;a&quot;, NULL))
+})
+
+test_that(&quot;rray_broadcast_names() returns NULL when `x` has no names&quot;, {
+  x &lt;- array(1:6, c(2L, 3L))
+  expect_null(rray_broadcast_names(x, c(2L, 3L)))
+})
+
+test_that(&quot;rray_broadcast_names() returns NULL when every named axis changes&quot;, {
+  x &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;a&quot;, &quot;b&quot;))
+  expect_null(rray_broadcast_names(x, c(2L, 2L)))
+})
+
+test_that(&quot;rray_broadcast_names() leaves new trailing axes unnamed&quot;, {
+  x &lt;- array(
+    1:6,
+    c(2L, 3L),
+    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+  expect_identical(
+    rray_broadcast_names(x, c(2L, 3L, 4L)),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;), NULL)
+  )
+})
+
+test_that(&quot;rray_broadcast_names() works with 1 dimensional arrays&quot;, {
+  x &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+  expect_identical(rray_broadcast_names(x, 2L), list(c(&quot;a&quot;, &quot;b&quot;)))
+  expect_identical(rray_broadcast_names(x, c(2L, 3L)), list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+})
+
+test_that(&quot;rray_broadcast_names() works with zero-size axes&quot;, {
+  x &lt;- array(integer(), c(0L, 3L), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  expect_identical(
+    rray_broadcast_names(x, c(0L, 3L)),
+    list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+# ------------------------------------------------------------------------------
+# rray_broadcast_names2()
+
+test_that(&quot;rray_broadcast_names2() prefers `x` where its dimension is kept&quot;, {
+  x &lt;- array(
+    1:6,
+    c(2L, 3L),
+    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+  expect_identical(
+    rray_broadcast_names2(x, y, c(2L, 3L)),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+test_that(&quot;rray_broadcast_names2() falls through to `y` where `x` broadcasts&quot;, {
+  x &lt;- array(1:3, c(1L, 3L), dimnames = list(&quot;only&quot;, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+  expect_identical(
+    rray_broadcast_names2(x, y, c(2L, 3L)),
+    list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+test_that(&quot;rray_broadcast_names2() falls through to `y` on an unnamed axis&quot;, {
+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+  expect_identical(</pre><p class="cut">215 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning R names handling inspection</strong></p>
+</details>
+<p>The current rule is indeed axis-by-axis: keep the first contributor whose size survives broadcasting, so one result can have row names from <code>x</code> and column names from <code>y</code>. That is a coherent array rule, but it is not obviously base R’s rule; I’m now checking R’s documentation and C implementation, plus executable examples where names and dimnames disagree.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;Most attributes are taken|names.*first argument|attributes.*longer|binary.*attributes&quot;…</summary>
+<pre>$ rg -n &quot;Most attributes are taken|names.*first argument|attributes.*longer|binary.*attributes&quot; ~/files/r/r-svn/src/library/base/man ~/files/r/r-svn/doc ~/files/r/r-svn/src/main 2&gt;/dev/null | head -n 120; rg -n &quot;copyMostAttrib|DUPLICATE_ATTRIB|namesgets|dimnames&quot; ~/files/r/r-svn/src/main/arithmetic.c ~/files/r/r-svn/src/main/relop.c ~/files/r/r-svn/src/main/logic.c 2&gt;/dev/null | head -n 220</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+~/files/r/r-svn/doc/NEWS.1:6451:    o	Printing of attributes of a list element no longer precedes
+~/files/r/r-svn/doc/manual/R-lang.texi:746:Binary operations normally copy most attributes from the longer argument
+~/files/r/r-svn/doc/NEWS.2:9522:    o	Deliberately using malformed source attributes no longer
+~/files/r/r-svn/src/main/complex.c:235:    /* Copy attributes from longer argument. */
+~/files/r/r-svn/doc/manual/R-ints.texi:700:@code{copyMostAttrib} to copy most attributes from the longer
+~/files/r/r-svn/src/main/arithmetic.c:663:    /* need to preserve object here, as *_binary copies class attributes */
+~/files/r/r-svn/src/main/arithmetic.c:945:    /* Copy attributes from longer argument. */
+~/files/r/r-svn/src/main/arithmetic.c:1196:    /* Copy attributes from longer argument. */
+~/files/r/r-svn/src/library/base/man/Arithmetic.Rd:79:  complicated.  Most attributes are taken from the longer argument.
+~/files/r/r-svn/src/library/base/man/Arithmetic.Rd:88:  dimensions and dimnames are taken from first argument if it is an
+~/files/r/r-svn/src/library/base/man/Logic.Rd:93:  complicated.  Most attributes are taken from the longer argument, the
+~/files/r/r-svn/src/library/base/man/cbind.Rd:135:  For \code{cbind} row names are taken from the first argument with
+~/files/r/r-svn/src/library/base/man/cbind.Rd:139:  For \code{rbind} column names are taken from the first argument with
+~/files/r/r-svn/src/main/arithmetic.c:741:    SEXP dimnames = PROTECT(getAttrib(s1, R_DimNamesSymbol));
+~/files/r/r-svn/src/main/arithmetic.c:744:    if(dimnames != R_NilValue) setAttrib(ans, R_DimNamesSymbol, dimnames);
+~/files/r/r-svn/src/main/arithmetic.c:948:	copyMostAttrib(s2, ans);
+~/files/r/r-svn/src/main/arithmetic.c:950:	copyMostAttrib(s1, ans); /* Done 2nd so s1's attrs overwrite s2's */
+~/files/r/r-svn/src/main/arithmetic.c:1199:	copyMostAttrib(s2, ans);
+~/files/r/r-svn/src/main/arithmetic.c:1201:	copyMostAttrib(s1, ans); /* Done 2nd so s1's attrs overwrite s2's */
+~/files/r/r-svn/src/main/arithmetic.c:1246:	SHALLOW_DUPLICATE_ATTRIB(sy, sa);
+~/files/r/r-svn/src/main/arithmetic.c:1283:	SHALLOW_DUPLICATE_ATTRIB(sy, sa);
+~/files/r/r-svn/src/main/arithmetic.c:1505:	SHALLOW_DUPLICATE_ATTRIB(s, x);
+~/files/r/r-svn/src/main/arithmetic.c:1538:	if (na == 0) SHALLOW_DUPLICATE_ATTRIB(sy, sa);	\
+~/files/r/r-svn/src/main/arithmetic.c:1566:    if      (n == na) SHALLOW_DUPLICATE_ATTRIB(sy, sa);	\
+~/files/r/r-svn/src/main/arithmetic.c:1567:    else if (n == nb) SHALLOW_DUPLICATE_ATTRIB(sy, sb);	\
+~/files/r/r-svn/src/main/arithmetic.c:1973:	if (na == 0) SHALLOW_DUPLICATE_ATTRIB(sy, sa);		\
+~/files/r/r-svn/src/main/arithmetic.c:1993:    if      (n == na) SHALLOW_DUPLICATE_ATTRIB(sy, sa);	\
+~/files/r/r-svn/src/main/arithmetic.c:1994:    else if (n == nb) SHALLOW_DUPLICATE_ATTRIB(sy, sb);	\
+~/files/r/r-svn/src/main/arithmetic.c:1995:    else if (n == nc) SHALLOW_DUPLICATE_ATTRIB(sy, sc);	\
+~/files/r/r-svn/src/main/arithmetic.c:2199:	if (na == 0) SHALLOW_DUPLICATE_ATTRIB(sy, sa);			\
+~/files/r/r-svn/src/main/arithmetic.c:2237:    if      (n == na) SHALLOW_DUPLICATE_ATTRIB(sy, sa);	\
+~/files/r/r-svn/src/main/arithmetic.c:2238:    else if (n == nb) SHALLOW_DUPLICATE_ATTRIB(sy, sb);	\
+~/files/r/r-svn/src/main/arithmetic.c:2239:    else if (n == nc) SHALLOW_DUPLICATE_ATTRIB(sy, sc);	\
+~/files/r/r-svn/src/main/arithmetic.c:2240:    else if (n == nd) SHALLOW_DUPLICATE_ATTRIB(sy, sd);	\
+~/files/r/r-svn/src/main/arithmetic.c:2414:    if      (n == na) SHALLOW_DUPLICATE_ATTRIB(sy, sa);	\
+~/files/r/r-svn/src/main/arithmetic.c:2415:    else if (n == nb) SHALLOW_DUPLICATE_ATTRIB(sy, sb);	\
+~/files/r/r-svn/src/main/arithmetic.c:2416:    else if (n == nc) SHALLOW_DUPLICATE_ATTRIB(sy, sc);	\
+~/files/r/r-svn/src/main/arithmetic.c:2417:    else if (n == nd) SHALLOW_DUPLICATE_ATTRIB(sy, sd);	\
+~/files/r/r-svn/src/main/arithmetic.c:2418:    else if (n == ne) SHALLOW_DUPLICATE_ATTRIB(sy, se);	\
+~/files/r/r-svn/src/main/logic.c:183:    SEXP x, dim, dimnames, names;
+~/files/r/r-svn/src/main/logic.c:199:	PROTECT(dimnames = getAttrib(arg, R_DimNamesSymbol));
+~/files/r/r-svn/src/main/logic.c:202:	if(dimnames != R_NilValue) setAttrib(x, R_DimNamesSymbol, dimnames);</pre></details>
+<details class="tool"><summary>Bash: sed -n '65,105p' ~/files/r/r-svn/src/library/base/man/Arithmetic.Rd; sed -n '730,7…</summary>
+<pre>$ sed -n '65,105p' ~/files/r/r-svn/src/library/base/man/Arithmetic.Rd; sed -n '730,770p' ~/files/r/r-svn/doc/manual/R-lang.texi; sed -n '900,970p' ~/files/r/r-svn/src/main/arithmetic.c; sed -n '1165,1210p' ~/files/r/r-svn/src/main/arithmetic.c; sed -n '620,770p' ~/files/r/r-svn/src/main/arithmetic.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+  \code{\link{NA_integer_}} or \code{\link{NaN}} (depending on the
+  \code{\link{typeof}} of the arguments) or for some non-\link{finite}
+  arguments, e.g., when the RHS of the identity above
+  amounts to \code{Inf - Inf}.
+
+  If either argument is complex the result will be complex, otherwise if
+  one or both arguments are numeric, the result will be numeric.  If
+  both arguments are of type \link{integer}, the type of the result of
+  \code{/} and \code{^} is \link{numeric} and for the other operators it
+  is integer (with overflow, which occurs at
+  \eqn{\pm(2^{31} - 1)}{+/- (2^31 - 1)},
+  returned as \code{NA_integer_} with a warning).
+
+  The rules for determining the attributes of the result are rather
+  complicated.  Most attributes are taken from the longer argument.
+  Names will be copied from the first if it is the same length as the
+  answer, otherwise from the second if that is.  If the arguments are
+  the same length, attributes will be copied from both, with those of
+  the first argument taking precedence when the same attribute is
+  present in both arguments. For time series, these operations are
+  allowed only if the series are compatible, when the class and
+  \code{\link{tsp}} attribute of whichever is a time series (the same,
+  if both are) are used.  For arrays (and an array result) the
+  dimensions and dimnames are taken from first argument if it is an
+  array, otherwise the second.
+
+}
+\details{
+  The unary and binary arithmetic operators are generic functions:
+  methods can be written for them individually or via the
+  \code{\link[=S3groupGeneric]{Ops}} group generic function.  (See
+  \code{\link[=S3groupGeneric]{Ops}} for how dispatch is computed.)
+
+  If applied to arrays the result will be an array if this is sensible
+  (for example it will not if the recycling rule has been invoked).
+
+  Logical vectors will be coerced to integer or numeric vectors,
+  \code{FALSE} having value zero and \code{TRUE} having value one.
+
+  \code{1 ^ y} and \code{y ^ 0} are \code{1}, \emph{always}.
+  \code{x ^ y} should also give the proper limit result when
+
+The @code{tsp} attribute is used to hold parameters of time series,
+start, end, and frequency.  This construction is mainly used to handle
+series with periodic substructure such as monthly or quarterly data.
+
+@node Copying of attributes
+@subsection Copying of attributes
+
+Whether attributes should be copied when an object is altered is a
+complex area, but there are some general rules (@I{Becker}, @I{Chambers}
+&amp; @I{Wilks}, 1988, pp. 144--6).
+
+Scalar functions (those which operate element-by-element on a vector and
+whose output is similar to the input) should preserve attributes (except
+perhaps class).
+
+Binary operations normally copy most attributes from the longer argument
+(and if they are of the same length from both, preferring the values on
+the first).  Here `most' means all except the @code{names}, @code{dim}
+and @code{dimnames} which are set appropriately by the code for the
+operator.
+
+Subsetting (other than by an empty index) generally drops all attributes
+except @code{names}, @code{dim} and @code{dimnames} which are reset as
+appropriate.  On the other hand, @I{subassignment} generally preserves
+attributes even if the length is changed.  Coercion drops all
+attributes.
+
+The default method for sorting drops all attributes except names, which
+are sorted along with the object.
+
+
+@node Special compound objects
+@section Special compound objects
+
+
+@node Factors
+@subsection Factors
+
+Factors are used to describe items that can have a finite number of
+values (gender, social class, etc.).  A factor has a @code{levels}
+		});
+	}
+	break;
+    case MODOP:
+	{
+	    int *pa = INTEGER(ans);
+	    const int *px1 = INTEGER_RO(s1);
+	    const int *px2 = INTEGER_RO(s2);
+	    MOD_ITERATE2_CHECK(NINTERRUPT, n, n1, n2, i, i1, i2, {
+		    x1 = px1[i1];
+		    x2 = px2[i2];
+		    if (x1 == NA_INTEGER || x2 == NA_INTEGER || x2 == 0)
+			pa[i] = NA_INTEGER;
+		    else {
+			pa[i] = /* till 0.63.2:	x1 % x2 */
+			    (x1 &gt;= 0 &amp;&amp; x2 &gt; 0) ? x1 % x2 :
+			    (int)myfmod((double)x1,(double)x2);
+		    }
+		});
+	}
+	break;
+    case IDIVOP:
+	{
+	    int *pa = INTEGER(ans);
+	    const int *px1 = INTEGER_RO(s1);
+	    const int *px2 = INTEGER_RO(s2);
+	    MOD_ITERATE2_CHECK(NINTERRUPT, n, n1, n2, i, i1, i2, {
+		    x1 = px1[i1];
+		    x2 = px2[i2];
+		    /* This had x %/% 0 == 0 prior to 2.14.1, but
+		       it seems conventionally to be undefined */
+		    if (x1 == NA_INTEGER || x2 == NA_INTEGER || x2 == 0)
+			pa[i] = NA_INTEGER;
+		    else
+			pa[i] = (int) floor((double)x1 / (double)x2);
+		});
+	}
+	break;
+    }
+    UNPROTECT(1);
+
+    /* quick return if there are no attributes */
+    if (ATTRIB(s1) == R_NilValue &amp;&amp; ATTRIB(s2) == R_NilValue)
+	return ans;
+
+    /* Copy attributes from longer argument. */
+
+    if (ans != s2 &amp;&amp; n == n2 &amp;&amp; ATTRIB(s2) != R_NilValue)
+	copyMostAttrib(s2, ans);
+    if (ans != s1 &amp;&amp; n == n1 &amp;&amp; ATTRIB(s1) != R_NilValue)
+	copyMostAttrib(s1, ans); /* Done 2nd so s1's attrs overwrite s2's */
+
+    return ans;
+}
+
+#define R_INTEGER(x) (double) ((x) == NA_INTEGER ? NA_REAL : (x))
+
+static SEXP real_binary(ARITHOP_TYPE code, SEXP s1, SEXP s2)
+{
+    R_xlen_t i, i1, i2, n, n1, n2;
+    SEXP ans;
+
+    /* Note: &quot;s1&quot; and &quot;s2&quot; are protected above. */
+    n1 = XLENGTH(s1);
+    n2 = XLENGTH(s2);
+
+    /* S4-compatibility change: if n1 or n2 is 0, result is of length 0 */
+    if (n1 == 0 || n2 == 0) return(allocVector(REALSXP, 0));
+
+    n = (n1 &gt; n2) ? n1 : n2;
+    PROTECT(ans = R_allocOrReuseVector(s1, s2, REALSXP, n));
+	break;
+    case IDIVOP:
+	if(TYPEOF(s1) == REALSXP &amp;&amp; TYPEOF(s2) == REALSXP) {
+	    double *da = REAL(ans);
+	    const double *px1 = REAL_RO(s1);
+	    const double *px2 = REAL_RO(s2);
+	    MOD_ITERATE2_CHECK(NINTERRUPT, n, n1, n2, i, i1, i2,
+			       da[i] = myfloor(px1[i1], px2[i2]););
+	}
+	else if(TYPEOF(s1) == INTSXP ) {
+	    double *da = REAL(ans);
+	    const int *px1 = INTEGER_RO(s1);
+	    const double *px2 = REAL_RO(s2);
+	    MOD_ITERATE2_CHECK(NINTERRUPT, n, n1, n2, i, i1, i2,
+			       da[i] = myfloor(R_INTEGER(px1[i1]), px2[i2]););
+	}
+	else if(TYPEOF(s2) == INTSXP ) {
+	    double *da = REAL(ans);
+	    const double *px1 = REAL_RO(s1);
+	    const int *px2 = INTEGER_RO(s2);
+	    MOD_ITERATE2_CHECK(NINTERRUPT, n, n1, n2, i, i1, i2,
+			       da[i] = myfloor(px1[i1], R_INTEGER(px2[i2])););
+	}
+	break;
+    }
+    UNPROTECT(1);
+
+    /* quick return if there are no attributes */
+    if (ATTRIB(s1) == R_NilValue &amp;&amp; ATTRIB(s2) == R_NilValue)
+	return ans;
+
+    /* Copy attributes from longer argument. */
+
+    if (ans != s2 &amp;&amp; n == n2 &amp;&amp; ATTRIB(s2) != R_NilValue)
+	copyMostAttrib(s2, ans);
+    if (ans != s1 &amp;&amp; n == n1 &amp;&amp; ATTRIB(s1) != R_NilValue)
+	copyMostAttrib(s1, ans); /* Done 2nd so s1's attrs overwrite s2's */
+
+    return ans;
+}
+
+
+/* Mathematical Functions of One Argument */</pre><p class="cut">154 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '540,680p' ~/files/r/r-svn/src/main/arithmetic.c; R --vanilla --quiet -e 'c…</summary>
+<pre>$ sed -n '540,680p' ~/files/r/r-svn/src/main/arithmetic.c; R --vanilla --quiet -e 'cat(R.version.string, &quot;\n&quot;)'</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+
+    R_xlen_t
+	nx = XLENGTH(x),
+	ny = XLENGTH(y);
+    if (ATTRIB(x) != R_NilValue) {
+	xattr = true;
+	xarray = isArray(x);
+	xts = isTs(x);
+	xS4 = isS4(x);
+    }
+    else xattr = xarray = xts = xS4 = false;
+    if (ATTRIB(y) != R_NilValue) {
+	yattr = true;
+	yarray = isArray(y);
+	yts = isTs(y);
+	yS4 = isS4(y);
+    }
+    else yattr = yarray = yts = yS4 = false;
+
+#define R_ARITHMETIC_ARRAY_1_SPECIAL
+
+#ifdef R_ARITHMETIC_ARRAY_1_SPECIAL
+    /* If either x or y is a matrix with length 1 and the other is a
+       vector of a different length, we want to coerce the matrix to be a vector.
+       Do we want to?  We don't do it!  BDR 2004-03-06
+
+       From 3.4.0 (Sep. 2016), this signals a warning,
+       and in the future we will disable these 2 clauses,
+       so it will give an error.
+    */
+
+    /* FIXME: Danger Will Robinson.
+     * -----  We might be trashing arguments here.
+     */
+    if (xarray != yarray) {
+    	if (xarray &amp;&amp; nx==1 &amp;&amp; ny!=1) {
+	    if(ny != 0)
+		warningcall(call, _(
+	&quot;Recycling array of length 1 in array-vector arithmetic is deprecated.\n\
+  Use c() or as.vector() instead.&quot;));
+    	    REPROTECT(x = duplicate(x), xpi);
+    	    setAttrib(x, R_DimSymbol, R_NilValue);
+    	}
+    	if (yarray &amp;&amp; ny==1 &amp;&amp; nx!=1) {
+	    if(nx != 0)
+		warningcall(call, _(
+	&quot;Recycling array of length 1 in vector-array arithmetic is deprecated.\n\
+  Use c() or as.vector() instead.&quot;));
+    	    REPROTECT(y = duplicate(y), ypi);
+    	    setAttrib(y, R_DimSymbol, R_NilValue);
+    	}
+    }
+#endif
+
+    SEXP dims, xnames, ynames;
+    if (xarray || yarray) {
+	/* if one is a length-atleast-1-array and the
+	 * other  is a length-0 *non*array, then do not use array treatment */
+	if (xarray &amp;&amp; yarray) {
+	    if (!conformable(x, y))
+		errorcall(call, _(&quot;non-conformable arrays&quot;));
+	    PROTECT(dims = getAttrib(x, R_DimSymbol)); nprotect++;
+	}
+	else if (xarray &amp;&amp; (ny != 0 || nx == 0)) {
+	    PROTECT(dims = getAttrib(x, R_DimSymbol)); nprotect++;
+	}
+	else if (yarray &amp;&amp; (nx != 0 || ny == 0)) {
+	    PROTECT(dims = getAttrib(y, R_DimSymbol)); nprotect++;
+	} else
+	    dims = R_NilValue;
+	if (xattr) {
+	    PROTECT(xnames = getAttrib(x, R_DimNamesSymbol));
+	    nprotect++;
+	}
+	else xnames = R_NilValue;
+	if (yattr) {
+	    PROTECT(ynames = getAttrib(y, R_DimNamesSymbol));
+	    nprotect++;
+	}
+	else ynames = R_NilValue;
+    }
+    else {
+	dims = R_NilValue;
+	if (xattr) {
+	    PROTECT(xnames = getAttrib(x, R_NamesSymbol));
+	    nprotect++;
+	}
+	else xnames = R_NilValue;
+	if (yattr) {
+	    PROTECT(ynames = getAttrib(y, R_NamesSymbol));
+	    nprotect++;
+	}
+	else ynames = R_NilValue;
+    }
+
+    SEXP klass = NULL, tsp = NULL; // -Wall
+    if (xts || yts) {
+	if (xts &amp;&amp; yts) {
+	    /* could check ts conformance here */
+	    PROTECT(tsp = getAttrib(x, R_TspSymbol));
+	    PROTECT(klass = getAttrib(x, R_ClassSymbol));
+	}
+	else if (xts) {
+	    if (nx &lt; ny)
+		ErrorMessage(call, ERROR_TSVEC_MISMATCH);
+	    PROTECT(tsp = getAttrib(x, R_TspSymbol));
+	    PROTECT(klass = getAttrib(x, R_ClassSymbol));
+	}
+	else {			/* (yts) */
+	    if (ny &lt; nx)
+		ErrorMessage(call, ERROR_TSVEC_MISMATCH);
+	    PROTECT(tsp = getAttrib(y, R_TspSymbol));
+	    PROTECT(klass = getAttrib(y, R_ClassSymbol));
+	}
+	nprotect += 2;
+    }
+
+    if (nx &gt; 0 &amp;&amp; ny &gt; 0 &amp;&amp;
+	((nx &gt; ny) ? nx % ny : ny % nx) != 0) // mismatch
+	warningcall(call,
+		    _(&quot;longer object length is not a multiple of shorter object length&quot;));
+
+    SEXP val;
+    /* need to preserve object here, as *_binary copies class attributes */
+    if (TYPEOF(x) == CPLXSXP || TYPEOF(y) == CPLXSXP) {
+/* TODO: if not both are CPLX, work with &quot;coordinate-wise   scalar o &lt;2D-vector&gt; &quot;
+   1) can be *faster* for all ops
+   2) for '*' and '/' (with  y  DBL/INT/LGL ) really different use C standard &lt;real&gt; o &lt;cmplx&gt;
+*/
+	COERCE_IF_NEEDED(x, CPLXSXP, xpi);
+	COERCE_IF_NEEDED(y, CPLXSXP, ypi);
+	val = complex_binary(oper, x, y);
+    }
+    else if (TYPEOF(x) == REALSXP || TYPEOF(y) == REALSXP) {
+	/* real_binary can handle REALSXP or INTSXP operand, but not LGLSXP. */
+	/* Can get a LGLSXP. In base-Ex.R on 24 Oct '06, got 8 of these. */
+	if (TYPEOF(x) != INTSXP) COERCE_IF_NEEDED(x, REALSXP, xpi);
+	if (TYPEOF(y) != INTSXP) COERCE_IF_NEEDED(y, REALSXP, ypi);
+	val = real_binary(oper, x, y);
+    }
+    else val = integer_binary(oper, x, y, call);
+&gt; cat(R.version.string, &quot;
++ &quot;)
+R version 4.6.0 alpha (2026-04-08 r89818) 
+&gt; </pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Researching R array broadcasting semantics</strong></p>
+<p><strong>Analyzing R names and dimnames precedence</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Researching R array broadcasting semantics</strong></p>
+<p><strong>Analyzing R names and dimnames precedence</strong></p>
+</details>
+<details class="tool"><summary>Web</summary>
+<pre>const out = await tools.web__run({search_query:[{q:&quot;site:stat.ethz.ch/R-manual/R-devel/library/base/html/Arithmetic.html attributes names dimensions dimnames first argument&quot;},{q:&quot;site:cran.r-project.org/doc/manuals/r-devel/R-ints.html arithmetic attributes names dimnames&quot;},{q:&quot;site:vctrs.r-lib.org names arithmetic vector attributes FAQ names&quot;}],&quot;response_length&quot;:&quot;long&quot;}); text(out)</pre><pre class="output">Script completed
+Wall time 1.2 seconds
+Output:
+
+R: Arithmetic Operators (https://stat.ethz.ch/R-manual/R-devel/RHOME/library/base/html/Arithmetic.html)
+citeturn0search0 [wordlim: 200] Crawled: last month; Arithmetic {base}  | R Documentation ... If the arguments are the same length, attributes will be copied from both, with those of the first argument taking precedence when the same attribute is present in both arguments. ... For arrays (and an array result) the dimensions and dimnames are taken from first argument if it is an array, otherwise the second.
+Arithmetic {base}  | R Documentation
+
+## Arithmetic Operators
+
+### Description
+
+These unary and binary operators perform arithmetic on numeric or complex vectors (or objects which can be coerced to them).
+
+### Usage
+    
+    `+ x
+    - x
+    x + y
+    x - y
+    x * y
+    x / y
+    x ^ y
+    x %% y
+    x %/% y
+    `
+
+### Arguments
+
+`x`, `y`  | numeric or complex vectors or objects which can be coerced to such, notably `array`s including matrices, or other objects for which methods have been written.
+
+### Details
+
+The unary and binary arithmetic operators are generic functions: methods can be written for them individually or via the `Ops` group generic function. (See `Ops` for how dispatch is computed.)
+
+If applied to arrays the result will be an array if this is sensible (for example it will not if the recycling rule has been invoked).
+
+Logical vectors will be coerced to integer or numeric vectors, `FALSE` having value zero and `TRUE` having value one.
+
+`1 ^ y` and `y ^ 0` are `1`, always. `x ^ y` should also give the proper limit result when either (numeric) argument is infinite (one of `Inf` or `-Inf`).
+### Value
+
+Unary `+` and unary `-` return a numeric or complex vector. All attributes (including class) are preserved if there is no coercion: logical `x` is coerced to integer and names, dims and dimnames are preserved.
+
+The binary operators return vectors containing the result of the element by element operations. If involving a zero-length vector the result has length zero. Otherwise, the elements of shorter vectors are recycled as necessary (with a `warning` when they are recycled only fractionally). The operators are `+` for addition, `-` for subtraction, `*` for multiplication, `/` for division and `^` for exponentiation.
+
+`%%` indicates `x mod y` (“x modulo y”), i.e., computes the ‘remainder’ `r &lt;- x %% y`, and `%/%` indicates integer division, where R uses “floored” integer division, i.e., `q &lt;- x %/% y := floor(x/y)`, as promoted by Donald Knuth, see the Wikipedia page on ‘Modulo operation’, and hence `sign(r) == sign(y)`. It is guaranteed that (up to rounding error)
+    
+        x == (x %% y) + y * (x %/% y)    
+
+unless `y == 0` where the result of `%%` is `NA_integer_` or `NaN` (depending on the `typeof` of the arguments) or for some non-finite arguments, e.g., when the RHS of the identity above amounts to `Inf - Inf`.
+
+If either argument is complex the result will be complex, otherwise if one or both arguments are numeric, the result will be numeric. If both arguments are of type integer, the type of the result of `/` and `^` is numeric and for the other operators it is integer (with overflow, which occurs at `\pm(2^{31} - 1)`, returned as `NA_integer_` with a warning).
+
+The rules for determining the attributes of the result are rather complicated. Most attributes are taken from the longer argument. Names will be copied from the first if it is the same length as the answer, otherwise from the second if that is. If the arguments are the same length, attributes will be copied from both, with those of the first argument taking precedence when the same attribute is present in both arguments. For time series, these operations are allowed only if the series are compatible, when the class and `tsp` attribute of whichever is a time series (the same, if both are) are used. For arrays (and an array result) the dimensions and dimnames are taken from first argument if it is an array, otherwise the second.
+
+--------------------------------------------------------------------------------
+Index of /R-manual/R-devel/library/base/html (https://stat.ethz.ch/R-manual/R-devel/library/base/html/)
+citeturn0search1 [wordlim: 200] Crawled: last week; # Index of /R-manual/R-devel/library/base/htmlImage: [ICO]  | Name  | Last modified  | Size  | Description ... Image: [TXT]  | Arithmetic.html  | 2026-02-12 01:48  | 12K  |
+# Index of /R-manual/R-devel/library/base/html
+
+Image: [ICO]  | Name  | Last modified  | Size  | Description
+--- | --- | --- | --- | ---
+
+* * *
+
+---
+Image: [PARENTDIR]  | Parent Directory  |    | -  |  
+Image: [TXT]  | 00Index.html  | 2026-02-24 01:51  | 149K  |  
+Image: [TXT]  | Arithmetic.html  | 2026-02-12 01:48  | 12K  |  
+Image: [TXT]  | AsIs.html  | 2025-08-18 01:49  | 3.3K  |  
+Image: [TXT]  | Bessel.html  | 2025-08-18 01:49  | 10K  |  
+Image: [TXT]  | CallExternal.html  | 2025-10-10 01:49  | 5.2K  |  
+Image: [TXT]  | Colon.html  | 2025-08-18 01:49  | 3.9K  |  
+Image: [TXT]  | Comparison.html  | 2025-09-18 01:49  | 8.4K  |  
+Image: [TXT]  | Constants.html  | 2025-08-18 01:49  | 3.0K  |  
+Image: [TXT]  | Control.html  | 2025-09-24 01:49  | 6.3K  |  
+--------------------------------------------------------------------------------
+R: Multi-way Arrays (https://stat.ethz.ch/R-manual/R-devel/library/base/html/array.html)
+citeturn0search2 [wordlim: 200] Crawled: 2 months ago; array {base}  | R Documentation ... It is simply a vector which is stored with additional attributes giving the dimensions (attribute `&quot;dim&quot;`) and optionally names for those dimensions (attribute `&quot;dimnames&quot;`). ... The `&quot;dimnames&quot;` attribute is optional: if present it is a list with one component for each dimension, either `NULL` or a character vector of the length given by the element of the `&quot;dim&quot;` attribute for that dimension. ... `is.array` returns `TRUE` or `FALSE` depending on whether its argument is an array (i.e., has a `dim` attribute of positive length) or not.
+array {base}  | R Documentation
+
+## Multi-way Arrays
+
+### Description
+
+Creates or tests for arrays.
+
+### Usage
+    
+    `array(data = NA, dim = length(data), dimnames = NULL)
+    as.array(x, ...)
+    is.array(x)
+    `
+
+### Arguments
+
+`data`  | a vector (including a list or `expression` vector) giving data to fill the array. Non-atomic classed objects are coerced by `as.vector`.
+`dim`  | the dim attribute for the array to be created, that is an integer vector of length one or more giving the maximal indices in each dimension.
+`dimnames`  | either `NULL` or the names for the dimensions. This must be a list (or it will be ignored) with one component for each dimension, either `NULL` or a character vector of the length given by `dim` for that dimension. The list can be named, and the list names will be used as names for the dimensions. If the list is shorter than the number of dimensions, it is extended by `NULL`s to the length required.
+`x`  | an R object.
+`...`  | additional arguments to be passed to or from methods.
+
+### Details
+
+An array in R can have one, two or more dimensions. It is simply a vector which is stored with additional attributes giving the dimensions (attribute `&quot;dim&quot;`) and optionally names for those dimensions (attribute `&quot;dimnames&quot;`).
+
+A two-dimensional array is the same thing as a `matrix`.
+
+One-dimensional arrays often look like vectors, but may be handled differently by some functions: `str` does distinguish them in recent versions of R.
+
+The `&quot;dim&quot;` attribute is an integer vector of length one or more containing non-negative values: the product of the values must match the length of the array.
+
+The `&quot;dimnames&quot;` attribute is optional: if present it is a list with one component for each dimension, either `NULL` or a character vector of the length given by the element of the `&quot;dim&quot;` attribute for that dimension.
+
+`is.array` is a primitive function.
+
+For a list array, the `print` method prints entries of length not one in the form ‘⁠integer,7⁠’ indicating the type and length.
+--------------------------------------------------------------------------------
+R: Dimensions of an Object (https://stat.ethz.ch/R-manual/R-devel/library/base/html/dim.html)
+citeturn0search3 [wordlim: 200] Crawled: 1.1 years ago; dim {base}  | R Documentation ... Retrieve or set the dimension of an object. ... The replacement method changes the `&quot;dim&quot;` attribute (provided the new value is compatible) and removes any `&quot;dimnames&quot;` and `&quot;names&quot;` attributes.
+dim {base}  | R Documentation
+
+## Dimensions of an Object
+
+### Description
+
+Retrieve or set the dimension of an object.
+
+### Usage
+    
+    `dim(x)
+    dim(x) &lt;- value
+    `
+
+### Arguments
+
+`x`  | an R object, for example a matrix, array or data frame.
+`value`  | for the default method, either `NULL` or a numeric vector, which is coerced to integer (by truncation).
+
+### Details
+
+The functions `dim` and `dim&lt;-` are internal generic primitive functions.
+
+`dim` has a method for `data.frame`s, which returns the lengths of the `row.names` attribute of `x` and of `x` (as the numbers of rows and columns respectively).
+
+### Value
+
+For an array (and hence in particular, for a matrix) `dim` retrieves the `dim` attribute of the object. It is `NULL` or a vector of mode `integer`.
+
+The replacement method changes the `&quot;dim&quot;` attribute (provided the new value is compatible) and removes any `&quot;dimnames&quot;` and `&quot;names&quot;` attributes.
+
+### References
+
+⁠Becker RA, Chambers JM, Wilks AR (1988). The New S Language. Chapman and Hall/CRC, London.
+
+### See Also
+
+`ncol`, `nrow` and `dimnames`.
+
+### Examples
+    
+    `x &lt;- 1:12 ; dim(x) &lt;- c(3,4)
+    x
+    
+    # simple versions of nrow and ncol could be defined as follows
+    nrow0 &lt;- function(x) dim(x)[1]
+    ncol0 &lt;- function(x) dim(x)[2]
+    `
+--------------------------------------------------------------------------------
+R: Dimnames of an Object (https://www.stat.ethz.ch/R-manual/R-devel/library/base/html/dimnames.html)
+citeturn0search4 [wordlim: 200] Crawled: 8 months ago; `unique`  | logical indicating that the dimnames constructed are unique within each dimension in the sense of `make.unique`. ... For an `array` (and hence in particular, for a `matrix`), they retrieve or set the `dimnames` attribute (see attributes) of the object.A list `value` can have names, and these will be used to label the dimensions of the array where appropriate. ...     provideDimnames(rbind(1, 2:3), base = list(&quot;&quot;), unique=FALSE)
+
+## Dimnames of an Object
+
+### Description
+
+Retrieve or set the dimnames of an object.
+
+### Usage
+    
+    `dimnames(x)
+    dimnames(x) &lt;- value
+    
+    provideDimnames(x, sep = &quot;&quot;, base = list(. = LETTERS), unique = TRUE,
+                    use.names = FALSE)
+    `
+
+### Arguments
+
+`x`  | an R object, for example a matrix, array or data frame.
+`value`  | a possible value for `dimnames(x)`: see the ‘Value’ section.
+`sep`  | a character string, used to separate `base` symbols and digits in the constructed dimnames.
+`base`  | a non-empty `list` of character vectors. The list components are used in turn (and recycled when needed) to construct replacements for empty dimnames components. See also the examples.
+`unique`  | logical indicating that the dimnames constructed are unique within each dimension in the sense of `make.unique`.
+`use.names`  | a logical indicating if `names(base)` is used to replace empty elements of `names(dimnames(x))`. If `TRUE`, then `unique` and `sep` apply to the constructed names, as well.
+
+### Details
+
+The functions `dimnames` and `dimnames&lt;-` are generic.</pre><p class="cut">331 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning R script for behavior tests</strong></p>
+<p><strong>Analyzing array dimnames inheritance rules</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning R script for behavior tests</strong></p>
+<p><strong>Analyzing array dimnames inheritance rules</strong></p>
+</details>
+<details class="tool"><summary>Web</summary>
+<pre>const out = await tools.web__run({search_query:[{q:&quot;site:docs.xarray.dev broadcasting dimension names coordinates arithmetic alignment official&quot;},{q:&quot;site:pytorch.org/docs stable named_tensor broadcasting names official&quot;},{q:&quot;site:vctrs.r-lib.org reference vec_arith names attributes official&quot;}],&quot;response_length&quot;:&quot;long&quot;}); text(out)</pre><pre class="output">Script completed
+Wall time 2.2 seconds
+Output:
+
+Broadcasting semantics — PyTorch 2.13 documentation (https://docs.pytorch.org/docs/stable/notes/broadcasting.html)
+citeturn1search0 [wordlim: 200] Published: 4 months ago; Crawled: 4 weeks ago; In short, if a PyTorch operation supports broadcast, then its Tensor arguments can be automatically expanded to be of equal sizes (without making copies of the data). ... PyTorch now supports broadcasting and the “1-dimensional” pointwise behavior is considered deprecated and will generate a Python warning in cases where tensors are not broadcastable, but have the same number of elements.
+
+# Broadcasting semantics#
+
+Created On: May 08, 2026 | Last Updated On: May 08, 2026
+
+Many PyTorch operations support NumPy’s broadcasting semantics. See Numpy Documentation for details.
+
+In short, if a PyTorch operation supports broadcast, then its Tensor arguments can be automatically expanded to be of equal sizes (without making copies of the data).
+
+## General semantics#
+
+Two tensors are “broadcastable” if the following rules hold:
+
+  * When iterating over the dimension sizes, starting at the trailing dimension, the dimension sizes must either be equal, one of them is 1, or one of them does not exist.
+
+For Example:
+    
+    &gt;&gt;&gt; x=torch.empty(5,7,3)
+    &gt;&gt;&gt; y=torch.empty(5,7,3)
+    # same shapes are always broadcastable (i.e. the above rules always hold)
+    
+    &gt;&gt;&gt; x=torch.empty((0,))
+    &gt;&gt;&gt; y=torch.empty(2,2)
+    # x and y are not broadcastable, because the 0-sized dimension of x
+    # does not match the 2-sized dimension of y.
+    
+    # can line up trailing dimensions
+    &gt;&gt;&gt; x=torch.empty(5,3,4,1)
+    &gt;&gt;&gt; y=torch.empty(  3,1,1)
+    # x and y are broadcastable.
+    # 1st trailing dimension: both have size 1
+    # 2nd trailing dimension: y has size 1
+    # 3rd trailing dimension: x size == y size
+    # 4th trailing dimension: y dimension doesn't exist
+    
+    # but:
+    &gt;&gt;&gt; x=torch.empty(5,2,4,1)
+    &gt;&gt;&gt; y=torch.empty(  3,1,1)
+    # x and y are not broadcastable, because in the 3rd trailing dimension 2 != 3
+    
+
+If two tensors `x`, `y` are “broadcastable”, the resulting tensor size is calculated as follows:
+
+  * If the number of dimensions of `x` and `y` are not equal, prepend 1 to the dimensions of the tensor with fewer dimensions to make them equal length.
+
+  * Then, for each dimension size, the resulting dimension size is the max of the sizes of `x` and `y` along that dimension.
+
+For Example:
+    
+    # can line up trailing dimensions to make reading easier
+    &gt;&gt;&gt; x=torch.empty(5,1,4,1)
+    &gt;&gt;&gt; y=torch.empty(  3,1,1)
+    &gt;&gt;&gt; (x+y).size()
+    torch.Size([5, 3, 4, 1])
+    
+    # but not necessary:
+    &gt;&gt;&gt; x=torch.empty(1)
+    &gt;&gt;&gt; y=torch.empty(3,1,7)
+    &gt;&gt;&gt; (x+y).size()
+    torch.Size([3, 1, 7])
+    
+    &gt;&gt;&gt; x=torch.empty(5,2,4,1)
+    &gt;&gt;&gt; y=torch.empty(3,1,1)
+    &gt;&gt;&gt; (x+y).size()
+    RuntimeError: The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 1
+
+## In-place semantics#
+
+One complication is that in-place operations do not allow the in-place tensor to change shape as a result of the broadcast.
+
+For Example:
+    
+    &gt;&gt;&gt; x=torch.empty(5,3,4,1)
+    &gt;&gt;&gt; y=torch.empty(3,1,1)
+    &gt;&gt;&gt; (x.add_(y)).size()
+    torch.Size([5, 3, 4, 1])
+    
+    # but:
+    &gt;&gt;&gt; x=torch.empty(1,3,1)
+    &gt;&gt;&gt; y=torch.empty(3,1,7)
+    &gt;&gt;&gt; (x.add_(y)).size()
+    RuntimeError: The expanded size of the tensor (1) must match the existing size (7) at non-singleton dimension 2.
+    
+
+## Backwards compatibility#
+
+Prior versions of PyTorch allowed certain pointwise functions to execute on tensors with different shapes, as long as the number of elements in each tensor was equal. The pointwise operation would then be carried out by viewing each tensor as 1-dimensional. PyTorch now supports broadcasting and the “1-dimensional” pointwise behavior is considered deprecated and will generate a Python warning in cases where tensors are not broadcastable, but have the same number of elements.
+
+Note that the introduction of broadcasting can cause backwards incompatible changes in the case where two tensors do not have the same shape, but are broadcastable and have the same number of elements. For Example:
+    
+    &gt;&gt;&gt; torch.add(torch.ones(4,1), torch.randn(4))
+    
+
+would previously produce a Tensor with size: torch.Size([4,1]), but now produces a Tensor with size: torch.Size([4,4]). In order to help identify cases in your code where backwards incompatibilities introduced by broadcasting may exist, you may set `torch.utils.backcompat.broadcast_warning.enabled` to `True`, which will generate a python warning in such cases.
+
+For Example:
+    
+    &gt;&gt;&gt; torch.utils.backcompat.broadcast_warning.enabled=True
+    &gt;&gt;&gt; torch.add(torch.ones(4,1), torch.ones(4))
+    __main__:1: UserWarning: self and other do not have the same shape, but are broadcastable, and have the same number of elements.
+    Changing behavior in a backwards incompatible manner to broadcasting rather than viewing as 1-dimensional.
+    --------------------------------------------------------------------------------
+(prototype) Introduction to Named Tensors in PyTorch — PyTorch Tutorials 1.11.0+cu102 documentation (https://docs.pytorch.org/tutorials/intermediate/named_tensor_tutorial.html)
+citeturn1search1 [wordlim: 200] Crawled: 1.2 years ago; PyTorch now allows Tensors to have named dimensions; factory functions take a new names argument that associates a name with each dimension. ... Unlike in the original named tensors blogpost, named dimensions are ordered: `tensor.names[i]` is the name of the `i` th dimension of `tensor`. ... Named tensors do not change broadcasting behavior; they still broadcast by position.
+
+# (prototype) Introduction to Named Tensors in PyTorch¶
+
+Author: Richard Zou
+
+Named Tensors aim to make tensors easier to use by allowing users to associate explicit names with tensor dimensions. In most cases, operations that take dimension parameters will accept dimension names, avoiding the need to track dimensions by position. In addition, named tensors use names to automatically check that APIs are being used correctly at runtime, providing extra safety. Names can also be used to rearrange dimensions, for example, to support “broadcasting by name” rather than “broadcasting by position”.
+
+This tutorial is intended as a guide to the functionality that will be included with the 1.3 launch. By the end of it, you will be able to:
+
+  * Create Tensors with named dimensions, as well as remove or rename those dimensions
+  * Understand the basics of how operations propagate dimension names
+  * See how naming dimensions enables clearer code in two key areas:
+    
+    * Broadcasting operations
+    * Flattening and unflattening dimensions
+
+Finally, we’ll put this into practice by writing a multi-head attention module using named tensors.
+
+Named tensors in PyTorch are inspired by and done in collaboration with Sasha Rush. Sasha proposed the original idea and proof of concept in his January 2019 blog post.
+
+## Basics: named dimensions¶
+
+PyTorch now allows Tensors to have named dimensions; factory functions take a new names argument that associates a name with each dimension. This works with most factory functions, such as
+
+  * tensor
+  * empty
+  * ones
+  * zeros
+  * randn
+  * rand
+
+Here we construct a tensor with names:
+    
+    import torch
+    imgs = torch.randn(1, 2, 2, 3, names=('N', 'C', 'H', 'W'))
+    print(imgs.names)
+    
+
+Out:
+    
+    ('N', 'C', 'H', 'W')
+    
+
+Unlike in the original named tensors blogpost, named dimensions are ordered: `tensor.names[i]` is the name of the `i` th dimension of `tensor`.
+
+There are two ways to rename a `Tensor`’s dimensions:
+    
+    # Method #1: set the .names attribute (this changes name in-place)
+    imgs.names = ['batch', 'channel', 'width', 'height']
+    print(imgs.names)
+    
+    # Method #2: specify new names (this changes names out-of-place)
+    imgs = imgs.rename(channel='C', width='W', height='H')
+    print(imgs.names)
+    
+
+Out:
+    
+    ('batch', 'channel', 'width', 'height')
+    ('batch', 'C', 'W', 'H')
+    
+
+The preferred way to remove names is to call `tensor.rename(None)`:
+    
+    imgs = imgs.rename(None)
+    print(imgs.names)
+    
+
+Out:
+    
+    (None, None, None, None)
+    
+
+Unnamed tensors (tensors with no named dimensions) still work as normal and do not have names in their `repr`.
+    
+    unnamed = torch.randn(2, 1, 3)
+    print(unnamed)
+    print(unnamed.names)
+    
+
+Out:
+    
+    tensor([[[-0.5647,  0.8112,  1.4354]],
+    
+            [[-1.1201, -2.5431,  0.1843]]])
+    (None, None, None)
+    
+
+Named tensors do not require that all dimensions be named.
+    </pre><p class="cut">550 more lines cut</p></details>
+<details class="tool"><summary>Web</summary>
+<pre>const out = await tools.web__run({search_query:[{q:&quot;site:docs.xarray.dev \&quot;conflicting coordinates\&quot; \&quot;dropped\&quot; arithmetic&quot;},{q:&quot;site:docs.xarray.dev \&quot;coordinate inheritance\&quot; conflicting values dropped result&quot;},{q:&quot;site:docs.xarray.dev DataArray arithmetic conflicting coordinate values dropped&quot;}],&quot;response_length&quot;:&quot;long&quot;}); text(out)</pre><pre class="output">Script completed
+Wall time 1.1 seconds
+Output:
+
+Computation (https://docs.xarray.dev/en/stable/user-guide/computation.html?highlight=apply_ufunc)
+citeturn2search0 [wordlim: 200] Published: 4 months ago; Crawled: 2 months ago; This ensures in-place arithmetic never needs to modify data types. ... Although index coordinates are aligned, other coordinates are not, and if their values conflict, they will be dropped. ...     # notice that the scalar coordinate 'x' is silently dropped ... Still, xarray will persist other coordinates in arithmetic, as long as there are no conflicting values:
+## Automatic alignment#
+
+Xarray enforces alignment between index Coordinates (that is, coordinates with the same name as a dimension, marked by `*`) on objects used in binary operations.
+
+Similarly to pandas, this alignment is automatic for arithmetic on binary operations. The default result of a binary operation is by the intersection (not the union) of coordinate labels:
+    
+    arr = xr.DataArray(np.arange(3), [(&quot;x&quot;, range(3))])
+    arr + arr[:-1]
+    
+    
+    &lt;xarray.DataArray (x: 2)&gt; Size: 16B
+    array([0, 2])
+    Coordinates:
+      * x        (x) int64 16B 0 1
+
+xarray.DataArray
+
+  * x: 2
+
+  * [Input]
+
+0 2
+    
+    array([0, 2])
+
+  * [Input]Coordinates: (1)
+
+    * x
+
+(x)
+
+int64
+
+0 1
+
+[Input][Input]
+        
+        array([0, 1])
+
+If coordinate values for a dimension are missing on either argument, all matching dimensions must have the same size:
+    
+    arr + xr.DataArray([1, 2], dims=&quot;x&quot;)
+    
+    
+    AlignmentError: cannot reindex or align along dimension 'x' because of conflicting dimension sizes: {2, 3} (note: an index is found along that dimension with size=3)
+
+## Coordinates#
+
+Although index coordinates are aligned, other coordinates are not, and if their values conflict, they will be dropped. This is necessary, for example, because indexing turns 1D coordinates into scalar coordinates:
+    
+    arr[0]
+    
+    
+    &lt;xarray.DataArray ()&gt; Size: 8B
+    array(0)
+    Coordinates:
+        x        int64 8B 0
+
+xarray.DataArray
+
+  * [Input]
+
+0
+    
+    array(0)
+
+  * [Input]Coordinates: (1)
+
+    * x
+
+()
+
+int64
+
+0
+
+[Input][Input]
+        
+        array(0)
+    
+    arr[1]
+    
+    
+    &lt;xarray.DataArray ()&gt; Size: 8B
+    array(1)
+    Coordinates:
+        x        int64 8B 1
+
+xarray.DataArray
+
+  * [Input]
+
+1
+    
+    array(1)
+
+  * [Input]Coordinates: (1)
+
+    * x
+
+()
+
+int64
+
+1
+
+[Input][Input]
+        
+        array(1)
+    
+    # notice that the scalar coordinate 'x' is silently dropped
+    arr[1] - arr[0]
+    
+    
+    &lt;xarray.DataArray ()&gt; Size: 8B
+    array(1)
+
+xarray.DataArray
+
+  * [Input]
+
+1
+    
+    array(1)
+
+Still, xarray will persist other coordinates in arithmetic, as long as there are no conflicting values:
+    
+    # only one argument has the 'x' coordinate
+    arr[0] + 1
+    
+    
+    &lt;xarray.DataArray ()&gt; Size: 8B
+    array(1)
+    Coordinates:
+        x        int64 8B 0
+
+xarray.DataArray
+
+  * [Input]
+
+1
+    
+    array(1)
+
+  * [Input]Coordinates: (1)
+
+    * x
+
+()
+
+int64
+
+0
+
+[Input][Input]
+        
+        array(0)
+    
+    # both arguments have the same 'x' coordinate
+    arr[0] - arr[0]
+    
+    
+    &lt;xarray.DataArray ()&gt; Size: 8B
+    array(0)
+    Coordinates:
+        x        int64 8B 0
+
+xarray.DataArray
+
+  * [Input]
+
+0
+    
+    array(0)
+
+  * [Input]Coordinates: (1)
+
+    * x
+
+()
+
+int64
+
+0
+
+[Input][Input]
+        
+        array(0)
+
+--------------------------------------------------------------------------------
+Computation (https://docs.xarray.dev/en/v2024.01.0/user-guide/computation.html)
+citeturn2search1 [wordlim: 200] Published: 2.6 years ago; Crawled: 2.6 years ago;     ValueError: arguments without labels along dimension 'x' cannot be aligned because they have different dimension size(s) {2} than the size of the aligned dimension labels: 3 ... Although index coordinates are aligned, other coordinates are not, and if their values conflict, they will be dropped. ...     # notice that the scalar coordinate 'x' is silently dropped ... Still, xarray will persist other coordinates in arithmetic, as long as there are no conflicting values: ... You can do arithmetic between any `DataArray` and a dataset:
+    
+    In [129]: with xr.set_options(arithmetic_join=&quot;outer&quot;):</pre><p class="cut">715 more lines cut</p></details>
+<details class="tool"><summary>Bash: git remote -v; nl -ba src/broadcast-names.c | sed -n '1,150p'; nl -ba tests/testthat/test-bro…</summary>
+<pre>$ git remote -v; nl -ba src/broadcast-names.c | sed -n '1,150p'; nl -ba tests/testthat/test-broadcast-names.R | sed -n '65,175p'; nl -ba src/arithmetic.c | sed -n '45,82p'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+origin	https://github.com/DavisVaughan/rray4.git (fetch)
+origin	https://github.com/DavisVaughan/rray4.git (push)
+     1	#include &quot;broadcast-names.h&quot;
+     2	
+     3	#include &quot;dimensionality.h&quot;
+     4	#include &quot;dimensions.h&quot;
+     5	#include &quot;names.h&quot;
+     6	
+     7	#include &quot;decl/broadcast-names-decl.h&quot;
+     8	
+     9	r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions) {
+    10	  return rray_broadcast_names(ffi_x, ffi_dimensions);
+    11	}
+    12	
+    13	r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions) {
+    14	  return rray_broadcast_names_fill(r_null, x, dimensions);
+    15	}
+    16	
+    17	r_obj* ffi_rray_broadcast_names2(
+    18	  r_obj* ffi_x,
+    19	  r_obj* ffi_y,
+    20	  r_obj* ffi_dimensions
+    21	) {
+    22	  return rray_broadcast_names2(ffi_x, ffi_y, ffi_dimensions);
+    23	}
+    24	
+    25	r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions) {
+    26	  r_obj* out = KEEP(rray_broadcast_names_fill(r_null, x, dimensions));
+    27	  out = rray_broadcast_names_fill(out, y, dimensions);
+    28	  FREE(1);
+    29	  return out;
+    30	}
+    31	
+    32	r_obj* ffi_rray_broadcast_names_common(r_obj* ffi_xs, r_obj* ffi_dimensions) {
+    33	  return rray_broadcast_names_common(ffi_xs, ffi_dimensions);
+    34	}
+    35	
+    36	r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions) {
+    37	  const r_ssize n = r_length(xs);
+    38	  r_obj* const* v_xs = r_list_cbegin(xs);
+    39	
+    40	  r_obj* out = r_null;
+    41	  r_keep_loc out_loc;
+    42	  KEEP_HERE(out, &amp;out_loc);
+    43	
+    44	  for (r_ssize i = 0; i &lt; n; ++i) {
+    45	    out = rray_broadcast_names_fill(out, v_xs[i], dimensions);
+    46	    KEEP_AT(out, out_loc);
+    47	  }
+    48	
+    49	  FREE(1);
+    50	  return out;
+    51	}
+    52	
+    53	// Broadcasting of array names
+    54	//
+    55	// Assumes the inputs are validated arrays and are broadcastable to the
+    56	// `dimensions`. The caller typically checks all of this already.
+    57	static r_obj* rray_broadcast_names_fill(
+    58	  r_obj* out,
+    59	  r_obj* x,
+    60	  r_obj* dimensions
+    61	) {
+    62	  r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+    63	  if (x_names == r_null) {
+    64	    return out;
+    65	  }
+    66	  KEEP(x_names);
+    67	
+    68	  r_obj* const* v_x_names = r_list_cbegin(x_names);
+    69	
+    70	  r_obj* x_dimensions = KEEP(rray_dimensions(x, rray_args.x, r_lazy_null));
+    71	  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    72	  const int x_dimensionality =
+    73	    rray_dimensionality_from_dimensions(x_dimensions);
+    74	
+    75	  const int* v_dimensions = r_int_cbegin(dimensions);
+    76	  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+    77	
+    78	  r_keep_loc out_loc;
+    79	  KEEP_HERE(out, &amp;out_loc);
+    80	
+    81	  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    82	    if (v_x_names[i] == r_null) {
+    83	      // No names to contribute on this axis
+    84	      continue;
+    85	    }
+    86	    if (v_x_dimensions[i] != v_dimensions[i]) {
+    87	      // No names to contribute when axis is broadcast
+    88	      continue;
+    89	    }
+    90	    if (out != r_null &amp;&amp; r_list_get(out, i) != r_null) {
+    91	      // Names already exist on this axis
+    92	      continue;
+    93	    }
+    94	    if (out == r_null) {
+    95	      out = r_alloc_list(dimensionality);
+    96	      KEEP_AT(out, out_loc);
+    97	    }
+    98	    r_list_poke(out, i, v_x_names[i]);
+    99	  }
+   100	
+   101	  FREE(3);
+   102	  return out;
+   103	}
+    65	# ------------------------------------------------------------------------------
+    66	# rray_broadcast_names2()
+    67	
+    68	test_that(&quot;rray_broadcast_names2() prefers `x` where its dimension is kept&quot;, {
+    69	  x &lt;- array(
+    70	    1:6,
+    71	    c(2L, 3L),
+    72	    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+    73	  )
+    74	  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+    75	  expect_identical(
+    76	    rray_broadcast_names2(x, y, c(2L, 3L)),
+    77	    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+    78	  )
+    79	})
+    80	
+    81	test_that(&quot;rray_broadcast_names2() falls through to `y` where `x` broadcasts&quot;, {
+    82	  x &lt;- array(1:3, c(1L, 3L), dimnames = list(&quot;only&quot;, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+    83	  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+    84	  expect_identical(
+    85	    rray_broadcast_names2(x, y, c(2L, 3L)),
+    86	    list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+    87	  )
+    88	})
+    89	
+    90	test_that(&quot;rray_broadcast_names2() falls through to `y` on an unnamed axis&quot;, {
+    91	  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+    92	  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+    93	  expect_identical(
+    94	    rray_broadcast_names2(x, y, c(2L, 3L)),
+    95	    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;))
+    96	  )
+    97	})
+    98	
+    99	test_that(&quot;rray_broadcast_names2() takes each axis from a different input&quot;, {
+   100	  x &lt;- array(1:3, c(3L, 1L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), NULL))
+   101	  y &lt;- array(1:2, c(1L, 2L), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+   102	  expect_identical(
+   103	    rray_broadcast_names2(x, y, c(3L, 2L)),
+   104	    list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), c(&quot;c1&quot;, &quot;c2&quot;))
+   105	  )
+   106	})
+   107	
+   108	test_that(&quot;rray_broadcast_names2() returns NULL when neither input has names&quot;, {
+   109	  x &lt;- array(1:6, c(2L, 3L))
+   110	  y &lt;- array(1:6, c(2L, 3L))
+   111	  expect_null(rray_broadcast_names2(x, y, c(2L, 3L)))
+   112	})
+   113	
+   114	test_that(&quot;rray_broadcast_names2() returns NULL when every axis broadcasts&quot;, {
+   115	  x &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;a&quot;, &quot;b&quot;))
+   116	  y &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;c&quot;, &quot;d&quot;))
+   117	  expect_null(rray_broadcast_names2(x, y, c(2L, 2L)))
+   118	})
+   119	
+   120	test_that(&quot;rray_broadcast_names2() works with differing dimensionality&quot;, {
+   121	  x &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+   122	  y &lt;- array(1:24, c(2L, 3L, 4L))
+   123	  y &lt;- rray_set_axis_names(y, 3L, letters[1:4])
+   124	  expect_identical(
+   125	    rray_broadcast_names2(x, y, c(2L, 3L, 4L)),
+   126	    list(c(&quot;a&quot;, &quot;b&quot;), NULL, letters[1:4])
+   127	  )
+   128	})
+   129	
+   130	# ------------------------------------------------------------------------------
+   131	# rray_broadcast_names_common()
+   132	
+   133	test_that(&quot;rray_broadcast_names_common() lets the first input to keep an axis win&quot;, {
+   134	  x &lt;- array(
+   135	    1:6,
+   136	    c(2L, 3L),
+   137	    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+   138	  )
+   139	  y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+   140	  expect_identical(
+   141	    rray_broadcast_names_common(x, y, .dimensions = c(2L, 3L)),
+   142	    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+   143	  )
+   144	})
+   145	
+   146	test_that(&quot;rray_broadcast_names_common() takes each axis from a different input&quot;, {
+   147	  x &lt;- array(1L, c(1L, 1L, 1L), dimnames = list(&quot;a&quot;, NULL, NULL))
+   148	  y &lt;- array(1:2, c(1L, 2L, 1L), dimnames = list(NULL, c(&quot;b&quot;, &quot;c&quot;), NULL))
+   149	  z &lt;- array(1:3, c(1L, 1L, 3L), dimnames = list(NULL, NULL, c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;)))
+   150	  expect_identical(
+   151	    rray_broadcast_names_common(x, y, z, .dimensions = c(1L, 2L, 3L)),
+   152	    list(&quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;g&quot;))
+   153	  )
+   154	})
+   155	</pre><p class="cut">58 more lines cut</p></details>
+<details class="tool"><summary>Bash: R --vanilla --quiet -e 'show_case &lt;- function(label, x, y) { z &lt;- x + y; cat(&quot;\n&quot;, label, &quot;\n…</summary>
+<pre>$ R --vanilla --quiet -e 'show_case &lt;- function(label, x, y) { z &lt;- x + y; cat(&quot;\n&quot;, label, &quot;\n&quot;, sep = &quot;&quot;); dput(list(dim = dim(z), names = names(z), dimnames = dimnames(z))) }; show_case(&quot;vectors same length conflict&quot;, setNames(1:3, letters[1:3]), setNames(4:6, LETTERS[1:3])); show_case(&quot;vectors longer y&quot;, setNames(1, &quot;x&quot;), setNames(4:6, LETTERS[1:3])); x &lt;- array(1:6, c(2,3), dimnames=list(c(&quot;xr1&quot;,&quot;xr2&quot;), NULL)); y &lt;- array(7:12, c(2,3), dimnames=list(NULL, c(&quot;yc1&quot;,&quot;yc2&quot;,&quot;yc3&quot;))); show_case(&quot;arrays complementary partial dimnames&quot;, x, y); show_case(&quot;arrays complementary reversed&quot;, y, x); x2 &lt;- unname(x); dim(x2) &lt;- c(2,3); show_case(&quot;first array wholly unnamed&quot;, x2, y); show_case(&quot;named vector plus named matrix&quot;, setNames(1:6, paste0(&quot;v&quot;,1:6)), y); show_case(&quot;named matrix plus named vector&quot;, y, setNames(1:6, paste0(&quot;v&quot;,1:6))); show_case(&quot;scalar plus named matrix&quot;, 1, y)'</pre><pre class="output">Script completed
+Wall time 0.5 seconds
+Output:
+
+&gt; show_case &lt;- function(label, x, y) { z &lt;- x + y; cat(&quot;
++ &quot;, label, &quot;
++ &quot;, sep = &quot;&quot;); dput(list(dim = dim(z), names = names(z), dimnames = dimnames(z))) }; show_case(&quot;vectors same length conflict&quot;, setNames(1:3, letters[1:3]), setNames(4:6, LETTERS[1:3])); show_case(&quot;vectors longer y&quot;, setNames(1, &quot;x&quot;), setNames(4:6, LETTERS[1:3])); x &lt;- array(1:6, c(2,3), dimnames=list(c(&quot;xr1&quot;,&quot;xr2&quot;), NULL)); y &lt;- array(7:12, c(2,3), dimnames=list(NULL, c(&quot;yc1&quot;,&quot;yc2&quot;,&quot;yc3&quot;))); show_case(&quot;arrays complementary partial dimnames&quot;, x, y); show_case(&quot;arrays complementary reversed&quot;, y, x); x2 &lt;- unname(x); dim(x2) &lt;- c(2,3); show_case(&quot;first array wholly unnamed&quot;, x2, y); show_case(&quot;named vector plus named matrix&quot;, setNames(1:6, paste0(&quot;v&quot;,1:6)), y); show_case(&quot;named matrix plus named vector&quot;, y, setNames(1:6, paste0(&quot;v&quot;,1:6))); show_case(&quot;scalar plus named matrix&quot;, 1, y)
+
+vectors same length conflict
+list(dim = NULL, names = c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), dimnames = NULL)
+
+vectors longer y
+list(dim = NULL, names = c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;), dimnames = NULL)
+
+arrays complementary partial dimnames
+list(dim = 2:3, names = NULL, dimnames = list(c(&quot;xr1&quot;, &quot;xr2&quot;), 
+    NULL))
+
+arrays complementary reversed
+list(dim = 2:3, names = NULL, dimnames = list(NULL, c(&quot;yc1&quot;, 
+&quot;yc2&quot;, &quot;yc3&quot;)))
+
+first array wholly unnamed
+list(dim = 2:3, names = NULL, dimnames = list(NULL, c(&quot;yc1&quot;, 
+&quot;yc2&quot;, &quot;yc3&quot;)))
+
+named vector plus named matrix
+list(dim = 2:3, names = NULL, dimnames = list(NULL, c(&quot;yc1&quot;, 
+&quot;yc2&quot;, &quot;yc3&quot;)))
+
+named matrix plus named vector
+list(dim = 2:3, names = NULL, dimnames = list(NULL, c(&quot;yc1&quot;, 
+&quot;yc2&quot;, &quot;yc3&quot;)))
+
+scalar plus named matrix
+list(dim = 2:3, names = NULL, dimnames = list(NULL, c(&quot;yc1&quot;, 
+&quot;yc2&quot;, &quot;yc3&quot;)))
+&gt; </pre></details>
+<details class="tool"><summary>Bash: sed -n '1,260p' R/names.R; sed -n '1,260p' src/names.c; sed -n '1,130p' tests/testthat/test-n…</summary>
+<pre>$ sed -n '1,260p' R/names.R; sed -n '1,260p' src/names.c; sed -n '1,130p' tests/testthat/test-names.R; sed -n '200,235p' tests/testthat/test-broadcast.R</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#' Get names for each axis of an array
+#'
+#' `rray_names()` returns the names for each axis of an array, or `NULL` if `x`
+#' has no names at all. Unlike [dimnames()], it returns a one-element list for
+#' named vectors.
+#'
+#' @param x An array.
+#'
+#' @returns
+#' Either:
+#' - A list with length equal to the dimensionality of `x`, where each element
+#'   is either a character vector of names or `NULL`.
+#' - `NULL` if `x` has no names.
+#'
+#' @export
+#' @examples
+#' # No names at all
+#' rray_names(1:3)
+#' # Named vectors return a one-element list
+#' rray_names(c(a = 1, b = 2))
+#'
+#' # All dimension names
+#' x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+#' rray_names(x)
+rray_names &lt;- function(x) {
+  .Call(ffi_rray_names, x, environment())
+}
+
+#' Get names for a single axis of an array
+#'
+#' @description
+#' - `rray_axis_names()` returns the names for a single `axis` of an array,
+#'   or `NULL` if that axis has no names.
+#'
+#' - `rray_row_names()` and `rray_col_names()` are shortcuts for
+#'   `rray_axis_names(x, 1)` and `rray_axis_names(x, 2)`.
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer. The axis to get names for.
+#'
+#' @returns
+#' A character vector of names, or `NULL` if that axis has no names.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+#'
+#' rray_axis_names(x, 1)
+#' rray_axis_names(x, 2)
+#'
+#' rray_row_names(x)
+#' rray_col_names(x)
+rray_axis_names &lt;- function(x, axis) {
+  .Call(ffi_rray_axis_names, x, axis, environment())
+}
+
+#' @rdname rray_axis_names
+#' @export
+rray_row_names &lt;- function(x) {
+  .Call(ffi_rray_row_names, x, environment())
+}
+
+#' @rdname rray_axis_names
+#' @export
+rray_col_names &lt;- function(x) {
+  .Call(ffi_rray_col_names, x, environment())
+}
+
+#' Set names for every axis of an array
+#'
+#' `rray_set_names()` sets the names for every axis of an array at once.
+#'
+#' @param x An array.
+#'
+#' @param names A list with length equal to the dimensionality of `x`, where
+#'   each element is either a character vector of names for that axis or
+#'   `NULL`. Can also be `NULL` to remove all names from `x`.
+#'
+#' @returns
+#' `x` with new names.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#'
+#' rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+#'
+#' # `NULL` clears all names
+#' y &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+#' rray_set_names(y, NULL)
+rray_set_names &lt;- function(x, names) {
+  .Call(ffi_rray_set_names, x, names, environment())
+}
+
+#' Set names for a single axis of an array
+#'
+#' @description
+#' - `rray_set_axis_names()` sets the names for a single `axis` of an array,
+#'   leaving every other axis untouched.
+#'
+#' - `rray_set_row_names()` and `rray_set_col_names()` are shortcuts for
+#'   `rray_set_axis_names(x, 1, names)` and `rray_set_axis_names(x, 2, names)`.
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer. The axis to set names for.
+#'
+#' @param names A character vector of names for `axis`, the same length as
+#'   the dimension of `axis`. Can also be `NULL` to remove names from `axis`.
+#'
+#' @returns
+#' `x` with new names for `axis`.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#'
+#' rray_set_axis_names(x, 1, c(&quot;r1&quot;, &quot;r2&quot;))
+#' rray_set_axis_names(x, 2, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+#'
+#' rray_set_row_names(x, c(&quot;r1&quot;, &quot;r2&quot;))
+#' rray_set_col_names(x, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+rray_set_axis_names &lt;- function(x, axis, names) {
+  .Call(ffi_rray_set_axis_names, x, axis, names, environment())
+}
+
+#' @rdname rray_set_axis_names
+#' @export
+rray_set_row_names &lt;- function(x, names) {
+  .Call(ffi_rray_set_row_names, x, names, environment())
+}
+
+#' @rdname rray_set_axis_names
+#' @export
+rray_set_col_names &lt;- function(x, names) {
+  .Call(ffi_rray_set_col_names, x, names, environment())
+}
+#include &quot;names.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/names-decl.h&quot;
+
+r_obj* ffi_rray_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_names(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_names(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim_names(x);
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_axis_names(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_axis_names(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_row_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_axis_names(ffi_x, 1, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_col_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_axis_names(ffi_x, 2, rray_args.x, error_call);
+}
+
+r_obj* rray_axis_names(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  r_obj* names = rray_names(x, arg, error_call);
+
+  r_obj* out = (names == r_null) ? r_null : r_list_get(names, axis - 1);
+
+  FREE(1);
+  return out;
+}</pre><p class="cut">314 more lines cut</p></details>
+<details class="tool"><summary>Bash: git log --follow --oneline -- src/broadcast-names.c; git log --follow -p -- src/broadcast-nam…</summary>
+<pre>$ git log --follow --oneline -- src/broadcast-names.c; git log --follow -p -- src/broadcast-names.c | sed -n '1,300p'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+195a8dc Build each axis' split names once instead of per output element (#22)
+e98c873 Add `rray_reduce_names()` similar to broadcasting equivalent (#20)
+d32a454 Add names broadcasting tools (#19)
+commit 195a8dc7995d47a1fafcc884f918a7e29516ba2b
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Wed Sep 2 19:47:08 2026 -0400
+
+    Build each axis' split names once instead of per output element (#22)
+
+diff --git a/src/broadcast-names.c b/src/broadcast-names.c
+index 98452d3..50ca459 100644
+--- a/src/broadcast-names.c
++++ b/src/broadcast-names.c
+@@ -60,11 +60,9 @@ static r_obj* rray_broadcast_names_fill(
+   r_obj* dimensions
+ ) {
+   r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+-
+   if (x_names == r_null) {
+     return out;
+   }
+-
+   KEEP(x_names);
+ 
+   r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+commit e98c873a285ed92988ac7f039acc507a84508952
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Wed Sep 2 14:18:38 2026 -0400
+
+    Add `rray_reduce_names()` similar to broadcasting equivalent (#20)
+
+diff --git a/src/broadcast-names.c b/src/broadcast-names.c
+index b874864..98452d3 100644
+--- a/src/broadcast-names.c
++++ b/src/broadcast-names.c
+@@ -1,6 +1,8 @@
+ #include &quot;broadcast-names.h&quot;
+ 
+ #include &quot;dimensionality.h&quot;
++#include &quot;dimensions.h&quot;
++#include &quot;names.h&quot;
+ 
+ #include &quot;decl/broadcast-names-decl.h&quot;
+ 
+@@ -57,15 +59,17 @@ static r_obj* rray_broadcast_names_fill(
+   r_obj* x,
+   r_obj* dimensions
+ ) {
+-  r_obj* x_names = r_dim_names(x);
++  r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+ 
+   if (x_names == r_null) {
+     return out;
+   }
+ 
++  KEEP(x_names);
++
+   r_obj* const* v_x_names = r_list_cbegin(x_names);
+ 
+-  r_obj* x_dimensions = r_dim(x);
++  r_obj* x_dimensions = KEEP(rray_dimensions(x, rray_args.x, r_lazy_null));
+   const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+   const int x_dimensionality =
+     rray_dimensionality_from_dimensions(x_dimensions);
+@@ -96,6 +100,6 @@ static r_obj* rray_broadcast_names_fill(
+     r_list_poke(out, i, v_x_names[i]);
+   }
+ 
+-  FREE(1);
++  FREE(3);
+   return out;
+ }
+
+commit d32a454a2ede1684b8cc72845e88c418c3f820e4
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Wed Sep 2 13:52:32 2026 -0400
+
+    Add names broadcasting tools (#19)
+
+diff --git a/src/broadcast-names.c b/src/broadcast-names.c
+new file mode 100644
+index 0000000..b874864
+--- /dev/null
++++ b/src/broadcast-names.c
+@@ -0,0 +1,101 @@
++#include &quot;broadcast-names.h&quot;
++
++#include &quot;dimensionality.h&quot;
++
++#include &quot;decl/broadcast-names-decl.h&quot;
++
++r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions) {
++  return rray_broadcast_names(ffi_x, ffi_dimensions);
++}
++
++r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions) {
++  return rray_broadcast_names_fill(r_null, x, dimensions);
++}
++
++r_obj* ffi_rray_broadcast_names2(
++  r_obj* ffi_x,
++  r_obj* ffi_y,
++  r_obj* ffi_dimensions
++) {
++  return rray_broadcast_names2(ffi_x, ffi_y, ffi_dimensions);
++}
++
++r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions) {
++  r_obj* out = KEEP(rray_broadcast_names_fill(r_null, x, dimensions));
++  out = rray_broadcast_names_fill(out, y, dimensions);
++  FREE(1);
++  return out;
++}
++
++r_obj* ffi_rray_broadcast_names_common(r_obj* ffi_xs, r_obj* ffi_dimensions) {
++  return rray_broadcast_names_common(ffi_xs, ffi_dimensions);
++}
++
++r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions) {
++  const r_ssize n = r_length(xs);
++  r_obj* const* v_xs = r_list_cbegin(xs);
++
++  r_obj* out = r_null;
++  r_keep_loc out_loc;
++  KEEP_HERE(out, &amp;out_loc);
++
++  for (r_ssize i = 0; i &lt; n; ++i) {
++    out = rray_broadcast_names_fill(out, v_xs[i], dimensions);
++    KEEP_AT(out, out_loc);
++  }
++
++  FREE(1);
++  return out;
++}
++
++// Broadcasting of array names
++//
++// Assumes the inputs are validated arrays and are broadcastable to the
++// `dimensions`. The caller typically checks all of this already.
++static r_obj* rray_broadcast_names_fill(
++  r_obj* out,
++  r_obj* x,
++  r_obj* dimensions
++) {
++  r_obj* x_names = r_dim_names(x);
++
++  if (x_names == r_null) {
++    return out;
++  }
++
++  r_obj* const* v_x_names = r_list_cbegin(x_names);
++
++  r_obj* x_dimensions = r_dim(x);
++  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
++  const int x_dimensionality =
++    rray_dimensionality_from_dimensions(x_dimensions);
++
++  const int* v_dimensions = r_int_cbegin(dimensions);
++  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
++
++  r_keep_loc out_loc;
++  KEEP_HERE(out, &amp;out_loc);
++
++  for (int i = 0; i &lt; x_dimensionality; ++i) {
++    if (v_x_names[i] == r_null) {
++      // No names to contribute on this axis
++      continue;
++    }
++    if (v_x_dimensions[i] != v_dimensions[i]) {
++      // No names to contribute when axis is broadcast
++      continue;
++    }
++    if (out != r_null &amp;&amp; r_list_get(out, i) != r_null) {
++      // Names already exist on this axis
++      continue;
++    }
++    if (out == r_null) {
++      out = r_alloc_list(dimensionality);
++      KEEP_AT(out, out_loc);
++    }
++    r_list_poke(out, i, v_x_names[i]);
++  }
++
++  FREE(1);
++  return out;
++}</pre></details>
+<details class="tool"><summary>Web</summary>
+<pre>const out = await tools.web__run({open:[{ref_id:&quot;https://github.com/DavisVaughan/rray4/pull/19&quot;}],&quot;response_length&quot;:&quot;long&quot;}); text(out)</pre><pre class="output">Script completed
+Wall time 1.1 seconds
+Output:
+
+Internal Error ()
+citeturn3view0 [wordlim: 200] Source: open({&quot;ref_id&quot;:&quot;https://github.com/DavisVaughan/rray4/pull/19&quot;,&quot;lineno&quot;:null}); Total lines: 1
+L0: Failed to fetch https://github.com/DavisVaughan/rray4/pull/19: Cache miss</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Formulating axis naming recommendation</strong></p>
+<p><strong>Clarifying axis naming conflict rules</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Formulating axis naming recommendation</strong></p>
+<p><strong>Clarifying axis naming conflict rules</strong></p>
+<p><strong>Designing name conflict resolution logic</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Formulating axis naming recommendation</strong></p>
+<p><strong>Clarifying axis naming conflict rules</strong></p>
+<p><strong>Designing name conflict resolution logic</strong></p>
+<p><strong>Comparing base R and rray naming behaviors</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Formulating axis naming recommendation</strong></p>
+<p><strong>Clarifying axis naming conflict rules</strong></p>
+<p><strong>Designing name conflict resolution logic</strong></p>
+<p><strong>Comparing base R and rray naming behaviors</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n &quot;^## 2\.3|coalesce rule|Names rule|dimension titles|names rule&quot; plans/implementation.md…</summary>
+<pre>$ rg -n &quot;^## 2\.3|coalesce rule|Names rule|dimension titles|names rule&quot; plans/implementation.md plans/*.md R/*.R tests/testthat/*.R | head -n 100; sed -n '430,535p' plans/implementation.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/implementation.md:289:## 2.3 Names
+plans/implementation.md:802:API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and
+plans/implementation.md:823:**Names rule**, from 2.3: follow the axis, reduce, coalesce, subset, or
+plans/implementation.md:289:## 2.3 Names
+plans/implementation.md:802:API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and
+plans/implementation.md:823:**Names rule**, from 2.3: follow the axis, reduce, coalesce, subset, or
+tests/testthat/test-broadcast.R:207:test_that(&quot;dimension titles are lost&quot;, {
+tests/testthat/test-broadcast.R:341:test_that(&quot;follows the dimension names rule&quot;, {
+  r_obj* xs,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_cast(
+  r_obj* x,
+  r_obj* to,
+  struct rray_arg* x_arg,
+  struct rray_arg* to_arg,
+  struct r_lazy error_call
+);
+r_obj* rray_cast_common(
+  r_obj* xs,
+  r_obj* to,
+  struct rray_arg* arg,
+  struct rray_arg* to_arg,
+  struct r_lazy error_call
+);
+```
+
+`ptype` and `to` may be `NULL` on the `_common` pair, in which case the common
+type of `xs` is computed. That is the same shape as `.dimensions` in
+`rray_dimensions_common()`: when it is supplied, `...` is never looked at.
+
+Working out a common type has to start somewhere, and `NULL` is not a type here,
+so it starts at the first input. That means `rray_ptype_common()` needs at least
+one input or a `ptype`, and errors on neither. `plans/null.md` writes up what it
+would take to lift that.
+
+### Argument tags and the error call
+
+Every one of these takes a tag per input, and the R wrappers expose them so a
+caller can make an error blame its own argument and its own call. The FFI builds
+each one with `new_lazy_arg()`, reading the tag out of the frame only once an
+error is actually raised, so a default of `caller_arg(x)` costs nothing when
+nothing goes wrong. The error call is read out of the frame the same way.
+
+```r
+rray_ptype(x, ..., arg = caller_arg(x), call = caller_env())
+rray_ptype2(
+  x,
+  y,
+  ...,
+  x_arg = caller_arg(x),
+  y_arg = caller_arg(y),
+  call = caller_env()
+)
+rray_ptype_common(
+  ...,
+  .ptype = NULL,
+  .arg = &quot;&quot;,
+  .ptype_arg = &quot;.ptype&quot;,
+  .call = caller_env()
+)
+rray_cast(x, to, ..., x_arg = caller_arg(x), to_arg = &quot;&quot;, call = caller_env())
+rray_cast_common(
+  ...,
+  .to = NULL,
+  .arg = &quot;&quot;,
+  .to_arg = &quot;.to&quot;,
+  .call = caller_env()
+)
+```
+
+`call = caller_env()` means the wrapper is blamed rather than the rray4
+function, which is the point of taking it:
+
+```r
+f &lt;- function(a, b) rray_ptype2(a, b)
+f(1L, &quot;a&quot;)
+#&gt; Error in `f()`:
+#&gt; ! Can't combine `a` &lt;integer&gt; and `b` &lt;character&gt;.
+```
+
+Called straight from the top level there is no wrapper to blame, so the message
+has no `Error in` at all. That is rlang's behaviour for the global environment,
+and it is what vctrs does too.
+
+The defaults follow vctrs. An input the caller names gets `caller_arg()`, so the
+error quotes what they actually wrote. A prototype does not, because `to` is a
+positional argument holding an anonymous type and naming it says nothing. `.arg`
+is the tag for `...` as a whole, so `.arg = &quot;foo&quot;` turns `..2` into `foo[[2]]`.
+
+`.to_arg` and `.ptype_arg` are the exception, and name their argument by
+default. Those are arguments the caller typed, so a bad one is worth pointing
+at. vctrs has no equivalent and hardcodes `.ptype` even inside
+`vec_cast_common()`, where the argument is really called `.to`.
+
+An empty tag drops out of the message rather than printing empty backticks:
+
+```r
+rray_ptype2(1L, &quot;a&quot;, x_arg = &quot;&quot;, y_arg = &quot;&quot;)
+#&gt; Error: Can't combine &lt;integer&gt; and &lt;character&gt;.
+```
+
+`rray_arg_type_format()` writes the `` `x` &lt;integer&gt; `` half of those messages
+and handles the empty case. `rray_arg_format_input()` does the same for a
+message that opens with the tag, falling back to the word &quot;Input&quot;.
+
+`rray_ptype2()` dispatches through `rray_typeof2()`, which maps a pair of types
+onto a symmetric `enum rray_type2` with one entry per unordered pair. Both
+switches are written out in full, following vctrs' `vec_typeof2()` and
+`vec_ptype2_switch_native()`. Do not collapse either into a rank function or any</pre></details>
+<details class="tool"><summary>Bash: sed -n '275,365p' plans/implementation.md; nl -ba plans/implementation.md | sed -n '285,350p'</summary>
+<pre>$ sed -n '275,365p' plans/implementation.md; nl -ba plans/implementation.md | sed -n '285,350p'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+nothing in `...` is checked when it is supplied. That matches `.size` in
+`vec_size_common()`.
+
+`rray_broadcast_common()` keeps the names of `...` on the list it returns, the
+same way `vec_recycle_common()` keeps them.
+
+`RRAY_MAX_DIMENSIONALITY` is 64.
+
+Long arrays are supported where it is not painful. R allows an array's total
+length to exceed 2^31 while every individual dimension stays under it, because
+`dim` is always integer. That is why `rray_size()` returns a double while
+`rray_dimensions()` returns integer. Use `r_ssize` throughout. If long array
+support makes something genuinely hard, drop it and say so in the pull request.
+
+## 2.3 Names
+
+There are five rules. Every function in Part 5 declares which one it follows.
+
+**Follow the axis.** An axis keeps its names if its dimension is unchanged, and
+loses them if its dimension changed. Whatever it keeps travels with it to
+wherever the axis ends up. New axes have no names.
+
+This is the rule for almost everything that reshapes an array. An axis of
+dimension 1 broadcast to 1 counts as unchanged and keeps its length 1 names.
+
+**Reduce.** Reduced axes lose their names. Every other axis keeps them.
+
+Nearly the same rule, but a reduced axis loses its names even when its dimension
+was already 1, so it needs stating separately.
+
+This lives in `rray_reduce_names(x, axes)`. Reductions take one array, so unlike
+the broadcasting family below there is no `2` or `_common` form, and no fill
+helper to share between them.
+
+**Coalesce.** Used by anything with two or more array inputs. For each axis of
+the common dimensions:
+
+1. Use `x`'s names if `x`'s dimension there equals the common dimension and `x`
+   has names there.
+
+2. Otherwise apply the same test to `y`.
+
+3. Otherwise `NULL`.
+
+This lives in three internal functions, one per arity:
+
+```c
+r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions);
+r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions);
+r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions);
+```
+
+All three fill one output list from a shared helper, never overwriting a slot
+that an earlier input already filled. Coalescing is just that &quot;don't overwrite&quot;
+rule, so the one-input case is the follow the axis rule and needs no separate
+implementation.
+
+They take arrays rather than extracted names, because `arg_as_array()` gives
+every input a real `dim`, which makes `r_dim()` and `r_dim_names()` free reads
+off an object the caller already protects. They assume validated, broadcastable
+inputs, so they take no `arg` and no `error_call` and cannot fail. Validation
+belongs in the caller, which has always done it already.
+
+**Subset.** Names are subset alongside the data, so an axis keeps the names of
+the elements that survived.
+
+`rray_split()` is the one case producing many arrays at once, so its
+`rray_split_names(x, dimensions)` returns one set of names per output element.
+A split axis gets the single name at that element's point, an unsplit axis
+carries its names over whole. It needs no `axes` argument, because an axis is
+split exactly when its split dimension is not 1, and splitting a size 1 axis
+gives the same answer either way.
+
+**Dropped.** All names are discarded. Used where no axis survives in a
+recognisable form, such as a reshape.
+
+The reasoning behind the split: a function that manipulates an existing array is
+still functionally the same array, so names travel with the axes that did not
+move. A function with two inputs builds a genuinely new array, but dropping
+every name would make `rray_add(named_matrix, 1)` lose its names, which reads as
+a bug.
+
+### The names API
+
+`rray_names(x)` returns the `dimnames` attribute as it is. A one dimensional
+array with names returns a one element list. No normalization on read.
+
+Setters take a list of length exactly the dimensionality, where each element is
+either `NULL` or a character vector of exactly that axis' dimension. `NULL`
+clears everything. Short lists are not padded, they are an error.
+
+   285	`dim` is always integer. That is why `rray_size()` returns a double while
+   286	`rray_dimensions()` returns integer. Use `r_ssize` throughout. If long array
+   287	support makes something genuinely hard, drop it and say so in the pull request.
+   288	
+   289	## 2.3 Names
+   290	
+   291	There are five rules. Every function in Part 5 declares which one it follows.
+   292	
+   293	**Follow the axis.** An axis keeps its names if its dimension is unchanged, and
+   294	loses them if its dimension changed. Whatever it keeps travels with it to
+   295	wherever the axis ends up. New axes have no names.
+   296	
+   297	This is the rule for almost everything that reshapes an array. An axis of
+   298	dimension 1 broadcast to 1 counts as unchanged and keeps its length 1 names.
+   299	
+   300	**Reduce.** Reduced axes lose their names. Every other axis keeps them.
+   301	
+   302	Nearly the same rule, but a reduced axis loses its names even when its dimension
+   303	was already 1, so it needs stating separately.
+   304	
+   305	This lives in `rray_reduce_names(x, axes)`. Reductions take one array, so unlike
+   306	the broadcasting family below there is no `2` or `_common` form, and no fill
+   307	helper to share between them.
+   308	
+   309	**Coalesce.** Used by anything with two or more array inputs. For each axis of
+   310	the common dimensions:
+   311	
+   312	1. Use `x`'s names if `x`'s dimension there equals the common dimension and `x`
+   313	   has names there.
+   314	
+   315	2. Otherwise apply the same test to `y`.
+   316	
+   317	3. Otherwise `NULL`.
+   318	
+   319	This lives in three internal functions, one per arity:
+   320	
+   321	```c
+   322	r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions);
+   323	r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions);
+   324	r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions);
+   325	```
+   326	
+   327	All three fill one output list from a shared helper, never overwriting a slot
+   328	that an earlier input already filled. Coalescing is just that &quot;don't overwrite&quot;
+   329	rule, so the one-input case is the follow the axis rule and needs no separate
+   330	implementation.
+   331	
+   332	They take arrays rather than extracted names, because `arg_as_array()` gives
+   333	every input a real `dim`, which makes `r_dim()` and `r_dim_names()` free reads
+   334	off an object the caller already protects. They assume validated, broadcastable
+   335	inputs, so they take no `arg` and no `error_call` and cannot fail. Validation
+   336	belongs in the caller, which has always done it already.
+   337	
+   338	**Subset.** Names are subset alongside the data, so an axis keeps the names of
+   339	the elements that survived.
+   340	
+   341	`rray_split()` is the one case producing many arrays at once, so its
+   342	`rray_split_names(x, dimensions)` returns one set of names per output element.
+   343	A split axis gets the single name at that element's point, an unsplit axis
+   344	carries its names over whole. It needs no `axes` argument, because an axis is
+   345	split exactly when its split dimension is not 1, and splitting a size 1 axis
+   346	gives the same answer either way.
+   347	
+   348	**Dropped.** All names are discarded. Used where no axis survives in a
+   349	recognisable form, such as a reshape.
+   350	</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning tracing R source for dimension handling</strong></p>
+<p><strong>Evaluating axis-wise name propagation approach</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning tracing R source for dimension handling</strong></p>
+<p><strong>Evaluating axis-wise name propagation approach</strong></p>
+<p><strong>Analyzing R dimnames conflict resolution logic</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning tracing R source for dimension handling</strong></p>
+<p><strong>Evaluating axis-wise name propagation approach</strong></p>
+<p><strong>Analyzing R dimnames conflict resolution logic</strong></p>
+<p><strong>Comparing base R and rray dimnames policies</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning tracing R source for dimension handling</strong></p>
+<p><strong>Evaluating axis-wise name propagation approach</strong></p>
+<p><strong>Analyzing R dimnames conflict resolution logic</strong></p>
+<p><strong>Comparing base R and rray dimnames policies</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning tracing R source for dimension handling</strong></p>
+<p><strong>Evaluating axis-wise name propagation approach</strong></p>
+<p><strong>Analyzing R dimnames conflict resolution logic</strong></p>
+<p><strong>Comparing base R and rray dimnames policies</strong></p>
+<p><strong>Recommending silent dimname conflict handling</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning tracing R source for dimension handling</strong></p>
+<p><strong>Evaluating axis-wise name propagation approach</strong></p>
+<p><strong>Analyzing R dimnames conflict resolution logic</strong></p>
+<p><strong>Comparing base R and rray dimnames policies</strong></p>
+<p><strong>Recommending silent dimname conflict handling</strong></p>
+<p><strong>Defining precise consensus dimnames unification algorithm</strong></p>
+</details>
+<p>You’re right: base R does not merge <code>dimnames</code> axis-by-axis.</p>
+<p>For an array result, R effectively chooses one complete <code>dimnames</code> object:</p>
+<ul>
+<li>Use all of <code>x</code>’s <code>dimnames</code> if <code>x</code> has them.</li>
+<li>Otherwise use all of <code>y</code>’s.</li>
+<li>A partially named <code>x</code> still wins wholesale; <code>NULL</code> axes are not filled from <code>y</code>.</li>
+<li>Consequently, reversing the operands can reverse which names survive.</li>
+</ul>
+<p>For ordinary vectors, the related rule is: use names from <code>x</code> if its length equals the result length; otherwise use names from <code>y</code> if its length does. Equal-length inputs therefore prefer <code>x</code>. These rules are documented as deliberately “rather complicated” in <a href="https://stat.ethz.ch/R-manual/R-devel/RHOME/library/base/html/Arithmetic.html">R’s arithmetic documentation</a> and are visible directly in R’s arithmetic implementation.</p>
+<p>For example, base R behaves like this:</p>
+<pre><code class="language-r">x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+y &lt;- array(1:6, c(2, 3), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+
+dimnames(x + y)
+# list(c(&quot;r1&quot;, &quot;r2&quot;), NULL)
+
+dimnames(y + x)
+# list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+</code></pre>
+<p>rray currently does something materially different. Its documented rule and implementation select the first eligible names independently for every axis: implementation.md, broadcast-names.c. Thus the example above becomes a hybrid containing <code>x</code>’s rows and <code>y</code>’s columns.</p>
+<p>I would not copy R’s all-or-nothing rule, though. R never had to define it for broadcasting two non-conformable arrays. In the important outer-broadcast case—</p>
+<pre><code class="language-text">x: 3 × 1, with row names
+y: 1 × 2, with column names
+</code></pre>
+<p>—neither input can donate a complete set of names. Combining <code>x</code>’s rows with <code>y</code>’s columns is exactly right.</p>
+<p>My recommendation is a third rule: consensus names.</p>
+<p>For each result axis:</p>
+<ol>
+<li>Ignore inputs that were broadcast on that axis.</li>
+<li>Treat <code>NULL</code> as “no information.”</li>
+<li>If exactly one distinct non-<code>NULL</code> name vector remains, keep it.</li>
+<li>If contributors supply conflicting name vectors, drop names for that axis.</li>
+</ol>
+<p>That produces:</p>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Base R</th>
+<th>Current rray</th>
+<th>Consensus rule</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Only <code>x</code> names an unchanged axis</td>
+<td><code>x</code></td>
+<td><code>x</code></td>
+<td><code>x</code></td>
+</tr>
+<tr>
+<td><code>x</code> and <code>y</code> supply identical names</td>
+<td><code>x</code></td>
+<td><code>x</code></td>
+<td>keep them</td>
+</tr>
+<tr>
+<td><code>x</code> and <code>y</code> supply conflicting names</td>
+<td><code>x</code></td>
+<td><code>x</code></td>
+<td>drop that axis</td>
+</tr>
+<tr>
+<td><code>x</code> supplies rows, <code>y</code> supplies columns</td>
+<td>only one operand</td>
+<td>merge both</td>
+<td>merge both</td>
+</tr>
+<tr>
+<td>An input broadcasts on an axis</td>
+<td>mostly not applicable</td>
+<td>ignore its names</td>
+<td>ignore its names</td>
+</tr>
+</tbody>
+</table>
+<p>I think this feels most natural because names remain only when they make a truthful, unambiguous statement about the result. It also makes metadata symmetric for commutative operations:</p>
+<pre><code class="language-r">rray_names(rray_add(x, y)) ==
+  rray_names(rray_add(y, x))
+</code></pre>
+<p>The current “first wins” rule cannot guarantee that. It also becomes increasingly arbitrary for the planned n-ary operations.</p>
+<p>There is precedent for this general philosophy: xarray preserves coordinate metadata when it is absent from one operand or agrees across operands, but drops conflicting non-index coordinates. Its overall model is richer because index coordinates participate in alignment, but the conflict policy is relevant here. <a href="https://docs.xarray.dev/en/stable/user-guide/computation.html">xarray computation documentation</a></p>
+<p>I’d make conflict-dropping silent. An error or warning would suggest that rray aligns data by names, which it does not—it broadcasts positionally. If named alignment is ever desired, that should be a separate and explicit feature.</p>
+<p>One implementation caveat: for n-ary inputs, “conflict” must be a sticky third state, distinct from <code>NULL</code>; otherwise <code>A</code>, then conflicting <code>B</code>, then <code>A</code> could accidentally regain names. I’d call the rule “unify names” rather than “coalesce names”: coalescing means first non-missing wins, while unification means preserve only compatible information.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>That last point avoids this problem?</p>
+<p>(x + y) + z    -&gt;  drop(A, B) = NULL,  then drop(NULL, B) = B<br />
+x + (y + z)    -&gt;  drop(B, B) = B,     then drop(A, B)    = NULL</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing binary nesting conflict handling</strong></p>
+<p><strong>Evaluating associative semilattice rules</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing binary nesting conflict handling</strong></p>
+<p><strong>Evaluating associative semilattice rules</strong></p>
+<p><strong>Analyzing name propagation with broadcasting</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing binary nesting conflict handling</strong></p>
+<p><strong>Evaluating associative semilattice rules</strong></p>
+<p><strong>Analyzing name propagation with broadcasting</strong></p>
+<p><strong>Finalizing left-biased coalesce recommendation</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing binary nesting conflict handling</strong></p>
+<p><strong>Evaluating associative semilattice rules</strong></p>
+<p><strong>Analyzing name propagation with broadcasting</strong></p>
+<p><strong>Finalizing left-biased coalesce recommendation</strong></p>
+<p><strong>Advocating strict conflict error with fallback</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing binary nesting conflict handling</strong></p>
+<p><strong>Evaluating associative semilattice rules</strong></p>
+<p><strong>Analyzing name propagation with broadcasting</strong></p>
+<p><strong>Finalizing left-biased coalesce recommendation</strong></p>
+<p><strong>Advocating strict conflict error with fallback</strong></p>
+</details>
+<p>No. That “sticky conflict” only works while one n-ary operation retains an internal conflict state. Once a binary operation returns an ordinary array, the conflict is encoded as <code>NULL</code>, indistinguishable from “nobody supplied names.” Your example proves the rule is not associative.</p>
+<p>In fact, these three properties cannot coexist when the output stores only <code>NULL</code> or a name:</p>
+<ol>
+<li><code>NULL</code> is an identity: <code>NULL ⊕ B = B</code>.</li>
+<li>Conflicts drop: <code>A ⊕ B = NULL</code>.</li>
+<li><code>⊕</code> is associative.</li>
+</ol>
+<p>Your <code>A, B, B</code> example gives the contradiction directly.</p>
+<p>I’d therefore revise my recommendation to strict unification:</p>
+<ul>
+<li><code>NULL</code> plus <code>A</code> → <code>A</code></li>
+<li><code>A</code> plus <code>A</code> → <code>A</code></li>
+<li><code>A</code> plus <code>B</code> → error when <code>A != B</code></li>
+<li>Names from broadcasted axes remain ineligible.</li>
+</ul>
+<p>Errors are the only clean way to retain symmetry, associativity, and the useful “unnamed means no opinion” behavior without inventing hidden conflict metadata.</p>
+<p>If name conflicts must never error, I would keep rray’s current left-biased, axis-wise coalescing. It is associative and is reasonably R-like: the first eligible operand wins, extended per axis so outer broadcasting can preserve complementary row and column names. It is order-dependent, but base R is already order-dependent.</p>
+<p>So my revised ranking is:</p>
+<ol>
+<li>Strict per-axis unification, with an error on conflicting names.</li>
+<li>Current left-biased per-axis coalescing if permissiveness is required.</li>
+<li>Base R’s whole-<code>dimnames</code> donor rule.</li>
+<li>Silent conflict dropping—which your example shows is algebraically unstable.</li>
+</ol>
+
+</section>
+</main>
+</body>
+</html>

@@ -1,0 +1,2157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Simplifying rray_mean_along() branches and applying review comments</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-66">rray timeline</a>
+<h1>Simplifying <code>rray_mean_along()</code> branches and applying review comments</h1>
+<p class="facts">Claude · Sep 15, 2026 · 9 prompts · 10 replies · <a href="https://github.com/r-lib/rray/pull/66">#66</a></p>
+</header>
+<main>
+<p class="divider">Sep 15, 2026, 09:08 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Should mean lgl and int one also use branch less designs?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls ~/files/r/packages/rray4/src/</summary>
+<pre>ls ~/files/r/packages/rray4/src/</pre><pre class="output">arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extremum.c
+extremum.h
+extremum.o
+init.c
+init.o
+Makevars
+missing.h
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+split-names.c
+split-names.h
+split-names.o
+split.c
+split.h
+split.o
+squeeze.c
+squeeze.h
+squeeze.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o</pre></details>
+<details class="tool"><summary>Bash: git log --oneline -15 &amp;&amp; git diff main --stat</summary>
+<pre>git log --oneline -15 &amp;&amp; git diff main --stat</pre><pre class="output">91cff06 Label the mean kernel state declarations
+bb7ec25 Declare the double mean count after the missing value check
+c45983c Declare the mean kernel count after the summing pass
+cb9b430 Test mean of mixed sign infinities under na_rm
+3562edb Update reduce-mean.c
+d12f893 Name the mean kernel correction term
+66f0941 Name mean kernel accumulators sum and count
+a98e1e5 Document flat reduction iteration
+5ecce7b Document nested reduction iteration
+ae34f7d Normalize zero-dimensional iterator plans
+7a2b563 Rename grouped reduction traversal to nested
+5c41cf1 Remove redundant grouped reduction output size
+c345e7e Use standard reduction location names
+8acb431 Name the outer output run start
+6c54b5a Inline missing double mean handling
+ NAMESPACE                            |   1 +
+ R/reduce.R                           |  14 +
+ bench/matrix-stats.R                 |   8 +-
+ bench/mean.R                         | 101 +++++++
+ man/reduce.Rd                        |   8 +
+ plans/implementation.md              |  14 +-
+ plans/no-macros.md                   | 555 -----------------------------------
+ src/decl/reduce-decl.h               |   6 +
+ src/decl/reduce-mean-decl.h          |  68 +++++
+ src/init.c                           |   7 +
+ src/reduce-mean.c                    | 321 ++++++++++++++++++++
+ src/reduce-mean.h                    |  16 +
+ src/reduce.c                         |  87 ++++++
+ src/reduce.h                         | 132 ++++++++-
+ src/strided-iterator.h               |  25 ++
+ tests/testthat/_snaps/reduce-mean.md | 112 +++++++
+ tests/testthat/test-reduce-mean.R    | 343 ++++++++++++++++++++++
+ 17 files changed, 1251 insertions(+), 567 deletions(-)</pre></details>
+<details class="tool"><summary>Read src/reduce-mean.c</summary>
+<pre class="output">1	#include &quot;reduce-mean.h&quot;
+2	
+3	#include &quot;reduce.h&quot;
+4	#include &quot;type.h&quot;
+5	#include &quot;utils.h&quot;
+6	
+7	#include &quot;decl/reduce-mean-decl.h&quot;
+8	
+9	r_obj* ffi_rray_mean_along(
+10	  r_obj* ffi_x,
+11	  r_obj* ffi_axes,
+12	  r_obj* ffi_na_rm,
+13	  r_obj* ffi_frame
+14	) {
+15	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+16	  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+17	  return rray_mean_along(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+18	}
+19	
+20	r_obj* rray_mean_along(
+21	  r_obj* x,
+22	  r_obj* axes,
+23	  bool na_rm,
+24	  struct rray_arg* arg,
+25	  struct r_lazy error_call
+26	) {
+27	  return rray_reduce_nested(
+28	    x,
+29	    axes,
+30	    na_rm,
+31	    rray_mean_along_switch,
+32	    arg,
+33	    error_call
+34	  );
+35	}
+36	
+37	static rray_reduce_nested_fn rray_mean_along_switch(
+38	  r_obj* x,
+39	  bool na_rm,
+40	  struct rray_arg* arg,
+41	  struct r_lazy error_call
+42	) {
+43	  switch (rray_typeof(x)) {
+44	  case RRAY_TYPE_logical:
+45	    return na_rm ? rray_mean_along_lgl_na_rm : rray_mean_along_lgl;
+46	  case RRAY_TYPE_integer:
+47	    return na_rm ? rray_mean_along_int_na_rm : rray_mean_along_int;
+48	  case RRAY_TYPE_double:
+49	    return na_rm ? rray_mean_along_dbl_na_rm : rray_mean_along_dbl;
+50	
+51	  case RRAY_TYPE_complex:
+52	  case RRAY_TYPE_character:
+53	  case RRAY_TYPE_raw:
+54	  case RRAY_TYPE_list:
+55	    stop_unsupported_reduce(&quot;mean&quot;, x, arg, error_call);
+56	
+57	  case RRAY_TYPE_scalar:
+58	    stop_scalar_input(x, arg, error_call);
+59	  }
+60	
+61	  r_stop_unreachable();
+62	}
+63	
+64	static r_obj* rray_mean_along_lgl(
+65	  r_obj* x,
+66	  const struct rray_strided_iterator_plan* outer_plan,
+67	  const struct rray_strided_iterator_plan* inner_plan
+68	) {
+69	  RRAY_REDUCE_OUTER(
+70	    int,
+71	    r_lgl_cbegin,
+72	    R_TYPE_double,
+73	    double,
+74	    r_dbl_begin,
+75	    rray_mean_along_lgl_one
+76	  );
+77	}
+78	
+79	static r_obj* rray_mean_along_lgl_na_rm(
+80	  r_obj* x,
+81	  const struct rray_strided_iterator_plan* outer_plan,
+82	  const struct rray_strided_iterator_plan* inner_plan
+83	) {
+84	  RRAY_REDUCE_OUTER(
+85	    int,
+86	    r_lgl_cbegin,
+87	    R_TYPE_double,
+88	    double,
+89	    r_dbl_begin,
+90	    rray_mean_along_lgl_one_na_rm
+91	  );
+92	}
+93	
+94	static r_obj* rray_mean_along_int(
+95	  r_obj* x,
+96	  const struct rray_strided_iterator_plan* outer_plan,
+97	  const struct rray_strided_iterator_plan* inner_plan
+98	) {
+99	  RRAY_REDUCE_OUTER(
+100	    int,
+101	    r_int_cbegin,
+102	    R_TYPE_double,
+103	    double,
+104	    r_dbl_begin,
+105	    rray_mean_along_int_one
+106	  );
+107	}
+108	
+109	static r_obj* rray_mean_along_int_na_rm(
+110	  r_obj* x,
+111	  const struct rray_strided_iterator_plan* outer_plan,
+112	  const struct rray_strided_iterator_plan* inner_plan
+113	) {
+114	  RRAY_REDUCE_OUTER(
+115	    int,
+116	    r_int_cbegin,
+117	    R_TYPE_double,
+118	    double,
+119	    r_dbl_begin,
+120	    rray_mean_along_int_one_na_rm
+121	  );
+122	}
+123	
+124	static r_obj* rray_mean_along_dbl(
+125	  r_obj* x,
+126	  const struct rray_strided_iterator_plan* outer_plan,
+127	  const struct rray_strided_iterator_plan* inner_plan
+128	) {
+129	  RRAY_REDUCE_OUTER(
+130	    double,
+131	    r_dbl_cbegin,
+132	    R_TYPE_double,
+133	    double,
+134	    r_dbl_begin,
+135	    rray_mean_along_dbl_one
+136	  );
+137	}
+138	
+139	static r_obj* rray_mean_along_dbl_na_rm(
+140	  r_obj* x,
+141	  const struct rray_strided_iterator_plan* outer_plan,
+142	  const struct rray_strided_iterator_plan* inner_plan
+143	) {
+144	  RRAY_REDUCE_OUTER(
+145	    double,
+146	    r_dbl_cbegin,
+147	    R_TYPE_double,
+148	    double,
+149	    r_dbl_begin,
+150	    rray_mean_along_dbl_one_na_rm
+151	  );
+152	}
+153	
+154	static inline double rray_mean_along_lgl_one(
+155	  const int* v_x,
+156	  r_ssize x_start,
+157	  const struct rray_strided_iterator_plan* inner_plan
+158	) {
+159	  // State
+160	  long double sum = 0.0;
+161	
+162	  RRAY_REDUCE_INNER(int, {
+163	    if (x_elt == r_globals.na_lgl) {
+164	      return r_globals.na_dbl;
+165	    }
+166	    sum += x_elt;
+167	  });
+168	
+169	  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+170	
+171	  return (double) (sum / count);
+172	}
+173	
+174	static inline double rray_mean_along_lgl_one_na_rm(
+175	  const int* v_x,
+176	  r_ssize x_start,
+177	  const struct rray_strided_iterator_plan* inner_plan
+178	) {
+179	  // State
+180	  r_ssize count = 0;
+181	  long double sum = 0.0;
+182	
+183	  RRAY_REDUCE_INNER(int, {
+184	    const bool ok = x_elt != r_globals.na_lgl;
+185	    sum += ok ? x_elt : 0;
+186	    count += ok;
+187	  });
+188	
+189	  return (double) (sum / count);
+190	}
+191	
+192	static inline double rray_mean_along_int_one(
+193	  const int* v_x,
+194	  r_ssize x_start,
+195	  const struct rray_strided_iterator_plan* inner_plan
+196	) {
+197	  // State
+198	  long double sum = 0.0;
+199	
+200	  RRAY_REDUCE_INNER(int, {</pre><p class="cut">122 more lines cut</p></details>
+<details class="tool"><summary>Read bench/mean.R</summary>
+<pre class="output">1	devtools::load_all(quiet = TRUE)
+2	
+3	size &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_SIZE&quot;, &quot;1000000&quot;))
+4	iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;15&quot;))
+5	output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+6	
+7	side &lt;- as.integer(sqrt(size))
+8	if (side * side != size) {
+9	  stop(&quot;`RRAY_BENCH_SIZE` must be a perfect square.&quot;, call. = FALSE)
+10	}
+11	
+12	dimensions &lt;- c(side, side)
+13	
+14	cases &lt;- expand.grid(
+15	  implementation = c(&quot;mean&quot;, &quot;sum&quot;, &quot;base&quot;),
+16	  na_rm = c(FALSE, TRUE),
+17	  missing = c(&quot;none&quot;, &quot;sparse&quot;),
+18	  axes = c(&quot;axis1&quot;, &quot;axis2&quot;, &quot;both&quot;),
+19	  stringsAsFactors = FALSE
+20	)
+21	
+22	add_missing &lt;- function(x, missing) {
+23	  if (missing == &quot;none&quot;) {
+24	    return(x)
+25	  }
+26	
+27	  x[seq.int(1L, length(x), by = 101L)] &lt;- NA
+28	  x
+29	}
+30	
+31	make_input &lt;- function(missing) {
+32	  x &lt;- as.double(seq_len(size)) / 7
+33	  x &lt;- add_missing(x, missing)
+34	  array(x, dimensions)
+35	}
+36	
+37	base_fn &lt;- function(axes) {
+38	  switch(
+39	    axes,
+40	    axis1 = colMeans,
+41	    axis2 = rowMeans,
+42	    both = function(x, na.rm) mean(x, na.rm = na.rm)
+43	  )
+44	}
+45	
+46	results &lt;- vector(&quot;list&quot;, nrow(cases))
+47	
+48	for (i in seq_len(nrow(cases))) {
+49	  case &lt;- cases[i, ]
+50	  x &lt;- make_input(case$missing)
+51	  axes &lt;- switch(case$axes, axis1 = 1L, axis2 = 2L, both = c(1L, 2L))
+52	  base &lt;- base_fn(case$axes)
+53	
+54	  measurement &lt;- switch(
+55	    case$implementation,
+56	    mean = bench::mark(
+57	      rray_mean_along(x, axes, na_rm = case$na_rm),
+58	      iterations = iterations,
+59	      check = FALSE,
+60	      memory = FALSE,
+61	      filter_gc = FALSE
+62	    ),
+63	    sum = bench::mark(
+64	      rray_sum_along(x, axes, na_rm = case$na_rm),
+65	      iterations = iterations,
+66	      check = FALSE,
+67	      memory = FALSE,
+68	      filter_gc = FALSE
+69	    ),
+70	    base = bench::mark(
+71	      base(x, na.rm = case$na_rm),
+72	      iterations = iterations,
+73	      check = FALSE,
+74	      memory = FALSE,
+75	      filter_gc = FALSE
+76	    )
+77	  )
+78	
+79	  results[[i]] &lt;- cbind(
+80	    case,
+81	    median_ns = as.numeric(measurement$median) * 1e9,
+82	    itr_per_sec = as.numeric(measurement$`itr/sec`)
+83	  )
+84	}
+85	
+86	results &lt;- do.call(rbind, results)
+87	row.names(results) &lt;- NULL
+88	
+89	print(results, row.names = FALSE)
+90	
+91	if (nzchar(output)) {
+92	  saveRDS(
+93	    list(
+94	      results = results,
+95	      size = size,
+96	      iterations = iterations,
+97	      revision = system2(&quot;git&quot;, c(&quot;rev-parse&quot;, &quot;HEAD&quot;), stdout = TRUE)
+98	    ),
+99	    output
+100	  )
+101	}
+102	</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;RRAY_REDUCE_INNER\|RRAY_REDUCE_OUTER&quot; -A 40 ~/files/r/packages/rray4/src/…</summary>
+<pre>grep -n &quot;RRAY_REDUCE_INNER\|RRAY_REDUCE_OUTER&quot; -A 40 ~/files/r/packages/rray4/src/reduce.h | head -120</pre><pre class="output">123:#define RRAY_REDUCE_OUTER(                                                     \
+124-  X_CTYPE,                                                                     \
+125-  X_CONST_DEREF,                                                               \
+126-  OUT_RTYPE,                                                                   \
+127-  OUT_CTYPE,                                                                   \
+128-  OUT_DEREF,                                                                   \
+129-  ONE                                                                          \
+130-)                                                                              \
+131-  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
+132-                                                                               \
+133-  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+134-  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+135-                                                                               \
+136-  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+137-                                                                               \
+138-  r_ssize out_run_start = 0;                                                   \
+139-  const r_ssize out_run_size =                                                 \
+140-    rray_strided_iterator_plan_run_size(outer_plan);                           \
+141-                                                                               \
+142-  r_ssize x_start = 0;                                                         \
+143-  const r_ssize x_run_stride =                                                 \
+144-    rray_strided_iterator_plan_run_stride(outer_plan);                         \
+145-                                                                               \
+146-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+147-  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality); \
+148-                                                                               \
+149-  while (out_run_start != size) {                                              \
+150-    const r_ssize out_run_end = out_run_start + out_run_size;                  \
+151-    r_ssize x_loc = x_start;                                                   \
+152-                                                                               \
+153-    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \
+154-      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \
+155-      x_loc += x_run_stride;                                                   \
+156-    }                                                                          \
+157-                                                                               \
+158-    out_run_start = out_run_end;                                               \
+159-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+160-  }                                                                            \
+161-                                                                               \
+162-  FREE(1);                                                                     \
+163-  return out;
+--
+165:#define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+166-  do {                                                                         \
+167-    const r_ssize size = rray_strided_iterator_plan_size(inner_plan);          \
+168-                                                                               \
+169-    r_ssize run_start = 0;                                                     \
+170-    const r_ssize run_size = rray_strided_iterator_plan_run_size(inner_plan);  \
+171-                                                                               \
+172-    const r_ssize x_run_stride =                                               \
+173-      rray_strided_iterator_plan_run_stride(inner_plan);                       \
+174-                                                                               \
+175-    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \
+176-    r_memset(                                                                  \
+177-      v_point,                                                                 \
+178-      0,                                                                       \
+179-      sizeof(r_ssize) * (size_t) inner_plan-&gt;dimensionality                    \
+180-    );                                                                         \
+181-                                                                               \
+182-    while (run_start != size) {                                                \
+183-      const r_ssize run_end = run_start + run_size;                            \
+184-      r_ssize x_loc = x_start;                                                 \
+185-                                                                               \
+186-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+187-        const X_CTYPE x_elt = v_x[x_loc];                                      \
+188-        ACCUMULATE;                                                            \
+189-        x_loc += x_run_stride;                                                 \
+190-      }                                                                        \
+191-                                                                               \
+192-      run_start = run_end;                                                     \
+193-      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, inner_plan);                \
+194-    }                                                                          \
+195-  } while (0)
+196-
+197-// --------------------------------------------------------------------------
+198-// stop_unsupported_reduce
+199-
+200-r_no_return void stop_unsupported_reduce(
+201-  const char* op,
+202-  r_obj* x,
+203-  struct rray_arg* arg,
+204-  struct r_lazy error_call
+205-);</pre></details>
+<details class="tool"><summary>Read src/reduce-sum.c</summary>
+<pre class="output">1	#include &quot;reduce-sum.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	
+5	#include &quot;reduce.h&quot;
+6	#include &quot;type.h&quot;
+7	#include &quot;utils.h&quot;
+8	
+9	#include &quot;decl/reduce-sum-decl.h&quot;
+10	
+11	r_obj* ffi_rray_sum_along(
+12	  r_obj* ffi_x,
+13	  r_obj* ffi_axes,
+14	  r_obj* ffi_na_rm,
+15	  r_obj* ffi_frame
+16	) {
+17	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+18	  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+19	  return rray_sum_along(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+20	}
+21	
+22	r_obj* rray_sum_along(
+23	  r_obj* x,
+24	  r_obj* axes,
+25	  bool na_rm,
+26	  struct rray_arg* arg,
+27	  struct r_lazy error_call
+28	) {
+29	  return rray_reduce(x, axes, na_rm, rray_sum_along_switch, arg, error_call);
+30	}
+31	
+32	static rray_reduce_fn rray_sum_along_switch(
+33	  r_obj* x,
+34	  bool na_rm,
+35	  struct rray_arg* arg,
+36	  struct r_lazy error_call
+37	) {
+38	  switch (rray_typeof(x)) {
+39	  case RRAY_TYPE_logical:
+40	    return na_rm ? rray_sum_along_lgl_na_rm : rray_sum_along_lgl;
+41	  case RRAY_TYPE_integer:
+42	    return na_rm ? rray_sum_along_int_na_rm : rray_sum_along_int;
+43	  case RRAY_TYPE_double:
+44	    return na_rm ? rray_sum_along_dbl_na_rm : rray_sum_along_dbl;
+45	  case RRAY_TYPE_complex:
+46	    return na_rm ? rray_sum_along_cpl_na_rm : rray_sum_along_cpl;
+47	
+48	  case RRAY_TYPE_character:
+49	  case RRAY_TYPE_raw:
+50	  case RRAY_TYPE_list:
+51	    stop_unsupported_reduce(&quot;sum&quot;, x, arg, error_call);
+52	
+53	  case RRAY_TYPE_scalar:
+54	    stop_scalar_input(x, arg, error_call);
+55	  }
+56	
+57	  r_stop_unreachable();
+58	}
+59	
+60	static r_obj* rray_sum_along_lgl(
+61	  r_obj* x,
+62	  r_ssize out_size,
+63	  const struct rray_strided_iterator_plan* plan
+64	) {
+65	  RRAY_REDUCE(
+66	    int,
+67	    r_lgl_cbegin,
+68	    R_TYPE_integer,
+69	    int,
+70	    r_int_begin,
+71	    0,
+72	    rray_sum_along_lgl_one
+73	  );
+74	}
+75	
+76	static r_obj* rray_sum_along_lgl_na_rm(
+77	  r_obj* x,
+78	  r_ssize out_size,
+79	  const struct rray_strided_iterator_plan* plan
+80	) {
+81	  RRAY_REDUCE(
+82	    int,
+83	    r_lgl_cbegin,
+84	    R_TYPE_integer,
+85	    int,
+86	    r_int_begin,
+87	    0,
+88	    rray_sum_along_lgl_one_na_rm
+89	  );
+90	}
+91	
+92	static r_obj* rray_sum_along_int(
+93	  r_obj* x,
+94	  r_ssize out_size,
+95	  const struct rray_strided_iterator_plan* plan
+96	) {
+97	  RRAY_REDUCE(
+98	    int,
+99	    r_int_cbegin,
+100	    R_TYPE_integer,
+101	    int,
+102	    r_int_begin,
+103	    0,
+104	    rray_sum_along_int_one
+105	  );
+106	}
+107	
+108	static r_obj* rray_sum_along_int_na_rm(
+109	  r_obj* x,
+110	  r_ssize out_size,
+111	  const struct rray_strided_iterator_plan* plan
+112	) {
+113	  RRAY_REDUCE(
+114	    int,
+115	    r_int_cbegin,
+116	    R_TYPE_integer,
+117	    int,
+118	    r_int_begin,
+119	    0,
+120	    rray_sum_along_int_one_na_rm
+121	  );
+122	}
+123	
+124	static r_obj* rray_sum_along_dbl(
+125	  r_obj* x,
+126	  r_ssize out_size,
+127	  const struct rray_strided_iterator_plan* plan
+128	) {
+129	  RRAY_REDUCE(
+130	    double,
+131	    r_dbl_cbegin,
+132	    R_TYPE_double,
+133	    double,
+134	    r_dbl_begin,
+135	    0.0,
+136	    rray_sum_along_dbl_one
+137	  );
+138	}
+139	
+140	static r_obj* rray_sum_along_dbl_na_rm(
+141	  r_obj* x,
+142	  r_ssize out_size,
+143	  const struct rray_strided_iterator_plan* plan
+144	) {
+145	  RRAY_REDUCE(
+146	    double,
+147	    r_dbl_cbegin,
+148	    R_TYPE_double,
+149	    double,
+150	    r_dbl_begin,
+151	    0.0,
+152	    rray_sum_along_dbl_one_na_rm
+153	  );
+154	}
+155	
+156	static r_obj* rray_sum_along_cpl(
+157	  r_obj* x,
+158	  r_ssize out_size,
+159	  const struct rray_strided_iterator_plan* plan
+160	) {
+161	  RRAY_REDUCE(
+162	    r_complex,
+163	    r_cpl_cbegin,
+164	    R_TYPE_complex,
+165	    r_complex,
+166	    r_cpl_begin,
+167	    ((r_complex){.r = 0, .i = 0}),
+168	    rray_sum_along_cpl_one
+169	  );
+170	}
+171	
+172	static r_obj* rray_sum_along_cpl_na_rm(
+173	  r_obj* x,
+174	  r_ssize out_size,
+175	  const struct rray_strided_iterator_plan* plan
+176	) {
+177	  RRAY_REDUCE(
+178	    r_complex,
+179	    r_cpl_cbegin,
+180	    R_TYPE_complex,
+181	    r_complex,
+182	    r_cpl_begin,
+183	    ((r_complex){.r = 0, .i = 0}),
+184	    rray_sum_along_cpl_one_na_rm
+185	  );
+186	}
+187	
+188	static inline int rray_sum_along_lgl_one(int out, int x) {
+189	  if (out == r_globals.na_int) {
+190	    return r_globals.na_int;
+191	  }
+192	
+193	  if (x == r_globals.na_lgl) {
+194	    return r_globals.na_int;
+195	  }
+196	
+197	  // Since long vectors aren't supported in arrays,
+198	  // we can't ever integer overflow in a logical array
+199	
+200	  return out + x;</pre><p class="cut">79 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat &gt; /tmp/bench-int-mean.R &lt;&lt;'EOF'</summary>
+<pre>cat &gt; /tmp/bench-int-mean.R &lt;&lt;'EOF'
+devtools::load_all(quiet = TRUE)
+
+side &lt;- 1000L
+n &lt;- side * side
+
+mk &lt;- function(missing) {
+  x &lt;- rep_len(1:100, n)
+  if (missing == &quot;late&quot;) x[n] &lt;- NA
+  if (missing == &quot;sparse&quot;) x[seq.int(1L, n, by = 101L)] &lt;- NA
+  array(x, c(side, side))
+}
+
+for (miss in c(&quot;none&quot;, &quot;late&quot;, &quot;sparse&quot;)) {
+  x &lt;- mk(miss)
+  for (na_rm in c(FALSE, TRUE)) {
+    b &lt;- bench::mark(
+      rray_mean_along(x, 1L, na_rm = na_rm),
+      iterations = 25, check = FALSE, memory = FALSE, filter_gc = FALSE
+    )
+    cat(sprintf(&quot;%-8s na_rm=%-5s %8.3f ms\n&quot;, miss, na_rm, as.numeric(b$median) * 1000))
+  }
+}
+EOF
+Rscript /tmp/bench-int-mean.R</pre><pre class="output">none     na_rm=FALSE    1.052 ms
+none     na_rm=TRUE     0.826 ms
+late     na_rm=FALSE    0.812 ms
+late     na_rm=TRUE     0.792 ms
+sparse   na_rm=FALSE    0.033 ms
+sparse   na_rm=TRUE     0.793 ms</pre></details>
+<details class="tool"><summary>Bash: Rscript /tmp/bench-int-mean.R &amp;&amp; Rscript /tmp/bench-int-mean.R</summary>
+<pre>Rscript /tmp/bench-int-mean.R &amp;&amp; Rscript /tmp/bench-int-mean.R</pre><pre class="output">none     na_rm=FALSE    1.109 ms
+none     na_rm=TRUE     0.828 ms
+late     na_rm=FALSE    0.819 ms
+late     na_rm=TRUE     0.794 ms
+sparse   na_rm=FALSE    0.034 ms
+sparse   na_rm=TRUE     0.793 ms
+none     na_rm=FALSE    1.052 ms
+none     na_rm=TRUE     0.827 ms
+late     na_rm=FALSE    0.813 ms
+late     na_rm=TRUE     0.792 ms
+sparse   na_rm=FALSE    0.033 ms
+sparse   na_rm=TRUE     0.793 ms</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  // State</span>
+<span class="del">-  long double sum = 0.0;</span>
+<span class="del">-</span>
+<span class="del">-  RRAY_REDUCE_INNER(int, {</span>
+<span class="del">-    if (x_elt == r_globals.na_int) {</span>
+<span class="del">-      return r_globals.na_dbl;</span>
+<span class="del">-    }</span>
+<span class="del">-    sum += x_elt;</span>
+<span class="del">-  });</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);</span>
+<span class="del">-</span>
+<span class="del">-  return (double) (sum / count);</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline double rray_mean_along_int_one_na_rm(</span>
+<span class="ins">+  // State</span>
+<span class="ins">+  int na = 0;</span>
+<span class="ins">+  long double sum = 0.0;</span>
+<span class="ins">+</span>
+<span class="ins">+  RRAY_REDUCE_INNER(int, {</span>
+<span class="ins">+    na |= x_elt == r_globals.na_int;</span>
+<span class="ins">+    sum += x_elt;</span>
+<span class="ins">+  });</span>
+<span class="ins">+</span>
+<span class="ins">+  if (na) {</span>
+<span class="ins">+    return r_globals.na_dbl;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);</span>
+<span class="ins">+</span>
+<span class="ins">+  return (double) (sum / count);</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+static inline double rray_mean_along_int_one_na_rm(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript /tmp/bench-int-mean.R</summary>
+<pre>Rscript /tmp/bench-int-mean.R</pre><pre class="output">none     na_rm=FALSE    0.926 ms
+none     na_rm=TRUE     0.795 ms
+late     na_rm=FALSE    0.758 ms
+late     na_rm=TRUE     0.793 ms
+sparse   na_rm=FALSE    0.757 ms
+sparse   na_rm=TRUE     0.793 ms</pre></details>
+<details class="tool"><summary>Bash: cat &gt; /tmp/bench-int-mean.R &lt;&lt;'EOF'</summary>
+<pre>cat &gt; /tmp/bench-int-mean.R &lt;&lt;'EOF'
+devtools::load_all(quiet = TRUE)
+
+side &lt;- 1000L
+n &lt;- side * side
+
+mk &lt;- function(missing) {
+  x &lt;- rep_len(1:100, n)
+  x[seq.int(1L, n, by = 101L)] &lt;- if (missing == &quot;sparse&quot;) NA else 1L
+  x[n] &lt;- if (missing == &quot;last&quot;) NA else 1L
+  array(x, c(side, side))
+}
+
+for (miss in c(&quot;none&quot;, &quot;last&quot;, &quot;sparse&quot;)) {
+  x &lt;- mk(miss)
+  for (na_rm in c(FALSE, TRUE)) {
+    b &lt;- bench::mark(
+      rray_mean_along(x, 1L, na_rm = na_rm),
+      iterations = 50, check = FALSE, memory = FALSE, filter_gc = FALSE
+    )
+    cat(sprintf(&quot;%-8s na_rm=%-5s %8.3f ms\n&quot;, miss, na_rm, as.numeric(b$median) * 1000))
+  }
+}
+EOF
+Rscript /tmp/bench-int-mean.R</pre><pre class="output">none     na_rm=FALSE    0.885 ms
+none     na_rm=TRUE     0.799 ms
+last     na_rm=FALSE    0.757 ms
+last     na_rm=TRUE     0.794 ms
+sparse   na_rm=FALSE    0.756 ms
+sparse   na_rm=TRUE     0.794 ms</pre></details>
+<details class="tool"><summary>Bash: cat &gt; /tmp/bench-int-mean2.R &lt;&lt;'EOF'</summary>
+<pre>cat &gt; /tmp/bench-int-mean2.R &lt;&lt;'EOF'
+devtools::load_all(quiet = TRUE)
+
+side &lt;- 1000L
+n &lt;- side * side
+
+mk &lt;- function(missing) {
+  x &lt;- rep_len(1:100, n)
+  x[seq.int(1L, n, by = 101L)] &lt;- if (missing == &quot;sparse&quot;) NA else 1L
+  x[n] &lt;- if (missing == &quot;last&quot;) NA else 1L
+  array(x, c(side, side))
+}
+
+xs &lt;- lapply(c(&quot;none&quot;, &quot;last&quot;, &quot;sparse&quot;), mk)
+names(xs) &lt;- c(&quot;none&quot;, &quot;last&quot;, &quot;sparse&quot;)
+
+for (rep in 1:2) {
+  for (miss in c(&quot;sparse&quot;, &quot;last&quot;, &quot;none&quot;)) {
+    x &lt;- xs[[miss]]
+    b &lt;- bench::mark(
+      rray_mean_along(x, 1L, na_rm = FALSE),
+      iterations = 50, check = FALSE, memory = FALSE, filter_gc = FALSE
+    )
+    cat(sprintf(&quot;rep%d %-8s %8.3f ms\n&quot;, rep, miss, as.numeric(b$median) * 1000))
+  }
+}
+EOF
+Rscript /tmp/bench-int-mean2.R</pre><pre class="output">rep1 sparse      0.778 ms
+rep1 last        0.758 ms
+rep1 none        0.758 ms
+rep2 sparse      0.758 ms
+rep2 last        0.758 ms
+rep2 none        0.758 ms</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  // State</span>
+<span class="del">-  int na = 0;</span>
+<span class="del">-  long double sum = 0.0;</span>
+<span class="del">-</span>
+<span class="del">-  RRAY_REDUCE_INNER(int, {</span>
+<span class="del">-    na |= x_elt == r_globals.na_int;</span>
+<span class="del">-    sum += x_elt;</span>
+<span class="del">-  });</span>
+<span class="del">-</span>
+<span class="del">-  if (na) {</span>
+<span class="del">-    return r_globals.na_dbl;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);</span>
+<span class="ins">+  // State</span>
+<span class="ins">+  long double sum = 0.0;</span>
+<span class="ins">+</span>
+<span class="ins">+  RRAY_REDUCE_INNER(int, {</span>
+<span class="ins">+    if (x_elt == r_globals.na_int) {</span>
+<span class="ins">+      return r_globals.na_dbl;</span>
+<span class="ins">+    }</span>
+<span class="ins">+    sum += x_elt;</span>
+<span class="ins">+  });</span>
+<span class="ins">+</span>
+<span class="ins">+  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript /tmp/bench-int-mean2.R</summary>
+<pre>Rscript /tmp/bench-int-mean2.R</pre><pre class="output">rep1 sparse      0.041 ms
+rep1 last        0.817 ms
+rep1 none        0.814 ms
+rep2 sparse      0.034 ms
+rep2 last        0.814 ms
+rep2 none        0.815 ms</pre></details>
+<details class="tool"><summary>Bash: git status --porcelain &amp;&amp; git diff --stat</summary>
+<pre>git status --porcelain &amp;&amp; git diff --stat</pre><pre class="output">(Bash completed with no output)</pre></details>
+<p>No. I patched the int kernel to be branchless, measured it, and reverted.</p>
+<h2>Numbers</h2>
+<p>1000x1000 integer array, <code>rray_mean_along(x, 1L, na_rm = FALSE)</code>, median of 50:</p>
+<table>
+<thead>
+<tr>
+<th>input</th>
+<th>early return (current)</th>
+<th>branchless <code>na |= ...</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>no NAs</td>
+<td>0.814 ms</td>
+<td>0.758 ms</td>
+</tr>
+<tr>
+<td>NA every 101st</td>
+<td>0.034 ms</td>
+<td>0.758 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Branchless buys 7% when there are no NAs and loses 22x when there are. The early return is the right call.</p>
+<h2>Why the na_rm kernels are different</h2>
+<p>The two cases look similar but the branch is not the same kind of branch.</p>
+<p>In <code>_na_rm</code>, the test is per element and its outcome is data dependent. With scattered NAs the predictor guesses wrong roughly as often as NAs appear, and every miss costs a pipeline flush. <code>sum += ok ? x_elt : 0</code> removes that.</p>
+<p>In the non-<code>na_rm</code> kernels, the test is a loop exit. It is not taken until it is taken once, and then the function returns. The predictor gets it right every single iteration. There is no misprediction to remove, so the only thing branchless changes is that you now always walk the whole run.</p>
+<p>The other usual reason to go branchless is vectorization, and it does not apply here: <code>sum</code> is <code>long double</code>, and FP addition is not associative, so the compiler will not vectorize the reduction either way.</p>
+<h2>One caveat on the measurement</h2>
+<p>My first pass showed the no-NA case at 1.05 ms, which made branchless look better than it is. That was an artifact of allocating the array immediately before benchmarking it. Building all inputs up front and then timing them gives 0.814 ms, and the numbers become stable across reorderings. Worth knowing for <code>bench/mean.R</code>, which builds its input inside the loop the same way.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Can sum /= count ever produce a non finite value?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;0L\|zero\|empty\|integer(0)\|double(0)&quot; ~/files/r/packages/rray4/tests/te…</summary>
+<pre>grep -n &quot;0L\|zero\|empty\|integer(0)\|double(0)&quot; ~/files/r/packages/rray4/tests/testthat/test-reduce-mean.R | head -40</pre><pre class="output">185:test_that(&quot;na_rm does not change the sign of a zero mean&quot;, {
+222:  x[c(1L, 5L, 9L, 20L)] &lt;- NA
+267:  x &lt;- matrix(numeric(), 0L, 2L)
+273:test_that(&quot;reducing over a non-zero-length axis with a zero-length axis&quot;, {
+274:  x &lt;- matrix(numeric(), 0L, 2L)
+276:  expect_identical(rray_dimensions(out), c(0L, 1L))
+280:test_that(&quot;reducing all axes of a zero-length array&quot;, {
+281:  x &lt;- matrix(numeric(), 0L, 2L)
+287:test_that(&quot;the empty reduction of each input type is `NaN`&quot;, {
+288:  zero_size &lt;- function(x) array(x, c(0L, 1L))
+290:  expect_identical(as.vector(rray_mean_along(zero_size(logical()), 1L)), NaN)
+291:  expect_identical(as.vector(rray_mean_along(zero_size(integer()), 1L)), NaN)
+292:  expect_identical(as.vector(rray_mean_along(zero_size(double()), 1L)), NaN)
+308:  expect_snapshot(rray_mean_along(x, 0L), error = TRUE)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet=TRUE); print(rray_mean_along(array(double(), c(0L,3L)), …</summary>
+<pre>Rscript -e 'devtools::load_all(quiet=TRUE); print(rray_mean_along(array(double(), c(0L,3L)), 1L)); print(rray_mean_along(array(c(NA,NA), c(2L,1L)), 1L, na_rm=TRUE))'</pre><pre class="output">     [,1] [,2] [,3]
+[1,]  NaN  NaN  NaN
+     [,1]
+[1,]  NaN</pre></details>
+<p>Yes, in exactly one case: <code>count == 0</code>.</p>
+<p>An empty run leaves <code>sum</code> at <code>0.0</code>, which passes both <code>ISNAN</code> and the outer <code>R_FINITE</code>, so you reach <code>sum /= count</code> with <code>0.0 / 0</code> and get <code>NaN</code>. That's the correct answer (it matches <code>mean(double())</code>), and the inner <code>R_FINITE</code> check right below it is what stops the correction pass from running on it.</p>
+<p>For <code>count &gt;= 1</code> it can't happen. Dividing a finite value by an integer of 1 or more only shrinks the magnitude, so there's no overflow path and no way to make a <code>NaN</code>.</p>
+<p>Two things that follow from that:</p>
+<p>The inner <code>if (R_FINITE((double) sum))</code> at <code>src/reduce-mean.c:255</code> and <code>:299</code> is purely the empty-run guard. It isn't catching an infinite sum, because the outer branch already routed those to the <code>else</code>. R's own <code>rmean()</code> in <code>summary.c</code> writes the check as one <code>R_FINITE</code> after <code>s /= n</code> precisely because it hasn't split those two cases apart first.</p>
+<p>The <code>else</code> branch can't be reached with <code>count == 0</code>, since a zero-length run always leaves <code>sum</code> finite. So <code>sum += x_elt / count</code> there is safe.</p>
+<p>The <code>long double</code> to <code>double</code> cast leans the right way too. If <code>sum</code> is out of <code>double</code> range on a platform where <code>long double</code> is wider, the cast gives <code>±Inf</code>, <code>R_FINITE</code> is false, and you take the <code>else</code>. The guard never lets a too-large value through.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Can we remove the count == 0 check</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;RRAY_STRIDED_ITERATOR_NEXT&quot; -A 25 ~/files/r/packages/rray4/src/strided-it…</summary>
+<pre>grep -n &quot;RRAY_STRIDED_ITERATOR_NEXT&quot; -A 25 ~/files/r/packages/rray4/src/strided-iterator.h</pre><pre class="output">248:#define RRAY_STRIDED_ITERATOR_NEXT(START, V_POINT, PLAN)                       \
+249-  for (int axis = 1; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+250-    ++V_POINT[axis];                                                           \
+251-    if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+252-      START += PLAN-&gt;v_strides[axis];                                          \
+253-      break;                                                                   \
+254-    }                                                                          \
+255-    V_POINT[axis] = 0;                                                         \
+256-    START -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides[axis];           \
+257-  }
+258-
+259-// --------------------------------------------------------------------------
+260-
+261-// Same as `rray_strided_iterator_plan`, but reports in two location spaces
+262-// while only walking the point space once
+263-struct rray_strided_iterator2_plan {
+264-  r_ssize size;
+265-
+266-  // Since coalescing can multiply two axes' dimensions together, we use an
+267-  // `r_ssize` here even though an individual dimension can't be above an `int`.
+268-  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+269-  int dimensionality;
+270-
+271-  r_ssize v_strides1[RRAY_MAX_DIMENSIONALITY];
+272-  r_ssize v_strides2[RRAY_MAX_DIMENSIONALITY];
+273-};
+--
+388:#define RRAY_STRIDED_ITERATOR_NEXT2(START1, START2, V_POINT, PLAN)             \
+389-  for (int axis = 1; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+390-    ++V_POINT[axis];                                                           \
+391-    if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+392-      START1 += PLAN-&gt;v_strides1[axis];                                        \
+393-      START2 += PLAN-&gt;v_strides2[axis];                                        \
+394-      break;                                                                   \
+395-    }                                                                          \
+396-    V_POINT[axis] = 0;                                                         \
+397-    START1 -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides1[axis];         \
+398-    START2 -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides2[axis];         \
+399-  }
+400-
+401-// --------------------------------------------------------------------------
+402-
+403-static inline int rray__strided_iterator_axes_coalesce(
+404-  r_ssize* v_dimensions,
+405-  r_ssize* v_strides,
+406-  int dimensionality
+407-) {
+408-  int out_axis = 0;
+409-
+410-  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+411-    const r_ssize left_dimension = v_dimensions[out_axis];
+412-    const r_ssize left_stride = v_strides[out_axis];
+413-    const r_ssize right_dimension = v_dimensions[axis];</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  if (R_FINITE((double) sum)) {</span>
+<span class="del">-    sum /= count;</span>
+<span class="del">-</span>
+<span class="del">-    if (R_FINITE((double) sum)) {</span>
+<span class="del">-      // State</span>
+<span class="del">-      long double correction = 0.0;</span>
+<span class="del">-      RRAY_REDUCE_INNER(double, correction += x_elt - sum);</span>
+<span class="del">-      sum += correction / count;</span>
+<span class="del">-    }</span>
+<span class="del">-  } else {</span>
+<span class="ins">+  if (R_FINITE((double) sum)) {</span>
+<span class="ins">+    sum /= count;</span>
+<span class="ins">+</span>
+<span class="ins">+    // State</span>
+<span class="ins">+    long double correction = 0.0;</span>
+<span class="ins">+    RRAY_REDUCE_INNER(double, correction += x_elt - sum);</span>
+<span class="ins">+    sum += correction / count;</span>
+<span class="ins">+  } else {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  if (R_FINITE((double) sum)) {</span>
+<span class="del">-    sum /= count;</span>
+<span class="del">-</span>
+<span class="del">-    if (R_FINITE((double) sum)) {</span>
+<span class="del">-      // State</span>
+<span class="del">-      long double correction = 0.0;</span>
+<span class="del">-      RRAY_REDUCE_INNER(double, correction += ISNAN(x_elt) ? 0 : x_elt - sum);</span>
+<span class="del">-      sum += correction / count;</span>
+<span class="del">-    }</span>
+<span class="del">-  } else {</span>
+<span class="ins">+  if (R_FINITE((double) sum)) {</span>
+<span class="ins">+    sum /= count;</span>
+<span class="ins">+</span>
+<span class="ins">+    // State</span>
+<span class="ins">+    long double correction = 0.0;</span>
+<span class="ins">+    RRAY_REDUCE_INNER(double, correction += ISNAN(x_elt) ? 0 : x_elt - sum);</span>
+<span class="ins">+    sum += correction / count;</span>
+<span class="ins">+  } else {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tai…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 375 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+print(rray_mean_along(array(double(), c(0L, 3L)), 1L))
+print(rray_mean_along(array(integer(), c(0L, 1L)), 1L))
+print(rray_mean_along(array(logical(), c(0L, 1L)), 1L))
+print(rray_mean_along(array(c(NA, NA), c(2L, 1L)), 1L, na_rm = TRUE))
+print(rray_mean_along(array(c(NA, 1, Inf, 2), c(2L, 2L)), 1L, na_rm = TRUE))
+print(rray_mean_along(array(c(1e308, 1e308, 1, 2), c(2L, 2L)), 1L))
+' &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -5</pre><pre class="output">     [,1] [,2] [,3]
+[1,]  NaN  NaN  NaN
+     [,1]
+[1,]  NaN
+     [,1]
+[1,]  NaN
+     [,1]
+[1,]  NaN
+     [,1] [,2]
+[1,]    1  Inf
+       [,1] [,2]
+[1,] 1e+308  1.5
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1606 ]</pre></details>
+<details class="tool"><summary>Bash: git diff</summary>
+<pre>git diff</pre><pre class="output">diff --git a/src/reduce-mean.c b/src/reduce-mean.c
+index 5f0c211..1a38dc2 100644
+--- a/src/reduce-mean.c
++++ b/src/reduce-mean.c
+@@ -252,12 +252,10 @@ static inline double rray_mean_along_dbl_one(
+   if (R_FINITE((double) sum)) {
+     sum /= count;
+ 
+-    if (R_FINITE((double) sum)) {
+-      // State
+-      long double correction = 0.0;
+-      RRAY_REDUCE_INNER(double, correction += x_elt - sum);
+-      sum += correction / count;
+-    }
++    // State
++    long double correction = 0.0;
++    RRAY_REDUCE_INNER(double, correction += x_elt - sum);
++    sum += correction / count;
+   } else {
+     sum = 0.0;
+     RRAY_REDUCE_INNER(double, sum += x_elt / count);
+@@ -296,12 +294,10 @@ static inline double rray_mean_along_dbl_one_na_rm(
+   if (R_FINITE((double) sum)) {
+     sum /= count;
+ 
+-    if (R_FINITE((double) sum)) {
+-      // State
+-      long double correction = 0.0;
+-      RRAY_REDUCE_INNER(double, correction += ISNAN(x_elt) ? 0 : x_elt - sum);
+-      sum += correction / count;
+-    }
++    // State
++    long double correction = 0.0;
++    RRAY_REDUCE_INNER(double, correction += ISNAN(x_elt) ? 0 : x_elt - sum);
++    sum += correction / count;
+   } else {
+     sum = 0.0;
+     RRAY_REDUCE_INNER(double, sum += ISNAN(x_elt) ? 0 : x_elt / count);</pre></details>
+<p>Yes. Removed it from both double kernels, full suite passes (1606, 0 failures).</p>
+<h2>Why it's safe</h2>
+<p>When <code>count == 0</code>, the correction pass falls through to <code>NaN</code> on its own:</p>
+<ul>
+<li><code>sum /= count</code> gives <code>NaN</code></li>
+<li><code>correction</code> stays <code>0.0</code> (non-<code>na_rm</code>: the run is empty so the loop body never runs; <code>na_rm</code>: every element is <code>NaN</code> so the <code>ISNAN</code> ternary contributes <code>0</code>)</li>
+<li><code>sum += correction / count</code> is <code>NaN + 0.0/0</code>, so <code>NaN + NaN</code>, so <code>NaN</code></li>
+</ul>
+<p>Same answer, fewer branches. The check was only ever reachable for <code>count == 0</code>, and for that case it was picking between two paths that both return <code>NaN</code>.</p>
+<p>Checked directly: <code>array(double(), c(0, 3))</code>, the integer and logical empties, and <code>mean(c(NA, NA), na.rm = TRUE)</code> all still give <code>NaN</code>.</p>
+<h2>What I left alone</h2>
+<p>The <code>R_FINITE</code> check in the <code>else</code> branch stays. That one is real. <code>sum</code> there is already <code>±Inf</code>, so the rescaled <code>sum += x_elt / count</code> can still come out <code>±Inf</code> (every element <code>Inf</code>, say), and running the correction pass on it would compute <code>Inf - Inf</code> and turn a correct <code>Inf</code> into <code>NaN</code>. The two branches no longer look symmetric, which is the one cost of this change.</p>
+<p>One note on the mechanism: the code now leans on <code>0.0 / 0</code> producing <code>NaN</code> in two places instead of one. That isn't a new dependency, since the old code already needed <code>sum /= count</code> to yield <code>NaN</code> to return the right answer for an empty run, and this codebase assumes IEEE semantics throughout.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status -sb &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</summary>
+<pre>git status -sb &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</pre><pre class="output">## feature/mean...origin/feature/mean
+ M src/reduce-mean.c
+origin/feature/mean</pre></details>
+<details class="tool"><summary>Bash: git add src/reduce-mean.c &amp;&amp; git commit -m &quot;Remove the redundant empty run check from the dou…</summary>
+<pre>git add src/reduce-mean.c &amp;&amp; git commit -m &quot;Remove the redundant empty run check from the double mean kernels&quot; &amp;&amp; git push</pre><pre class="output">[feature/mean 0ac50d8] Remove the redundant empty run check from the double mean kernels
+ 1 file changed, 8 insertions(+), 12 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   91cff06..0ac50d8  feature/mean -&gt; feature/mean</pre></details>
+<p>Committed as <code>0ac50d8</code> and pushed to <code>origin/feature/mean</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Address all GitHub comments that add code comments in one commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: gh pr list --head feature/mean --json number,title,url,state</summary>
+<pre>gh pr list --head feature/mean --json number,title,url,state</pre><pre class="output">[{&quot;number&quot;:66,&quot;state&quot;:&quot;OPEN&quot;,&quot;title&quot;:&quot;Add`rray_mean_along()` and stateful reducing infra&quot;,&quot;url&quot;:&quot;https://github.com/DavisVaughan/rray4/pull/66&quot;}]</pre></details>
+<details class="tool"><summary>Bash: gh api repos/DavisVaughan/rray4/pulls/66/comments --paginate --jq '.[] | &quot;=== id=\(.id) \(.pa…</summary>
+<pre>gh api repos/DavisVaughan/rray4/pulls/66/comments --paginate --jq '.[] | &quot;=== id=\(.id) \(.path):\(.line // .original_line) user=\(.user.login) state=\(if .in_reply_to_id then &quot;reply to \(.in_reply_to_id)&quot; else &quot;top&quot; end)\n\(.body)\n&quot;'</pre><pre class="output">=== id=4006270418 R/reduce.R:24 user=DavisVaughan state=top
+Remove your comment
+
+=== id=4007278172 src/reduce-mean.c:64 user=DavisVaughan state=top
+Call this rray_reduce_outer
+
+=== id=4007285981 src/reduce-mean.c:202 user=DavisVaughan state=top
+Call this rray_reduce_inner
+
+=== id=4007308750 src/reduce-mean.c:204 user=DavisVaughan state=top
+```suggestion
+    const r_ssize size = rray_strided_iterator_plan_size(inner_plan);                \
+```
+ 
+The function signatures probably need to match this
+
+=== id=4007312381 src/reduce-mean.c:209 user=DavisVaughan state=top
+Order these like how rray_reduce_outer does
+
+=== id=4007506763 src/reduce-mean.c:64 user=DavisVaughan state=top
+Go ahead and move this and reduce inner to reduce.h
+
+=== id=4007518315 src/reduce.h:1 user=DavisVaughan state=top
+Section this file as
+
+- all rray reduce stuff
+- all rray reduce grouped stuff
+- stop unsupported reduce
+
+Sectioned by // --- as used elsewhere 
+
+=== id=4007582083 src/reduce-mean.c:378 user=DavisVaughan state=top
+Just inline this
+
+=== id=4007591963 src/reduce-mean.c:79 user=DavisVaughan state=top
+Name this out_run_start
+
+=== id=4007596110 src/reduce-mean.c:92 user=DavisVaughan state=top
+Name this x_loc here like any other loop. in the helpers, name the argument x_start. I think that should remove the local x_start in the inner helper. Stop and ask if that isn't the case
+
+=== id=4007804791 R/reduce.R:24 user=DavisVaughan state=reply to 4006270418
+Resolved in [abb332c](https://github.com/DavisVaughan/rray4/commit/abb332c).
+
+=== id=4007811942 src/reduce-mean.c:64 user=DavisVaughan state=reply to 4007278172
+Resolved in [8cd2d12](https://github.com/DavisVaughan/rray4/commit/8cd2d12).
+
+=== id=4007817233 src/reduce-mean.c:202 user=DavisVaughan state=reply to 4007285981
+Resolved in [da185c2](https://github.com/DavisVaughan/rray4/commit/da185c2).
+
+=== id=4007827444 src/reduce-mean.c:204 user=DavisVaughan state=reply to 4007308750
+Resolved in [475d5f8](https://github.com/DavisVaughan/rray4/commit/475d5f8).
+
+=== id=4007832593 src/reduce-mean.c:209 user=DavisVaughan state=reply to 4007312381
+Resolved in [5e4e004](https://github.com/DavisVaughan/rray4/commit/5e4e004).
+
+=== id=4007845102 src/reduce-mean.c:64 user=DavisVaughan state=reply to 4007506763
+Resolved in [5585e41](https://github.com/DavisVaughan/rray4/commit/5585e41).
+
+=== id=4007853948 src/reduce.h:1 user=DavisVaughan state=reply to 4007518315
+Resolved in [c9dc25e](https://github.com/DavisVaughan/rray4/commit/c9dc25e).
+
+=== id=4007860641 src/reduce-mean.c:378 user=DavisVaughan state=reply to 4007582083
+Resolved in [6c54b5a](https://github.com/DavisVaughan/rray4/commit/6c54b5a).
+
+=== id=4007868541 src/reduce-mean.c:79 user=DavisVaughan state=reply to 4007591963
+Resolved in [8acb431](https://github.com/DavisVaughan/rray4/commit/8acb431).
+
+=== id=4007880680 src/reduce-mean.c:92 user=DavisVaughan state=reply to 4007596110
+Resolved in [c345e7e](https://github.com/DavisVaughan/rray4/commit/c345e7e).
+
+=== id=4011050263 src/reduce-mean.c:290 user=DavisVaughan state=top
+```suggestion
+  // Handles `c(Inf, -Inf)`. `NaN` and `NA` have otherwise been filtered out.
+  if (ISNAN((double) sum)) {
+```
+
+
+=== id=4011087629 src/reduce-mean.c:160 user=DavisVaughan state=top
+```suggestion
+  // State
+  long double sum = 0.0;
+```
+
+
+=== id=4011088659 src/reduce-mean.c:180 user=DavisVaughan state=top
+```suggestion
+  // State
+  r_ssize count = 0;
+```
+
+
+=== id=4011090046 src/reduce-mean.c:198 user=DavisVaughan state=top
+```suggestion
+  // State
+  long double sum = 0.0;
+```
+
+
+=== id=4011091009 src/reduce-mean.c:218 user=DavisVaughan state=top
+```suggestion
+  // State
+  r_ssize count = 0;
+```
+
+
+=== id=4011091888 src/reduce-mean.c:236 user=DavisVaughan state=top
+```suggestion
+  // State
+  long double sum = 0.0;
+```
+
+
+=== id=4011093558 src/reduce-mean.c:251 user=DavisVaughan state=top
+```suggestion
+      // State
+      long double correction = 0.0;
+```
+
+
+=== id=4011094191 src/reduce-mean.c:265 user=DavisVaughan state=top
+```suggestion
+      // State
+      long double correction = 0.0;
+```
+
+
+=== id=4011096113 src/reduce-mean.c:280 user=DavisVaughan state=top
+```suggestion
+  // State
+  r_ssize count = 0;
+```
+
+
+=== id=4011097056 src/reduce-mean.c:292 user=DavisVaughan state=top
+```suggestion
+      // State
+      long double correction = 0.0;
+```
+
+
+=== id=4011097941 src/reduce-mean.c:307 user=DavisVaughan state=top
+```suggestion
+      // State
+      long double correction = 0.0;
+```
+
+
+=== id=4011110992 src/reduce-mean.c:160 user=DavisVaughan state=reply to 4011087629
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111109 src/reduce-mean.c:180 user=DavisVaughan state=reply to 4011088659
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111246 src/reduce-mean.c:198 user=DavisVaughan state=reply to 4011090046
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111367 src/reduce-mean.c:218 user=DavisVaughan state=reply to 4011091009
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111505 src/reduce-mean.c:236 user=DavisVaughan state=reply to 4011091888
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111637 src/reduce-mean.c:251 user=DavisVaughan state=reply to 4011093558
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111739 src/reduce-mean.c:265 user=DavisVaughan state=reply to 4011094191
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111859 src/reduce-mean.c:280 user=DavisVaughan state=reply to 4011096113
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011111974 src/reduce-mean.c:292 user=DavisVaughan state=reply to 4011097056
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4011112101 src/reduce-mean.c:307 user=DavisVaughan state=reply to 4011097941
+Resolved in [91cff06](https://github.com/DavisVaughan/rray4/commit/91cff06).
+
+=== id=4013984823 src/reduce-mean.c:192 user=DavisVaughan state=top
+```suggestion
+// Impossible to overflow to `NaN`
+static inline double rray_mean_along_int_one(
+```
+
+
+=== id=4013999564 src/reduce-mean.c:238 user=DavisVaughan state=top
+```suggestion
+  // Naively sum up the elements
+  RRAY_REDUCE_INNER(double, sum += x_elt);
+```
+
+
+=== id=4014044762 src/reduce-mean.c:241 user=DavisVaughan state=top
+```suggestion
+  // If the sum is `NaN` or `NA`, 
+  // we return a missing value. Existing `NA` should win over `NaN` so the result is deterministic but that's implementation defined, so if we see either we do another pass through the data looking for any `NA`, otherwise we return `NaN`.
+  if (ISNAN((double) sum)) {
+    RRAY_REDUCE_INNER(double, {
+```
+
+Reflow </pre><p class="cut">17 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat ~/files/r/packages/rray4/.clang-format</summary>
+<pre>cat ~/files/r/packages/rray4/.clang-format</pre><pre class="output">IndentWidth: 2
+ContinuationIndentWidth: 2
+SortIncludes: Never
+BinPackArguments: false
+BinPackParameters: false
+InsertBraces: true
+PointerAlignment: Left
+SpaceAfterCStyleCast: true
+Cpp11BracedListStyle: true
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AlignAfterOpenBracket: BlockIndent
+AlignOperands: DontAlign
+BreakBeforeTernaryOperators: true
+BreakAfterReturnType: Automatic
+PenaltyReturnTypeOnItsOwnLine: 10000</pre></details>
+<details class="tool"><summary>Read src/reduce-mean.c</summary>
+<pre class="output">188	
+189	  return (double) (sum / count);
+190	}
+191	
+192	static inline double rray_mean_along_int_one(
+193	  const int* v_x,
+194	  r_ssize x_start,
+195	  const struct rray_strided_iterator_plan* inner_plan
+196	) {
+197	  // State
+198	  long double sum = 0.0;
+199	
+200	  RRAY_REDUCE_INNER(int, {
+201	    if (x_elt == r_globals.na_int) {
+202	      return r_globals.na_dbl;
+203	    }
+204	    sum += x_elt;
+205	  });
+206	
+207	  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+208	
+209	  return (double) (sum / count);
+210	}
+211	
+212	static inline double rray_mean_along_int_one_na_rm(
+213	  const int* v_x,
+214	  r_ssize x_start,
+215	  const struct rray_strided_iterator_plan* inner_plan
+216	) {
+217	  // State
+218	  r_ssize count = 0;
+219	  long double sum = 0.0;
+220	
+221	  RRAY_REDUCE_INNER(int, {
+222	    const bool ok = x_elt != r_globals.na_int;
+223	    sum += ok ? x_elt : 0;
+224	    count += ok;
+225	  });
+226	
+227	  return (double) (sum / count);
+228	}
+229	
+230	static inline double rray_mean_along_dbl_one(
+231	  const double* v_x,
+232	  r_ssize x_start,
+233	  const struct rray_strided_iterator_plan* inner_plan
+234	) {
+235	  // State
+236	  long double sum = 0.0;
+237	
+238	  RRAY_REDUCE_INNER(double, sum += x_elt);
+239	
+240	  if (ISNAN((double) sum)) {
+241	    RRAY_REDUCE_INNER(double, {
+242	      if (R_IsNA(x_elt)) {
+243	        return r_globals.na_dbl;
+244	      }
+245	    });
+246	
+247	    return R_NaN;
+248	  }
+249	
+250	  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+251	
+252	  if (R_FINITE((double) sum)) {
+253	    sum /= count;
+254	
+255	    // State
+256	    long double correction = 0.0;
+257	    RRAY_REDUCE_INNER(double, correction += x_elt - sum);
+258	    sum += correction / count;
+259	  } else {
+260	    sum = 0.0;
+261	    RRAY_REDUCE_INNER(double, sum += x_elt / count);
+262	
+263	    if (R_FINITE((double) sum)) {
+264	      // State
+265	      long double correction = 0.0;
+266	      RRAY_REDUCE_INNER(double, correction += (x_elt - sum) / count);
+267	      sum += correction;
+268	    }
+269	  }
+270	
+271	  return (double) sum;
+272	}
+273	
+274	static inline double rray_mean_along_dbl_one_na_rm(
+275	  const double* v_x,
+276	  r_ssize x_start,
+277	  const struct rray_strided_iterator_plan* inner_plan</pre></details>
+<p>All 5 unresolved comments are <code>suggestion</code> blocks that add code comments to <code>src/reduce-mean.c</code>. Applying them, reflowing the three long ones to 80 columns.</p>
+
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-static inline double rray_mean_along_int_one(</span>
+<span class="del">-  const int* v_x,</span>
+<span class="ins">+// Impossible to overflow to `NaN`</span>
+<span class="ins">+static inline double rray_mean_along_int_one(</span>
+<span class="ins">+  const int* v_x,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  RRAY_REDUCE_INNER(double, sum += x_elt);</span>
+<span class="del">-</span>
+<span class="del">-  if (ISNAN((double) sum)) {</span>
+<span class="del">-    RRAY_REDUCE_INNER(double, {</span>
+<span class="del">-      if (R_IsNA(x_elt)) {</span>
+<span class="ins">+  // Naively sum up the elements</span>
+<span class="ins">+  RRAY_REDUCE_INNER(double, sum += x_elt);</span>
+<span class="ins">+</span>
+<span class="ins">+  // If the sum is `NaN` or `NA`, we return a missing value. Existing `NA`</span>
+<span class="ins">+  // should win over `NaN` so the result is deterministic but that's</span>
+<span class="ins">+  // implementation defined, so if we see either we do another pass through the</span>
+<span class="ins">+  // data looking for any `NA`, otherwise we return `NaN`.</span>
+<span class="ins">+  if (ISNAN((double) sum)) {</span>
+<span class="ins">+    RRAY_REDUCE_INNER(double, {</span>
+<span class="ins">+      if (R_IsNA(x_elt)) {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-  if (R_FINITE((double) sum)) {</span>
+<span class="del">-    sum /= count;</span>
+<span class="del">-</span>
+<span class="del">-    // State</span>
+<span class="del">-    long double correction = 0.0;</span>
+<span class="del">-    RRAY_REDUCE_INNER(double, correction += x_elt - sum);</span>
+<span class="del">-    sum += correction / count;</span>
+<span class="del">-  } else {</span>
+<span class="del">-    sum = 0.0;</span>
+<span class="del">-    RRAY_REDUCE_INNER(double, sum += x_elt / count);</span>
+<span class="ins">+  if (R_FINITE((double) sum)) {</span>
+<span class="ins">+    // Naive sum was finite! Compute the mean, and apply the correction.</span>
+<span class="ins">+    sum /= count;</span>
+<span class="ins">+</span>
+<span class="ins">+    // State</span>
+<span class="ins">+    long double correction = 0.0;</span>
+<span class="ins">+    RRAY_REDUCE_INNER(double, correction += x_elt - sum);</span>
+<span class="ins">+    sum += correction / count;</span>
+<span class="ins">+  } else {</span>
+<span class="ins">+    // Naive sum overflowed to infinity. This doesn't necessarily mean that the</span>
+<span class="ins">+    // mean would also overflow though (since it's scaled by the count). So</span>
+<span class="ins">+    // compute a more expensive and lossy scaled sum to see if that overflows.</span>
+<span class="ins">+    // And if it doesn't, apply a correction there too.</span>
+<span class="ins">+    sum = 0.0;</span>
+<span class="ins">+    RRAY_REDUCE_INNER(double, sum += x_elt / count);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; awk 'length &gt; 80 {print FILENAME&quot;:&quot;FNR&quot;: &quot;length}' src/red…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; awk 'length &gt; 80 {print FILENAME&quot;:&quot;FNR&quot;: &quot;length}' src/reduce-mean.c; git diff --stat</pre><pre class="output"> src/reduce-mean.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tail -5</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tail -5</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 375 ]</pre></details>
+<details class="tool"><summary>Bash: git add src/reduce-mean.c &amp;&amp; git commit -m &quot;Document the double and integer mean kernel passe…</summary>
+<pre>git add src/reduce-mean.c &amp;&amp; git commit -m &quot;Document the double and integer mean kernel passes&quot; &amp;&amp; git push</pre><pre class="output">[feature/mean 86ff661] Document the double and integer mean kernel passes
+ 1 file changed, 11 insertions(+)
+To https://github.com/DavisVaughan/rray4.git
+   0ac50d8..86ff661  feature/mean -&gt; feature/mean</pre></details>
+<p>Done, <code>86ff661</code> pushed. All 5 unresolved comments were <code>suggestion</code> blocks adding code comments; the other 20 already had &quot;Resolved in&quot; replies.</p>
+<pre><code>+// Impossible to overflow to `NaN`
+ static inline double rray_mean_along_int_one(
+
++  // Naively sum up the elements
+   RRAY_REDUCE_INNER(double, sum += x_elt);
+
++  // If the sum is `NaN` or `NA`, we return a missing value. Existing `NA`
++  // should win over `NaN` so the result is deterministic but that's
++  // implementation defined, so if we see either we do another pass through the
++  // data looking for any `NA`, otherwise we return `NaN`.
+   if (ISNAN((double) sum)) {
+
+   if (R_FINITE((double) sum)) {
++    // Naive sum was finite! Compute the mean, and apply the correction.
+     sum /= count;
+   } else {
++    // Naive sum overflowed to infinity. This doesn't necessarily mean that the
++    // mean would also overflow though (since it's scaled by the count). So
++    // compute a more expensive and lossy scaled sum to see if that overflows.
++    // And if it doesn't, apply a correction there too.
+     sum = 0.0;
+</code></pre>
+<p>Your wording is verbatim. The three marked &quot;Reflow&quot; are wrapped at 80 columns, greedy, matching <code>clang-format</code>'s default. <code>clang-format</code> is clean and <code>reduce</code> tests pass (375, 0 failures).</p>
+<p>Two things to decide:</p>
+<p>All four double-kernel comments landed in <code>rray_mean_along_dbl_one()</code> only. <code>rray_mean_along_dbl_one_na_rm()</code> has the same finite/overflow split and now reads undocumented next to it. You'd written the <code>c(Inf, -Inf)</code> comment there already but nothing on the two branches. Want the same four mirrored down, or is the non-<code>na_rm</code> version meant to be the one that carries the explanation?</p>
+<p>I didn't post &quot;Resolved in 86ff661&quot; replies on the five threads, since you only asked for the commit and push. Say the word and I'll add them in the format the other threads use.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Pull then mark as resolved</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git pull --ff-only 2&gt;&amp;1 &amp;&amp; git log --oneline -3</summary>
+<pre>git pull --ff-only 2&gt;&amp;1 &amp;&amp; git log --oneline -3</pre><pre class="output">From https://github.com/DavisVaughan/rray4
+   86ff661..2493eb2  feature/mean -&gt; origin/feature/mean
+Updating 86ff661..2493eb2
+Fast-forward
+ src/reduce-mean.c | 1 +
+ 1 file changed, 1 insertion(+)
+2493eb2 Update reduce-mean.c
+86ff661 Document the double and integer mean kernel passes
+0ac50d8 Remove the redundant empty run check from the double mean kernels</pre></details>
+<details class="tool"><summary>Bash: gh api graphql -f query='</summary>
+<pre>gh api graphql -f query='
+{
+  repository(owner: &quot;DavisVaughan&quot;, name: &quot;rray4&quot;) {
+    pullRequest(number: 66) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          path
+          comments(first: 1) { nodes { databaseId body } }
+        }
+      }
+    }
+  }
+}' --jq '.data.repository.pullRequest.reviewThreads.nodes[] | &quot;\(.id) resolved=\(.isResolved) \(.path) id=\(.comments.nodes[0].databaseId) :: \(.comments.nodes[0].body | split(&quot;\n&quot;)[0])&quot;'</pre><pre class="output">PRRT_kwDOUHAoJs6iJpwC resolved=true R/reduce.R id=4006270418 :: Remove your comment
+PRRT_kwDOUHAoJs6iMOsS resolved=true src/reduce-mean.c id=4007278172 :: Call this rray_reduce_outer
+PRRT_kwDOUHAoJs6iMP-B resolved=true src/reduce-mean.c id=4007285981 :: Call this rray_reduce_inner
+PRRT_kwDOUHAoJs6iMTrd resolved=true src/reduce-mean.c id=4007308750 :: ```suggestion
+PRRT_kwDOUHAoJs6iMUQU resolved=true src/reduce-mean.c id=4007312381 :: Order these like how rray_reduce_outer does
+PRRT_kwDOUHAoJs6iMzrw resolved=true src/reduce-mean.c id=4007506763 :: Go ahead and move this and reduce inner to reduce.h
+PRRT_kwDOUHAoJs6iM1gY resolved=true src/reduce.h id=4007518315 :: Section this file as
+PRRT_kwDOUHAoJs6iM_fE resolved=true src/reduce-mean.c id=4007582083 :: Just inline this
+PRRT_kwDOUHAoJs6iNBG0 resolved=true src/reduce-mean.c id=4007591963 :: Name this out_run_start
+PRRT_kwDOUHAoJs6iNBys resolved=true src/reduce-mean.c id=4007596110 :: Name this x_loc here like any other loop. in the helpers, name the argument x_start. I think that should remove the local x_start in the inner helper. Stop and ask if that isn't the case
+PRRT_kwDOUHAoJs6iVnlR resolved=true src/reduce-mean.c id=4011050263 :: ```suggestion
+PRRT_kwDOUHAoJs6iVtYI resolved=true src/reduce-mean.c id=4011087629 :: ```suggestion
+PRRT_kwDOUHAoJs6iVtiu resolved=true src/reduce-mean.c id=4011088659 :: ```suggestion
+PRRT_kwDOUHAoJs6iVtxN resolved=true src/reduce-mean.c id=4011090046 :: ```suggestion
+PRRT_kwDOUHAoJs6iVt60 resolved=true src/reduce-mean.c id=4011091009 :: ```suggestion
+PRRT_kwDOUHAoJs6iVuDX resolved=true src/reduce-mean.c id=4011091888 :: ```suggestion
+PRRT_kwDOUHAoJs6iVuUR resolved=true src/reduce-mean.c id=4011093558 :: ```suggestion
+PRRT_kwDOUHAoJs6iVuaq resolved=true src/reduce-mean.c id=4011094191 :: ```suggestion
+PRRT_kwDOUHAoJs6iVuuW resolved=true src/reduce-mean.c id=4011096113 :: ```suggestion
+PRRT_kwDOUHAoJs6iVu43 resolved=true src/reduce-mean.c id=4011097056 :: ```suggestion
+PRRT_kwDOUHAoJs6iVvBh resolved=true src/reduce-mean.c id=4011097941 :: ```suggestion
+PRRT_kwDOUHAoJs6ic9Tz resolved=true src/reduce-mean.c id=4013984823 :: ```suggestion
+PRRT_kwDOUHAoJs6ic_v2 resolved=false src/reduce-mean.c id=4013999564 :: ```suggestion
+PRRT_kwDOUHAoJs6idHRB resolved=false src/reduce-mean.c id=4014044762 :: ```suggestion
+PRRT_kwDOUHAoJs6idRE_ resolved=false src/reduce-mean.c id=4014107686 :: ```suggestion
+PRRT_kwDOUHAoJs6idVWg resolved=false src/reduce-mean.c id=4014133916 :: ```suggestion</pre></details>
+<details class="tool"><summary>Bash: for id in PRRT_kwDOUHAoJs6ic_v2 PRRT_kwDOUHAoJs6idHRB PRRT_kwDOUHAoJs6idRE_ PRRT_kwDOUHAoJs6i…</summary>
+<pre>for id in PRRT_kwDOUHAoJs6ic_v2 PRRT_kwDOUHAoJs6idHRB PRRT_kwDOUHAoJs6idRE_ PRRT_kwDOUHAoJs6idVWg; do
+  gh api graphql -f query='mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { id isResolved } } }' -f id=&quot;$id&quot; --jq '.data.resolveReviewThread.thread | &quot;\(.id) resolved=\(.isResolved)&quot;'
+done</pre><pre class="output">PRRT_kwDOUHAoJs6ic_v2 resolved=true
+PRRT_kwDOUHAoJs6idHRB resolved=true
+PRRT_kwDOUHAoJs6idRE_ resolved=true
+PRRT_kwDOUHAoJs6idVWg resolved=true</pre></details>
+<p>Pulled <code>2493eb2</code> and resolved the four open threads. All 26 review threads on PR #66 are now resolved.</p>
+<p>The fifth one (<code>// Impossible to overflow to NaN</code>) was already resolved on your end, and that's where a problem came in. <code>2493eb2</code> applied that suggestion through the web UI on top of my commit that had already applied it, so the line is now duplicated:</p>
+<pre><code class="language-c">// Impossible to overflow to `NaN`
+// Impossible to overflow to `NaN`
+static inline double rray_mean_along_int_one(
+</code></pre>
+<p><code>src/reduce-mean.c:192-193</code>. Leaving it as-is since it came from your commit. Say the word and I'll drop the duplicate.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Drop the duplicate and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/reduce-mean.c</summary>
+<pre class="diff"><span class="del">-// Impossible to overflow to `NaN`</span>
+<span class="del">-// Impossible to overflow to `NaN`</span>
+<span class="del">-static inline double rray_mean_along_int_one(</span>
+<span class="ins">+// Impossible to overflow to `NaN`</span>
+<span class="ins">+static inline double rray_mean_along_int_one(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-mean.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^r…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tail -3</pre><pre class="output"> src/reduce-mean.c | 1 -
+ 1 file changed, 1 deletion(-)
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 375 ]</pre></details>
+<details class="tool"><summary>Bash: git add src/reduce-mean.c &amp;&amp; git commit -m &quot;Drop the duplicated integer mean overflow comment…</summary>
+<pre>git add src/reduce-mean.c &amp;&amp; git commit -m &quot;Drop the duplicated integer mean overflow comment&quot; &amp;&amp; git push</pre><pre class="output">[feature/mean 849826c] Drop the duplicated integer mean overflow comment
+ 1 file changed, 1 deletion(-)
+To https://github.com/DavisVaughan/rray4.git
+   2493eb2..849826c  feature/mean -&gt; feature/mean</pre></details>
+<p>Pushed as <code>849826c</code>. One line removed, <code>clang-format</code> clean, reduce tests pass (375, 0 failures).</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Wrap rray reduce putter in do while 0 for consistency and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/reduce.h</summary>
+<pre class="output">1	#ifndef RRAY_REDUCE_H
+2	#define RRAY_REDUCE_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	#include &quot;strided-iterator.h&quot;
+8	
+9	// --------------------------------------------------------------------------
+10	// rray_reduce
+11	
+12	// Flat reduction is useful when the output element is the only state carried
+13	// between input elements. It walks `x` once in storage order, updating the
+14	// output element that each input contributes to. This is faster than nested
+15	// reduction because it reads `x` linearly and avoids a separate inner traversal
+16	// for each output element.
+17	
+18	typedef r_obj* (*rray_reduce_fn)(
+19	  r_obj* x,
+20	  r_ssize out_size,
+21	  const struct rray_strided_iterator_plan* plan
+22	);
+23	
+24	typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+25	  r_obj* x,
+26	  bool na_rm,
+27	  struct rray_arg* arg,
+28	  struct r_lazy error_call
+29	);
+30	
+31	r_obj* rray_reduce(
+32	  r_obj* x,
+33	  r_obj* axes,
+34	  bool na_rm,
+35	  rray_reduce_fn_switch fn_switch,
+36	  struct rray_arg* arg,
+37	  struct r_lazy error_call
+38	);
+39	
+40	#define RRAY_REDUCE(                                                           \
+41	  X_CTYPE,                                                                     \
+42	  X_CONST_DEREF,                                                               \
+43	  OUT_RTYPE,                                                                   \
+44	  OUT_CTYPE,                                                                   \
+45	  OUT_DEREF,                                                                   \
+46	  OUT_INIT,                                                                    \
+47	  ONE                                                                          \
+48	)                                                                              \
+49	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+50	                                                                               \
+51	  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+52	  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+53	                                                                               \
+54	  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+55	    v_out[i] = OUT_INIT;                                                       \
+56	  }                                                                            \
+57	                                                                               \
+58	  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+59	                                                                               \
+60	  r_ssize run_start = 0;                                                       \
+61	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+62	                                                                               \
+63	  r_ssize out_start = 0;                                                       \
+64	  const r_ssize out_run_stride = rray_strided_iterator_plan_run_stride(plan);  \
+65	                                                                               \
+66	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+67	  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \
+68	                                                                               \
+69	  while (run_start != size) {                                                  \
+70	    const r_ssize run_end = run_start + run_size;                              \
+71	    r_ssize out_loc = out_start;                                               \
+72	                                                                               \
+73	    if (out_run_stride == 0) {                                                 \
+74	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+75	        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+76	      }                                                                        \
+77	    } else {                                                                   \
+78	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+79	        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+80	        out_loc += out_run_stride;                                             \
+81	      }                                                                        \
+82	    }                                                                          \
+83	                                                                               \
+84	    run_start = run_end;                                                       \
+85	    RRAY_STRIDED_ITERATOR_NEXT(out_start, v_point, plan);                      \
+86	  }                                                                            \
+87	                                                                               \
+88	  FREE(1);                                                                     \
+89	  return out;
+90	
+91	// --------------------------------------------------------------------------
+92	// rray_reduce_nested
+93	
+94	// Nested reduction is needed when an output element cannot hold all reduction
+95	// state, such as the sum and count required by a mean. The outer plan walks the
+96	// retained axes to select each output element, and the inner plan walks the
+97	// reduction axes to compute it. Conceptually, this is like using
+98	// `rray_permute_axes()` to bring the reduction axes to the front, without
+99	// materializing the permuted array.
+100	
+101	typedef r_obj* (*rray_reduce_nested_fn)(
+102	  r_obj* x,
+103	  const struct rray_strided_iterator_plan* outer_plan,
+104	  const struct rray_strided_iterator_plan* inner_plan
+105	);
+106	
+107	typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+108	  r_obj* x,
+109	  bool na_rm,
+110	  struct rray_arg* arg,
+111	  struct r_lazy error_call
+112	);
+113	
+114	r_obj* rray_reduce_nested(
+115	  r_obj* x,
+116	  r_obj* axes,
+117	  bool na_rm,
+118	  rray_reduce_nested_fn_switch fn_switch,
+119	  struct rray_arg* arg,
+120	  struct r_lazy error_call
+121	);
+122	
+123	#define RRAY_REDUCE_OUTER(                                                     \
+124	  X_CTYPE,                                                                     \
+125	  X_CONST_DEREF,                                                               \
+126	  OUT_RTYPE,                                                                   \
+127	  OUT_CTYPE,                                                                   \
+128	  OUT_DEREF,                                                                   \
+129	  ONE                                                                          \
+130	)                                                                              \
+131	  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
+132	                                                                               \
+133	  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+134	  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+135	                                                                               \
+136	  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+137	                                                                               \
+138	  r_ssize out_run_start = 0;                                                   \
+139	  const r_ssize out_run_size =                                                 \
+140	    rray_strided_iterator_plan_run_size(outer_plan);                           \
+141	                                                                               \
+142	  r_ssize x_start = 0;                                                         \
+143	  const r_ssize x_run_stride =                                                 \
+144	    rray_strided_iterator_plan_run_stride(outer_plan);                         \
+145	                                                                               \
+146	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+147	  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality); \
+148	                                                                               \
+149	  while (out_run_start != size) {                                              \
+150	    const r_ssize out_run_end = out_run_start + out_run_size;                  \
+151	    r_ssize x_loc = x_start;                                                   \
+152	                                                                               \
+153	    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \
+154	      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \
+155	      x_loc += x_run_stride;                                                   \
+156	    }                                                                          \
+157	                                                                               \
+158	    out_run_start = out_run_end;                                               \
+159	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+160	  }                                                                            \
+161	                                                                               \
+162	  FREE(1);                                                                     \
+163	  return out;
+164	
+165	#define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+166	  do {                                                                         \
+167	    const r_ssize size = rray_strided_iterator_plan_size(inner_plan);          \
+168	                                                                               \
+169	    r_ssize run_start = 0;                                                     \
+170	    const r_ssize run_size = rray_strided_iterator_plan_run_size(inner_plan);  \
+171	                                                                               \
+172	    const r_ssize x_run_stride =                                               \
+173	      rray_strided_iterator_plan_run_stride(inner_plan);                       \
+174	                                                                               \
+175	    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \
+176	    r_memset(                                                                  \
+177	      v_point,                                                                 \
+178	      0,                                                                       \
+179	      sizeof(r_ssize) * (size_t) inner_plan-&gt;dimensionality                    \
+180	    );                                                                         \
+181	                                                                               \
+182	    while (run_start != size) {                                                \
+183	      const r_ssize run_end = run_start + run_size;                            \
+184	      r_ssize x_loc = x_start;                                                 \
+185	                                                                               \
+186	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+187	        const X_CTYPE x_elt = v_x[x_loc];                                      \
+188	        ACCUMULATE;                                                            \
+189	        x_loc += x_run_stride;                                                 \
+190	      }                                                                        \
+191	                                                                               \
+192	      run_start = run_end;                                                     \
+193	      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, inner_plan);                \
+194	    }                                                                          \
+195	  } while (0)
+196	
+197	// --------------------------------------------------------------------------
+198	// stop_unsupported_reduce
+199	
+200	r_no_return void stop_unsupported_reduce(</pre><p class="cut">8 more lines cut</p></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="del">-  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \</span>
+<span class="del">-  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize out_run_start = 0;                                                   \</span>
+<span class="del">-  const r_ssize out_run_size =                                                 \</span>
+<span class="del">-    rray_strided_iterator_plan_run_size(outer_plan);                           \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize x_start = 0;                                                         \</span>
+<span class="del">-  const r_ssize x_run_stride =                                                 \</span>
+<span class="del">-    rray_strided_iterator_plan_run_stride(outer_plan);                         \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \</span>
+<span class="del">-  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality); \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  while (out_run_start != size) {                                              \</span>
+<span class="del">-    const r_ssize out_run_end = out_run_start + out_run_size;                  \</span>
+<span class="del">-    r_ssize x_loc = x_start;                                                   \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \</span>
+<span class="del">-      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \</span>
+<span class="del">-      x_loc += x_run_stride;                                                   \</span>
+<span class="del">-    }                                                                          \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-    out_run_start = out_run_end;                                               \</span>
+<span class="del">-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \</span>
+<span class="del">-  }                                                                            \</span>
+<span class="del">-                                                                               \</span>
+<span class="del">-  FREE(1);                                                                     \</span>
+<span class="del">-  return out;</span>
+<span class="ins">+  do {                                                                         \</span>
+<span class="ins">+    const r_ssize size = rray_strided_iterator_plan_size(outer_plan);          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                        \</span>
+<span class="ins">+    OUT_CTYPE* v_out = OUT_DEREF(out);                                         \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    const X_CTYPE* v_x = X_CONST_DEREF(x);                                     \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_ssize out_run_start = 0;                                                 \</span>
+<span class="ins">+    const r_ssize out_run_size =                                               \</span>
+<span class="ins">+      rray_strided_iterator_plan_run_size(outer_plan);                         \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_ssize x_start = 0;                                                       \</span>
+<span class="ins">+    const r_ssize x_run_stride =                                               \</span>
+<span class="ins">+      rray_strided_iterator_plan_run_stride(outer_plan);                       \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \</span>
+<span class="ins">+    r_memset(                                                                  \</span>
+<span class="ins">+      v_point,                                                                 \</span>
+<span class="ins">+      0,                                                                       \</span>
+<span class="ins">+      sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality                    \</span>
+<span class="ins">+    );                                                                         \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    while (out_run_start != size) {                                            \</span>
+<span class="ins">+      const r_ssize out_run_end = out_run_start + out_run_size;                \</span>
+<span class="ins">+      r_ssize x_loc = x_start;                                                 \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                  \</span>
+<span class="ins">+        v_out[i] = ONE(v_x, x_loc, inner_plan);                                \</span>
+<span class="ins">+        x_loc += x_run_stride;                                                 \</span>
+<span class="ins">+      }                                                                        \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+      out_run_start = out_run_end;                                             \</span>
+<span class="ins">+      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                \</span>
+<span class="ins">+    }                                                                          \</span>
+<span class="ins">+                                                                               \</span>
+<span class="ins">+    FREE(1);                                                                   \</span>
+<span class="ins">+    return out;                                                                \</span>
+<span class="ins">+  } while (0)</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; rm -f src/*.o src/*.so &amp;&amp; Rscript -e &quot;p…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; rm -f src/*.o src/*.so &amp;&amp; Rscript -e &quot;pkgbuild::compile_dll()&quot; 2&gt;&amp;1 | grep -iE &quot;warn|error|reduce-mean|reduce\.c&quot; | head -20; echo &quot;--- build exit above ---&quot;</pre><pre class="output"> src/reduce.h | 54 ++++++++++++++++++++++++++++++------------------------
+ 1 file changed, 30 insertions(+), 24 deletions(-)
+[1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1m./missing.h:16:10: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1m./missing.h:16:10: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[0m[1mequal.c:558:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:558:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:564:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:564:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:570:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:570:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:576:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:576:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:583:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:583:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+[1mequal.c:589:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+[0m[1mequal.c:589:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-mean.c -o reduce-mean.o
+1 warning generated.
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce.c -o reduce.o
+7 warnings generated.
+--- build exit above ---</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -6</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -6</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1606 ]</pre></details>
+<details class="tool"><summary>Bash: git diff src/reduce.h | head -80</summary>
+<pre>git diff src/reduce.h | head -80</pre><pre class="output">diff --git a/src/reduce.h b/src/reduce.h
+index f79a5e7..b2fc6fb 100644
+--- a/src/reduce.h
++++ b/src/reduce.h
+@@ -128,39 +128,45 @@ r_obj* rray_reduce_nested(
+   OUT_DEREF,                                                                   \
+   ONE                                                                          \
+ )                                                                              \
+-  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
++  do {                                                                         \
++    const r_ssize size = rray_strided_iterator_plan_size(outer_plan);          \
+                                                                                \
+-  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+-  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
++    r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                        \
++    OUT_CTYPE* v_out = OUT_DEREF(out);                                         \
+                                                                                \
+-  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
++    const X_CTYPE* v_x = X_CONST_DEREF(x);                                     \
+                                                                                \
+-  r_ssize out_run_start = 0;                                                   \
+-  const r_ssize out_run_size =                                                 \
+-    rray_strided_iterator_plan_run_size(outer_plan);                           \
++    r_ssize out_run_start = 0;                                                 \
++    const r_ssize out_run_size =                                               \
++      rray_strided_iterator_plan_run_size(outer_plan);                         \
+                                                                                \
+-  r_ssize x_start = 0;                                                         \
+-  const r_ssize x_run_stride =                                                 \
+-    rray_strided_iterator_plan_run_stride(outer_plan);                         \
++    r_ssize x_start = 0;                                                       \
++    const r_ssize x_run_stride =                                               \
++      rray_strided_iterator_plan_run_stride(outer_plan);                       \
+                                                                                \
+-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+-  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality); \
++    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \
++    r_memset(                                                                  \
++      v_point,                                                                 \
++      0,                                                                       \
++      sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality                    \
++    );                                                                         \
+                                                                                \
+-  while (out_run_start != size) {                                              \
+-    const r_ssize out_run_end = out_run_start + out_run_size;                  \
+-    r_ssize x_loc = x_start;                                                   \
++    while (out_run_start != size) {                                            \
++      const r_ssize out_run_end = out_run_start + out_run_size;                \
++      r_ssize x_loc = x_start;                                                 \
+                                                                                \
+-    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \
+-      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \
+-      x_loc += x_run_stride;                                                   \
+-    }                                                                          \
++      for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                  \
++        v_out[i] = ONE(v_x, x_loc, inner_plan);                                \
++        x_loc += x_run_stride;                                                 \
++      }                                                                        \
+                                                                                \
+-    out_run_start = out_run_end;                                               \
+-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+-  }                                                                            \
++      out_run_start = out_run_end;                                             \
++      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                \
++    }                                                                          \
+                                                                                \
+-  FREE(1);                                                                     \
+-  return out;
++    FREE(1);                                                                   \
++    return out;                                                                \
++  } while (0)
+ 
+ #define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+   do {                                                                         \</pre></details>
+<details class="tool"><summary>Bash: git add src/reduce.h &amp;&amp; git commit -m &quot;Wrap RRAY_REDUCE_OUTER in a do while block&quot; &amp;&amp; git push</summary>
+<pre>git add src/reduce.h &amp;&amp; git commit -m &quot;Wrap RRAY_REDUCE_OUTER in a do while block&quot; &amp;&amp; git push</pre><pre class="output">[feature/mean 893ce3c] Wrap RRAY_REDUCE_OUTER in a do while block
+ 1 file changed, 30 insertions(+), 24 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   849826c..893ce3c  feature/mean -&gt; feature/mean</pre></details>
+<p>Pushed as <code>893ce3c</code>. <code>RRAY_REDUCE_OUTER</code> now matches <code>RRAY_REDUCE_INNER</code>'s shape.</p>
+<p>The <code>return out;</code> inside the <code>do</code> still returns from the calling function, and no compiler complained about control reaching the end of a non-void function, so the six <code>rray_mean_along_*()</code> wrappers are unchanged. Clean rebuild of <code>reduce.c</code> and <code>reduce-mean.c</code> produced only the pre-existing <code>-Wbitwise-instead-of-logical</code> warnings from <code>missing.h</code>. Full suite passes (1606, 0 failures).</p>
+<p><code>clang-format</code> reflowed the <code>r_memset()</code> call to three lines under the extra indent, same as <code>RRAY_REDUCE_INNER</code> already had.</p>
+<p>One note: <code>RRAY_REDUCE</code> in the flat section (<code>src/reduce.h:40</code>) is still unwrapped, so the file now has two wrapped macros and one bare one. Want that one done too?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Oh darn undo that and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git revert -n 893ce3c &amp;&amp; git diff --cached --stat &amp;&amp; git diff 849826c --stat</summary>
+<pre>git revert -n 893ce3c &amp;&amp; git diff --cached --stat &amp;&amp; git diff 849826c --stat</pre><pre class="output"> src/reduce.h | 54 ++++++++++++++++++++++++------------------------------
+ 1 file changed, 24 insertions(+), 30 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --porcelain &amp;&amp; Rscript -e &quot;devtools::test(filte…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --porcelain &amp;&amp; Rscript -e &quot;devtools::test(filter = '^reduce')&quot; 2&gt;&amp;1 | tail -3</pre><pre class="output">M  src/reduce.h
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 375 ]</pre></details>
+<details class="tool"><summary>Bash: git commit -m &quot;Unwrap RRAY_REDUCE_OUTER from its do while block&quot; &amp;&amp; git push &amp;&amp; git diff 8498…</summary>
+<pre>git commit -m &quot;Unwrap RRAY_REDUCE_OUTER from its do while block&quot; &amp;&amp; git push &amp;&amp; git diff 849826c --stat &amp;&amp; echo &quot;tree matches 849826c&quot;</pre><pre class="output">[feature/mean 260d934] Unwrap RRAY_REDUCE_OUTER from its do while block
+ 1 file changed, 24 insertions(+), 30 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   893ce3c..260d934  feature/mean -&gt; feature/mean
+tree matches 849826c</pre></details>
+<p>Undone and pushed as <code>260d934</code>. <code>src/reduce.h</code> is byte-identical to <code>849826c</code>, before the wrapping. Reduce tests pass (375, 0 failures).</p>
+<p>I used <code>git revert</code> rather than resetting, since <code>893ce3c</code> was already pushed, so history now shows the wrap and the unwrap as two commits. If you'd rather they both disappear, that needs a force-push to rewrite the branch. Say so and I'll do it.</p>
+
+</section>
+</main>
+</body>
+</html>

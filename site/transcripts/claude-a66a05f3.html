@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whether a read-only r_wrap() would fix its soundness bug</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-150">rray timeline</a>
+<h1>Whether a read-only <code>r_wrap()</code> would fix its soundness bug</h1>
+<p class="facts">Claude · Oct 16, 2026 · 1 prompt · 1 reply · <a href="https://github.com/r-lib/rray/pull/150">#150</a></p>
+</header>
+<main>
+<p class="divider">Oct 16, 2026, 19:04 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Out of curiosity would the soundness issue of r_wrap be fixed if it never returned writable pointers?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat plans/wrap.md; ls src; grep -rn &quot;wrap&quot; src/*.h | head -40</summary>
+<pre>cat plans/wrap.md; ls src; grep -rn &quot;wrap&quot; src/*.h | head -40</pre><pre class="output"># Dropping the ALTREP wrapper
+
+`r_wrap()` (`src/wrapper.c`) has a memory safety bug: a read-only data pointer
+taken before a writable request can dangle. Fixing it properly costs a copy on
+the first outside read, plus a lot of tricky code to keep sound. The previous
+version of this plan (commit `4565791`) describes the bug and that fix in
+detail.
+
+This plan removes the wrapper instead. The wrapper exists for two reasons:
+
+1. `vec_as_array()` wraps every plain vector input, so rray can treat it as a
+   1D array without copying it.
+
+2. The attribute setters (`rray_set_dimensions()` and friends) return a
+   wrapper, so changing attributes does not copy the data.
+
+Reason 1 goes away if rray reads a plain vector as a 1D array natively, with
+no object in between. Reason 2 goes away if the setters copy, the way base
+R's `dim&lt;-` copies shared data.
+
+The work is three checklists, done one pull request at a time, in order:
+
+1. Low-level helpers that natively understand plain vectors.
+
+2. Functions moved off `arg_as_array()` and `vec_as_array()`.
+
+3. Setters that copy, then deleting the wrapper.
+
+Every pull request is green on its own. Until the last one, `arg_as_array()`
+still wraps, and a wrapper has real dimensions, so native helpers and
+unmigrated functions work together at every step.
+
+---
+
+# Part 1: The model
+
+## A plain vector is a 1D array
+
+Everywhere in rray, a vector without a `dim` attribute reads as a 1D array:
+
+|                | array               | plain vector                  |
+|----------------|---------------------|-------------------------------|
+| dimensions     | `dim(x)`            | `length(x)`                   |
+| dimensionality | `length(dim(x))`    | `1`                           |
+| names          | `dimnames(x)`       | `list(names(x))`, or `NULL`   |
+| titles         | `names(dimnames(x))`| `NULL`                        |
+| data           | `x`                 | `x`                           |
+
+This is exactly what `vec_as_array()` produces today, so no user-visible
+reading changes:
+
+```r
+x &lt;- c(a = 1, b = 2)
+rray_dimensions(x)
+#&gt; [1] 2
+rray_names(x)
+#&gt; [[1]]
+#&gt; [1] &quot;a&quot; &quot;b&quot;
+```
+
+## rray returns arrays
+
+Functions that allocate their output already set `dim` on it from the
+computed dimensions, so they keep returning arrays when given a plain vector.
+
+The exceptions are the paths that return an input unchanged. Part 5 lists
+every one of them, and gives each a fix so it returns a 1D array too. rray
+always returns arrays.
+
+## `check_vector()`
+
+`arg_as_array()` does two things: it rejects scalar types (with
+`stop_scalar_input()`), and it calls `vec_as_array()`. `check_vector()` takes
+over the first:
+
+```c
+void check_vector(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  if (rray_typeof(x) == RRAY_TYPE_scalar) {
+    stop_scalar_input(x, arg, error_call);
+  }
+}
+```
+
+It goes in `src/utils.c`, next to `check_unclassed()`, and every
+migrated function calls it right after `check_unclassed()`:
+
+```c
+check_unclassed(x, arg, error_call);
+check_vector(x, arg, error_call);
+```
+
+rray supports list arrays, and `rray_typeof()` reports a list as
+`RRAY_TYPE_list`, so lists pass `check_vector()`, the same as they pass
+`arg_as_array()` today.
+
+## Protection
+
+`r_dim()` and `r_dim_names()` never allocate. Much of the code relies on
+that and leaves their result unprotected:
+
+```c
+r_obj* x_dimensions = r_dim(x);
+const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+```
+
+`rray_dimensions()` and `rray_names()` allocate for a plain vector. So every
+`r_dim(x)` that becomes `rray_dimensions(x)` must be `KEEP()`ed, and the
+function's `FREE()` count goes up. This is the main mechanical risk in
+Checklist 2, and the protection pass in Part 6 is how it gets checked.
+
+## `r_dim()` calls that stay
+
+Some `r_dim()` calls ask &quot;does this object have a `dim` attribute?&quot;, not &quot;what
+are its dimensions?&quot;. These must keep `r_dim()`:
+
+- Subscript shape checks: `rray_as_extract_subscript()`,
+  `rray_as_extract_mask()`, `rray_as_extract_points()`
+  (`src/extract-subscript.c`) and `rray_as_slice_subscript()`
+  (`src/slice-subscript.c`). A numeric matrix means points and a numeric
+  vector means locations, so a missing `dim` is meaningful here.
+
+- Reads of an output rray just allocated and gave a `dim`, like `r_dim(out)`
+  in `RRAY_EXTRACT_ASSIGN_POINTS_LOOP()`.
+
+---
+
+# Part 2: Checklist 1, native helpers
+
+One pull request each. Each helper keeps its signature and its own
+`check_unclassed()` call, since most are also FFI entry points. They replace
+`arg_as_array()` with `check_vector()`.
+
+Callers do not change in these pull requests: they still pass arrays
+(often wrappers), and the array path of each helper behaves as it does
+today. Each pull request adds tests for the plain vector path through the
+exported R function.
+
+- [ ] **`check_vector()`.** Add it to `src/utils.c` and `src/utils.h`. Make
+  `arg_as_array()` call it, so the error stays in one place. No behavior
+  change.
+
+- [ ] **`rray_clone_array()`** (`src/clone.c`, `src/clone.h`). Returns a
+  shallow duplicate of `x` (`r_clone()`, which copies the data and keeps
+  every attribute, as `r_wrap()` does today). For a plain vector, it also
+  does what `vec_as_array()` does: set `dim` to `length(x)`, and move
+  `names` into `dimnames`. Used by the Part 5 early returns and by every
+  setter in Checklist 3. Test it through a small FFI test helper, since
+  nothing calls it yet.
+
+- [ ] **`rray_dimensions()`** (`src/dimensions.c`). Return `r_dim(x)` when it
+  is not `r_null`, else `r_int(r_ssize_as_integer(r_length(x)))`. Long
+  vectors hit the same internal error they hit in `vec_as_array()` today.
+
+  Callers already treat the result as possibly allocated, because it
+  currently comes off a wrapper that is about to be freed. Check each one
+  anyway: `rray_dimension()`, `rray_dimensionality()`, `rray_broadcast()`,
+  `rray_dimensions_common_opts()`, `rray_broadcast_names_fill()`,
+  `rray_reduce_names()`, `rray_set_names()`, `rray_split()`,
+  `rray_permute_axes()`, `rray_locate()`, `rray_reduce()`,
+  `rray_insert_axes()`, `rray_remove_axes()`,
+  `rray_expand_dimensionality()`.
+
+- [ ] **`rray_dimensionality()`** (`src/dimensionality.c`). Return `1` for a
+  plain vector without allocating, else `r_length(r_dim(x))`. It is called
+  per element in `list_max_dimensionality()`.
+
+- [ ] **`rray_size()`** (`src/size.c`). Already `r_length(x)`. Swap
+  `arg_as_array()` for `check_vector()`.
+
+- [ ] **`rray_names()`** (`src/names.c`). Return `r_dim_names(x)` when
+  `x` has a `dim`. For a plain vector, return `r_null` when `names(x)` is
+  `r_null`, else a fresh `list(names(x))`.
+
+  Check each caller protects the result before its next allocation:
+  `rray_axis_names()`, `rray_set_axis_names()`, `rray_titles()`,
+  `rray_broadcast_names_fill()`, `rray_reduce_names()`.
+
+- [ ] **`rray_axis_names()`** (`src/names.c`). For a plain vector, after the
+  axis check, return `names(x)` directly instead of going through the list.
+  This saves the allocation on `rray_row_names()` of a vector.
+
+- [ ] **`rray_titles()`** and **`rray_axis_title()`** (`src/titles.c`). Return
+  `r_null` for a plain vector without calling `rray_names()`. A plain vector
+  never has titles.
+
+These need no change of their own, and become native once the helpers above
+land. Tick them off with a test each:
+
+- [ ] `rray_dimensions_common()`, `rray_dimensions_common_opts()`,
+  `list_max_dimensionality()`.
+
+- [ ] `rray_broadcast_names()`, `rray_broadcast_names2()`,
+  `rray_broadcast_names_common()`, `rray_reduce_names()`.
+
+---
+
+# Part 3: Checklist 2, functions off `arg_as_array()`
+
+Each item replaces `arg_as_array()` (or `vec_as_array()`) with
+`check_vector()`, and moves every dimension and names read onto the helpers.</pre><p class="cut">549 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/wrapper.c; git show 9172a64:plans/wrap.md | head -150</summary>
+<pre>cat src/wrapper.c; git show 9172a64:plans/wrap.md | head -150</pre><pre class="output">#include &quot;wrapper.h&quot;
+
+#include &lt;R_ext/Altrep.h&gt;
+
+#include &quot;clone.h&quot;
+
+#include &quot;decl/wrapper-decl.h&quot;
+
+static char* package = &quot;rray&quot;;
+
+// Wrap an R object in a lightweight ALTREP wrapper
+//
+// Useful when only modifying the attributes of an object,
+// without touching the underlying data.
+//
+// - Read only accesses to the data are &quot;passed through&quot; to the wrapped object
+// - Writable access forces a shallow duplication of the wrapped object if it
+//   EVER looks shared, which happens if we are wrapping a basic R object
+//   supplied from the R side by a user, or if we rewrap a wrapper's underlying
+//   data (because the original wrapper also shares it).
+r_obj* r_wrap(r_obj* x) {
+  R_altrep_class_t cls = wrapper_class(r_typeof(x));
+
+  // If `x` is a wrapper, unwrap it to gain access to the underlying data. This
+  // is what we wrap and bump the reference count of. This avoids a
+  // proliferation of wrappers. We manage writable access to the underlying data
+  // by always cloning it before giving out a writable handle if it is ever
+  // `MAYBE_SHARED()` (i.e. a ref count &gt;1), meaning that we aren't the sole
+  // owner of it at that time.
+  r_obj* data = is_wrapper(x) ? wrapper_readonly(x) : x;
+
+  // Reference count on `data` is bumped when we wrap it here.
+  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+
+  // Creates a fresh attribute pairlist!
+  // Note that we always use `x` here, not `data`.
+  r_attrib_clone_from(out, x);
+
+  FREE(1);
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// Class
+
+static R_altrep_class_t wrapper_logical_class;
+static R_altrep_class_t wrapper_integer_class;
+static R_altrep_class_t wrapper_double_class;
+static R_altrep_class_t wrapper_complex_class;
+static R_altrep_class_t wrapper_raw_class;
+static R_altrep_class_t wrapper_character_class;
+static R_altrep_class_t wrapper_list_class;
+
+static inline bool is_wrapper(r_obj* x) {
+  if (!ALTREP(x)) {
+    return false;
+  }
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    return R_altrep_inherits(x, wrapper_logical_class);
+  case R_TYPE_integer:
+    return R_altrep_inherits(x, wrapper_integer_class);
+  case R_TYPE_double:
+    return R_altrep_inherits(x, wrapper_double_class);
+  case R_TYPE_complex:
+    return R_altrep_inherits(x, wrapper_complex_class);
+  case R_TYPE_raw:
+    return R_altrep_inherits(x, wrapper_raw_class);
+  case R_TYPE_character:
+    return R_altrep_inherits(x, wrapper_character_class);
+  case R_TYPE_list:
+    return R_altrep_inherits(x, wrapper_list_class);
+  default:
+    return false;
+  }
+}
+
+static inline R_altrep_class_t wrapper_class(enum r_type type) {
+  switch (type) {
+  case R_TYPE_logical:
+    return wrapper_logical_class;
+  case R_TYPE_integer:
+    return wrapper_integer_class;
+  case R_TYPE_double:
+    return wrapper_double_class;
+  case R_TYPE_complex:
+    return wrapper_complex_class;
+  case R_TYPE_raw:
+    return wrapper_raw_class;
+  case R_TYPE_character:
+    return wrapper_character_class;
+  case R_TYPE_list:
+    return wrapper_list_class;
+  default:
+    r_abort(&quot;Can't wrap a %s.&quot;, Rf_type2char(type));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Data
+
+static inline r_obj* wrapper_readonly(r_obj* x) {
+  return R_altrep_data1(x);
+}
+
+static inline r_obj* wrapper_writable(r_obj* x) {
+  r_obj* data = R_altrep_data1(x);
+
+  // If ANYONE besides us shares the wrapped data, clone it
+  // before giving out a writable handle.
+  if (MAYBE_SHARED(data)) {
+    data = r_clone_data(data);
+    R_set_altrep_data1(x, data);
+  }
+
+  return data;
+}
+
+// -----------------------------------------------------------------------------
+// Generic
+
+static r_obj* wrapper_serialized_state(r_obj* x) {
+  // Full serialization, lose ALTREP-ness
+  return NULL;
+}
+
+// Powers `Rf_duplicate()` and `Rf_shallow_duplicate()`
+static r_obj* wrapper_duplicate(r_obj* x, Rboolean deep) {
+  if (deep) {
+    // Wrapper only guarantees shallow ownership.
+    // No need to return another wrapper if we fully duplicate.
+    return Rf_duplicate(wrapper_readonly(x));
+  } else {
+    // Perform shallow duplication by rewrapping the wrapped
+    // data in a new wrapper. This won't wrap the wrapper itself.
+    return r_wrap(x);
+  }
+}
+
+static Rboolean wrapper_inspect(
+  r_obj* x,
+  int pre,
+  int deep,
+  int pvec,
+  void (*inspect_subtree)(r_obj*, int, int, int)
+) {
+  Rprintf(&quot;&lt;wrapper&gt;\n&quot;);
+  inspect_subtree(wrapper_readonly(x), pre, deep, pvec);
+  return TRUE;
+}
+
+static r_ssize wrapper_length(r_obj* x) {
+  return r_length(wrapper_readonly(x));
+}
+
+// -----------------------------------------------------------------------------
+// Dataptr
+
+static void* wrapper_logical_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_lgl_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_lgl_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_integer_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_int_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_int_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_double_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_dbl_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_dbl_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_complex_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_cpl_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_cpl_cbegin(wrapper_readonly(x));
+  }
+}
+
+static void* wrapper_raw_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    return r_raw_begin(wrapper_writable(x));
+  } else {
+    return (void*) r_raw_cbegin(wrapper_readonly(x));
+  }
+}
+</pre><p class="cut">459 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;altstring_Set_elt_default\|altlist_Set_elt…</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;altstring_Set_elt_default\|altlist_Set_elt_default&quot; -A3 altrep.c | head; grep -n &quot;REAL(x)\|INTEGER(x)&quot; subassign.c | head -5; grep -c &quot;REAL(&quot; summary.c arithmetic.c</pre><pre class="output">880:static void altstring_Set_elt_default(SEXP x, R_xlen_t i, SEXP v)
+881-{
+882-    ALTREP_ERROR_IN_CLASS(&quot;No Set_elt found for ALTSTRING class&quot;, x);
+883-}
+--
+893:static void altlist_Set_elt_default(SEXP x, R_xlen_t i, SEXP v)
+894-{
+895-    ALTREP_ERROR_IN_CLASS(&quot;ALTLIST classes must provide a Set_elt method&quot;, x);
+896-}
+--
+627:		    REAL(x)[ival - 1] = SCALAR_DVAL(y);
+636:			REAL(x)[ival - 1] = SCALAR_DVAL(y);
+727:	    int *px = INTEGER(x);
+736:	    double *px = REAL(x);
+752:	    double *px = REAL(x);
+arithmetic.c:31
+summary.c:9
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Yes, it would fix the bug, but only if it covers all writes, and the price is that rray's results can no longer be modified.</p>
+<h2>Why it fixes the bug</h2>
+<p>A stale pointer only happens when <code>wrapper_writable()</code> swaps out <code>data1</code>. If nothing ever swaps it, <code>data1</code> stays the same vector for the wrapper's whole life. The wrapper keeps that vector alive, so any read-only pointer into it stays valid. Rewrapping and shallow duplicates share <code>data1</code>, which is also fine when nobody writes.</p>
+<p>There is a catch. <code>Dataptr</code> is not the only caller of <code>wrapper_writable()</code>. The character and list <code>Set_elt</code> methods call it too (<code>src/wrapper.c</code>, the <code>Set_elt</code> section). This still dangles:</p>
+<pre><code class="language-c">const r_obj* const* p = r_chr_cbegin(w);
+SET_STRING_ELT(w, 0, v); // swaps data1
+p[0];                    // points into the old vector
+</code></pre>
+<p>So &quot;never writable&quot; has to mean the writable <code>Dataptr</code> aborts for every type and <code>Set_elt</code> aborts as well. For strings and lists you can just drop <code>Set_elt</code>, because R's defaults already raise an error (<code>altstring_Set_elt_default()</code> in <code>src/main/altrep.c</code>).</p>
+<h2>Why it doesn't help in practice</h2>
+<p>A wrapper reaches the user, through <code>rray_set_dimensions()</code> and friends. R asks for writable pointers all the time, even on objects it owns:</p>
+<ul>
+<li>
+<p>Modifying in place. In <code>y &lt;- rray_set_dimensions(x, 2:3); y[1] &lt;- 0</code>, <code>y</code> is not shared, so R skips the duplicate. It then calls <code>REAL(y)</code> on the wrapper (<code>src/main/subassign.c:736</code>), and that errors. Changing the <code>Duplicate</code> method doesn't help, because R never calls it here.</p>
+</li>
+<li>
+<p>Reading with <code>REAL()</code>. A lot of base R and package C code reads through <code>REAL()</code> or <code>INTEGER()</code> instead of the <code>_RO</code> versions. Every one of those calls would error on a wrapper.</p>
+</li>
+</ul>
+<p>So you would swap a rare memory bug for a common, visible error. That is safer, but it isn't a wrapper users can live with. Making writes work again means replacing <code>data1</code> at some point, and doing that safely is what base R's lock does: copy before handing out the first pointer, then never swap. That was the costly design in the earlier plan.</p>
+<p>That's why the current plan in <code>plans/wrap.md</code> removes the wrapper. If the data is never shared, nothing has to stop writes.</p>
+
+</section>
+</main>
+</body>
+</html>

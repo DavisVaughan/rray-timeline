@@ -1,0 +1,1347 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broadcasting rray_roll_each() shifts with an iterator in the plan</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-94">rray timeline</a>
+<h1>Broadcasting <code>rray_roll_each()</code> shifts with an iterator in the plan</h1>
+<p class="facts">Claude · Sep 28, 2026 · 2 prompts · 4 replies · <a href="https://github.com/r-lib/rray/pull/94">#94</a></p>
+</header>
+<main>
+<p class="divider">Sep 28, 2026, 07:33 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I’m reviewing roll.md’s roll each</p>
+<p>A few notes</p>
+<ul>
+<li>I don’t think size&gt;0 check is needed</li>
+<li>I think n should be broadcast using an iterator to avoid the potential big copy. Seems fine to me if it’s only used to fill shift?</li>
+</ul>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls plans &amp;&amp; grep -n &quot;&quot; plans/roll.md | sed -n '1,400p'</summary>
+<pre>ls plans &amp;&amp; grep -n &quot;&quot; plans/roll.md | sed -n '1,400p'</pre><pre class="output">extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+roll.md
+slice.md
+1:# Rolling plan
+2:
+3:## Recommendation
+4:
+5:Add two functions:
+6:
+7:```r
+8:rray_roll(x, ..., n, axes)
+9:rray_roll_each(x, ..., n, axis)
+10:```
+11:
+12:Both move elements along an axis. An element pushed off one end comes back on
+13:the other.
+14:
+15:- `rray_roll()` rolls one or more axes, with one shift per axis. Every lane
+16:  through an axis moves by the same amount, so each output position has exactly
+17:  one source position, and names roll with the data.
+18:
+19:- `rray_roll_each()` rolls one axis, with one shift per lane. Lanes can move by
+20:  different amounts, so an output position can come from different source
+21:  positions in different lanes. Names on the rolled axis are always dropped.
+22:
+23:The split mirrors pairs the package already has:
+24:
+25:| Every lane moves together | Each lane moves on its own |
+26:|---|---|
+27:| `rray_slice_axis()` | `rray_index_axis()` |
+28:| `rray_rep()` | `rray_rep_each()` |
+29:| `rray_roll()` | `rray_roll_each()` |
+30:
+31:The function decides what happens to names. The size or values of `n` never do.
+32:A caller who wants names kept calls `rray_roll()`.
+33:
+34:## Terms
+35:
+36:- **Lane.** One run of elements along the rolled axis, with every other
+37:  coordinate held fixed. For a matrix and `axis = 2`, each row is a lane. For
+38:  dimensions `(A, B, C)` and `axis = 2`, there are `A * C` lanes, each of
+39:  length `B`.
+40:
+41:- **Lane dimensions.** The dimensions of `x` with the rolled axis set to 1. For
+42:  `(A, B, C)` and `axis = 2`, they are `(A, 1, C)`. There is one lane per
+43:  element of an array with these dimensions.
+44:
+45:- **Shift.** The value of `n` for one lane or one axis. It can be negative,
+46:  zero, or larger than the dimension.
+47:
+48:## Shared rules
+49:
+50:### Direction
+51:
+52:A positive shift moves elements toward higher positions, as in NumPy:
+53:
+54:```r
+55:rray_roll(1:5, n = 2, axes = 1)
+56:# [1] 4 5 1 2 3
+57:```
+58:
+59:A negative shift moves them toward lower positions:
+60:
+61:```r
+62:rray_roll(1:5, n = -1, axes = 1)
+63:# [1] 2 3 4 5 1
+64:```
+65:
+66:### Wrapping
+67:
+68:A shift is reduced modulo the dimension `d` of the rolled axis, into `[0, d)`:
+69:
+70:```text
+71:k = n mod d
+72:out[..., j, ...] = x[..., (j - k) mod d, ...]
+73:```
+74:
+75:So a shift of `7` on a dimension of `5` is a shift of `2`, and a shift of `-1`
+76:is a shift of `4`:
+77:
+78:```r
+79:rray_roll(1:5, n = 7, axes = 1)
+80:# [1] 4 5 1 2 3
+81:```
+82:
+83:A shift of `0`, or any multiple of `d`, leaves the axis unchanged.
+84:
+85:### Values of `n`
+86:
+87:- Integers, and anything that casts losslessly to integer. Doubles holding
+88:  whole numbers work and `1.5` is an error. Logicals work too, with `TRUE` as
+89:  `1`, the same as `axes` and `times` accept them today.
+90:
+91:- Any sign and any magnitude within the R integer range, which is
+92:  `-2147483647` to `2147483647`. `-2147483648` is reserved for `NA`, and a
+93:  double outside the range fails the cast.
+94:
+95:- No missing values.
+96:
+97:- No classed objects.
+98:
+99:### Zero dimensions
+100:
+101:When the rolled axis has dimension 0, there is nothing to move. Every shift is
+102:valid, and it is still validated. The result equals `x`, with the names rule of
+103:the function applied.
+104:
+105:### Bare vectors
+106:
+107:`x` goes through `arg_as_array()`, so a bare vector is a one-dimensional array
+108:and its names move to `dimnames`. The result is always an array.
+109:
+110:## `rray_roll()`
+111:
+112:```r
+113:rray_roll(x, ..., n, axes)
+114:```
+115:
+116:### Arguments
+117:
+118:- `x`: an array or bare vector.
+119:
+120:- `...`: must be empty. It forces `n` and `axes` to be named, as in
+121:  `rray_rep()`.
+122:
+123:- `n`: a bare integer vector of size 1 or the size of `axes`, validated the
+124:  same way as `axes`. A size 1 `n` is used for every axis in `axes`. Otherwise
+125:  `n[[i]]` is the shift for `axes[[i]]`. `n` can't have attributes, so names,
+126:  dimensions, and classes are all errors. Arrays of per-lane shifts belong to
+127:  `rray_roll_each()`.
+128:
+129:- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+130:  An axis can't appear twice. `integer()` is allowed and rolls nothing.
+131:
+132:The result has the type, dimensions, and dimensionality of `x`.
+133:
+134:### Worked examples
+135:
+136:#### One dimension
+137:
+138:```r
+139:rray_roll(1:5, n = 2, axes = 1)
+140:# [1] 4 5 1 2 3
+141:
+142:rray_roll(1:5, n = -1, axes = 1)
+143:# [1] 2 3 4 5 1
+144:
+145:rray_roll(1:5, n = 7, axes = 1)
+146:# [1] 4 5 1 2 3
+147:
+148:rray_roll(1:5, n = 0, axes = 1)
+149:# [1] 1 2 3 4 5
+150:```
+151:
+152:Each result is a one-dimensional array with dimensions `5`.
+153:
+154:#### A matrix
+155:
+156:```r
+157:x &lt;- matrix(
+158:  1:6,
+159:  nrow = 2,
+160:  dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+161:)
+162:
+163:x
+164:#    a b c
+165:# r1 1 3 5
+166:# r2 2 4 6
+167:```
+168:
+169:Roll the columns:
+170:
+171:```r
+172:rray_roll(x, n = 1, axes = 2)
+173:#    c a b
+174:# r1 5 1 3
+175:# r2 6 2 4
+176:
+177:rray_roll(x, n = -1, axes = 2)
+178:#    b c a
+179:# r1 3 5 1
+180:# r2 4 6 2
+181:```
+182:
+183:Roll the rows:
+184:
+185:```r
+186:rray_roll(x, n = 1, axes = 1)
+187:#    a b c
+188:# r2 2 4 6
+189:# r1 1 3 5
+190:```
+191:
+192:Roll both at once. A size 1 `n` is used for every axis:</pre><p class="cut">208 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '400,900p' plans/roll.md | cat -n | sed 's/^ *\([0-9]*\)/\1+399/' | awk -F'\t' '{split…</summary>
+<pre>sed -n '400,900p' plans/roll.md | cat -n | sed 's/^ *\([0-9]*\)/\1+399/' | awk -F'\t' '{split($1,a,&quot;+&quot;); printf &quot;%d\t%s\n&quot;, a[1]+a[2], $2}'</pre><pre class="output">400	
+401	#### One shift per column
+402	
+403	```r
+404	x &lt;- matrix(1:12, nrow = 3)
+405	
+406	x
+407	#      [,1] [,2] [,3] [,4]
+408	# [1,]    1    4    7   10
+409	# [2,]    2    5    8   11
+410	# [3,]    3    6    9   12
+411	
+412	rray_roll_each(x, n = matrix(c(0, 1, 2, 3), nrow = 1), axis = 1)
+413	#      [,1] [,2] [,3] [,4]
+414	# [1,]    1    6    8   10
+415	# [2,]    2    4    9   11
+416	# [3,]    3    5    7   12
+417	```
+418	
+419	The lane dimensions are `(1, 4)`, so `n` must be a one row matrix. A plain
+420	vector of length 4 has dimensions `(4)` and fails on axis 1:
+421	
+422	```r
+423	rray_roll_each(x, n = c(0, 1, 2, 3), axis = 1)
+424	# Error in `rray_roll_each()`:
+425	# ! Can't broadcast axis 1 of `n` from dimension 4 to 1.
+426	```
+427	
+428	The last column has a shift of `3` on a dimension of `3`, so it doesn't move.
+429	
+430	#### Three dimensions
+431	
+432	`x` has dimensions `(2, 5, 3)`. Think of it as 3 sheets, each with 2 rows and 5
+433	columns. Roll along axis 2, the columns. The lane dimensions are `(2, 1, 3)`,
+434	so there are 6 lanes: 2 rows on each of 3 sheets.
+435	
+436	```r
+437	x &lt;- array(1:30, c(2, 5, 3))
+438	
+439	x[, , 1]
+440	#      [,1] [,2] [,3] [,4] [,5]
+441	# [1,]    1    3    5    7    9
+442	# [2,]    2    4    6    8   10
+443	
+444	x[, , 2]
+445	#      [,1] [,2] [,3] [,4] [,5]
+446	# [1,]   11   13   15   17   19
+447	# [2,]   12   14   16   18   20
+448	
+449	x[, , 3]
+450	#      [,1] [,2] [,3] [,4] [,5]
+451	# [1,]   21   23   25   27   29
+452	# [2,]   22   24   26   28   30
+453	```
+454	
+455	One shift for every lane:
+456	
+457	```r
+458	out &lt;- rray_roll_each(x, n = 1, axis = 2)
+459	
+460	out[, , 1]
+461	#      [,1] [,2] [,3] [,4] [,5]
+462	# [1,]    9    1    3    5    7
+463	# [2,]   10    2    4    6    8
+464	
+465	out[, , 2]
+466	#      [,1] [,2] [,3] [,4] [,5]
+467	# [1,]   19   11   13   15   17
+468	# [2,]   20   12   14   16   18
+469	
+470	out[, , 3]
+471	#      [,1] [,2] [,3] [,4] [,5]
+472	# [1,]   29   21   23   25   27
+473	# [2,]   30   22   24   26   28
+474	```
+475	
+476	The values match `rray_roll(x, n = 1, axes = 2)`. Only the names rule differs.
+477	
+478	One shift per row, the same on every sheet. `n` has dimensions `(2)`, read as
+479	`(2, 1, 1)`:
+480	
+481	```r
+482	out &lt;- rray_roll_each(x, n = c(1, 2), axis = 2)
+483	
+484	out[, , 1]
+485	#      [,1] [,2] [,3] [,4] [,5]
+486	# [1,]    9    1    3    5    7
+487	# [2,]    8   10    2    4    6
+488	
+489	out[, , 2]
+490	#      [,1] [,2] [,3] [,4] [,5]
+491	# [1,]   19   11   13   15   17
+492	# [2,]   18   20   12   14   16
+493	
+494	out[, , 3]
+495	#      [,1] [,2] [,3] [,4] [,5]
+496	# [1,]   29   21   23   25   27
+497	# [2,]   28   30   22   24   26
+498	```
+499	
+500	One shift per sheet, the same for both rows. `n` has dimensions `(1, 1, 3)`,
+501	so axis 1 and axis 2 are written as 1:
+502	
+503	```r
+504	out &lt;- rray_roll_each(x, n = array(c(0, 1, 2), c(1, 1, 3)), axis = 2)
+505	
+506	out[, , 1]
+507	#      [,1] [,2] [,3] [,4] [,5]
+508	# [1,]    1    3    5    7    9
+509	# [2,]    2    4    6    8   10
+510	
+511	out[, , 2]
+512	#      [,1] [,2] [,3] [,4] [,5]
+513	# [1,]   19   11   13   15   17
+514	# [2,]   20   12   14   16   18
+515	
+516	out[, , 3]
+517	#      [,1] [,2] [,3] [,4] [,5]
+518	# [1,]   27   29   21   23   25
+519	# [2,]   28   30   22   24   26
+520	```
+521	
+522	One shift per lane. `n` has the full lane dimensions `(2, 1, 3)`:
+523	
+524	```r
+525	n &lt;- array(1:6, c(2, 1, 3))
+526	
+527	n[, 1, ]
+528	#      [,1] [,2] [,3]
+529	# [1,]    1    3    5
+530	# [2,]    2    4    6
+531	
+532	out &lt;- rray_roll_each(x, n = n, axis = 2)
+533	
+534	out[, , 1]
+535	#      [,1] [,2] [,3] [,4] [,5]
+536	# [1,]    9    1    3    5    7
+537	# [2,]    8   10    2    4    6
+538	
+539	out[, , 2]
+540	#      [,1] [,2] [,3] [,4] [,5]
+541	# [1,]   15   17   19   11   13
+542	# [2,]   14   16   18   20   12
+543	
+544	out[, , 3]
+545	#      [,1] [,2] [,3] [,4] [,5]
+546	# [1,]   21   23   25   27   29
+547	# [2,]   30   22   24   26   28
+548	```
+549	
+550	Row 1 of sheet 3 has a shift of `5` on a dimension of `5`, so it doesn't move.
+551	Row 2 of sheet 3 has a shift of `6`, which wraps to `1`.
+552	
+553	#### Shifts computed along the axis
+554	
+555	A reducer keeps the reduced axis as a dimension of 1, so anything computed
+556	along `axis` already has the lane dimensions:
+557	
+558	```r
+559	n &lt;- rray_sum_along(counts, axes = 2)   # dimensions (2, 1, 3)
+560	rray_roll_each(x, n = n, axis = 2)
+561	```
+562	
+563	#### One dimension
+564	
+565	A one-dimensional `x` has one lane, so `n` must have size 1:
+566	
+567	```r
+568	rray_roll_each(1:5, n = 2, axis = 1)
+569	# [1] 4 5 1 2 3
+570	```
+571	
+572	### Names
+573	
+574	- Names on the rolled axis are always dropped, whatever the size or values of
+575	  `n`.
+576	
+577	- Every other axis keeps its names. Its dimension is unchanged and every
+578	  position still means the same thing.
+579	
+580	- Names on `n` are ignored.
+581	
+582	This is the reduce rule from `plans/implementation.md` 2.3 applied to the one
+583	rolled axis, and is what `rray_index_axis()` does to its selected axis.
+584	
+585	Dropping is forced by the per-lane case. When lanes move by different amounts,
+586	column 1 can hold data from column `c` in one row and from column `b` in
+587	another, so no single name is correct:
+588	
+589	```r
+590	x &lt;- matrix(
+591	  1:6,
+592	  nrow = 2,
+593	  dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+594	)
+595	
+596	rray_roll_each(x, n = c(1, 2), axis = 2)
+597	#    [,1] [,2] [,3]
+598	# r1    5    1    3
+599	# r2    4    6    2</pre><p class="cut">301 more lines cut</p></details>
+<details class="tool"><summary>Bash: awk 'NR&gt;=899{printf &quot;%d\t%s\n&quot;, NR, $0}' plans/roll.md; ls src | grep -i -E &quot;iter|broadcast&quot;;…</summary>
+<pre>awk 'NR&gt;=899{printf &quot;%d\t%s\n&quot;, NR, $0}' plans/roll.md; ls src | grep -i -E &quot;iter|broadcast&quot;; grep -rn &quot;iter&quot; src/*.h | head -40</pre><pre class="output">899	Notes:
+900	
+901	- `n` is fully validated before the size check, with `check_broadcastable()`
+902	  from `src/broadcast.h`. It checks the dimensions without allocating and gives
+903	  the same messages as `rray_broadcast()`. So a bad `n` errors even when `x` is
+904	  empty.
+905	
+906	- Nothing proportional to the lane count is allocated for an empty `x`. When
+907	  the rolled axis has dimension 0, the lane dimensions can still be huge, for
+908	  example `(100000, 1, 100000)` for `x` with dimensions `(100000, 0, 100000)`.
+909	  Broadcasting `n` there would allocate ten billion integers for an empty
+910	  result.
+911	
+912	- `block_size`, `n_groups`, and `n_lanes` are computed only when `size &gt; 0`.
+913	  Each is then a product of factors of `size`, so none can overflow. With a
+914	  zero dimension elsewhere, a product of the other dimensions could overflow
+915	  `r_ssize`.
+916	
+917	- `rray_broadcast()` returns its input unchanged when the dimensions already
+918	  match. That input can be the caller's own `n`, so never write into it. The
+919	  reduced shifts go into a separate `shifts` table.
+920	
+921	- `shifts` has `size / axis_dimension` elements, which is at most the size of
+922	  `x` and usually much smaller. Reducing once per lane keeps `%` out of the main
+923	  loop.
+924	
+925	- Skipping the fill when `size` is 0 also avoids reducing by an
+926	  `axis_dimension` of 0.
+927	
+928	- `rray_reduce_names()` drops names on the given axes and keeps the rest. It
+929	  returns `NULL` when nothing survives. Its meaning here is exactly the names
+930	  rule for `rray_roll_each()`.
+931	
+932	#### The fill
+933	
+934	`rray_roll_each_fill()` switches on `r_typeof(x)` to seven cores, like
+935	`rray_rep_fill_varying()`. Each core is one macro call, with
+936	`RRAY_ROLL_EACH_FILL_ATOMIC` for logical, integer, double, complex, and raw,
+937	and `RRAY_ROLL_EACH_FILL_BARRIER` for character and list. Undefine both after
+938	the cores.
+939	
+940	The loop walks `out` in column-major order, so every write is sequential:
+941	
+942	```c
+943	const CTYPE* v_x = CONST_DEREF(x);
+944	CTYPE* v_out = DEREF(out);
+945	
+946	const r_ssize group_size = block_size * axis_dimension;
+947	
+948	r_ssize out_i = 0;
+949	
+950	for (r_ssize group = 0; group &lt; n_groups; ++group) {
+951	  const CTYPE* v_x_group = v_x + group * group_size;
+952	  const int* v_group_shifts = v_shifts + group * block_size;
+953	
+954	  for (int j = 0; j &lt; axis_dimension; ++j) {
+955	    for (r_ssize i = 0; i &lt; block_size; ++i) {
+956	      const int shift = v_group_shifts[i];
+957	      const int source =
+958	        (j &gt;= shift) ? j - shift : j - shift + axis_dimension;
+959	
+960	      v_out[out_i] = v_x_group[(r_ssize) source * block_size + i];
+961	      ++out_i;
+962	    }
+963	  }
+964	}
+965	```
+966	
+967	The barrier version replaces the assignment with `POKE(out, out_i, ...)`.
+968	
+969	Reads stay inside the current group, so they stay close in memory. When `axis`
+970	is 1, `block_size` is 1 and each lane is contiguous. A lane by lane path with
+971	two `memcpy()` calls would be faster there. Add it only if a benchmark against
+972	the general loop shows a real gap.
+973	
+974	### File order
+975	
+976	Following the C conventions in `CLAUDE.md`, `src/roll.c` reads top down:
+977	
+978	1. `ffi_rray_roll()`, `rray_roll()`
+979	
+980	2. `arg_as_roll_n()`, `stop_roll_n_size()`
+981	
+982	3. `rray_roll_locations()`
+983	
+984	4. `ffi_rray_roll_each()`, `rray_roll_each()`
+985	
+986	5. `arg_as_roll_each_n()`
+987	
+988	6. `rray_roll_each_fill()`, then its seven cores and macros
+989	
+990	7. `check_roll_n_not_missing()` and `rray_roll_shift()`, last, since both
+991	   halves use them. Declare `rray_roll_shift()` in the decl header as a
+992	   `static inline`, like `axis_is_reduced()` in
+993	   `src/decl/reduce-names-decl.h`.
+994	
+995	`src/roll.h` declares `rray_roll()` and `rray_roll_each()`.
+996	`src/decl/roll-decl.h` declares every static helper and core, and is included
+997	last.
+998	
+999	### Protection review
+1000	
+1001	Do this as a separate pass over the diff before calling the C done. Points
+1002	specific to this plan:
+1003	
+1004	- In both functions, keep `x` right after `arg_as_array()`. For a bare vector
+1005	  it returns a new array, and every later step allocates before `x` is last
+1006	  used.
+1007	
+1008	- In `rray_roll()`, `axes` and `n` from `arg_as_axes_unsorted()` and
+1009	  `arg_as_roll_n()` can be fresh allocations from a cast. Keep both across the
+1010	  loop, which allocates.
+1011	
+1012	- Keep `indices` from its allocation until `rray_slice()` returns.
+1013	
+1014	- Poke each result of `rray_roll_locations()` straight into `indices`, with no
+1015	  allocation in between. Once poked, `indices` protects it.
+1016	
+1017	- In `arg_as_roll_each_n()`, keep `n` after each of `arg_as_array()` and
+1018	  `rray_cast()`.
+1019	
+1020	- In `rray_roll_each()`, keep `n` after `arg_as_roll_each_n()` and after
+1021	  `rray_broadcast()`. Keep `lane_dimensions` from its allocation until
+1022	  `rray_broadcast()` returns. `check_broadcastable()` does not allocate, but
+1023	  `rray_broadcast()` and the allocation of `out` in between do.
+1024	
+1025	- Keep `out` across the allocation of `shifts` and across
+1026	  `rray_reduce_names()`. Keep `shifts` until the fill returns.
+1027	
+1028	- `r_int(axis)` passed to `rray_reduce_names()` must be kept, since
+1029	  `rray_reduce_names()` allocates before it reads `axes`.
+1030	
+1031	### Documentation
+1032	
+1033	One topic, `rray-roll`, in `R/roll.R`, shaped like `rray-rep` in `R/rep.R`:
+1034	
+1035	- A description bullet for each function, saying one shift per axis versus one
+1036	  shift per lane.
+1037	
+1038	- `@details` covering direction, wrapping, broadcasting of `n` in
+1039	  `rray_roll_each()`, and the names rule for each function.
+1040	
+1041	- `@param n` with a paragraph per function, `@param axes`, and `@param axis`,
+1042	  with a full blank line between each `@param`.
+1043	
+1044	- Examples: the one-dimensional roll, the named matrix with `rray_roll()` on
+1045	  each axis and on both, the one shift per row example, the one row matrix for
+1046	  per column shifts, and a names comparison between the two functions.
+1047	
+1048	Wrap at 80 characters and re-document afterwards. Run
+1049	`pkgdown::check_pkgdown()`.
+1050	
+1051	## Test plan
+1052	
+1053	`tests/testthat/test-roll.R` has two `# ----` sections, `rray_roll()` then
+1054	`rray_roll_each()`. No other section headers.
+1055	
+1056	`tests/testthat/helper-roll.R` holds two reference implementations written
+1057	with base R only:
+1058	
+1059	- `expected_roll(x, n, axes)` builds rotated locations per axis and slices with
+1060	  `[` and `drop = FALSE`.
+1061	
+1062	- `expected_roll_each(x, n, axis)` walks every output point, reads its lane's
+1063	  shift from `n` expanded to the lane dimensions, and reads the source
+1064	  element. It then removes the names on `axis`.
+1065	
+1066	### `rray_roll()`
+1067	
+1068	- Positive, negative, zero, and larger than dimension shifts on a
+1069	  one-dimensional array.
+1070	
+1071	- Every axis of a three-dimensional array, compared with `expected_roll()`.
+1072	
+1073	- Several axes at once, with a size 1 `n` and with one shift per axis.
+1074	
+1075	- `n` pairs with `axes` in the order given, including unsorted `axes`.
+1076	
+1077	- Rolling several axes equals rolling them one at a time.
+1078	
+1079	- Rolling by `n` then `-n` gives back `x`.
+1080	
+1081	- Equals `rray_slice_axis()` with rotated locations, names included.
+1082	
+1083	- All seven types.
+1084	
+1085	- Bare vectors, with and without names.
+1086	
+1087	- Names roll on rolled axes and are untouched elsewhere, including when only
+1088	  some axes have names.
+1089	
+1090	- Gives a result identical to `x` for a shift of 0, a multiple of the
+1091	  dimension, empty `axes`, and a zero dimension.
+1092	
+1093	- Zero size arrays with a zero dimension on the rolled axis and on another
+1094	  axis. With the zero on another axis, names on the rolled axis still roll.
+1095	
+1096	- Integer-ish doubles and logicals for `n` and `axes`.
+1097	
+1098	- `n = integer()` works with `axes = integer()` and is a size error with</pre><p class="cut">159 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/strided-iterator.h &amp;&amp; cat src/decl/strided-iterator-decl.h 2&gt;/dev/null; grep -n &quot;stri…</summary>
+<pre>cat src/strided-iterator.h &amp;&amp; cat src/decl/strided-iterator-decl.h 2&gt;/dev/null; grep -n &quot;strided_iterator&quot; src/*.c | head -40</pre><pre class="output">#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// For iterator2, note that both sets of location strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// When the inner loop receives the stride as a runtime value, the compiler
+// can't prove that the location is fixed and falls back to a scalar loop. The
+// public iteration macros check for a zero stride and pass a literal 0 to a
+// specialized path. This lets the compiler see that the location does not
+// change. For binary operations, it can then hoist the fixed load out of the
+// loop and vectorize the remaining stride 1 work.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_strided_iterator_plan {
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_dimensionality(dimensionality);
+
+  struct rray_strided_iterator_plan plan;
+
+  plan.size = rray_size_from_dimensions_checked(
+    v_dimensions,
+    dimensionality,
+    r_lazy_null
+  );
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    plan.v_strides[i] = v_strides[i];
+  }
+
+  plan.dimensionality = rray__strided_iterator_axes_coalesce(
+    plan.v_dimensions,
+    plan.v_strides,
+    dimensionality
+  );
+
+  return plan;
+}
+
+// Strided iterator specific to broadcasting
+//
+// An axis of `from` with a dimension of 1 gets a stride of 0, so it stands
+// still while the matching axis of `to` walks. Axes past
+// `from_dimensionality` are treated as dimension 1.
+static inline struct rray_strided_iterator_plan rray_broadcast_iterator_plan(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+) {
+  check_dimensionality(to_dimensionality);</pre><p class="cut">535 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;size\b\|size ==\|size &gt; 0\|n_groups\|block_size&quot; src/rep.c | head -60; grep -n &quot;rray…</summary>
+<pre>grep -n &quot;size\b\|size ==\|size &gt; 0\|n_groups\|block_size&quot; src/rep.c | head -60; grep -n &quot;rray_size_from_dimensions_checked&quot; -A30 src/size.c | head -50</pre><pre class="output">7:#include &quot;size.h&quot;
+77:  const r_ssize times_size = r_length(times);
+80:    rray_rep_dimension(axis_dimension, v_times, times_size, error_call);
+87:  const r_ssize out_size = rray_size_from_dimensions_checked(
+93:  r_obj* out = KEEP(r_alloc_vector(r_typeof(x), out_size));
+96:  r_ssize block_size = 1;
+98:    block_size *= v_dimensions[i];
+102:    block_size *= axis_dimension;
+105:  r_ssize n_groups = 1;
+107:    n_groups *= v_dimensions[i];
+110:  const r_ssize n_blocks_per_group = each ? axis_dimension : 1;
+112:  if (times_size == 1) {
+115:    const r_ssize n_blocks = n_groups * n_blocks_per_group;
+116:    rray_rep_fill_uniform(x, out, block_size, n_blocks, times);
+121:      block_size,
+123:      n_groups,
+134:    times_size
+146:  r_ssize size,
+152:  const r_ssize times_size = r_length(times);
+154:  if (times_size != 1 &amp;&amp; times_size != size) {
+155:    stop_times_size(times_size, size, arg, error_call);
+162:static r_no_return void stop_times_size(
+163:  r_ssize times_size,
+164:  r_ssize size,
+168:  if (size == 1) {
+171:      &quot;%s must be size 1, not size %&quot; R_PRI_SSIZE &quot;.&quot;,
+173:      times_size
+178:      &quot;%s must be size 1 or the `axis` dimension of %&quot; R_PRI_SSIZE &quot;, &quot;
+179:      &quot;not size %&quot; R_PRI_SSIZE &quot;.&quot;,
+181:      size,
+182:      times_size
+190:  r_ssize times_size,
+193:  if (times_size == 1) {
+231:  r_ssize block_size,
+232:  r_ssize n_blocks,
+237:    rray_rep_fill_uniform_lgl(x, out, block_size, n_blocks, times);
+240:    rray_rep_fill_uniform_int(x, out, block_size, n_blocks, times);
+243:    rray_rep_fill_uniform_dbl(x, out, block_size, n_blocks, times);
+246:    rray_rep_fill_uniform_cpl(x, out, block_size, n_blocks, times);
+249:    rray_rep_fill_uniform_raw(x, out, block_size, n_blocks, times);
+252:    rray_rep_fill_uniform_chr(x, out, block_size, n_blocks, times);
+255:    rray_rep_fill_uniform_list(x, out, block_size, n_blocks, times);
+266:  r_ssize out_i = 0;                                                           \
+268:  for (r_ssize block = 0; block &lt; n_blocks; ++block) {                         \
+269:    const CTYPE* v_x_block = v_x + block * block_size;                         \
+272:      for (r_ssize i = 0; i &lt; block_size; ++i) {                               \
+282:  r_ssize out_i = 0;                                                           \
+284:  for (r_ssize block = 0; block &lt; n_blocks; ++block) {                         \
+285:    r_obj* const* v_x_block = v_x + block * block_size;                        \
+288:      for (r_ssize i = 0; i &lt; block_size; ++i) {                               \
+298:  r_ssize block_size,
+299:  r_ssize n_blocks,
+308:  r_ssize block_size,
+309:  r_ssize n_blocks,
+318:  r_ssize block_size,
+319:  r_ssize n_blocks,
+328:  r_ssize block_size,
+329:  r_ssize n_blocks,
+338:  r_ssize block_size,
+339:  r_ssize n_blocks,
+32:r_ssize rray_size_from_dimensions_checked(
+33-  const int* v_dimensions,
+34-  int dimensionality,
+35-  struct r_lazy error_call
+36-) {
+37-  r_ssize out = 1;
+38-
+39-  for (int i = 0; i &lt; dimensionality; ++i) {
+40-    const int dimension = v_dimensions[i];
+41-
+42-    if (dimension != 0 &amp;&amp; out &gt; R_SSIZE_MAX / dimension) {
+43-      stop_size_too_large(v_dimensions, dimensionality, error_call);
+44-    }
+45-
+46-    out *= dimension;
+47-  }
+48-
+49-  return out;
+50-}
+51-
+52-static r_no_return void stop_size_too_large(
+53-  const int* v_dimensions,
+54-  int dimensionality,
+55-  struct r_lazy error_call
+56-) {
+57-  double size = 1;
+58-
+59-  for (int i = 0; i &lt; dimensionality; ++i) {
+60-    size *= v_dimensions[i];
+61-  }
+62-</pre></details>
+<p>Reading the broadcast loop so the iterator fill in the plan matches existing code.</p>
+
+<details class="tool"><summary>Bash: grep -n &quot;plan&quot; src/broadcast.c | head -30; grep -n &quot;RRAY_BROADCAST_FILL\|define RRAY_BROADCAS…</summary>
+<pre>grep -n &quot;plan&quot; src/broadcast.c | head -30; grep -n &quot;RRAY_BROADCAST_FILL\|define RRAY_BROADCAST&quot; -A40 src/broadcast.c | sed -n '1,60p'</pre><pre class="output">62:  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+73:    out = rray_broadcast_lgl(x, &amp;plan);
+76:    out = rray_broadcast_int(x, &amp;plan);
+79:    out = rray_broadcast_dbl(x, &amp;plan);
+82:    out = rray_broadcast_cpl(x, &amp;plan);
+85:    out = rray_broadcast_raw(x, &amp;plan);
+88:    out = rray_broadcast_chr(x, &amp;plan);
+91:    out = rray_broadcast_list(x, &amp;plan);
+111:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+119:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+122:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+125:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+144:    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+151:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+158:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+161:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+164:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+183:    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+191:  const struct rray_strided_iterator_plan* plan
+198:  const struct rray_strided_iterator_plan* plan
+205:  const struct rray_strided_iterator_plan* plan
+212:  const struct rray_strided_iterator_plan* plan
+219:  const struct rray_strided_iterator_plan* plan
+226:  const struct rray_strided_iterator_plan* plan
+233:  const struct rray_strided_iterator_plan* plan
+110:#define RRAY_BROADCAST_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)                \
+111-  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+112-                                                                               \
+113-  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+114-  CTYPE* v_out = DEREF(out);                                                   \
+115-                                                                               \
+116-  const CTYPE* v_x = CONST_DEREF(x);                                           \
+117-                                                                               \
+118-  r_ssize run_start = 0;                                                       \
+119-  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+120-                                                                               \
+121-  r_ssize x_start = 0;                                                         \
+122-  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+123-                                                                               \
+124-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+125-  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+126-                                                                               \
+127-  while (run_start != size) {                                                  \
+128-    const r_ssize run_end = run_start + run_size;                              \
+129-    r_ssize x_loc = x_start;                                                   \
+130-                                                                               \
+131-    if (x_run_stride == 0) {                                                   \
+132-      const CTYPE x_elt = v_x[x_loc];                                          \
+133-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+134-        v_out[i] = x_elt;                                                      \
+135-      }                                                                        \
+136-    } else {                                                                   \
+137-      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+138-        v_out[i] = v_x[x_loc];                                                 \
+139-        x_loc += x_run_stride;                                                 \
+140-      }                                                                        \
+141-    }                                                                          \
+142-                                                                               \
+143-    run_start = run_end;                                                       \
+144-    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+145-  }                                                                            \
+146-                                                                               \
+147-  FREE(1);                                                                     \
+148-  return out;
+149-
+150:#define RRAY_BROADCAST_BARRIER(RTYPE, CONST_DEREF, POKE)                       \
+151-  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+152-                                                                               \
+153-  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+154-                                                                               \
+155-  r_obj* const* v_x = CONST_DEREF(x);                                          \
+156-                                                                               \
+157-  r_ssize run_start = 0;                                                       \
+158-  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+159-                                                                               \
+160-  r_ssize x_start = 0;                                                         \
+161-  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+162-                                                                               \
+163-  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+164-  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+165-                                                                               \
+166-  while (run_start != size) {                                                  \
+167-    const r_ssize run_end = run_start + run_size;                              \
+168-    r_ssize x_loc = x_start;                                                   \
+169-                                                                               \</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;check_broadcastable&quot; -A8 src/broadcast.h</summary>
+<pre>grep -n &quot;check_broadcastable&quot; -A8 src/broadcast.h</pre><pre class="output">21:void check_broadcastable(
+22-  const int* v_x_dimensions,
+23-  int x_dimensionality,
+24-  const int* v_dimensions,
+25-  int dimensionality,
+26-  struct rray_arg* arg,
+27-  struct r_lazy error_call
+28-);
+29-</pre></details>
+<details class="tool"><summary>Read plans/roll.md</summary>
+<pre class="output">872	#### The shell
+873	
+874	```text
+875	check_unclassed(x)
+876	x = KEEP(arg_as_array(x))
+877	check_dimensionality()
+878	check_axis(axis, dimensionality)
+879	
+880	n = KEEP(arg_as_roll_each_n(n, rray_args.n))
+881	
+882	lane_dimensions = copy of dim(x) with axis set to 1
+883	check_broadcastable(dim(n), lane_dimensions, rray_args.n)
+884	
+885	out = r_alloc_vector(r_typeof(x), size)
+886	poke r_dim(x) onto out
+887	
+888	if size &gt; 0:
+889	  compute block_size, n_groups, and n_lanes
+890	  n = rray_broadcast(n, lane_dimensions, rray_args.n)
+891	  shifts = r_alloc_integer(n_lanes)
+892	  shifts[l] = rray_roll_shift(v_n[l], axis_dimension) for every lane l
+893	  rray_roll_each_fill(x, out, v_shifts, block_size, axis_dimension, n_groups)
+894	
+895	names = rray_reduce_names(x, r_int(axis))
+896	poke names onto out if not NULL
+897	```
+898	
+899	Notes:
+900	
+901	- `n` is fully validated before the size check, with `check_broadcastable()`
+902	  from `src/broadcast.h`. It checks the dimensions without allocating and gives
+903	  the same messages as `rray_broadcast()`. So a bad `n` errors even when `x` is
+904	  empty.
+905	
+906	- Nothing proportional to the lane count is allocated for an empty `x`. When
+907	  the rolled axis has dimension 0, the lane dimensions can still be huge, for
+908	  example `(100000, 1, 100000)` for `x` with dimensions `(100000, 0, 100000)`.
+909	  Broadcasting `n` there would allocate ten billion integers for an empty
+910	  result.
+911	
+912	- `block_size`, `n_groups`, and `n_lanes` are computed only when `size &gt; 0`.
+913	  Each is then a product of factors of `size`, so none can overflow. With a
+914	  zero dimension elsewhere, a product of the other dimensions could overflow
+915	  `r_ssize`.
+916	
+917	- `rray_broadcast()` returns its input unchanged when the dimensions already
+918	  match. That input can be the caller's own `n`, so never write into it. The
+919	  reduced shifts go into a separate `shifts` table.
+920	
+921	- `shifts` has `size / axis_dimension` elements, which is at most the size of
+922	  `x` and usually much smaller. Reducing once per lane keeps `%` out of the main
+923	  loop.
+924	
+925	- Skipping the fill when `size` is 0 also avoids reducing by an
+926	  `axis_dimension` of 0.
+927	
+928	- `rray_reduce_names()` drops names on the given axes and keeps the rest. It
+929	  returns `NULL` when nothing survives. Its meaning here is exactly the names
+930	  rule for `rray_roll_each()`.
+931	</pre></details>
+<details class="tool"><summary>Edit plans/roll.md</summary>
+<pre class="diff"><span class="del">-lane_dimensions = copy of dim(x) with axis set to 1</span>
+<span class="del">-check_broadcastable(dim(n), lane_dimensions, rray_args.n)</span>
+<span class="del">-</span>
+<span class="del">-out = r_alloc_vector(r_typeof(x), size)</span>
+<span class="del">-poke r_dim(x) onto out</span>
+<span class="del">-</span>
+<span class="del">-if size &gt; 0:</span>
+<span class="del">-  compute block_size, n_groups, and n_lanes</span>
+<span class="del">-  n = rray_broadcast(n, lane_dimensions, rray_args.n)</span>
+<span class="del">-  shifts = r_alloc_integer(n_lanes)</span>
+<span class="del">-  shifts[l] = rray_roll_shift(v_n[l], axis_dimension) for every lane l</span>
+<span class="del">-  rray_roll_each_fill(x, out, v_shifts, block_size, axis_dimension, n_groups)</span>
+<span class="del">-</span>
+<span class="del">-names = rray_reduce_names(x, r_int(axis))</span>
+<span class="del">-poke names onto out if not NULL</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Notes:</span>
+<span class="del">-</span>
+<span class="del">-- `n` is fully validated before the size check, with `check_broadcastable()`</span>
+<span class="del">-  from `src/broadcast.h`. It checks the dimensions without allocating and gives</span>
+<span class="del">-  the same messages as `rray_broadcast()`. So a bad `n` errors even when `x` is</span>
+<span class="del">-  empty.</span>
+<span class="del">-</span>
+<span class="del">-- Nothing proportional to the lane count is allocated for an empty `x`. When</span>
+<span class="del">-  the rolled axis has dimension 0, the lane dimensions can still be huge, for</span>
+<span class="del">-  example `(100000, 1, 100000)` for `x` with dimensions `(100000, 0, 100000)`.</span>
+<span class="del">-  Broadcasting `n` there would allocate ten billion integers for an empty</span>
+<span class="del">-  result.</span>
+<span class="del">-</span>
+<span class="del">-- `block_size`, `n_groups`, and `n_lanes` are computed only when `size &gt; 0`.</span>
+<span class="del">-  Each is then a product of factors of `size`, so none can overflow. With a</span>
+<span class="del">-  zero dimension elsewhere, a product of the other dimensions could overflow</span>
+<span class="del">-  `r_ssize`.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_broadcast()` returns its input unchanged when the dimensions already</span>
+<span class="del">-  match. That input can be the caller's own `n`, so never write into it. The</span>
+<span class="del">-  reduced shifts go into a separate `shifts` table.</span>
+<span class="del">-</span>
+<span class="del">-- `shifts` has `size / axis_dimension` elements, which is at most the size of</span>
+<span class="del">-  `x` and usually much smaller. Reducing once per lane keeps `%` out of the main</span>
+<span class="del">-  loop.</span>
+<span class="del">-</span>
+<span class="del">-- Skipping the fill when `size` is 0 also avoids reducing by an</span>
+<span class="del">-  `axis_dimension` of 0.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_reduce_names()` drops names on the given axes and keeps the rest. It</span>
+<span class="del">-  returns `NULL` when nothing survives. Its meaning here is exactly the names</span>
+<span class="del">-  rule for `rray_roll_each()`.</span>
+<span class="ins">+int v_lane_dimensions[RRAY_MAX_DIMENSIONALITY]</span>
+<span class="ins">+copy dim(x) into v_lane_dimensions, with axis set to 1</span>
+<span class="ins">+check_broadcastable(dim(n), v_lane_dimensions, rray_args.n)</span>
+<span class="ins">+</span>
+<span class="ins">+out = r_alloc_vector(r_typeof(x), size)</span>
+<span class="ins">+poke r_dim(x) onto out</span>
+<span class="ins">+</span>
+<span class="ins">+if size &gt; 0:</span>
+<span class="ins">+  compute block_size and n_groups</span>
+<span class="ins">+  plan = rray_broadcast_iterator_plan(dim(n), v_lane_dimensions)</span>
+<span class="ins">+  shifts = rray_roll_each_shifts(n, &amp;plan, axis_dimension)</span>
+<span class="ins">+  rray_roll_each_fill(x, out, v_shifts, block_size, axis_dimension, n_groups)</span>
+<span class="ins">+</span>
+<span class="ins">+names = rray_reduce_names(x, r_int(axis))</span>
+<span class="ins">+poke names onto out if not NULL</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+Notes:</span>
+<span class="ins">+</span>
+<span class="ins">+- `n` is fully validated before the size check, with `check_broadcastable()`</span>
+<span class="ins">+  from `src/broadcast.h`. It checks the dimensions without allocating and gives</span>
+<span class="ins">+  the same messages as `rray_broadcast()`. So a bad `n` errors even when `x` is</span>
+<span class="ins">+  empty.</span>
+<span class="ins">+</span>
+<span class="ins">+- The lane dimensions are a stack array, since nothing needs them as an R</span>
+<span class="ins">+  object.</span>
+<span class="ins">+</span>
+<span class="ins">+- Nothing proportional to the lane count is allocated for an empty `x`. When</span>
+<span class="ins">+  the rolled axis has dimension 0, the lane dimensions can still be huge, for</span>
+<span class="ins">+  example `(100000, 1, 100000)` for `x` with dimensions `(100000, 0, 100000)`.</span>
+<span class="ins">+  The `shifts` table there would be ten billion integers for an empty result.</span>
+<span class="ins">+  This is the only reason for the size check.</span>
+<span class="ins">+</span>
+<span class="ins">+- `n` is never broadcast into an R object. Its dimensions only drive the</span>
+<span class="ins">+  iterator plan, and `n` itself is only read. So there is no copy of `n` the</span>
+<span class="ins">+  size of the lane count, only the `shifts` table.</span>
+<span class="ins">+</span>
+<span class="ins">+- `shifts` has `size / axis_dimension` elements, which is at most the size of</span>
+<span class="ins">+  `x` and usually much smaller. Reducing once per lane keeps `%` out of the main</span>
+<span class="ins">+  loop.</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_reduce_names()` drops names on the given axes and keeps the rest. It</span>
+<span class="ins">+  returns `NULL` when nothing survives. Its meaning here is exactly the names</span>
+<span class="ins">+  rule for `rray_roll_each()`.</span>
+<span class="ins">+</span>
+<span class="ins">+#### The shifts</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_roll_each_shifts()` walks the lane dimensions with the broadcast</span>
+<span class="ins">+iterator, reads each lane's value from `n`, and writes its reduced shift. It</span>
+<span class="ins">+follows the loop in `RRAY_BROADCAST_ATOMIC` in `src/broadcast.c`, including the</span>
+<span class="ins">+fixed path for a zero run stride, which reduces a shift once per run instead of</span>
+<span class="ins">+once per lane:</span>
+<span class="ins">+</span>
+<span class="ins">+```c</span>
+<span class="ins">+static r_obj* rray_roll_each_shifts(</span>
+<span class="ins">+  r_obj* n,</span>
+<span class="ins">+  const struct rray_strided_iterator_plan* plan,</span>
+<span class="ins">+  int axis_dimension</span>
+<span class="ins">+) {</span>
+<span class="ins">+  const r_ssize size = rray_strided_iterator_plan_size(plan);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_integer(size));</span>
+<span class="ins">+  int* v_out = r_int_begin(out);</span>
+<span class="ins">+</span>
+<span class="ins">+  const int* v_n = r_int_cbegin(n);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize run_start = 0;</span>
+<span class="ins">+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize n_start = 0;</span>
+<span class="ins">+  const r_ssize n_run_stride = rray_strided_iterator_plan_run_stride(plan);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+  rray_strided_iterator_plan_point_init(plan, v_point);</span>
+<span class="ins">+</span>
+<span class="ins">+  while (run_start != size) {</span>
+<span class="ins">+    const r_ssize run_end = run_start + run_size;</span>
+<span class="ins">+    r_ssize n_loc = n_start;</span>
+<span class="ins">+</span>
+<span class="ins">+    if (n_run_stride == 0) {</span>
+<span class="ins">+      const int shift = rray_roll_shift(v_n[n_loc], axis_dimension);</span>
+<span class="ins">+      for (r_ssize i = run_start; i &lt; run_end; ++i) {</span>
+<span class="ins">+        v_out[i] = shift;</span>
+<span class="ins">+      }</span>
+<span class="ins">+    } else {</span>
+<span class="ins">+      for (r_ssize i = run_start; i &lt; run_end; ++i) {</span>
+<span class="ins">+        v_out[i] = rray_roll_shift(v_n[n_loc], axis_dimension);</span>
+<span class="ins">+        n_loc += n_run_stride;</span>
+<span class="ins">+      }</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    run_start = run_end;</span>
+<span class="ins">+    RRAY_STRIDED_ITERATOR_NEXT(n_start, v_point, plan);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(1);</span>
+<span class="ins">+  return out;</span>
+<span class="ins">+}</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+For a size 1 `n`, the plan coalesces to one run with stride 0, so there is one</span>
+<span class="ins">+`%` for the whole table.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/roll.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/roll.md</summary>
+<pre class="diff"><span class="del">-6. `rray_roll_each_fill()`, then its seven cores and macros</span>
+<span class="ins">+6. `rray_roll_each_shifts()`</span>
+<span class="ins">+</span>
+<span class="ins">+7. `rray_roll_each_fill()`, then its seven cores and macros</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/roll.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/roll.md</summary>
+<pre class="diff"><span class="del">-7. `check_roll_n_not_missing()` and `rray_roll_shift()`, last</span>
+<span class="ins">+8. `check_roll_n_not_missing()` and `rray_roll_shift()`, last</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/roll.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/roll.md</summary>
+<pre class="diff"><span class="del">-- In `rray_roll_each()`, keep `n` after `arg_as_roll_each_n()` and after</span>
+<span class="del">-  `rray_broadcast()`. Keep `lane_dimensions` from its allocation until</span>
+<span class="del">-  `rray_broadcast()` returns. `check_broadcastable()` does not allocate, but</span>
+<span class="del">-  `rray_broadcast()` and the allocation of `out` in between do.</span>
+<span class="del">-</span>
+<span class="del">-- Keep `out` across the allocation of `shifts` and across</span>
+<span class="del">-  `rray_reduce_names()`. Keep `shifts` until the fill returns.</span>
+<span class="ins">+- In `rray_roll_each()`, keep `n` after `arg_as_roll_each_n()`, since the</span>
+<span class="ins">+  allocation of `out` comes before `rray_roll_each_shifts()` reads it.</span>
+<span class="ins">+  `check_broadcastable()` and `rray_broadcast_iterator_plan()` do not</span>
+<span class="ins">+  allocate.</span>
+<span class="ins">+</span>
+<span class="ins">+- Keep `out` across `rray_roll_each_shifts()` and across</span>
+<span class="ins">+  `rray_reduce_names()`. Keep `shifts` until the fill returns.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/roll.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;rray_broadcast()\|without broadcasting\|n_lanes&quot; plans/roll.md</summary>
+<pre>grep -n &quot;rray_broadcast()\|without broadcasting\|n_lanes&quot; plans/roll.md</pre><pre class="output">657:`rray_broadcast()`, the cast error from `rray_cast()`, and the rest from
+903:  the same messages as `rray_broadcast()`. So a bad `n` errors even when `x` is</pre></details>
+<details class="tool"><summary>Read plans/roll.md</summary>
+<pre class="output">655	
+656	Only the missing value error is new text. The broadcast errors come from
+657	`rray_broadcast()`, the cast error from `rray_cast()`, and the rest from
+658	existing helpers.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;returns quickly&quot; -B2 -A1 plans/roll.md</summary>
+<pre>grep -n &quot;returns quickly&quot; -B2 -A1 plans/roll.md</pre><pre class="output">1192-
+1193-- A zero rolled dimension with huge lane dimensions, such as `x` with
+1194:  dimensions `c(100000, 0, 100000)` and `n = 1`, returns quickly without
+1195-  broadcasting `n`.</pre></details>
+<p>Fixing two leftover references to the old broadcast step, then done.</p>
+
+<details class="tool"><summary>Edit plans/roll.md</summary>
+<pre class="diff"><span class="del">-Only the missing value error is new text. The broadcast errors come from</span>
+<span class="del">-`rray_broadcast()`, the cast error</span>
+<span class="ins">+Only the missing value error is new text. The broadcast errors come from</span>
+<span class="ins">+`check_broadcastable()`, the cast error</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/roll.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/roll.md</summary>
+<pre class="diff"><span class="del">-  dimensions `c(100000, 0, 100000)` and `n = 1`, returns quickly without</span>
+<span class="del">-  broadcasting `n`.</span>
+<span class="ins">+  dimensions `c(100000, 0, 100000)` and `n = 1`, returns quickly without</span>
+<span class="ins">+  allocating the `shifts` table.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/roll.md has been updated successfully.</pre></details>
+<p>I made your iterator change to <code>plans/roll.md</code>. On the <code>size &gt; 0</code> check, I kept it, and here is the case that still needs it.</p>
+<p><strong>The <code>size &gt; 0</code> check.</strong> Two of the three reasons the plan gave for it were weak, and I cut them:</p>
+<ul>
+<li>
+<p><strong>Dividing by a zero dimension:</strong> <code>rray_roll_shift()</code> already returns 0 when the dimension is 0, so the check isn't needed for that.</p>
+</li>
+<li>
+<p><strong>Overflow of <code>block_size</code> and <code>n_groups</code>:</strong> <code>src/rep.c</code> computes the same products with no check, so this plan shouldn't treat it differently.</p>
+</li>
+</ul>
+<p>The reason left is memory. The <code>shifts</code> table has one entry per lane, and the iterator doesn't change that. Take <code>x</code> with dimensions <code>(100000, 0, 100000)</code> and <code>axis = 2</code>. <code>x</code> is empty, but it has <code>100000 * 100000</code> lanes. Without the check, <code>shifts</code> would be ten billion integers, about 40 GB, for an empty result. The plan already has a test for exactly this case. The notes now say this is the only reason for the check.</p>
+<p>A narrower guard, <code>axis_dimension &gt; 0</code>, would work too, since a zero on any other axis gives zero lanes. I kept <code>size &gt; 0</code> because it reads more simply. Tell me if you'd rather have the narrower one.</p>
+<p><strong><code>n</code> through an iterator.</strong> Done, and it only fills <code>shifts</code>:</p>
+<ul>
+<li>
+<p><strong>New helper <code>rray_roll_each_shifts()</code>:</strong> it walks the lane dimensions with <code>rray_broadcast_iterator_plan()</code> and writes <code>rray_roll_shift(v_n[n_loc], axis_dimension)</code> for each lane. It copies the loop in <code>RRAY_BROADCAST_ATOMIC</code>, including the fast path for a zero stride. For a size 1 <code>n</code>, the whole table is one run, so <code>%</code> runs once instead of once per lane.</p>
+</li>
+<li>
+<p><strong>Memory:</strong> before, we held a broadcast copy of <code>n</code> plus <code>shifts</code>, both one entry per lane. Now only <code>shifts</code> is allocated, and <code>n</code> is only read. I removed the note about never writing into the caller's <code>n</code>, since nothing could anymore.</p>
+</li>
+<li>
+<p><strong>Lane dimensions:</strong> they are now a stack array (<code>int v_lane_dimensions[RRAY_MAX_DIMENSIONALITY]</code>) instead of an R object, because <code>check_broadcastable()</code> and the plan both take <code>const int*</code>. That removes one protection concern.</p>
+</li>
+</ul>
+<p>I also updated the places that depended on the old approach:</p>
+<ul>
+<li>
+<p>the protection review</p>
+</li>
+<li>
+<p>the file order (the new helper goes before the fill)</p>
+</li>
+<li>
+<p>the errors section, which now says the broadcast errors come from <code>check_broadcastable()</code></p>
+</li>
+<li>
+<p>the huge-lanes test, which now checks that the <code>shifts</code> table isn't allocated</p>
+</li>
+</ul>
+<p>Nothing is committed. I didn't open the plan in your editor from this session.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add plans/roll.md &amp;&amp; git commit -q -m &quot;Broadcast roll each shifts with an iterator instea…</summary>
+<pre>git add plans/roll.md &amp;&amp; git commit -q -m &quot;Broadcast roll each shifts with an iterator instead of a copy of \`n\`&quot; &amp;&amp; git push -u origin feature/roll 2&gt;&amp;1 | tail -3 &amp;&amp; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   59991b1..096b06a  feature/roll -&gt; feature/roll
+branch 'feature/roll' set up to track 'origin/feature/roll'.
+096b06a Broadcast roll each shifts with an iterator instead of a copy of `n`</pre></details>
+<p>I committed the plan change and pushed it to <code>origin/feature/roll</code>:</p>
+<pre><code>096b06a Broadcast roll each shifts with an iterator instead of a copy of `n`
+</code></pre>
+<p>The commit contains only <code>plans/roll.md</code>, and I didn't add a co-author line.</p>
+
+</section>
+</main>
+</body>
+</html>
