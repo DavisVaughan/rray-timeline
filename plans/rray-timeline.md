@@ -8,21 +8,23 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
 ## What the reader sees
 
-- **The line.** A step line of the export count, from 2026-03-20 to today. It steps up when a PR adds exports. Exports were never removed outright, only renamed, so it never steps down.
+- **The line.** A step line of the export count, from the first PR on 2026-08-28 to today. The 9 exports from the March commits pushed straight to `main` are carried in as the starting value, since the five idle months in between would otherwise take up most of the x axis. It steps up when a PR adds exports. Exports were never removed outright, only renamed, so it never steps down.
 
 - **The dots.** One dot per merged PR (about 157), placed at its merge time and at the export count after the merge.
 
-  - PRs that add exports get a filled dot and a permanent label, like `+ rray_slice()` or `+ rray_sum(), rray_prod()`.
+  - PRs that add exports get a filled dot, and every other PR gets a smaller dot. Renames count as other PRs.
 
-  - PRs that rename exports get a ringed dot and a permanent label, like `rray_squeeze() → rray_remove_axes()`. A PR with many renames (#97 renamed 7) shows a count, like `7 renames`, and the full list on hover.
+- **Labels.** Only the 10 most complex PRs get a permanent label, or the top 5 on a phone. The labels tell the steering story; color and hover already cover the rest.
 
-  - Early commits pushed straight to `main` that changed exports also get dots, linked to the commit instead of a PR.
+  - A PR that adds exports is labeled with them, like `rray_slice()` or `rray_locate_max(), rray_locate_min()`.
 
-  - Every other PR gets a smaller dot, and its label appears on hover.
+  - Any other PR gets a short label from `overrides.yml`, like `iterator performance`.
 
-  - Labels go through a simple collision pass so they never overlap. Labels that can't be placed fall back to hover.
+  - Every label has a thin leader line to its dot.
 
-- **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 23px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would.
+  - Labels are placed most complex first, and never overlap the line, the dots, or each other. A label that can't be placed falls back to hover.
+
+- **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 100px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would.
 
 - **Complexity color.** Dot fill uses a single-hue sequential scale, light for simple PRs and dark for complex ones. PRs with no score are neutral grey. A small legend explains both. See [Complexity](#complexity).
 

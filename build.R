@@ -37,7 +37,7 @@ main <- function() {
   links <- link_sessions(sessions, prs, compact(overrides$sessions))
   report_unmatched(sessions, links)
 
-  timeline <- build_timeline(commits, prs, sessions, links)
+  timeline <- build_timeline(commits, prs, sessions, links, overrides$labels)
 
   dir.create("site", showWarnings = FALSE)
   jsonlite::write_json(
@@ -620,7 +620,16 @@ report_unmatched <- function(sessions, links) {
 # ------------------------------------------------------------------------------
 # Output
 
-build_timeline <- function(commits, prs, sessions, links) {
+build_timeline <- function(commits, prs, sessions, links, labels) {
+  numbers <- vapply(prs, function(pr) pr$number, integer(1))
+
+  unknown <- setdiff(names(labels), numbers)
+  if (length(unknown)) {
+    cli::cli_abort(
+      "{.file overrides.yml} labels unknown PRs: {.val {unknown}}."
+    )
+  }
+
   commit_shas <- vapply(commits, function(commit) commit$sha, character(1))
   pr_shas <- vapply(prs, function(pr) pr$sha, character(1))
 
@@ -632,7 +641,7 @@ build_timeline <- function(commits, prs, sessions, links) {
     ))
   }
 
-  session_prs <- invert(links, vapply(prs, function(pr) pr$number, integer(1)))
+  session_prs <- invert(links, numbers)
   complexity <- compute_complexity(prs, sessions, session_prs)
 
   pr_out <- Map(
@@ -641,6 +650,7 @@ build_timeline <- function(commits, prs, sessions, links) {
       list(
         number = pr$number,
         title = pr$title,
+        label = labels[[as.character(pr$number)]],
         url = pr$url,
         opened = format_time(pr$opened),
         merged = format_time(pr$merged),
