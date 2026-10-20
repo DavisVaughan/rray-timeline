@@ -24,7 +24,7 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
 - **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 23px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would.
 
-- **Complexity color.** Dot fill uses a single-hue sequential scale, light for simple PRs and dark for complex ones. A small legend explains it. See [Complexity](#complexity).
+- **Complexity color.** Dot fill uses a single-hue sequential scale, light for simple PRs and dark for complex ones. PRs with no score are neutral grey. A small legend explains both. See [Complexity](#complexity).
 
 - **Clicking a dot** selects that PR:
 
@@ -81,8 +81,8 @@ One R script, `build.R`, run by hand. It reads the rray repo, GitHub, and the lo
 |---|---|---|
 | git | rray checkout | `NAMESPACE` at each merge commit |
 | GitHub | `gh api graphql` | PRs, reviews, review comments, timestamps |
-| Claude | `~/.claude/projects/-Users-davis-files-r-packages-rray{,4}/*.jsonl` | sessions, about 214 |
-| Codex | `~/.codex/sessions/**/*.jsonl` filtered to rray `cwd` | sessions, about 334 |
+| Claude | `~/.claude/projects/-Users-davis-files-r-packages-rray{,4}/*.jsonl` | sessions, 173 |
+| Codex | `~/.codex/{sessions,archived_sessions}/**/*.jsonl` filtered to rray `cwd` | sessions, 117 |
 
 ### Steps
 
@@ -92,15 +92,25 @@ One R script, `build.R`, run by hand. It reads the rray repo, GitHub, and the lo
 
 3. **Sessions.** Stream each JSONL file and keep the session id, tool, branch(es), message timestamps, and message counts by role. Also keep token usage (Claude `usage`, Codex `token_count`) and any Claude `pr-link` events.
 
+   - A session id is the tool plus the last 8 characters of its UUID. Codex UUIDs are v7, so their leading characters are a timestamp and collide.
+
+   - Codex only records the branch a session started on, so branches from `git switch` and `git checkout` tool calls are added.
+
+   - Codex `guardian_review` sessions are automated approval reviews, not conversations, and are skipped.
+
+   - Codex `exec` sessions were started by Claude to review plans. They are kept, but their prompts don't count as yours.
+
+   - A session with no typed prompts is skipped. Slash commands, injected context, and interrupt markers are not typed prompts.
+
 4. **Join sessions to PRs.** In priority order:
 
-   1. A Claude `pr-link` event naming the PR.
+   1. A manual `overrides.yml`, mapping session id to PR number(s), or to `null` to drop a session. It comes first so it can correct the rules below.
 
-   2. The session's branch matches the PR's head branch, and the session overlaps the window from the previous PR on that branch to this PR's merge. The window handles branch names that were reused.
+   2. A Claude `pr-link` event naming the PR.
 
-   3. A manual `overrides.yml`, mapping session id to PR number(s), or to `null` to drop a session.
+   3. The session's branch matches the PR's head branch, and the session overlaps the window from the previous PR on that branch to this PR's merge. The window handles branch names that were reused.
 
-   Today, branches alone match 200 of 214 Claude sessions and 268 of 334 Codex sessions. The script prints the unmatched ones so they can be triaged into `overrides.yml`. Any left unmatched go in the unshipped track.
+   Today, these match 143 of 173 Claude sessions and 97 of 117 Codex sessions. The script prints the unmatched ones so they can be triaged into `overrides.yml`. Any left unmatched go in the unshipped track.
 
 5. **Complexity.** Compute per PR, see below.
 
@@ -164,12 +174,16 @@ Each PR gets a score from 0 to 1 that measures how much steering it needed. It i
 
 | Signal | Meaning |
 |---|---|
-| Your review comments | comments and reviews you wrote on the PR |
+| Your review comments | review threads you started on the PR |
 | Your messages | user turns across the linked sessions |
+
+Agents reply to review threads and post benchmark comments under your account, so only thread roots count as yours.
 
 Each signal becomes a percentile rank across all PRs, and the score is their mean. Percentiles keep one huge PR from flattening every other PR into the same color.
 
-The detail panel shows both parts, plus a few numbers for context only: conversation tokens, plan length, and time from open to merge.
+Transcripts for the earliest PRs were lost to Claude's 30 day cleanup. Those PRs have no score, are left out of the percentiles, and are drawn in a neutral grey that the legend labels as unknown.
+
+The detail panel shows both parts, plus a few numbers for context only: conversation tokens and time from open to merge.
 
 ## Layout
 
