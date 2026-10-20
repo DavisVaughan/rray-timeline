@@ -8,7 +8,7 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
 ## What the reader sees
 
-- **The line.** A step line of the export count, from 2026-03-20 to today. It steps up when a PR adds exports. Exports were never removed outright, only renamed, so it never steps down.
+- **The line.** A step line of the export count, from the first PR on 2026-08-28 to today. The 9 exports from the March commits pushed straight to `main` are carried in as the starting value, since the five idle months in between would otherwise take up most of the x axis. It steps up when a PR adds exports. Exports were never removed outright, only renamed, so it never steps down.
 
 - **The dots.** One dot per merged PR (about 157), placed at its merge time and at the export count after the merge.
 
@@ -16,13 +16,11 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
   - PRs that rename exports get a ringed dot and a permanent label, like `rray_squeeze() → rray_remove_axes()`. A PR with many renames (#97 renamed 7) shows a count, like `7 renames`, and the full list on hover.
 
-  - Early commits pushed straight to `main` that changed exports also get dots, linked to the commit instead of a PR.
-
   - Every other PR gets a smaller dot, and its label appears on hover.
 
   - Labels go through a simple collision pass so they never overlap. Labels that can't be placed fall back to hover.
 
-- **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 23px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would.
+- **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 100px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would.
 
 - **Complexity color.** Dot fill uses a single-hue sequential scale, light for simple PRs and dark for complex ones. PRs with no score are neutral grey. A small legend explains both. See [Complexity](#complexity).
 
