@@ -624,7 +624,9 @@ link_sessions <- function(sessions, prs, overrides) {
       return(linked)
     }
 
-    linked <- intersect(session$pr_links, numbers)
+    # Links to PRs merged before the session started are only references
+    current <- numbers[merged >= as.numeric(session$start)]
+    linked <- intersect(session$pr_links, current)
     if (length(linked)) {
       return(linked)
     }
