@@ -24,6 +24,9 @@ pr_link_repos <- c("r-lib/rray", "DavisVaughan/rray4")
 
 segment_gap <- 30 * 60
 
+# Prompts too empty to title a session with
+greetings <- c("hi", "hello", "hey", "you there")
+
 main <- function() {
   overrides <- yaml::read_yaml("overrides.yml")
 
@@ -528,12 +531,19 @@ session_title <- function(prompts) {
   if (length(prompts) == 0L) {
     return(NA_character_)
   }
-  lines <- strsplit(trimws(prompts[[1L]]), "\n", fixed = TRUE)[[1L]]
+  substantive <- Filter(Negate(is_greeting), prompts)
+  prompt <- if (length(substantive)) substantive[[1L]] else prompts[[1L]]
+  lines <- strsplit(trimws(prompt), "\n", fixed = TRUE)[[1L]]
   title <- trimws(lines[[1L]])
   if (nchar(title) > 80L) {
     title <- paste0(substr(title, 1L, 79L), "…")
   }
   title
+}
+
+is_greeting <- function(prompt) {
+  words <- trimws(gsub("[[:punct:][:space:]]+", " ", tolower(prompt)))
+  words %in% greetings
 }
 
 # Splits sorted times into stretches with no gap longer than `segment_gap`
