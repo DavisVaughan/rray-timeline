@@ -24,6 +24,15 @@ pr_link_repos <- c("r-lib/rray", "DavisVaughan/rray4")
 
 segment_gap <- 30 * 60
 
+# Prompts too empty to title a session with
+greetings <- c("hi", "hello", "hey", "you there")
+
+# Sessions started with this prompt are titled `review_title`
+review_prompt <- "Address all GitHub PR comments one by one"
+review_title <- "/gh-pr-review"
+
+title_width <- 72L
+
 main <- function() {
   overrides <- yaml::read_yaml("overrides.yml")
 
@@ -33,6 +42,7 @@ main <- function() {
 
   dropped <- names(Filter(is.null, overrides$sessions))
   sessions <- sessions[!names(sessions) %in% dropped]
+  sessions <- retitle(sessions, overrides$titles)
 
   links <- link_sessions(sessions, prs, compact(overrides$sessions))
   report_unmatched(sessions, links)
@@ -276,8 +286,17 @@ read_sessions <- function() {
 }
 
 read_claude_session <- function(path) {
+  uuid <- sub("\\.jsonl$", "", basename(path))
+
+  # Some sessions carry copies of other sessions' entries
   entries <- read_jsonl(path)
-  entries <- Filter(function(entry) !isTRUE(entry$isSidechain), entries)
+  entries <- Filter(
+    function(entry) {
+      !isTRUE(entry$isSidechain) &&
+        (is.null(entry$sessionId) || identical(entry$sessionId, uuid))
+    },
+    entries
+  )
 
   messages <- Filter(
     function(entry) is_type(entry, c("user", "assistant")),
@@ -320,7 +339,7 @@ read_claude_session <- function(path) {
 
   new_session(
     tool = "claude",
-    uuid = sub("\\.jsonl$", "", basename(path)),
+    uuid = uuid,
     times = vapply(messages, function(entry) entry$timestamp, character(1)),
     branches = vapply(
       messages,
@@ -528,12 +547,43 @@ session_title <- function(prompts) {
   if (length(prompts) == 0L) {
     return(NA_character_)
   }
-  lines <- strsplit(trimws(prompts[[1L]]), "\n", fixed = TRUE)[[1L]]
+  substantive <- Filter(Negate(is_greeting), prompts)
+  prompt <- if (length(substantive)) substantive[[1L]] else prompts[[1L]]
+  if (startsWith(trimws(prompt), review_prompt)) {
+    return(review_title)
+  }
+  lines <- strsplit(trimws(prompt), "\n", fixed = TRUE)[[1L]]
   title <- trimws(lines[[1L]])
-  if (nchar(title) > 80L) {
-    title <- paste0(substr(title, 1L, 79L), "…")
+  if (nchar(title) > title_width) {
+    title <- paste0(substr(title, 1L, title_width - 1L), "…")
   }
   title
+}
+
+retitle <- function(sessions, titles) {
+  unknown <- setdiff(names(titles), names(sessions))
+  if (length(unknown)) {
+    cli::cli_abort(
+      "{.file overrides.yml} titles unknown sessions: {.val {unknown}}."
+    )
+  }
+
+  long <- names(titles)[nchar(unlist(titles)) > title_width]
+  if (length(long)) {
+    cli::cli_abort(
+      "{.file overrides.yml} titles are over {title_width} characters: {.val {long}}."
+    )
+  }
+
+  for (id in names(titles)) {
+    sessions[[id]]$title <- titles[[id]]
+  }
+  sessions
+}
+
+is_greeting <- function(prompt) {
+  words <- trimws(gsub("[[:punct:][:space:]]+", " ", tolower(prompt)))
+  words %in% greetings
 }
 
 # Splits sorted times into stretches with no gap longer than `segment_gap`
@@ -574,7 +624,9 @@ link_sessions <- function(sessions, prs, overrides) {
       return(linked)
     }
 
-    linked <- intersect(session$pr_links, numbers)
+    # Links to PRs merged before the session started are only references
+    current <- numbers[merged >= as.numeric(session$start)]
+    linked <- intersect(session$pr_links, current)
     if (length(linked)) {
       return(linked)
     }

@@ -18,13 +18,13 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
   - A PR that adds exports is labeled with them, like `rray_slice()` or `rray_locate_max(), rray_locate_min()`.
 
-  - Any other PR gets a short label from `overrides.yml`, like `iterator performance`.
+  - Any other PR gets a short label from `overrides.yml`, like `iterator performance`. PRs without one are never labeled.
 
   - Every label has a thin leader line to its dot.
 
   - Labels are placed most complex first, and never overlap the line, the dots, or each other. A label that can't be placed falls back to hover.
 
-- **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 100px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would.
+- **Overview strip.** A thin strip under the chart shows the full range. Dragging a window over it zooms the main chart. This matters in the busiest weeks (2026-W40 and W41 each had about 35 commits), which would otherwise fit into roughly 100px. The strip also works by touch, and it doesn't take over page scrolling the way scroll-to-zoom would. The y axis rescales to the exports in the window, so a busy week spreads out vertically too.
 
 - **Complexity color.** Dot fill uses a single-hue sequential scale, light for simple PRs and dark for complex ones. PRs with no score are neutral grey. A small legend explains both. See [Complexity](#complexity).
 
@@ -38,7 +38,7 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
   - A detail panel below the chart shows the PR title and a link to it, the complexity breakdown, and a list of the linked conversations. Each one has its date, length, and a link to its transcript page.
 
-- **Deep links.** Selecting a PR sets the URL hash (`#pr-123`), so the blog text can link straight to a specific moment.
+- **Deep links.** Selecting a PR sets the URL hash (`#pr-123`), so the blog text can link straight to a specific moment. Following a link zooms to fit that PR's conversations and open window, and scrolls the chart into view.
 
 - **Keyboard and touch.** Dots are focusable, arrow keys move between PRs, Enter selects, Escape clears. On a phone, tap replaces hover.
 
