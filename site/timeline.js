@@ -73,6 +73,15 @@ function buildModel(data) {
       opened: new Date(pr.opened),
       title: pr.title,
       label: pr.label,
+      haystack: [
+        `#${pr.number}`,
+        pr.title.replaceAll("`", ""),
+        pr.label ?? "",
+        ...pr.added.map(fn),
+        ...pr.renamed.flatMap(({ from, to }) => [fn(from), fn(to)]),
+      ]
+        .join(" ")
+        .toLowerCase(),
       url: pr.url,
       exports: pr.exports,
       added: pr.added,
@@ -127,6 +136,9 @@ class Timeline {
     this.hovered = null;
     this.highlighted = null;
 
+    // PRs matching the search, or `null` without one
+    this.matches = null;
+
     // Unshipped session whose tooltip stays open until dismissed
     this.pinned = null;
 
@@ -136,7 +148,9 @@ class Timeline {
     this.width = 0;
     this.scrollPending = false;
 
-    renderLegend(root.append("div").attr("class", "tl-legend"));
+    const legend = root.append("div").attr("class", "tl-legend");
+    renderLegend(legend);
+    this.renderSearch(legend);
     this.figure = root.append("div").attr("class", "tl-figure");
     this.tooltip = root.append("div").attr("class", "tl-tooltip").attr("aria-hidden", true).attr("hidden", "");
     this.panel = root.append("div").attr("class", "tl-panel").attr("aria-live", "polite");
@@ -160,6 +174,74 @@ class Timeline {
     });
 
     this.renderPanel();
+  }
+
+  renderSearch(parent) {
+    const search = parent.append("span").attr("class", "tl-search");
+
+    this.count = search.append("span").attr("class", "tl-search-count").attr("aria-live", "polite");
+
+    const field = search.append("span").attr("class", "tl-search-field");
+
+    this.input = field
+      .append("input")
+      .attr("type", "search")
+      .attr("placeholder", "Filter PRs")
+      .attr("aria-label", "Filter pull requests")
+      .attr("spellcheck", false)
+      .on("input", () => this.search(this.input.property("value")))
+      .on("keydown", (event) => {
+        if (event.key !== "Escape" || !this.input.property("value")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this.clearSearch();
+      });
+
+    this.clear = field
+      .append("button")
+      .attr("type", "button")
+      .attr("class", "tl-close")
+      .attr("aria-label", "Clear filter")
+      .attr("hidden", "")
+      .text("×")
+      .on("click", () => {
+        this.clearSearch();
+        this.input.node().focus();
+      });
+  }
+
+  search(query) {
+    this.filter(query);
+    this.hover(null);
+    this.raiseMatches();
+
+    if (this.selected && !this.matching(this.selected)) this.select(null);
+    else this.update();
+  }
+
+  clearSearch() {
+    this.input.property("value", "");
+    this.search("");
+  }
+
+  // Every word must appear, in any order
+  filter(query) {
+    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+
+    this.matches = terms.length
+      ? new Set(this.model.prs.filter((pr) => terms.every((term) => pr.haystack.includes(term))))
+      : null;
+
+    this.clear.attr("hidden", this.matches ? null : "");
+    this.count.text(this.matches ? plural(this.matches.size, "PR") : "");
+
+    if (this.matches?.size && !this.matches.has(this.active)) {
+      this.active = d3.least(this.matches, (pr) => Math.abs(pr.date - this.active.date));
+    }
+  }
+
+  matching(pr) {
+    return !this.matches || this.matches.has(pr);
   }
 
   resize(width) {
@@ -272,7 +354,7 @@ class Timeline {
     this.dots.each(function (pr) {
       nodes.set(pr, this);
     });
-    this.raise(this.selected);
+    this.raiseMatches();
 
     // Pointer input goes through the nearest dot rather than each dot's tiny hit area
     this.overlay = svg
@@ -327,6 +409,8 @@ class Timeline {
           .y0(y(0))
           .y1((step) => y(step.exports))(model.steps),
       );
+
+    this.stripMatches = svg.append("g").attr("class", "tl-strip-matches");
 
     this.brush = d3
       .brushX()
@@ -404,19 +488,29 @@ class Timeline {
       .attr("tabindex", (pr) => (pr === this.active ? 0 : -1))
       .attr("aria-pressed", (pr) => pr === selected)
       .classed("tl-selected", (pr) => pr === selected)
-      .classed("tl-faded", (pr) => selected && pr !== selected);
+      .classed("tl-faded", (pr) => (selected && pr !== selected) || !this.matching(pr));
+
+    this.stripMatches
+      .selectAll("line")
+      .data(this.matches ?? [])
+      .join("line")
+      .attr("x1", (pr) => this.sx(pr.date))
+      .attr("x2", (pr) => this.sx(pr.date))
+      .attr("y1", 0)
+      .attr("y2", STRIP_HEIGHT);
 
     this.drawSelection(this.bands, x, plot.y0, plot.y1, { reviews: true });
     this.drawSelection(this.stripBands, this.sx, 0, STRIP_HEIGHT, { reviews: false });
 
     const inDomain = (pr) => pr.date >= domain[0] && pr.date <= domain[1];
-    const visible = model.prs.filter(inDomain);
+    const shown = model.prs.filter(inDomain);
+    const visible = shown.filter((pr) => this.matching(pr));
     const labeled = model.ranked
-      .filter(inDomain)
+      .filter((pr) => inDomain(pr) && this.matching(pr))
       .slice(0, this.width < NARROW_WIDTH ? LABEL_COUNT.narrow : LABEL_COUNT.wide);
 
     this.labels.selectAll("*").remove();
-    placeLabels(this.labels, labeled, visible, {
+    placeLabels(this.labels, labeled, shown, {
       x,
       y,
       steps: model.steps,
@@ -526,6 +620,13 @@ class Timeline {
     this.selected = pr;
     this.highlighted = null;
 
+    // A deep link to a PR the search hides
+    if (pr && !this.matching(pr)) {
+      this.input.property("value", "");
+      this.filter("");
+      this.raiseMatches();
+    }
+
     if (pr) {
       this.active = pr;
       this.raise(pr);
@@ -539,6 +640,14 @@ class Timeline {
     writeHash(pr);
     this.renderPanel();
     this.update();
+  }
+
+  // Faded dots would otherwise draw over smaller matches
+  raiseMatches() {
+    if (!this.dots) return;
+    this.dots.order();
+    if (this.matches) this.dots.filter((pr) => this.matches.has(pr)).raise();
+    this.raise(this.selected);
   }
 
   // Moving the node blurs it, so focus is put back
@@ -568,7 +677,7 @@ class Timeline {
   }
 
   keydown(event, pr) {
-    const { prs } = this.model;
+    const prs = this.model.prs.filter((other) => this.matching(other));
     const i = prs.indexOf(pr);
 
     const target = {
@@ -583,7 +692,7 @@ class Timeline {
     if (target !== undefined) {
       event.preventDefault();
       const next = prs[Math.max(0, Math.min(target, prs.length - 1))];
-      this.nodes.get(next).focus({ preventScroll: true });
+      if (next) this.nodes.get(next).focus({ preventScroll: true });
       return;
     }
 
