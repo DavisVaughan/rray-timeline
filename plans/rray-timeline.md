@@ -4,7 +4,7 @@ An interactive chart for a blog post about how rray was built: almost entirely t
 
 The x axis is time. The y axis is the number of exported functions. Each merged PR is a dot. Clicking a dot shows when the conversations and the review behind that PR happened, with links to the PR and to a readable copy of each conversation.
 
-The code will live outside of the rray repo. This plan only lives here.
+Everything is built in this repo. The finished `site/` folder is then copied into the blog post.
 
 ## What the reader sees
 
@@ -171,7 +171,7 @@ Each signal becomes a percentile rank across all PRs, and the score is their mea
 
 The detail panel shows both parts, plus a few numbers for context only: conversation tokens, plan length, and time from open to merge.
 
-## Layout of the timeline repo
+## Layout
 
 ```
 rray-timeline/
@@ -185,7 +185,7 @@ rray-timeline/
     transcripts/
 ```
 
-`site/` is the folder that gets copied into the Quarto post's directory.
+`site/` is the folder that gets copied into the Quarto post's directory. Everything outside it is build tooling and stays here.
 
 ## Phases
 
