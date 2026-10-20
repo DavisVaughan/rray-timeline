@@ -257,8 +257,6 @@ class Timeline {
     });
     this.raise(this.selected);
 
-    this.labels = svg.append("g").attr("class", "tl-labels");
-
     // Pointer input goes through the nearest dot rather than each dot's tiny hit area
     this.overlay = svg
       .append("rect")
@@ -274,6 +272,9 @@ class Timeline {
         const pr = this.nearest(event);
         this.select(pr === this.selected ? null : pr);
       });
+
+    // Above the overlay so labels can be clicked
+    this.labels = svg.append("g").attr("class", "tl-labels");
 
     this.svg = svg;
   }
@@ -404,7 +405,13 @@ class Timeline {
       steps: model.steps,
       bounds: { x0: plot.x0, y0: 0, x1: plot.x1, y1: plot.y1 },
     });
-    this.labels.selectAll("*").classed("tl-faded", (pr) => selected && pr !== selected);
+    this.labels
+      .selectAll(":scope > *")
+      .classed("tl-faded", (pr) => selected && pr !== selected);
+    this.labels.selectAll("a").on("click", (event, pr) => {
+      event.preventDefault();
+      this.select(pr);
+    });
 
     this.x = x;
     this.y = y;
@@ -876,7 +883,8 @@ function placeLabels(layer, labeled, prs, { x, y, steps, bounds }) {
   };
 
   for (const pr of labeled) {
-    const text = layer.append("text").datum(pr).attr("class", "tl-label").text(pr.label);
+    const link = layer.append("a").datum(pr).attr("href", `#pr-${pr.number}`);
+    const text = link.append("text").attr("class", "tl-label").text(pr.label);
     const bbox = text.node().getBBox();
 
     const cx = x(pr.date);
@@ -886,7 +894,7 @@ function placeLabels(layer, labeled, prs, { x, y, steps, bounds }) {
     const box = candidates(cx, cy, r, bbox.width, bbox.height).find((box) => fits(pr, box));
 
     if (!box) {
-      text.remove();
+      link.remove();
       continue;
     }
 
@@ -896,7 +904,7 @@ function placeLabels(layer, labeled, prs, { x, y, steps, bounds }) {
     leaders.push(box.leader);
     const [[x1, y1], [x2, y2]] = box.leader;
     layer
-      .insert("line", "text")
+      .insert("line", ":scope > a")
       .datum(pr)
       .attr("class", "tl-leader")
       .attr("x1", x1)
@@ -980,15 +988,14 @@ function renderLegend(legend) {
     return svg.append("circle").attr("class", "tl-key-dot").attr("r", RADIUS[kind]);
   };
 
-  key("Adds exports", (item) => swatch(item, "add"));
+  key("New function", (item) => swatch(item, "add"));
   key("Other", (item) => swatch(item, "other"));
+  key("Lost transcript", (item) => swatch(item, "other").style("fill", "var(--tl-unknown)"));
 
   const ramp = legend.append("span").attr("class", "tl-key");
   ramp.append("span").text("Simple");
   ramp.append("span").attr("class", "tl-ramp");
   ramp.append("span").text("Complex");
-
-  key("Unknown", (item) => swatch(item, "add").style("fill", "var(--tl-unknown)"));
 
   for (const [tool, name] of Object.entries(TOOLS)) {
     key(name, (item) => item.append("span").attr("class", `tl-swatch tl-${tool}`));
