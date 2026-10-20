@@ -234,7 +234,6 @@ class Timeline {
       .selectAll("a")
       .data(model.unshipped)
       .join("a")
-      .attr("class", (session) => `tl-${session.tool}`)
       .attr("href", (session) => session.page)
       .attr("aria-label", (session) => `${session.title}, ${dayRange(session)}, didn't ship`)
       .on("pointerenter", (event, session) => this.showSessionTooltip(session))
@@ -459,7 +458,7 @@ class Timeline {
       .selectAll("rect")
       .data(segments)
       .join("rect")
-      .attr("class", (segment) => `tl-band tl-${segment.session.tool}`)
+      .attr("class", "tl-band")
       .call(spanX, x, (segment) => [segment.start, segment.end])
       .attr("y", y0)
       .attr("height", y1 - y0);
@@ -729,8 +728,6 @@ class Timeline {
       .join("li")
       .on("pointerenter", (event, session) => this.highlight(session))
       .on("pointerleave", () => this.highlight(null));
-
-    items.append("span").attr("class", (session) => `tl-swatch tl-${session.tool}`);
 
     items.each(function (session) {
       d3.select(this)
@@ -1040,8 +1037,4 @@ function renderLegend(legend) {
   ramp.append("span").text("Simple");
   ramp.append("span").attr("class", "tl-ramp");
   ramp.append("span").text("Complex");
-
-  for (const [tool, name] of Object.entries(TOOLS)) {
-    key(name, (item) => item.append("span").attr("class", `tl-swatch tl-${tool}`));
-  }
 }
