@@ -28,6 +28,8 @@ Everything is built in this repo. The finished `site/` folder is then copied int
 
 - **Complexity color.** Dot fill uses a single-hue sequential scale, light for simple PRs and dark for complex ones. PRs with no score are neutral grey. A small legend explains both. See [Complexity](#complexity).
 
+- **Search.** A filter box at the top right fades every PR whose title, short label, or export names don't contain all of the typed words. Labels are chosen from the matches, the overview strip marks where they fall, and arrow keys step between them. A selected PR that stops matching is cleared.
+
 - **Clicking a dot** selects that PR:
 
   - Other dots fade.
