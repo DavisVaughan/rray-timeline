@@ -2,10 +2,14 @@ import * as d3 from "https://cdn.jsdelivr.net/npm/d3@7.9.0/+esm";
 
 const MARGIN = { top: 12, right: 12, bottom: 28, left: 36 };
 
-const RADIUS = { add: 4.5, rename: 3, ring: 6, other: 2.5 };
+const RADIUS = { add: 4.5, other: 2.5 };
 
 // Labels with more names than this show a count instead
 const MAX_ADDED_NAMES = 3;
+
+// Only the most complex PRs are labeled, fewer on narrow screens
+const LABEL_COUNT = { wide: 10, narrow: 5 };
+const NARROW_WIDTH = 576;
 
 const MIN_TICK_SPACING = 64;
 
@@ -31,6 +35,7 @@ function buildModel(data) {
       number: pr.number,
       date: new Date(pr.merged),
       title: pr.title,
+      label: pr.label,
       url: pr.url,
       exports: pr.exports,
       added: pr.added,
@@ -40,9 +45,14 @@ function buildModel(data) {
     .sort((a, b) => a.date - b.date);
 
   for (const pr of prs) {
-    pr.kind = pr.added.length ? "add" : pr.renamed.length ? "rename" : "other";
-    pr.label = label(pr);
+    pr.kind = pr.added.length ? "add" : "other";
+    pr.label = pr.label ?? exportLabel(pr) ?? pr.title;
   }
+
+  const ranked = d3.sort(
+    prs.filter((pr) => pr.score !== null),
+    (pr) => -pr.score,
+  );
 
   const start = d3.timeDay.floor(prs[0].date);
   const end = new Date(data.generated);
@@ -54,16 +64,14 @@ function buildModel(data) {
     { date: end, exports: prs.at(-1).exports },
   ];
 
-  return { start, end, prs, steps };
+  return { start, end, prs, ranked, steps };
 }
 
-function label(pr) {
-  const { added, renamed } = pr;
+function exportLabel(pr) {
+  const { added } = pr;
 
-  if (added.length > MAX_ADDED_NAMES) return `+ ${added.length} exports`;
-  if (added.length) return `+ ${added.map(fn).join(", ")}`;
-  if (renamed.length > 1) return `${renamed.length} renames`;
-  if (renamed.length) return `${fn(renamed[0].from)} → ${fn(renamed[0].to)}`;
+  if (added.length > MAX_ADDED_NAMES) return `${added.length} new exports`;
+  if (added.length) return added.map(fn).join(", ");
 
   return null;
 }
@@ -136,7 +144,7 @@ function render(figure, model, width) {
 
   svg.append("path").attr("class", "tl-line").attr("d", line(model.steps));
 
-  // Minor dots first so labeled dots draw on top
+  // Small dots first so larger ones draw on top
   const prs = d3.sort(model.prs, (pr) => pr.kind !== "other");
 
   const dots = svg
@@ -148,12 +156,6 @@ function render(figure, model, width) {
     .attr("transform", (pr) => `translate(${x(pr.date)},${y(pr.exports)})`);
 
   dots.append("title").text(describe);
-
-  dots
-    .filter((pr) => pr.kind === "rename")
-    .append("circle")
-    .attr("class", "tl-ring")
-    .attr("r", RADIUS.ring);
 
   dots
     .append("circle")
@@ -173,7 +175,7 @@ function tickInterval(x) {
   return d3.timeMonth;
 }
 
-// Greedy placement, biggest changes first. Labels that can't be placed are dropped.
+// Greedy placement, most complex first. Labels that can't be placed are dropped.
 function placeLabels(svg, model, prs, { x, y, width, height }) {
   const bounds = {
     x0: MARGIN.left,
@@ -196,7 +198,7 @@ function placeLabels(svg, model, prs, { x, y, width, height }) {
 
   const dots = new Map(
     prs.map((pr) => {
-      const r = outerRadius(pr) + 1;
+      const r = RADIUS[pr.kind] + 1;
       const cx = x(pr.date);
       const cy = y(pr.exports);
       return [pr, { x0: cx - r, y0: cy - r, x1: cx + r, y1: cy + r }];
@@ -214,19 +216,17 @@ function placeLabels(svg, model, prs, { x, y, width, height }) {
     if (boxes.some((other) => overlaps(box, other))) return false;
     if (leaders.some((leader) => crosses(leader, box))) return false;
 
-    for (const [other, dot] of dots) {
+    // Dots touching this one can't be avoided where the leader starts
+    const own = dots.get(pr);
+    for (const dot of dots.values()) {
       if (overlaps(box, dot)) return false;
-      if (box.leader && other !== pr && crosses(box.leader, dot)) return false;
+      if (!overlaps(own, dot) && crosses(box.leader, dot)) return false;
     }
 
-    return !box.leader || !boxes.some((other) => crosses(box.leader, other));
+    return !boxes.some((other) => crosses(box.leader, other));
   };
 
-  const labeled = d3.sort(
-    prs.filter((pr) => pr.label),
-    (pr) => -(pr.added.length + pr.renamed.length),
-    (pr) => pr.date,
-  );
+  const labeled = model.ranked.slice(0, width < NARROW_WIDTH ? LABEL_COUNT.narrow : LABEL_COUNT.wide);
 
   const layer = svg.append("g").attr("class", "tl-labels");
 
@@ -236,7 +236,7 @@ function placeLabels(svg, model, prs, { x, y, width, height }) {
 
     const cx = x(pr.date);
     const cy = y(pr.exports);
-    const r = outerRadius(pr);
+    const r = RADIUS[pr.kind];
 
     const box = candidates(cx, cy, r, bbox.width, bbox.height).find((box) => fits(pr, box));
 
@@ -248,53 +248,46 @@ function placeLabels(svg, model, prs, { x, y, width, height }) {
     boxes.push(box);
     text.attr("x", box.x0 - bbox.x).attr("y", box.y0 - bbox.y);
 
-    if (box.leader) {
-      leaders.push(box.leader);
-      const [[x1, y1], [x2, y2]] = box.leader;
-      layer
-        .insert("line", "text")
-        .attr("class", "tl-leader")
-        .attr("x1", x1)
-        .attr("y1", y1)
-        .attr("x2", x2)
-        .attr("y2", y2);
-    }
+    leaders.push(box.leader);
+    const [[x1, y1], [x2, y2]] = box.leader;
+    layer
+      .insert("line", "text")
+      .attr("class", "tl-leader")
+      .attr("x1", x1)
+      .attr("y1", y1)
+      .attr("x2", x2)
+      .attr("y2", y2);
   }
 }
 
 // Only above left and below right are stacked, since those stay clear of the rising line at any distance
 function* candidates(cx, cy, r, w, h) {
-  const gap = 3;
+  // Room for a visible leader, and clears the largest dot on the same row
+  const gap = 5;
+  const rise = RADIUS.add + 6;
 
   const box = (x0, y0, anchor) => {
     const x1 = x0 + w;
     const y1 = y0 + h;
+
+    // Leaders run from the edge of the dot to the nearest corner of the label
     const corner = [anchor[0] < 0 ? x0 : x1, anchor[1] < 0 ? y0 : y1];
     const distance = Math.hypot(corner[0] - cx, corner[1] - cy);
+    const start = [cx + ((corner[0] - cx) / distance) * r, cy + ((corner[1] - cy) / distance) * r];
 
-    // Leaders start at the edge of the dot, and only when the label isn't touching it
-    const leader =
-      distance > r + 2 * gap + 1
-        ? [[cx + ((corner[0] - cx) / distance) * r, cy + ((corner[1] - cy) / distance) * r], corner]
-        : null;
-
-    return { x0, y0, x1, y1, leader };
+    return { x0, y0, x1, y1, leader: [start, corner] };
   };
 
-  yield box(cx - r - gap - w, cy - gap - h, [1, 1]);
-  yield box(cx + r + gap, cy + gap, [-1, -1]);
-  yield box(cx + r + gap, cy - gap - h, [-1, 1]);
-  yield box(cx - r - gap - w, cy + gap, [1, -1]);
+  yield box(cx - r - gap - w, cy - rise - h, [1, 1]);
+  yield box(cx + r + gap, cy + rise, [-1, -1]);
+  yield box(cx + r + gap, cy - rise - h, [-1, 1]);
+  yield box(cx - r - gap - w, cy + rise, [1, -1]);
 
   for (let level = 1; level <= 3; level++) {
     const shift = level * (h + 2);
-    yield box(cx - r - gap - w, cy - gap - h - shift, [1, 1]);
-    yield box(cx + r + gap, cy + gap + shift, [-1, -1]);
+    yield box(cx - r - gap - w, cy - rise - h - shift, [1, 1]);
+    yield box(cx + r + gap, cy + rise + shift, [-1, -1]);
   }
-}
-
-function outerRadius(pr) {
-  return pr.kind === "rename" ? RADIUS.ring : RADIUS[pr.kind];
 }
 
 function overlaps(a, b) {
@@ -338,12 +331,10 @@ function renderLegend(legend) {
 
   const swatch = (item, kind) => {
     const svg = item.append("svg").attr("width", 14).attr("height", 14).attr("viewBox", "-7 -7 14 14");
-    if (kind === "rename") svg.append("circle").attr("class", "tl-ring").attr("r", RADIUS.ring);
     return svg.append("circle").attr("class", "tl-key-dot").attr("r", RADIUS[kind]);
   };
 
   key("Adds exports", (item) => swatch(item, "add"));
-  key("Renames exports", (item) => swatch(item, "rename"));
   key("Other", (item) => swatch(item, "other"));
 
   const ramp = legend.append("span").attr("class", "tl-key");
