@@ -127,6 +127,9 @@ class Timeline {
     this.hovered = null;
     this.highlighted = null;
 
+    // Unshipped session whose tooltip stays open until dismissed
+    this.pinned = null;
+
     // The one dot in the tab order
     this.active = model.prs[0];
 
@@ -141,10 +144,19 @@ class Timeline {
     root.on("keydown", (event) => {
       if (event.key !== "Escape") return;
       this.hover(null);
-      if (this.selected) {
+      if (this.pinned) {
+        event.preventDefault();
+        this.pin(null);
+      } else if (this.selected) {
         event.preventDefault();
         this.select(null);
       }
+    });
+
+    addEventListener("click", (event) => {
+      if (!this.pinned) return;
+      if (this.tooltip.node().contains(event.target) || event.target.closest(".tl-track a")) return;
+      this.pin(null);
     });
 
     this.renderPanel();
@@ -225,8 +237,14 @@ class Timeline {
       .attr("class", (session) => `tl-${session.tool}`)
       .attr("href", (session) => session.page)
       .attr("aria-label", (session) => `${session.title}, ${dayRange(session)}, didn't ship`)
-      .on("pointerenter", (event, session) => this.showSessionTooltip(event, session))
-      .on("pointerleave", () => this.hideTooltip());
+      .on("pointerenter", (event, session) => this.showSessionTooltip(session))
+      .on("pointerleave", () => this.hideTooltip())
+      .on("click", (event, session) => {
+        // Modified clicks still open the transcript
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        this.pin(session === this.pinned ? null : session);
+      });
 
     this.track
       .selectAll("rect")
@@ -421,6 +439,12 @@ class Timeline {
       (pr) => x(pr.date),
       (pr) => y(pr.exports),
     );
+
+    if (this.pinned) {
+      const [start, end] = sessionExtent(this.pinned);
+      if (end < domain[0] || start > domain[1]) this.pin(null);
+      else if (!this.hovered) this.showSessionTooltip(this.pinned);
+    }
   }
 
   // Bands for the selected PR's conversations, and its open to merge window
@@ -492,7 +516,14 @@ class Timeline {
     else this.hideTooltip();
   }
 
+  pin(session) {
+    this.pinned = session;
+    if (session) this.showSessionTooltip(session);
+    else this.hideTooltip();
+  }
+
   select(pr, { fit = false } = {}) {
+    if (this.pinned) this.pin(null);
     this.selected = pr;
     this.highlighted = null;
 
@@ -586,22 +617,31 @@ class Timeline {
     });
   }
 
-  showSessionTooltip(event, session) {
-    const point = d3.pointer(event, this.svg.node());
+  showSessionTooltip(session) {
+    const { plot } = this;
+    const [start, end] = sessionExtent(session);
+    const middle = this.x(new Date((+start + +end) / 2));
+    const point = [Math.max(plot.x0, Math.min(middle, plot.x1)), plot.y1 + TRACK.gap];
+    const pinned = session === this.pinned;
 
-    this.showTooltip(this.svg.node(), point, (tooltip) => {
+    const content = (tooltip) => {
       tooltip.append("div").attr("class", "tl-tooltip-title").call(inline, session.title);
       tooltip.append("div").text(`${TOOLS[session.tool]}, ${dayRange(session)}`);
       tooltip.append("div").attr("class", "tl-muted").text("Didn't lead to a merged PR");
-    });
+      if (pinned && session.page) {
+        tooltip.append("a").attr("class", "tl-tooltip-link").attr("href", session.page).text("Open transcript");
+      }
+    };
+
+    this.showTooltip(this.svg.node(), point, content, { pinned });
   }
 
   // Places the tooltip above `point`, given in the coordinates of `node`
-  showTooltip(node, [px, py], content) {
+  showTooltip(node, [px, py], content, { pinned = false } = {}) {
     const tooltip = this.tooltip;
     tooltip.selectAll("*").remove();
     content(tooltip);
-    tooltip.attr("hidden", null);
+    tooltip.attr("hidden", null).attr("aria-hidden", pinned ? null : true).classed("tl-pinned", pinned);
 
     const origin = this.root.node().getBoundingClientRect();
     const box = node.getBoundingClientRect();
@@ -616,7 +656,8 @@ class Timeline {
   }
 
   hideTooltip() {
-    this.tooltip.attr("hidden", "");
+    if (this.pinned) this.showSessionTooltip(this.pinned);
+    else this.tooltip.attr("hidden", "");
   }
 
   renderPanel() {
@@ -802,9 +843,12 @@ function inline(selection, text) {
   });
 }
 
+function sessionExtent(session) {
+  return [session.segments[0][0], session.segments.at(-1)[1]];
+}
+
 function dayRange(session) {
-  const start = session.segments[0][0];
-  const end = session.segments.at(-1)[1];
+  const [start, end] = sessionExtent(session);
 
   if (d3.timeDay.floor(start) - d3.timeDay.floor(end) === 0) return formatDay(start);
   if (start.getMonth() === end.getMonth()) return `${formatDay(start)} – ${end.getDate()}`;
