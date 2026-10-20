@@ -1,0 +1,2572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Planning an ignore option for rray_dimensions_common() in combine</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-71">rray timeline</a>
+<h1>Planning an ignore option for <code>rray_dimensions_common()</code> in combine</h1>
+<p class="facts">Codex · Sep 17, 2026 · 4 prompts · 9 replies · <a href="https://github.com/r-lib/rray/pull/71">#71</a></p>
+</header>
+<main>
+<p class="divider">Sep 17, 2026, 19:18 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Let’s talk about the broadcast common loop in rray combine.</p>
+<p>It’s like really close to just being dimensions common, except it sums on the axis being combined on</p>
+<p>It’s possible we should let the C level rray dimensions common function have an <code>ignore</code> argument for axes to ignore in the computation, which should make it possible to reuse all of the existing code.</p>
+<p>Ignore axes would probably return 1 as their dimension from broadcast common</p>
+<p>We would not expose at R level because this is not a common idea, and we’d allow NULL to mean ignore nothing</p>
+<p>What do you think of this idea? Does it fit? Are there any issues? Is there anything better that keeps code reuse high?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll trace the current combine and dimensions-common paths, then compare the proposed <code>ignore</code> contract against their callers and edge cases. I’ll keep this at the design level and won’t change files.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;broadcast_common|dimensions_common|combine&quot; R src tests/testthat -g '*.[chR]'</summary>
+<pre>$ rg -n &quot;broadcast_common|dimensions_common|combine&quot; R src tests/testthat -g '*.[chR]'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+src/ptype.c:143:    &quot;Can't combine %s and %s.&quot;,
+src/dimensions.h:43:r_obj* rray_dimensions_common(
+src/combine.c:1:#include &quot;combine.h&quot;
+src/combine.c:15:#include &quot;decl/combine-decl.h&quot;
+src/combine.c:17:r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+src/combine.c:20:  return rray_combine(
+src/combine.c:30:r_obj* rray_combine(
+src/combine.c:87:            &quot;The combined dimension on `.axis` is too large.&quot;
+src/combine.c:170:    rray_combine_fill(x, out, out_start, &amp;plan);
+src/combine.c:174:  r_obj* out_names = KEEP(rray_combine_names(xs, out_dimensions, axis));
+src/combine.c:185:static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {
+src/combine.c:194:  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis));
+src/combine.c:208:static r_obj* rray_combine_axis_names(r_obj* xs, int axis) {
+src/combine.c:265:static void rray_combine_fill(
+src/combine.c:273:    rray_combine_fill_lgl(x, out, out_start, plan);
+src/combine.c:276:    rray_combine_fill_int(x, out, out_start, plan);
+src/combine.c:279:    rray_combine_fill_dbl(x, out, out_start, plan);
+src/combine.c:282:    rray_combine_fill_cpl(x, out, out_start, plan);
+src/combine.c:285:    rray_combine_fill_raw(x, out, out_start, plan);
+src/combine.c:288:    rray_combine_fill_chr(x, out, out_start, plan);
+src/combine.c:291:    rray_combine_fill_list(x, out, out_start, plan);
+src/combine.c:363:static void rray_combine_fill_lgl(
+src/combine.c:372:static void rray_combine_fill_int(
+src/combine.c:381:static void rray_combine_fill_dbl(
+src/combine.c:390:static void rray_combine_fill_cpl(
+src/combine.c:399:static void rray_combine_fill_raw(
+src/combine.c:408:static void rray_combine_fill_chr(
+src/combine.c:417:static void rray_combine_fill_list(
+src/broadcast.h:15:r_obj* rray_broadcast_common(
+R/dimensions.R:27:#' `rray_dimensions_common()` finds the common dimensions among multiple
+R/dimensions.R:41:#' rray_dimensions_common(array(1, c(2, 3)), array(1, c(1, 3)))
+R/dimensions.R:42:#' rray_dimensions_common(1:5, array(1, c(1, 3)))
+R/dimensions.R:43:#' rray_dimensions_common(1:5, .dimensions = c(5L, 3L))
+R/dimensions.R:44:rray_dimensions_common &lt;- function(..., .dimensions = NULL) {
+R/dimensions.R:45:  .Call(ffi_rray_dimensions_common, list2(...), .dimensions, environment())
+src/combine.h:8:r_obj* rray_combine(
+src/init.c:11:extern r_obj* ffi_rray_broadcast_common(
+src/init.c:60:extern r_obj* ffi_rray_dimensions_common(
+src/init.c:70:extern r_obj* ffi_rray_combine(
+src/init.c:191:  {&quot;ffi_rray_broadcast_common&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_common, 3},
+src/init.c:194:  {&quot;ffi_rray_dimensions_common&quot;, (DL_FUNC) &amp;ffi_rray_dimensions_common, 3},
+src/init.c:212:  {&quot;ffi_rray_combine&quot;, (DL_FUNC) &amp;ffi_rray_combine, 3},
+tests/testthat/test-dimensions.R:42:# rray_dimensions_common()
+tests/testthat/test-dimensions.R:46:    rray_dimensions_common(1:5, 1:5),
+tests/testthat/test-dimensions.R:50:    rray_dimensions_common(array(1, c(2, 3)), array(1, c(2, 3))),
+tests/testthat/test-dimensions.R:57:    rray_dimensions_common(array(1, c(1, 3)), array(1, c(2, 1))),
+tests/testthat/test-dimensions.R:61:    rray_dimensions_common(array(1, c(1, 3)), array(1, c(2, 3))),
+tests/testthat/test-dimensions.R:68:    rray_dimensions_common(1:5, array(1, c(5, 3))),
+tests/testthat/test-dimensions.R:72:    rray_dimensions_common(array(1, c(2, 3)), array(1, c(2, 3, 4))),
+tests/testthat/test-dimensions.R:79:    rray_dimensions_common(NULL, 1:5)
+tests/testthat/test-dimensions.R:80:    rray_dimensions_common(1:5, NULL)
+tests/testthat/test-dimensions.R:81:    rray_dimensions_common(x = 1:5, y = NULL)
+tests/testthat/test-dimensions.R:82:    rray_dimensions_common(NULL, NULL)
+tests/testthat/test-dimensions.R:87:  expect_identical(rray_dimensions_common(NULL, .dimensions = 2L), 2L)
+tests/testthat/test-dimensions.R:91:  expect_identical(rray_dimensions_common(1:3), 3L)
+tests/testthat/test-dimensions.R:93:    rray_dimensions_common(array(1, c(2, 3))),
+tests/testthat/test-dimensions.R:100:    rray_dimensions_common(
+tests/testthat/test-dimensions.R:111:    rray_dimensions_common(1:5, .dimensions = c(5L, 3L)),
+tests/testthat/test-dimensions.R:117:    rray_dimensions_common(1:6, .dimensions = c(5L, 3L)),
+tests/testthat/test-dimensions.R:124:    rray_dimensions_common(array(1, c(2, 3)), array(1, c(4, 3))),
+tests/testthat/test-dimensions.R:131:    rray_dimensions_common(x = array(1, c(2, 3)), y = array(1, c(4, 3))),
+tests/testthat/test-dimensions.R:138:    rray_dimensions_common(
+tests/testthat/test-dimensions.R:151:    do.call(rray_dimensions_common, args)
+tests/testthat/test-dimensions.R:157:    rray_dimensions_common(`a b` = NULL)
+tests/testthat/test-dimensions.R:162:  expect_snapshot(rray_dimensions_common(), error = TRUE)
+tests/testthat/test-dimensions.R:167:  expect_snapshot(rray_dimensions_common(x), error = TRUE)
+tests/testthat/test-dimensions.R:171:  expect_snapshot(rray_dimensions_common(1, .dimensions = &quot;a&quot;), error = TRUE)
+tests/testthat/test-dimensions.R:173:    rray_dimensions_common(1, .dimensions = integer()),
+src/broadcast.c:241:r_obj* ffi_rray_broadcast_common(
+src/broadcast.c:247:  return rray_broadcast_common(ffi_xs, ffi_dimensions, error_call);
+src/broadcast.c:250:r_obj* rray_broadcast_common(
+src/broadcast.c:255:  dimensions = KEEP(rray_dimensions_common(xs, dimensions, error_call));
+src/dimensions.c:125:r_obj* ffi_rray_dimensions_common(
+src/dimensions.c:131:  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);
+src/dimensions.c:134:r_obj* rray_dimensions_common(
+R/combine.R:3:#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+R/combine.R:6:#' @param ... Arrays to combine.
+R/combine.R:21:#' rray_combine(x, y, .axis = 1)
+R/combine.R:22:#' rray_combine(x, y, .axis = 2)
+R/combine.R:25:#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+R/combine.R:26:rray_combine &lt;- function(..., .axis) {
+R/combine.R:27:  .Call(ffi_rray_combine, list2(...), .axis, environment())
+R/broadcast.R:36:#' `rray_broadcast_common()` broadcasts every array to the common dimensions
+R/broadcast.R:37:#' found by [rray_dimensions_common()].
+R/broadcast.R:49:#' rray_broadcast_common(array(1:3, c(3L, 1L)), array(1:2, c(1L, 2L)))
+R/broadcast.R:52:#' rray_broadcast_common(x = 1:3, y = 1L)
+R/broadcast.R:55:#' rray_broadcast_common(1:3, .dimensions = c(3L, 2L))
+R/broadcast.R:56:rray_broadcast_common &lt;- function(..., .dimensions = NULL) {
+R/broadcast.R:57:  .Call(ffi_rray_broadcast_common, list2(...), .dimensions, environment())
+src/decl/combine-decl.h:1:static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis);
+src/decl/combine-decl.h:2:static r_obj* rray_combine_axis_names(r_obj* xs, int axis);
+src/decl/combine-decl.h:3:static void rray_combine_fill(
+src/decl/combine-decl.h:9:static void rray_combine_fill_lgl(
+src/decl/combine-decl.h:15:static void rray_combine_fill_int(
+src/decl/combine-decl.h:21:static void rray_combine_fill_dbl(
+src/decl/combine-decl.h:27:static void rray_combine_fill_cpl(
+src/decl/combine-decl.h:33:static void rray_combine_fill_raw(
+src/decl/combine-decl.h:39:static void rray_combine_fill_chr(
+src/decl/combine-decl.h:45:static void rray_combine_fill_list(
+tests/testthat/test-broadcast.R:287:# rray_broadcast_common()
+tests/testthat/test-broadcast.R:292:  out &lt;- rray_broadcast_common(x, y)
+tests/testthat/test-broadcast.R:300:  out &lt;- rray_broadcast_common(1:2, array(1L, c(2L, 3L, 4L)))
+tests/testthat/test-broadcast.R:307:  expect_identical(rray_broadcast_common(x, x), list(x, x))
+tests/testthat/test-broadcast.R:311:  expect_identical(rray_broadcast_common(1:3), list(array(1:3)))
+tests/testthat/test-broadcast.R:315:  out &lt;- rray_broadcast_common(
+tests/testthat/test-broadcast.R:324:  out &lt;- rray_broadcast_common(1L, 2.5, &quot;a&quot;, TRUE, 1i, as.raw(1), list(1))
+tests/testthat/test-broadcast.R:332:  out &lt;- rray_broadcast_common(x = 1:3, y = 1L)
+tests/testthat/test-broadcast.R:335:  out &lt;- rray_broadcast_common(1:3, y = 1L)
+tests/testthat/test-broadcast.R:338:  expect_null(names(rray_broadcast_common(1:3, 1L)))
+tests/testthat/test-broadcast.R:343:  out &lt;- rray_broadcast_common(x, array(1L, c(2L, 3L)))
+tests/testthat/test-broadcast.R:348:  out &lt;- rray_broadcast_common(1:3, .dimensions = c(3L, 2L))
+tests/testthat/test-broadcast.R:353:  expect_snapshot(rray_broadcast_common(NULL, 1:2), error = TRUE)
+tests/testthat/test-broadcast.R:354:  expect_snapshot(rray_broadcast_common(NULL), error = TRUE)
+tests/testthat/test-broadcast.R:359:  expect_snapshot(rray_broadcast_common(y = x), error = TRUE)
+tests/testthat/test-broadcast.R:364:    rray_broadcast_common(x = 1:3, y = 1:2)
+tests/testthat/test-broadcast.R:367:    rray_broadcast_common(a = 1:2, b = 1:3, .dimensions = c(2L, 2L))
+tests/testthat/test-broadcast.R:370:    rray_broadcast_common(1:2, array(1L, c(2L, 2L)), .dimensions = 2L)
+tests/testthat/test-combine.R:1:test_that(&quot;combines arrays along every axis&quot;, {
+tests/testthat/test-combine.R:3:    rray_combine(1:2, 3:5, .axis = 1L),
+tests/testthat/test-combine.R:10:  out &lt;- rray_combine(x, y, .axis = 1L)
+tests/testthat/test-combine.R:15:  out &lt;- rray_combine(x, y, .axis = 2L)
+tests/testthat/test-combine.R:22:    out &lt;- rray_combine(z, z + 24L, .axis = axis)
+tests/testthat/test-combine.R:34:test_that(&quot;combines one or more than two inputs&quot;, {
+tests/testthat/test-combine.R:36:  expect_identical(rray_combine(x, .axis = 1L), x)
+tests/testthat/test-combine.R:38:  out &lt;- rray_combine(x, x + 4L, x + 8L, .axis = 2L)
+tests/testthat/test-combine.R:46:    rlang::inject(rray_combine(!!!xs, .axis = 2L)),
+tests/testthat/test-combine.R:52:  expect_type(rray_combine(TRUE, 2L, .axis = 1L), &quot;integer&quot;)
+tests/testthat/test-combine.R:53:  expect_type(rray_combine(TRUE, 2, .axis = 1L), &quot;double&quot;)
+tests/testthat/test-combine.R:54:  expect_type(rray_combine(1L, 2i, .axis = 1L), &quot;complex&quot;)
+tests/testthat/test-combine.R:57:    rray_combine(&quot;a&quot;, &quot;b&quot;, .axis = 1L),
+tests/testthat/test-combine.R:61:    rray_combine(as.raw(1), as.raw(2), .axis = 1L),
+tests/testthat/test-combine.R:65:    rray_combine(list(1L), list(&quot;x&quot;), .axis = 1L),
+tests/testthat/test-combine.R:70:test_that(&quot;broadcasts every non-combine axis&quot;, {
+tests/testthat/test-combine.R:73:  out &lt;- rray_combine(x, y, .axis = 1L)
+tests/testthat/test-combine.R:81:  out &lt;- rray_combine(x, y, .axis = 1L)
+tests/testthat/test-combine.R:91:  out &lt;- rray_combine(x, y, .axis = 2L)
+tests/testthat/test-combine.R:97:test_that(&quot;combines on an implicit trailing axis&quot;, {
+tests/testthat/test-combine.R:100:  out &lt;- rray_combine(x, y, .axis = 2L)
+tests/testthat/test-combine.R:110:  expect_identical(rray_combine(x, y, .axis = 1L), y)
+tests/testthat/test-combine.R:115:    rray_combine(x, y, .axis = 1L),
+tests/testthat/test-combine.R:120:test_that(&quot;combines axis names and broadcasts other names&quot;, {
+tests/testthat/test-combine.R:132:  out &lt;- rray_combine(first = x, second = y, .axis = 1L)
+tests/testthat/test-combine.R:140:  out &lt;- rray_combine(x, y, .axis = 1L)
+tests/testthat/test-combine.R:144:  out &lt;- rray_combine(named = x, unnamed = 3L, .axis = 1L)
+tests/testthat/test-combine.R:154:  rray_combine(x, y, .axis = 1L)
+tests/testthat/test-combine.R:164:    rray_combine(.axis = 1L)
+tests/testthat/test-combine.R:165:    rray_combine(x)
+tests/testthat/test-combine.R:166:    rray_combine(x, .axis = integer())
+tests/testthat/test-combine.R:167:    rray_combine(x, .axis = c(1L, 2L))
+tests/testthat/test-combine.R:168:    rray_combine(x, .axis = NA_integer_)
+tests/testthat/test-combine.R:169:    rray_combine(x, .axis = structure(1L, foo = &quot;bar&quot;))
+tests/testthat/test-combine.R:170:    rray_combine(x, .axis = 1.5)
+tests/testthat/test-combine.R:171:    rray_combine(x, .axis = 0L)
+tests/testthat/test-combine.R:172:    rray_combine(x, .axis = 3L)
+tests/testthat/test-combine.R:178:    rray_combine(array(1:4, c(2L, 2L)), array(1:6, c(3L, 2L)), .axis = 2L)
+tests/testthat/test-combine.R:179:    rray_combine(x = 1L, y = &quot;x&quot;, .axis = 1L)
+tests/testthat/test-combine.R:180:    rray_combine(x = NULL, y = 1L, .axis = 1L)
+tests/testthat/test-combine.R:181:    rray_combine(x = mean, y = 1L, .axis = 1L)
+tests/testthat/test-combine.R:182:    rray_combine(
+tests/testthat/test-reduce-product.R:182:test_that(&quot;complex Inf combined with NA matches base R's prod()&quot;, {
+tests/testthat/test-ptype.R:72:test_that(&quot;errors on types that don't combine&quot;, {</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,240p' src/dimensions.c; sed -n '1,130p' src/dimensions.h; sed -n '1,230p' src/combi…</summary>
+<pre>$ sed -n '1,240p' src/dimensions.c; sed -n '1,130p' src/dimensions.h; sed -n '1,230p' src/combine.c; sed -n '230,470p' src/combine.c; sed -n '1,130p' src/broadcast.c; sed -n '230,285p' src/broadcast.c; sed -n '1,230p' tests/testthat/test-combine.R</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+#include &quot;dimensions.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/dimensions-decl.h&quot;
+
+r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_dimensions(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim(x);
+  FREE(1);
+  return out;
+}
+
+int rray_dimension(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return r_int_get(dimensions, axis - 1);
+}
+
+bool rray_dimensions_are_equal(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality
+) {
+  if (x_dimensionality != y_dimensionality) {
+    return false;
+  }
+
+  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    if (v_x_dimensions[i] != v_y_dimensions[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+r_obj* ffi_rray_set_dimensions(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_dimensions(ffi_x, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_set_dimensions(
+  r_obj* x,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  dimensions =
+    KEEP(arg_as_dimensions(dimensions, rray_args.dimensions, error_call));
+
+  const r_ssize x_size = rray_size(x, arg, error_call);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  if (x_size != size) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Can't set these dimensions. &quot;
+      &quot;Can't change from a size of %&quot; R_PRIdXLEN_T
+      &quot; to a size of %&quot; R_PRIdXLEN_T &quot;.&quot;,
+      x_size,
+      size
+    );
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+
+  r_attrib_poke_dim_names(out, r_null);
+  r_attrib_poke_dim(out, dimensions);
+
+  FREE(3);
+  return out;
+}
+
+r_obj* rray_set_axes_dimension(
+  const int* v_dimensions,
+  int dimensionality,
+  const int* v_axes,
+  r_ssize axes_size,
+  int dimension
+) {
+  r_obj* out = KEEP(r_alloc_integer(dimensionality));
+  int* v_out = r_int_begin(out);
+
+  // Start with `v_dimensions`
+  r_memcpy(v_out, v_dimensions, sizeof(int) * dimensionality);
+
+  // Set `axes` to `dimension`
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out[v_axes[i] - 1] = dimension;
+  }
+
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_dimensions_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);
+}
+
+r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct r_lazy error_call
+) {
+  if (dimensions != r_null) {
+    return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);
+  }
+
+  const r_ssize n = r_length(xs);
+
+  if (n == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  r_obj* const* v_xs = r_list_cbegin(xs);
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  r_ssize out_i = 0;
+  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, n, &amp;out_i);
+  KEEP(out_arg-&gt;shelter);
+
+  int out_dimensionality = 1;
+
+  // Stack allocated array of known max size that we accumulate the common
+  // dimensions in. Initialized to 1, which works very nicely with broadcasting.
+  int v_out_dimensions[RRAY_MAX_DIMENSIONALITY];
+
+  // Index of the input that set each axis of `v_out_dimensions`, always
+  // populated by the time that axis can conflict
+  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+    v_out_dimensions[i] = 1;
+    v_out_args[i] = 0;
+  }
+
+  for (; x_i &lt; n; ++x_i) {
+    r_obj* x = v_xs[x_i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, x_arg, error_call));
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    check_max_dimensionality(x_dimensionality);
+
+    // Update `v_out_dimensions` and `out_dimensionality` in place
+    // with common dimensions
+    rray_dimensions_merge(
+      v_out_dimensions,
+      v_out_args,
+      &amp;out_dimensionality,
+      &amp;out_i,
+      v_x_dimensions,
+      x_dimensionality,
+      x_i,
+      out_arg,
+      x_arg,
+      error_call</pre><p class="cut">911 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning dimension merging refinement</strong></p>
+<p><strong>Evaluating axis ignoring in dimension merging</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning dimension merging refinement</strong></p>
+<p><strong>Evaluating axis ignoring in dimension merging</strong></p>
+</details>
+<p>The core reuse looks sound, but there are two contracts to separate: finding the non-combine dimensions, and preserving combine’s error context. I’m checking the lower-level merge and name paths now, because that determines whether <code>ignore</code> belongs on the public-shaped C entry point or on a smaller internal helper.</p>
+
+<details class="tool"><summary>Bash: sed -n '134,360p' src/dimensions.c; sed -n '1,280p' src/broadcast-names.c; sed -n '1,180p' sr…</summary>
+<pre>$ sed -n '134,360p' src/dimensions.c; sed -n '1,280p' src/broadcast-names.c; sed -n '1,180p' src/broadcast-names.h; rg -n &quot;rray_dimensions_common\(&quot; src -g '*.[ch]'; rg -n &quot;dimensions_common|combine&quot; ~/files/r/packages/rray/src ~/files/r/packages/rray/R -g '*.[chR]'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct r_lazy error_call
+) {
+  if (dimensions != r_null) {
+    return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);
+  }
+
+  const r_ssize n = r_length(xs);
+
+  if (n == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  r_obj* const* v_xs = r_list_cbegin(xs);
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  r_ssize out_i = 0;
+  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, n, &amp;out_i);
+  KEEP(out_arg-&gt;shelter);
+
+  int out_dimensionality = 1;
+
+  // Stack allocated array of known max size that we accumulate the common
+  // dimensions in. Initialized to 1, which works very nicely with broadcasting.
+  int v_out_dimensions[RRAY_MAX_DIMENSIONALITY];
+
+  // Index of the input that set each axis of `v_out_dimensions`, always
+  // populated by the time that axis can conflict
+  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+    v_out_dimensions[i] = 1;
+    v_out_args[i] = 0;
+  }
+
+  for (; x_i &lt; n; ++x_i) {
+    r_obj* x = v_xs[x_i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, x_arg, error_call));
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    check_max_dimensionality(x_dimensionality);
+
+    // Update `v_out_dimensions` and `out_dimensionality` in place
+    // with common dimensions
+    rray_dimensions_merge(
+      v_out_dimensions,
+      v_out_args,
+      &amp;out_dimensionality,
+      &amp;out_i,
+      v_x_dimensions,
+      x_dimensionality,
+      x_i,
+      out_arg,
+      x_arg,
+      error_call
+    );
+
+    FREE(1);
+  }
+
+  r_obj* out = KEEP(r_alloc_integer(out_dimensionality));
+  int* v_out = r_int_begin(out);
+  r_memcpy(v_out, v_out_dimensions, sizeof(int) * out_dimensionality);
+
+  FREE(4);
+  return out;
+}
+
+static inline void rray_dimensions_merge(
+  int* v_out_dimensions,
+  r_ssize* v_out_args,
+  int* p_out_dimensionality,
+  r_ssize* p_out_i,
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  r_ssize x_i,
+  struct rray_arg* out_arg,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+) {
+  const int out_dimensionality = *p_out_dimensionality;
+
+  const int common_dimensionality = (out_dimensionality &gt; x_dimensionality)
+    ? out_dimensionality
+    : x_dimensionality;
+
+  *p_out_dimensionality = common_dimensionality;
+
+  for (int i = 0; i &lt; common_dimensionality; ++i) {
+    const int out_dimension =
+      (i &lt; out_dimensionality) ? v_out_dimensions[i] : 1;
+    const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;
+
+    *p_out_i = v_out_args[i];
+
+    const int dimension = rray_dimension2(
+      out_dimension,
+      x_dimension,
+      i + 1,
+      out_arg,
+      x_arg,
+      error_call
+    );
+
+    if (dimension != out_dimension) {
+      v_out_dimensions[i] = dimension;
+      v_out_args[i] = x_i;
+    }
+  }
+}
+
+r_obj* rray_dimensions2(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  const int dimensionality =
+    (x_dimensionality &gt; y_dimensionality) ? x_dimensionality : y_dimensionality;
+
+  check_max_dimensionality(dimensionality);
+
+  r_obj* out = KEEP(r_alloc_integer(dimensionality));
+  int* v_out = r_int_begin(out);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;
+    const int y_dimension = (i &lt; y_dimensionality) ? v_y_dimensions[i] : 1;
+
+    v_out[i] = rray_dimension2(
+      x_dimension,
+      y_dimension,
+      i + 1,
+      x_arg,
+      y_arg,
+      error_call
+    );
+  }
+
+  FREE(1);
+  return out;
+}
+
+static inline int rray_dimension2(
+  int x,
+  int y,
+  int axis,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  if (x == y) {
+    return x;
+  }
+
+  if (x == 1) {
+    return y;
+  }
+
+  if (y == 1) {
+    return x;
+  }
+
+  stop_incompatible_dimensions(x, y, axis, x_arg, y_arg, error_call);
+}
+
+static r_no_return void stop_incompatible_dimensions(
+  int x,
+  int y,
+  int axis,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't find common dimensions at axis %d. &quot;
+    &quot;%s has dimension %d and %s has dimension %d.&quot;,
+    axis,
+    rray_arg_format(x_arg),
+    x,
+    rray_arg_format(y_arg),
+    y
+  );
+}</pre><p class="cut">151 more lines cut</p></details>
+<details class="tool"><summary>Bash: rg -n &quot;bind|common.*dim|dim_common|broadcast&quot; ~/files/r/packages/rray/src -g '*'; …</summary>
+<pre>$ rg -n &quot;bind|common.*dim|dim_common|broadcast&quot; ~/files/r/packages/rray/src -g '*'; sed -n '1,220p' ~/files/r/packages/rray/R/bind.R; rg -n &quot;new_subscript_arg\(|struct rray_arg&quot; src/arg.c src/arg.h src -g '*.[ch]'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+~/files/r/packages/rray/src/bind.cpp:170:Rcpp::List compute_bind_dim_names(const Rcpp::List&amp; lst_of_dim_names,
+~/files/r/packages/rray/src/bind.cpp:262:Rcpp::RObject rray__bind_impl(const Rcpp::List&amp; args,
+~/files/r/packages/rray/src/bind.cpp:298:  const Rcpp::List&amp; new_dim_names = compute_bind_dim_names(
+~/files/r/packages/rray/src/bind.cpp:312:Rcpp::RObject rray__bind(Rcpp::RObject proxy,
+~/files/r/packages/rray/src/bind.cpp:329:    case REALSXP: return rray__bind_impl&lt;double&gt;(args, axis, lst_of_dim_names);
+~/files/r/packages/rray/src/bind.cpp:330:    case INTSXP: return rray__bind_impl&lt;int&gt;(args, axis, lst_of_dim_names);
+~/files/r/packages/rray/src/bind.cpp:331:    case LGLSXP: return rray__bind_impl&lt;rlogical&gt;(args, axis, lst_of_dim_names);
+~/files/r/packages/rray/src/RcppExports.cpp:84:// rray__bind
+~/files/r/packages/rray/src/RcppExports.cpp:85:Rcpp::RObject rray__bind(Rcpp::RObject proxy, Rcpp::List args, const int&amp; axis);
+~/files/r/packages/rray/src/RcppExports.cpp:86:RcppExport SEXP _rray_rray__bind(SEXP proxySEXP, SEXP argsSEXP, SEXP axisSEXP) {
+~/files/r/packages/rray/src/RcppExports.cpp:92:    rcpp_result_gen = Rcpp::wrap(rray__bind(proxy, args, axis));
+~/files/r/packages/rray/src/RcppExports.cpp:96:// rray__broadcast
+~/files/r/packages/rray/src/RcppExports.cpp:97:Rcpp::RObject rray__broadcast(Rcpp::RObject x, Rcpp::IntegerVector dim);
+~/files/r/packages/rray/src/RcppExports.cpp:98:RcppExport SEXP _rray_rray__broadcast(SEXP xSEXP, SEXP dimSEXP) {
+~/files/r/packages/rray/src/RcppExports.cpp:103:    rcpp_result_gen = Rcpp::wrap(rray__broadcast(x, dim));
+~/files/r/packages/rray/src/RcppExports.cpp:719:// rray__validate_broadcastable_to_dim
+~/files/r/packages/rray/src/RcppExports.cpp:720:void rray__validate_broadcastable_to_dim(Rcpp::IntegerVector x_dim, Rcpp::IntegerVector dim);
+~/files/r/packages/rray/src/RcppExports.cpp:721:RcppExport SEXP _rray_rray__validate_broadcastable_to_dim(SEXP x_dimSEXP, SEXP dimSEXP) {
+~/files/r/packages/rray/src/RcppExports.cpp:725:    rray__validate_broadcastable_to_dim(x_dim, dim);
+~/files/r/packages/rray/src/RcppExports.cpp:761:    {&quot;_rray_rray__bind&quot;, (DL_FUNC) &amp;_rray_rray__bind, 3},
+~/files/r/packages/rray/src/RcppExports.cpp:762:    {&quot;_rray_rray__broadcast&quot;, (DL_FUNC) &amp;_rray_rray__broadcast, 2},
+~/files/r/packages/rray/src/RcppExports.cpp:819:    {&quot;_rray_rray__validate_broadcastable_to_dim&quot;, (DL_FUNC) &amp;_rray_rray__validate_broadcastable_to_dim, 2},
+~/files/r/packages/rray/src/yank-assign.cpp:54:    rray__validate_broadcastable_to(value, out_view);
+~/files/r/packages/rray/src/yank-assign.cpp:65:    rray__validate_broadcastable_to(value, out_view);
+~/files/r/packages/rray/src/broadcast.cpp:5:Rcpp::RObject rray__broadcast_impl(const xt::rarray&lt;T&gt;&amp; x,
+~/files/r/packages/rray/src/broadcast.cpp:15:  xt::rarray&lt;T&gt; out = xt::broadcast(x_view, dim_vec);
+~/files/r/packages/rray/src/broadcast.cpp:21:Rcpp::RObject rray__broadcast(Rcpp::RObject x, Rcpp::IntegerVector dim) {
+~/files/r/packages/rray/src/broadcast.cpp:34:  rray__validate_broadcastable_to_dim(x_dim, dim);
+~/files/r/packages/rray/src/broadcast.cpp:37:  DISPATCH_UNARY_ONE(out, rray__broadcast_impl, x, dim);
+~/files/r/packages/rray/src/reducers.cpp:179:  xt::rarray&lt;double&gt; xt_inf_out = xt::broadcast(xt_inf, dim);
+~/files/r/packages/rray/src/compare.cpp:123:// - No broadcasting is performed (the shape is part of the check)
+~/files/r/packages/rray/src/subset-assign.cpp:32:    rray__validate_broadcastable_to(value_view, xt_out_subset_view);
+~/files/r/packages/rray/src/subset-assign.cpp:38:    rray__validate_broadcastable_to(value_view, xt_out_subset_view);
+~/files/r/packages/rray/src/dim.cpp:62:// Determine the &quot;common dimensions&quot; between two sets of dimensions by
+~/files/r/packages/rray/src/dim.cpp:63:// applying broadcasting rules.
+~/files/r/packages/rray/src/dim.cpp:94:        &quot;Non-broadcastable dimensions: %s and %s.&quot;,
+~/files/r/packages/rray/src/dim-names-common.cpp:181:  Rcpp::List common_dim_names = rray__coalesce_dim_names(
+~/files/r/packages/rray/src/dim-names-common.cpp:186:  return common_dim_names;
+~/files/r/packages/rray/src/dim-names-common.cpp:191:// Performs the VERY common task of reshaping dim names of `x` to the new
+~/files/r/packages/rray/src/extract-assign.cpp:28:    rray__validate_broadcastable_to(value, xt_out_extract_view);
+~/files/r/packages/rray/src/extract-assign.cpp:35:    rray__validate_broadcastable_to(value, xt_out_extract_view);
+~/files/r/packages/rray/src/validation.cpp:56:// 4 cases where broadcasting works:
+~/files/r/packages/rray/src/validation.cpp:58:// - Dimension of x is 1 (broadcast to new dimension)
+~/files/r/packages/rray/src/validation.cpp:65:void rray__validate_broadcastable_to_dim(Rcpp::IntegerVector x_dim,
+~/files/r/packages/rray/src/validation.cpp:86:        &quot;Cannot broadcast from %s to %s due to dimension %i.&quot;,
+#' Combine many arrays together into one array
+#'
+#' These functions bind multiple vectors, matrices, arrays, or rrays together
+#' into one, combining along the `.axis`.
+#'
+#' @details
+#'
+#' `rray_bind()` is extremely flexible. It uses broadcasting to combine
+#' arrays together in a way that the native functions of `cbind()` and `rbind()`
+#' cannot. See the examples section for more explanation!
+#'
+#' @return
+#'
+#' An array, or rray, depending on the input.
+#'
+#' @param ... Vectors, matrices, arrays, or rrays.
+#'
+#' @param .axis A single integer. The axis to bind along.
+#'
+#' @examples
+#' # ---------------------------------------------------------------------------
+#' a &lt;- matrix(1:4, ncol = 2)
+#' b &lt;- matrix(5:6, ncol = 1)
+#'
+#' # Bind along columns
+#' rray_bind(a, b, .axis = 2)
+#'
+#' # Bind along rows
+#' # Broadcasting is done automatically
+#' rray_bind(a, b, .axis = 1)
+#'
+#' # Notice that this is not possible with rbind()!
+#' try(rbind(a, b))
+#'
+#' # You can bind &quot;up&quot; to a new dimension
+#' # to stack matrices into an array
+#' rray_bind(a, b, .axis = 3)
+#'
+#' # ---------------------------------------------------------------------------
+#' # Dimension name example
+#'
+#' x &lt;- matrix(
+#'  1:6,
+#'  ncol = 3,
+#'  dimnames = list(c(&quot;a_r1&quot;, &quot;a_r2&quot;), c(&quot;a_c1&quot;, &quot;a_c2&quot;, &quot;a_c3&quot;))
+#' )
+#'
+#' y &lt;- matrix(
+#'  7:8,
+#'  ncol = 1,
+#'  dimnames = list(NULL, c(&quot;b_c1&quot;))
+#' )
+#'
+#' # Dimension names come along for the ride
+#' # following rray name handling
+#' rray_bind(x, y, .axis = 2)
+#'
+#' # If some inputs are named, and others
+#' # are not, the non-named inputs get `&quot;&quot;`
+#' # as names
+#' rray_bind(x, y, .axis = 1)
+#'
+#' # You can add &quot;outer&quot; names to the
+#' # axis you are binding along.
+#' # They are added to existing names with `..`
+#' rray_bind(outer = x, y, .axis = 2)
+#'
+#' # Outer names can be used to give unnamed
+#' # inputs default names
+#' rray_bind(outer = x, outer_y = y, .axis = 1)
+#'
+#' @export
+rray_bind &lt;- function(..., .axis) {
+  .axis &lt;- vec_cast(.axis, integer())
+  validate_axes(.axis, x = numeric(), n = 1L, nm = &quot;.axis&quot;, dim_n = Inf)
+
+  args &lt;- compact(list2(...))
+
+  if (length(args) == 0L) {
+    return(NULL)
+  }
+
+  # finalize partial types
+  args &lt;- map(args, vec_ptype_finalise)
+
+  proxy &lt;- vec_ptype_inner_common(!!!args)
+  container &lt;- vec_ptype_container_common(!!!args)
+
+  res &lt;- rray__bind(proxy, args, as_cpp_idx(.axis))
+
+  vec_cast_container(res, container)
+}
+
+#' @rdname rray_bind
+#' @export
+rray_rbind &lt;- function(...) {
+  rray_bind(..., .axis = 1L)
+}
+
+#' @rdname rray_bind
+#' @export
+rray_cbind &lt;- function(...) {
+  rray_bind(..., .axis = 2L)
+}
+src/arg.h:6:struct rray_arg {
+src/arg.h:8:  struct rray_arg* parent;
+src/arg.h:13:struct rray_args {
+src/arg.h:14:  struct rray_arg* empty;
+src/arg.h:15:  struct rray_arg* x;
+src/arg.h:16:  struct rray_arg* y;
+src/arg.h:17:  struct rray_arg* names;
+src/arg.h:18:  struct rray_arg* axis;
+src/arg.h:19:  struct rray_arg* dot_axis;
+src/arg.h:20:  struct rray_arg* axes;
+src/arg.h:21:  struct rray_arg* from;
+src/arg.h:22:  struct rray_arg* to;
+src/arg.h:23:  struct rray_arg* dimensions;
+src/arg.h:24:  struct rray_arg* dot_dimensions;
+src/arg.h:27:extern struct rray_args rray_args;
+src/arg.h:29:r_obj* rray_arg(struct rray_arg* arg);
+src/arg.h:31:const char* rray_arg_format(struct rray_arg* arg);
+src/arg.h:33:const char* rray_arg_format_input(struct rray_arg* arg);
+src/arg.h:35:bool rray_arg_is_empty(struct rray_arg* arg);
+src/arg.h:37:struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+src/arg.h:39:struct rray_arg new_lazy_arg(struct r_lazy* arg);
+src/arg.h:41:struct rray_arg* new_subscript_arg(
+src/arg.h:42:  struct rray_arg* parent,
+src/arg.c:12:r_obj* rray_arg(struct rray_arg* arg) {
+src/arg.c:34:const char* rray_arg_format(struct rray_arg* arg) {
+src/arg.c:41:const char* rray_arg_format_input(struct rray_arg* arg) {
+src/arg.c:50:  struct rray_arg* arg,
+src/arg.c:86:struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg) {
+src/arg.c:87:  struct rray_arg out =
+src/arg.c:96:struct rray_arg new_lazy_arg(struct r_lazy* arg) {
+src/arg.c:97:  return (struct rray_arg){.fill = &amp;lazy_arg_fill, .data = arg};
+src/arg.c:121:  struct rray_arg self;
+src/arg.c:127:struct rray_arg* new_subscript_arg(
+src/arg.c:128:  struct rray_arg* parent,
+src/arg.c:139:  p_data-&gt;self = (struct rray_arg){
+src/arg.c:150:  return (struct rray_arg*) p_data;
+src/arg.c:195:bool rray_arg_is_empty(struct rray_arg* arg) {
+src/arg.c:204:struct rray_args rray_args;
+src/arg.c:207:  static struct rray_arg ARG;                                                  \
+src/arg.c:212:  static struct rray_arg ARG;                                                  \
+src/ptype.c:13:  struct rray_arg arg = new_lazy_arg(&amp;arg_lazy);
+src/ptype.c:18:r_obj* rray_ptype(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+src/ptype.c:47:  struct rray_arg x_arg = new_lazy_arg(&amp;x_arg_lazy);
+src/ptype.c:50:  struct rray_arg y_arg = new_lazy_arg(&amp;y_arg_lazy);
+src/ptype.c:61:  struct rray_arg* x_arg,
+src/ptype.c:62:  struct rray_arg* y_arg,
+src/ptype.c:137:  struct rray_arg* x_arg,</pre><p class="cut">329 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,100p' src/dimensionality.c; sed -n '1,90p' src/cast-common.c; sed -n '1,90p' src/pt…</summary>
+<pre>$ sed -n '1,100p' src/dimensionality.c; sed -n '1,90p' src/cast-common.c; sed -n '1,90p' src/ptype-common.c; sed -n '1,230p' tests/testthat/_snaps/combine.md; sed -n '1,220p' ~/files/r/packages/rray/src/bind.cpp</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;dimensionality.h&quot;
+
+#include &quot;dimensions.h&quot;
+
+r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+}
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return rray_dimensionality_from_dimensions(dimensions);
+}
+
+int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+  return (int) r_length(dimensions);
+}
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  int out = 1;
+
+  for (; x_i &lt; xs_size; ++x_i) {
+    const int x_dimensionality =
+      rray_dimensionality(v_xs[x_i], x_arg, error_call);
+
+    if (x_dimensionality &gt; out) {
+      out = x_dimensionality;
+    }
+  }
+
+  FREE(2);
+  return out;
+}
+
+void check_max_dimensionality(int dimensionality) {
+  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+    r_abort(
+      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+      &quot;A dimensionality of %d was requested.&quot;,
+      RRAY_MAX_DIMENSIONALITY,
+      dimensionality
+    );
+  }
+}
+#include &quot;cast-common.h&quot;
+
+#include &quot;cast.h&quot;
+#include &quot;ptype-common.h&quot;
+#include &quot;syms.h&quot;
+
+r_obj* ffi_rray_cast_common(r_obj* ffi_xs, r_obj* ffi_to, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = rray_syms.dot_call, .env = ffi_frame};
+
+  struct r_lazy arg_lazy = {.x = rray_syms.dot_arg, .env = ffi_frame};
+  struct rray_arg arg = new_lazy_arg(&amp;arg_lazy);
+
+  struct r_lazy to_arg_lazy = {.x = rray_syms.dot_to_arg, .env = ffi_frame};
+  struct rray_arg to_arg = new_lazy_arg(&amp;to_arg_lazy);
+
+  return rray_cast_common(ffi_xs, ffi_to, &amp;arg, &amp;to_arg, error_call);
+}
+
+r_obj* rray_cast_common(
+  r_obj* xs,
+  r_obj* to,
+  struct rray_arg* arg,
+  struct rray_arg* to_arg,
+  struct r_lazy error_call
+) {
+  to = KEEP(rray_ptype_common(xs, to, arg, to_arg, error_call));
+
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_obj* out = KEEP(r_alloc_list(n));
+  r_attrib_poke_names(out, xs_names);
+
+  r_ssize i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;i);
+  KEEP(x_arg-&gt;shelter);
+
+  for (; i &lt; n; ++i) {
+    r_list_poke(out, i, rray_cast(v_xs[i], to, x_arg, to_arg, error_call));
+  }
+
+  FREE(4);
+  return out;
+}
+#include &quot;ptype-common.h&quot;
+
+#include &quot;ptype.h&quot;
+#include &quot;syms.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* ffi_rray_ptype_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_ptype,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = rray_syms.dot_call, .env = ffi_frame};
+
+  struct r_lazy arg_lazy = {.x = rray_syms.dot_arg, .env = ffi_frame};
+  struct rray_arg arg = new_lazy_arg(&amp;arg_lazy);
+
+  struct r_lazy ptype_arg_lazy = {
+    .x = rray_syms.dot_ptype_arg,
+    .env = ffi_frame
+  };
+  struct rray_arg ptype_arg = new_lazy_arg(&amp;ptype_arg_lazy);
+
+  return rray_ptype_common(ffi_xs, ffi_ptype, &amp;arg, &amp;ptype_arg, error_call);
+}
+
+r_obj* rray_ptype_common(
+  r_obj* xs,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+) {
+  if (ptype != r_null) {
+    return rray_ptype(ptype, ptype_arg, error_call);
+  }
+
+  const r_ssize n = r_length(xs);
+
+  if (n == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  r_obj* const* v_xs = r_list_cbegin(xs);
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  r_ssize out_i = 0;
+  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, n, &amp;out_i);
+  KEEP(out_arg-&gt;shelter);
+
+  r_keep_loc out_pi;
+  r_obj* out = rray_ptype(v_xs[0], x_arg, error_call);
+  KEEP_HERE(out, &amp;out_pi);
+
+  for (x_i = 1; x_i &lt; n; ++x_i) {
+    enum rray_side side;
+    out = rray_ptype2(out, v_xs[x_i], &amp;side, out_arg, x_arg, error_call);
+    KEEP_AT(out, out_pi);
+
+    if (side == RRAY_SIDE_right) {
+      out_i = x_i;
+    }
+  }
+
+  FREE(4);
+  return out;
+}
+# validates inputs and axis
+
+    Code
+      rray_combine(.axis = 1L)
+    Condition
+      Error in `rray_combine()`:
+      ! Must supply at least one array to `...`.
+    Code
+      rray_combine(x)
+    Condition
+      Error in `rray_combine()`:
+      ! argument &quot;.axis&quot; is missing, with no default
+    Code
+      rray_combine(x, .axis = integer())
+    Condition
+      Error in `rray_combine()`:
+      ! `.axis` must be a single integer, not length 0.
+    Code
+      rray_combine(x, .axis = c(1L, 2L))
+    Condition</pre><p class="cut">277 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '220,380p' ~/files/r/packages/rray/src/bind.cpp; sed -n '1,120p' src/utils.…</summary>
+<pre>$ sed -n '220,380p' ~/files/r/packages/rray/src/bind.cpp; sed -n '1,120p' src/utils.c; sed -n '1,90p' src/dimensions.h; sed -n '1,80p' src/broadcast.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+                            const int&amp; dim_n) {
+
+  const int&amp; n_args = args.size();
+
+  int loc = 0;
+  int out_axis_size = 0;
+
+  Rcpp::IntegerVector out_dim(dim_n, 1);
+  Rcpp::IntegerVector axis_starts(n_args);
+  Rcpp::IntegerVector axis_ends(n_args);
+  Rcpp::IntegerVector axis_sizes(n_args);
+
+  for (int i = 0; i &lt; n_args; ++i) {
+    // Must clone, otherwise directly affecting the args `dim`
+    Rcpp::IntegerVector arg_dim_i = Rcpp::clone(rray__dim(args[i]));
+    arg_dim_i = rray__increase_dims(arg_dim_i, dim_n);
+
+    int axis_size_i = arg_dim_i[axis];
+    axis_sizes[i] = axis_size_i;
+    arg_dim_i[axis] = 0;
+
+    out_dim = rray__dim2(out_dim, arg_dim_i);
+    out_axis_size = out_axis_size + axis_size_i;
+
+    axis_starts[i] = loc;
+    loc = loc + axis_size_i;
+    axis_ends[i] = loc;
+  }
+
+  out_dim[axis] = out_axis_size;
+
+  return Rcpp::List::create(
+    Rcpp::Named(&quot;out_dim&quot;) = out_dim,
+    Rcpp::Named(&quot;axis_starts&quot;) = axis_starts,
+    Rcpp::Named(&quot;axis_ends&quot;) = axis_ends,
+    Rcpp::Named(&quot;axis_sizes&quot;) = axis_sizes
+  );
+}
+
+// -----------------------------------------------------------------------------
+
+template &lt;typename T&gt;
+Rcpp::RObject rray__bind_impl(const Rcpp::List&amp; args,
+                              const int&amp; axis,
+                              const Rcpp::List&amp; lst_of_dim_names) {
+
+  const int&amp; n_args = args.size();
+  const int&amp; dim_n = compute_dimensionality(args, axis);
+
+  Rcpp::List out_info = compute_out_info(args, axis, dim_n);
+
+  Rcpp::IntegerVector out_dim = out_info[&quot;out_dim&quot;];
+  Rcpp::IntegerVector axis_starts = out_info[&quot;axis_starts&quot;];
+  Rcpp::IntegerVector axis_ends = out_info[&quot;axis_ends&quot;];
+  Rcpp::IntegerVector axis_sizes = out_info[&quot;axis_sizes&quot;];
+
+  // Allocate an empty container of type `T` and shape `out_dim`
+  const std::vector&lt;std::size_t&gt;&amp; shape = Rcpp::as&lt;std::vector&lt;std::size_t&gt;&gt;(out_dim);
+  xt::rarray&lt;T&gt; xt_out(shape);
+
+  // Initialize slice vector with `all()`
+  xt::xstrided_slice_vector sv(dim_n, xt::all());
+
+  for (int i = 0; i &lt; n_args; ++i) {
+
+    // Update slice vector positions
+    sv[axis] = xt::range(axis_starts[i], axis_ends[i]);
+
+    // Reshape view on args[i]
+    xt::rarray&lt;T&gt; arg_i = args[i];
+    auto arg_i_view = rray__increase_dims_view(arg_i, dim_n);
+
+    auto xt_view = xt::strided_view(xt_out, sv);
+    xt::noalias(xt_view) = arg_i_view;
+  }
+
+  Rcpp::RObject out = SEXP(xt_out);
+
+  const Rcpp::List&amp; new_dim_names = compute_bind_dim_names(
+    lst_of_dim_names,
+    axis,
+    out_dim,
+    axis_sizes
+  );
+
+  Rf_setAttrib(out, R_DimNamesSymbol, new_dim_names);
+
+  return out;
+}
+
+
+// [[Rcpp::export(rng = false)]]
+Rcpp::RObject rray__bind(Rcpp::RObject proxy,
+                         Rcpp::List args,
+                         const int&amp; axis) {
+
+  R_len_t n_args = args.size();
+  Rcpp::List lst_of_dim_names(n_args);
+
+  // Attach outer names
+  lst_of_dim_names.names() = args.names();
+
+  for (int i = 0; i &lt; n_args; ++i) {
+    lst_of_dim_names[i] = rray__dim_names(args[i]);
+    args[i] = vec__cast_inner(args[i], proxy);
+  }
+
+  // Dispatch on proxy type
+  switch(TYPEOF(proxy)) {
+    case REALSXP: return rray__bind_impl&lt;double&gt;(args, axis, lst_of_dim_names);
+    case INTSXP: return rray__bind_impl&lt;int&gt;(args, axis, lst_of_dim_names);
+    case LGLSXP: return rray__bind_impl&lt;rlogical&gt;(args, axis, lst_of_dim_names);
+    default: error_unknown_type();
+  }
+
+}
+#include &quot;utils.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;syms.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/utils-decl.h&quot;
+
+// Normalize a vector into an array
+//
+// - Turns length into `dim`
+// - Turns `names` into `dimnames`
+// - Clears `names`
+//
+// Since we are only modifying attributes,
+// we use a lightweight wrapper
+r_obj* vec_as_array(r_obj* x) {
+  if (r_dim(x) != r_null) {
+    return x;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+
+  const r_ssize size = r_length(x);
+  r_obj* dimensions = r_int(r_ssize_as_integer(size));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* axis_names = r_names(x);
+  if (axis_names != r_null) {
+    KEEP(axis_names);
+    r_obj* names = KEEP(r_alloc_list(1));
+    r_list_poke(names, 0, axis_names);
+    r_attrib_poke_dim_names(out, names);
+    r_attrib_zap(out, r_syms.names);
+    FREE(2);
+  }
+
+  FREE(1);
+  return out;
+}
+
+void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  if (r_is_object(x)) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be a bare array, not %s.&quot;,
+      rray_arg_format_input(arg),
+      r_obj_type_friendly(x)
+    );
+  }
+}
+
+r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  if (rray_typeof(x) == RRAY_TYPE_scalar) {
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  return vec_as_array(x);
+}
+
+r_no_return void stop_scalar_input(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;%s must be an array, not %s.&quot;,
+    rray_arg_format_input(arg),
+    r_obj_type_friendly(x)
+  );
+}
+
+r_obj* arg_as_integer(r_obj* x, struct rray_arg* arg) {
+  if (r_typeof(x) == R_TYPE_integer) {
+    return x;
+  }
+
+  return vec_cast(x, r_globals.empty_int, arg, NULL);</pre><p class="cut">135 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing rray axis combining behavior</strong></p>
+<p><strong>Designing C wrapper for axis ignoring</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Assessing rray axis combining behavior</strong></p>
+<p><strong>Designing C wrapper for axis ignoring</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n &quot;rray_combine\(&quot; src -g '*.[ch]'</summary>
+<pre>$ rg -n &quot;rray_combine\(&quot; src -g '*.[ch]'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+src/combine.c:17:r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+src/combine.c:20:  return rray_combine(
+src/combine.c:30:r_obj* rray_combine(
+src/init.c:70:extern r_obj* ffi_rray_combine(
+src/combine.h:8:r_obj* rray_combine(</pre></details>
+<details class="tool"><summary>Bash: rg -n &quot;ignore.*axe|ignored.*axe|v_ignore|ignore_size|_opts\(&quot; src ~/files/r/packag…</summary>
+<pre>$ rg -n &quot;ignore.*axe|ignored.*axe|v_ignore|ignore_size|_opts\(&quot; src ~/files/r/packages/vctrs/src ~/files/r/packages/rlang/src -g '*.[ch]'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+~/files/r/packages/vctrs/src/slice-interleave.c:23:  struct name_repair_opts name_repair_opts = new_name_repair_opts(
+~/files/r/packages/vctrs/src/cast-dispatch.c:74:      return df_cast_opts(opts);
+~/files/r/packages/vctrs/src/cast-dispatch.c:96:  struct cast_opts cast_opts = new_cast_opts(
+~/files/r/packages/vctrs/src/cast.c:20:r_obj* vec_cast_opts(const struct cast_opts* opts) {
+~/files/r/packages/vctrs/src/cast.c:137:    return df_cast_opts(opts);
+~/files/r/packages/vctrs/src/cast.c:254:  data-&gt;out = vec_cast_opts(data-&gt;opts);
+~/files/r/packages/vctrs/src/cast.c:272:r_obj* vec_cast_common_opts(r_obj* xs,
+~/files/r/packages/vctrs/src/cast.c:310:    r_list_poke(out, i, vec_cast_opts(&amp;cast_opts));
+~/files/r/packages/vctrs/src/cast.c:326:  return vec_cast_common_opts(xs, to, &amp;opts);
+~/files/r/packages/vctrs/src/cast.c:358:r_obj* ffi_cast_common_opts(r_obj* ffi_call, r_obj* op, r_obj* args, r_obj* env) {
+~/files/r/packages/vctrs/src/cast.c:373:    .s3_fallback = s3_fallback_from_opts(ffi_opts)
+~/files/r/packages/vctrs/src/cast.c:376:  r_obj* out = vec_cast_common_opts(xs, to, &amp;opts);
+~/files/r/packages/vctrs/src/cast.c:381:struct cast_opts new_cast_opts(r_obj* x,
+~/files/r/packages/vctrs/src/cast.c:393:    .s3_fallback = s3_fallback_from_opts(opts)
+~/files/r/packages/vctrs/src/list-combine.c:43:  struct name_repair_opts name_repair_opts = new_name_repair_opts(
+~/files/r/packages/vctrs/src/list-combine.c:574:    // We don't actually recycle `x` because both `vec_proxy_assign_opts()` and
+~/files/r/packages/vctrs/src/list-combine.c:618:    x = vec_cast_opts(&amp;cast_opts);
+~/files/r/packages/vctrs/src/list-combine.c:621:    out = vec_proxy_assign_opts(out, index, x, &amp;proxy_assign_opts);
+~/files/r/packages/vctrs/src/list-combine.c:675:    x = vec_cast_opts(&amp;default_cast_opts);
+~/files/r/packages/vctrs/src/list-combine.c:678:    out = vec_proxy_assign_opts(out, index, x, &amp;default_proxy_assign_opts);
+~/files/r/packages/vctrs/src/list-combine.c:708:  out = vec_restore_opts(out, ptype, &amp;restore_opts);
+~/files/r/packages/vctrs/src/slice.h:17:r_obj* vec_slice_opts(r_obj* x,
+~/files/r/packages/vctrs/src/slice.h:24:  return vec_slice_opts(x, i, &amp;opts);
+~/files/r/packages/vctrs/src/subscript.c:5:r_obj* vec_as_subscript_opts(r_obj* subscript,
+~/files/r/packages/vctrs/src/subscript.c:120:    return vec_cast_opts(&amp;cast_opts);
+~/files/r/packages/vctrs/src/subscript.c:132:    return vec_cast_opts(&amp;cast_opts);
+~/files/r/packages/vctrs/src/subscript.c:144:    return vec_cast_opts(&amp;cast_opts);
+~/files/r/packages/vctrs/src/subscript.c:241:  r_obj* out = vec_as_subscript_opts(subscript, &amp;opts, &amp;err);
+~/files/r/packages/vctrs/src/subscript.c:270:  r_obj* out = vec_as_subscript_opts(subscript, &amp;opts, &amp;err);
+~/files/r/packages/vctrs/src/type-data-frame.h:26:r_obj* df_cast_opts(const struct cast_opts* opts);
+~/files/r/packages/vctrs/src/type-data-frame.h:40:  return df_cast_opts(&amp;opts);
+~/files/r/packages/vctrs/src/proxy-restore.h:14:r_obj* vec_restore_opts(
+~/files/r/packages/vctrs/src/subscript-loc.c:7:  return vec_as_location_opts(subscript,
+~/files/r/packages/vctrs/src/subscript-loc.c:24:  return vec_as_location_opts(subscript,
+~/files/r/packages/vctrs/src/subscript-loc.c:30:r_obj* vec_as_location_opts(r_obj* subscript,
+~/files/r/packages/vctrs/src/subscript-loc.c:36:  subscript = vec_as_subscript_opts(subscript, &amp;opts-&gt;subscript_opts, &amp;err);
+~/files/r/packages/vctrs/src/subscript-loc.c:561:  return vec_as_location_opts(subscript, n, names, &amp;opts);
+~/files/r/packages/vctrs/src/ptype-common.c:55:  const enum s3_fallback s3_fallback = s3_fallback_from_opts(opts);
+~/files/r/packages/vctrs/src/ptype2.h:31:enum s3_fallback s3_fallback_from_opts(r_obj* opts);
+~/files/r/packages/vctrs/src/slice-assign.c:6:r_obj* vec_assign_opts(r_obj* x,
+~/files/r/packages/vctrs/src/slice-assign.c:33:    index = vec_as_location_opts(
+~/files/r/packages/vctrs/src/slice-assign.c:76:  proxy = KEEP(vec_proxy_assign_opts(proxy, index, value, &amp;assign_opts));
+~/files/r/packages/vctrs/src/slice-assign.c:77:  r_obj* out = vec_restore_opts(proxy, x, &amp;restore_opts);
+~/files/r/packages/vctrs/src/slice-assign.c:119:  return vec_assign_opts(ffi_x, ffi_i, ffi_value, &amp;opts);
+~/files/r/packages/vctrs/src/slice-assign.c:158:  return vec_assign_opts(ffi_x, ffi_index, ffi_value, &amp;opts);
+~/files/r/packages/vctrs/src/slice-assign.c:183:// `vec_proxy_assign_opts()` conditionally duplicates the `proxy` depending
+~/files/r/packages/vctrs/src/slice-assign.c:216:// `vec_proxy_assign_opts()` is to catch and protect their output rather than
+~/files/r/packages/vctrs/src/slice-assign.c:228:r_obj* vec_proxy_assign_opts(r_obj* proxy,
+~/files/r/packages/vctrs/src/slice-assign.c:235:  // method instead. We can't lift this check out of `vec_proxy_assign_opts()`
+~/files/r/packages/vctrs/src/slice-assign.c:244:  // `vec_proxy_assign_opts()`. After it has been used once, it is set to
+~/files/r/packages/vctrs/src/slice-assign.c:761: * then `vec_proxy_assign_opts()` would see an unreferenced column and modify it
+~/files/r/packages/vctrs/src/slice-assign.c:812:    // NOTE: `vec_proxy_assign_opts()` proxies `value_elt`.
+~/files/r/packages/vctrs/src/slice-assign.c:815:    r_obj* assigned_elt = KEEP(vec_proxy_assign_opts(proxy_elt, index, value_elt, &amp;col_proxy_assign_opts));
+~/files/r/packages/vctrs/src/slice-assign.c:822:      assigned_elt = vec_restore_opts(assigned_elt, out_elt, &amp;col_restore_opts);
+~/files/r/packages/vctrs/src/slice-assign.c:1119:  proxy = KEEP(vec_proxy_assign_opts(proxy, index, value, &amp;assign_opts));
+~/files/r/packages/vctrs/src/slice-assign.c:1120:  r_obj* out = vec_restore_opts(proxy, x, &amp;restore_opts);
+~/files/r/packages/vctrs/src/slice-assign.c:1178:  proxy = KEEP(vec_proxy_assign_opts(proxy, index, value, &amp;assign_opts));
+~/files/r/packages/vctrs/src/slice-assign.c:1179:  r_obj* out = vec_restore_opts(proxy, x, &amp;restore_opts);
+~/files/r/packages/vctrs/src/c.c:16:  struct name_repair_opts name_repair_opts = new_name_repair_opts(
+~/files/r/packages/vctrs/src/dictionary.c:36:static struct dictionary* new_dictionary_opts(SEXP x, struct dictionary_opts* opts);
+~/files/r/packages/vctrs/src/dictionary.c:45:  return new_dictionary_opts(x, &amp;opts);
+~/files/r/packages/vctrs/src/dictionary.c:52:  return new_dictionary_opts(x, &amp;opts);
+~/files/r/packages/vctrs/src/dictionary.c:59:  return new_dictionary_opts(x, &amp;opts);
+~/files/r/packages/vctrs/src/dictionary.c:62:static struct dictionary* new_dictionary_opts(SEXP x, struct dictionary_opts* opts) {
+~/files/r/packages/vctrs/src/bind.c:338:  out = vec_restore_opts(out, ptype, &amp;bind_restore_opts);
+~/files/r/packages/vctrs/src/bind.c:656:  out = vec_restore_opts(out, type, &amp;cbind_restore_opts);
+~/files/r/packages/vctrs/src/bind.c:759:  struct name_repair_opts opts = new_name_repair_opts(name_repair,
+~/files/r/packages/vctrs/src/list-unchop.c:18:  struct name_repair_opts name_repair_opts = new_name_repair_opts(
+~/files/r/packages/vctrs/src/init.c:76:extern r_obj* ffi_df_cast_opts(r_obj*, r_obj*, r_obj*, r_obj*);
+~/files/r/packages/vctrs/src/init.c:77:extern r_obj* ffi_df_ptype2_opts(r_obj*, r_obj*, r_obj*, r_obj*);
+~/files/r/packages/vctrs/src/init.c:117:extern r_obj* ffi_ptype2_opts(r_obj*, r_obj*, r_obj*, r_obj*);
+~/files/r/packages/vctrs/src/init.c:395:extern r_obj* ffi_cast_common_opts(r_obj*, r_obj*, r_obj*, r_obj*);
+~/files/r/packages/vctrs/src/names.c:37:  struct name_repair_opts repair_opts = new_name_repair_opts(repair,
+~/files/r/packages/vctrs/src/names.c:888:  struct name_repair_opts opts = new_name_repair_opts(arg,
+~/files/r/packages/vctrs/src/names.c:910:struct name_repair_opts new_name_repair_opts(r_obj* name_repair,
+~/files/r/packages/vctrs/src/ptype2-dispatch.c:237:  const enum s3_fallback s3_fallback = s3_fallback_from_opts(opts);
+~/files/r/packages/vctrs/src/slice-assign.h:52:r_obj* vec_assign_opts(
+~/files/r/packages/vctrs/src/slice-assign.h:59:r_obj* vec_proxy_assign_opts(
+~/files/r/packages/vctrs/src/names.h:35:struct name_repair_opts new_name_repair_opts(r_obj* name_repair,
+~/files/r/packages/vctrs/src/ptype2.c:6:r_obj* ffi_ptype2_opts(r_obj* x,
+~/files/r/packages/vctrs/src/ptype2.c:18:  enum s3_fallback s3_fallback = s3_fallback_from_opts(ffi_opts);
+~/files/r/packages/vctrs/src/ptype2.c:351:  const enum s3_fallback s3_fallback = s3_fallback_from_opts(opts);
+~/files/r/packages/vctrs/src/ptype2.c:389:enum s3_fallback s3_fallback_from_opts(r_obj* opts) {
+~/files/r/packages/vctrs/src/proxy-restore.c:13:  return vec_restore_opts(x, to, &amp;opts);
+~/files/r/packages/vctrs/src/proxy-restore.c:23:  return vec_restore_opts(x, to, &amp;opts);
+~/files/r/packages/vctrs/src/proxy-restore.c:33:r_obj* vec_restore_opts(
+~/files/r/packages/vctrs/src/proxy-restore.c:235:      r_obj* x_restored = vec_restore_opts(v_x[i], v_to[i], &amp;col_opts);
+~/files/r/packages/vctrs/src/type-tibble.c:48:  SEXP out = PROTECT(df_cast_opts(opts));
+~/files/r/packages/vctrs/src/cast.h:22:r_obj* vec_cast_opts(const struct cast_opts* opts);
+~/files/r/packages/vctrs/src/cast.h:37:  return vec_cast_opts(&amp;opts);
+~/files/r/packages/vctrs/src/cast.h:55:  return vec_cast_opts(&amp;opts);
+~/files/r/packages/vctrs/src/cast.h:63:r_obj* vec_cast_common_opts(r_obj* xs,
+~/files/r/packages/vctrs/src/cast.h:73:struct cast_opts new_cast_opts(r_obj* x,
+~/files/r/packages/vctrs/src/slice.c:329:      out = vec_restore_opts(out, x, &amp;restore_opts);
+~/files/r/packages/vctrs/src/slice.c:377:    out = vec_restore_opts(out, x, &amp;restore_opts);
+~/files/r/packages/vctrs/src/slice.c:396:    out = vec_restore_opts(out, x, &amp;restore_opts);
+~/files/r/packages/vctrs/src/slice.c:442:  return vec_slice_opts(x, i, &amp;opts);
+~/files/r/packages/vctrs/src/slice.c:445:r_obj* vec_slice_opts(r_obj* x,
+~/files/r/packages/vctrs/src/expand.c:14:  struct name_repair_opts name_repair_opts = new_name_repair_opts(
+~/files/r/packages/vctrs/src/subscript-loc.h:55:r_obj* vec_as_location_opts(r_obj* subscript,
+~/files/r/packages/vctrs/src/slice-chop.c:289:    elt = vec_restore_opts(elt, x, &amp;elt_restore_opts);
+~/files/r/packages/vctrs/src/slice-chop.c:365:    elt = vec_restore_opts(elt, x, &amp;elt_restore_opts);
+~/files/r/packages/vctrs/src/slice-chop.c:416:    elt = vec_restore_opts(elt, x, &amp;elt_restore_opts);
+~/files/r/packages/vctrs/src/slice-chop.c:471:      elt = vec_restore_opts(elt, x, &amp;elt_restore_opts);
+~/files/r/packages/vctrs/src/slice-chop.c:543:    index = vec_as_location_opts(index, n, names, &amp;opts);
+~/files/r/packages/vctrs/src/type-data-frame.c:186:  struct name_repair_opts name_repair_opts = new_name_repair_opts(name_repair,
+~/files/r/packages/vctrs/src/type-data-frame.c:226:  struct name_repair_opts name_repair_opts = new_name_repair_opts(name_repair,
+~/files/r/packages/vctrs/src/type-data-frame.c:496:r_obj* ffi_df_ptype2_opts(r_obj* x, r_obj* y, r_obj* opts, r_obj* frame) {
+~/files/r/packages/vctrs/src/type-data-frame.c:505:  const enum s3_fallback s3_fallback = s3_fallback_from_opts(opts);
+~/files/r/packages/vctrs/src/type-data-frame.c:712:r_obj* ffi_df_cast_opts(r_obj* x, r_obj* to, r_obj* opts, r_obj* frame) {
+~/files/r/packages/vctrs/src/type-data-frame.c:721:  struct cast_opts c_opts = new_cast_opts(x,
+~/files/r/packages/vctrs/src/type-data-frame.c:728:  return df_cast_opts(&amp;c_opts);
+~/files/r/packages/vctrs/src/type-data-frame.c:736:r_obj* df_cast_opts(const struct cast_opts* opts) {
+~/files/r/packages/vctrs/src/type-data-frame.c:815:      r_obj* col = vec_cast_opts(&amp;col_opts);
+~/files/r/packages/vctrs/src/type-data-frame.c:872:    r_obj* col = vec_cast_opts(&amp;col_opts);
+~/files/r/packages/vctrs/src/subscript.h:38:SEXP vec_as_subscript_opts(SEXP subscript,</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Designing common options struct</strong></p>
+<p><strong>Evaluating dimension merge refactoring options</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Designing common options struct</strong></p>
+<p><strong>Evaluating dimension merge refactoring options</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n &quot;RRAY_MAX_DIMENSIONALITY&quot; src</summary>
+<pre>$ rg -n &quot;RRAY_MAX_DIMENSIONALITY&quot; src</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+src/binary.h:41:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/point-iterator.h:15:  int v_point[RRAY_MAX_DIMENSIONALITY];
+src/point-iterator.h:16:  int v_point_dimensions[RRAY_MAX_DIMENSIONALITY];
+src/combine.c:56:  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+src/combine.c:129:  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+src/combine.c:146:    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+src/combine.c:154:    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+src/combine.c:313:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/combine.c:345:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/permute-axes.c:32:  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+src/permute-axes.c:47:  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+src/permute-axes.c:113:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/permute-axes.c:152:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/dimensionality.c:53:  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+src/dimensionality.c:57:      RRAY_MAX_DIMENSIONALITY,
+src/move-axes.c:51:  bool v_moved[RRAY_MAX_DIMENSIONALITY] = {false};
+src/move-axes.c:52:  bool v_filled[RRAY_MAX_DIMENSIONALITY] = {false};
+src/broadcast.c:124:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/broadcast.c:163:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/reduce.c:85:  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+src/reduce.c:158:  int v_dimensions[RRAY_MAX_DIMENSIONALITY];
+src/reduce.c:159:  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+src/dimensionality.h:8:#define RRAY_MAX_DIMENSIONALITY 64
+src/strided-iterator.h:153:  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:156:  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:204:  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:256:  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:259:  r_ssize v_strides1[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:260:  r_ssize v_strides2[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:317:  r_ssize v_strides1[RRAY_MAX_DIMENSIONALITY];
+src/strided-iterator.h:318:  r_ssize v_strides2[RRAY_MAX_DIMENSIONALITY];
+src/reduce.h:66:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/reduce.h:146:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/reduce.h:175:    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \
+src/dimensions.c:164:  int v_out_dimensions[RRAY_MAX_DIMENSIONALITY];
+src/dimensions.c:168:  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+src/dimensions.c:170:  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+src/axes.c:97:  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+src/axes.c:179:  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+src/split.c:152:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/split.c:207:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning axes ignore optimization</strong></p>
+<p><strong>Designing axes ignore API signature</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning axes ignore optimization</strong></p>
+<p><strong>Designing axes ignore API signature</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning axes ignore optimization</strong></p>
+<p><strong>Designing axes ignore API signature</strong></p>
+<p><strong>Assessing axis validation and dimension passes</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning axes ignore optimization</strong></p>
+<p><strong>Designing axes ignore API signature</strong></p>
+<p><strong>Assessing axis validation and dimension passes</strong></p>
+<p><strong>Proposing generalized dimensions_common with ignore</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning axes ignore optimization</strong></p>
+<p><strong>Designing axes ignore API signature</strong></p>
+<p><strong>Assessing axis validation and dimension passes</strong></p>
+<p><strong>Proposing generalized dimensions_common with ignore</strong></p>
+<p><strong>Designing separate dimensions_common opts helper</strong></p>
+</details>
+<p>Yes, it fits well. Combine dimensions are exactly:</p>
+<ol>
+<li>Find common dimensions while treating the combine axis as dimension <code>1</code>.</li>
+<li>Replace that axis with the sum of the input dimensions along it.</li>
+</ol>
+<p>Returning <code>1</code> for ignored axes is the right choice. It is the broadcasting identity and handles implicit trailing axes naturally.</p>
+<p>I would keep this entirely internal, but use an options-style helper rather than adding an R object argument directly to the main function. For example, pass a pointer to one-based axes plus a size. <code>NULL</code> with size <code>0</code> means ignore nothing. The normal <code>rray_dimensions_common()</code> path can call this helper with no ignored axes.</p>
+<p>A few details matter:</p>
+<ul>
+<li>Keep the overflow-checked sum in <code>rray_combine()</code>. Dimension common should only produce <code>1</code> for the ignored axis.</li>
+<li>Ignoring an axis should not remove it or determine dimensionality. Dimensionality should still come from the inputs.</li>
+<li>Preserve <code>check_axis()</code> before finding common dimensions. Otherwise an invalid <code>.axis</code> could be masked by an unrelated dimension incompatibility.</li>
+<li>Pass <code>combine</code>’s parent <code>arg</code> into the common-dimensions helper. The current <code>rray_dimensions_common()</code> constructs subscript arguments with a <code>NULL</code> parent. Reusing it directly would lose nested error context for internal callers.</li>
+<li>Decide explicitly what happens when <code>dimensions != r_null</code>. Since that is an override rather than a computation, I would only support ignored axes on the computed path. A small internal helper makes this distinction clearer.</li>
+<li>Combine will need another small pass over <code>xs</code> to sum the axis dimensions. That is unlikely to matter compared with casting, allocation, and filling the result.</li>
+</ul>
+<p>I prefer this over generalizing the merge loop with callbacks or axis-specific reduction operations. Those designs save one pass, but make ordinary dimension common much harder to read.</p>
+<p>So my preferred shape is:</p>
+<ul>
+<li><code>rray_dimensions_common()</code> remains the simple entry point.</li>
+<li>An internal options/helper form accepts ignored axes and a parent argument.</li>
+<li>Both ordinary dimension common and combine use that helper.</li>
+<li>Combine overwrites the returned <code>1</code> with its checked sum.</li>
+</ul>
+<p>That removes almost all of the duplicated common-dimension loop while keeping the special combine behavior visibly inside <code>combine.c</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Add arg to C level rray_dimensions_common which right now the ffi intermediate just sets to empty or whatever</p>
+<p>An internal helper form sounds fine that accepts the extra ignored arguments</p>
+<p>I think it should take r_obj* ignore, which the main entry point sets to r_null but combine passes through as axis</p>
+<p>Write this up in plans/combine.md for another agent to implement in full and commit and push to this branch</p>
+<p>Let me know if there are any further questions before starting</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>No further questions. I’ll write the plan with the agreed C API shape, the helper contract for <code>ignore</code>, the combine refactor, protection checks, tests, formatting, and exact commit/push requirements.</p>
+
+<details class="tool"><summary>Bash: rg --files plans . | sed -n '1,160p'</summary>
+<pre>$ rg --files plans . | sed -n '1,160p'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+plans/mod-and-idiv.md
+plans/null.md
+plans/split-optimize.md
+plans/n-ary.md
+plans/rep.md
+plans/combine-stack-unstack.md
+plans/extensions.md
+plans/implementation.md
+./plans/mod-and-idiv.md
+./plans/null.md
+./plans/split-optimize.md
+./plans/n-ary.md
+./plans/rep.md
+./plans/combine-stack-unstack.md
+./plans/extensions.md
+./plans/implementation.md
+./LICENSE
+./_pkgdown.yml
+./rray4.Rproj
+./bench/iterator.R
+./bench/matrix-stats.R
+./bench/mean.R
+./bench/stride-zero.R
+./bench/extremum.R
+./bench/broadcast.R
+./bench/reduce-logical.R
+./LICENSE.md
+./man/rray_remove_axes.Rd
+./man/rray_dimensions_common.Rd
+./man/arithmetic.Rd
+./man/rray_dimensions.Rd
+./man/equal.Rd
+./man/rray_broadcast_common.Rd
+./man/reduce.Rd
+./man/extremum.Rd
+./man/rray_dimensionality.Rd
+./man/rray_axis_names.Rd
+./man/rray_insert_axes.Rd
+./man/rray_size.Rd
+./man/rray_set_dimensions.Rd
+./man/rray_move_axes.Rd
+./man/rray_split.Rd
+./man/rray_set_names.Rd
+./man/rray_combine.Rd
+./man/rray4-package.Rd
+./man/rray_broadcast.Rd
+./man/rray_names.Rd
+./man/rray_permute_axes.Rd
+./man/compare.Rd
+./man/rray_set_axis_names.Rd
+./src/compare.c
+./src/size.h
+./src/names.c
+./src/type.h
+./AGENTS.md
+./DESCRIPTION
+./NAMESPACE
+./air.toml
+./R/split.R
+./R/rray4-package.R
+./R/insert-axes.R
+./R/arithmetic.R
+./R/split-names.R
+./R/zzz.R
+./R/cast.R
+./R/reduce.R
+./R/remove-axes.R
+./R/ptype-common.R
+./R/dimensions.R
+./R/cast-common.R
+./R/dimensionality.R
+./R/compare.R
+./R/reduce-names.R
+./R/names.R
+./R/ptype.R
+./R/broadcast-names.R
+./R/extremum.R
+./R/permute-axes.R
+./R/combine.R
+./R/broadcast.R
+./R/equal.R
+./R/move-axes.R
+./R/size.R
+./tests/testthat.R
+./src/ptype.c
+./src/insert-axes.h
+./src/arithmetic-multiply.h
+./src/reduce-product.h
+./src/binary.h
+./src/reduce-sum.c
+./src/decl/reduce-product-decl.h
+./tests/testthat/test-size.R
+./src/decl/arithmetic-multiply-decl.h
+./src/decl/split-names-decl.h
+./src/decl/cast-decl.h
+./src/decl/split-decl.h
+./src/decl/reduce-sum-decl.h
+./src/decl/equal-decl.h
+./src/decl/names-decl.h
+./src/decl/combine-decl.h
+./src/decl/arithmetic-exponentiate-decl.h
+./src/decl/strided-iterator-decl.h
+./src/decl/ptype-decl.h
+./src/decl/arithmetic-subtract-decl.h
+./src/decl/extremum-decl.h
+./src/decl/reduce-names-decl.h
+./src/decl/arg-decl.h
+./src/decl/wrapper-decl.h
+./src/decl/compare-decl.h
+./src/decl/arithmetic-divide-decl.h
+./src/decl/utils-decl.h
+./src/decl/size-decl.h
+./src/decl/broadcast-decl.h
+./src/decl/reduce-decl.h
+./src/decl/reduce-logical-decl.h
+./src/decl/permute-axes-decl.h
+./src/decl/arithmetic-add-decl.h
+./src/decl/broadcast-names-decl.h
+./src/decl/dimensions-decl.h
+./src/decl/reduce-mean-decl.h
+./tests/testthat/helper-wrapper.R
+./tests/testthat/test-names.R
+./tests/testthat/test-dimensions.R
+./tests/testthat/test-dimensionality.R
+./tests/testthat/test-split.R
+./tests/testthat/test-arithmetic-subtract.R
+./tests/testthat/test-wrapper.R
+./tests/testthat/test-permute-axes.R
+./tests/testthat/test-broadcast.R
+./tests/testthat/test-combine.R
+./tests/testthat/test-reduce-product.R
+./tests/testthat/test-move-axes.R
+./tests/testthat/test-equal.R
+./tests/testthat/test-arithmetic-add.R
+./src/split.h
+./tests/testthat/test-arithmetic-multiply.R
+./src/syms.c
+./tests/testthat/test-broadcast-names.R
+./src/typeof2.h
+./tests/testthat/test-extremum.R
+./src/reduce-mean.h
+./tests/testthat/test-reduce-logical.R
+./src/arg.c
+./tests/testthat/test-ptype-common.R
+./src/split-names.h
+./tests/testthat/test-remove-axes.R
+./src/broadcast-names.c
+./tests/testthat/test-reduce-names.R
+./src/point-iterator.h
+./tests/testthat/test-cast.R
+./src/permute-axes.c
+./tests/testthat/test-cast-common.R
+./src/arithmetic.h
+./tests/testthat/helper-ptype.R
+./src/extremum.c
+./src/dimensionality.h
+./src/cast-common.h
+./src/dimensions.h
+./src/combine.c
+./src/broadcast.c</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,260p' plans/combine-stack-unstack.md; sed -n '1,240p' plans/split-optimize.md; sed …</summary>
+<pre>$ sed -n '1,260p' plans/combine-stack-unstack.md; sed -n '1,240p' plans/split-optimize.md; sed -n '1,220p' plans/mod-and-idiv.md; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+# Combine, stack, and unstack
+
+## Status
+
+This document is an implementation plan. It does not describe code that is
+already present.
+
+The target branch is `feature/combine-stack-unstack`, based on `main`.
+
+## Goal
+
+Add three array manipulation functions:
+
+```r
+rray_combine(..., .axis)
+rray_stack(..., .axis)
+rray_unstack(x, .axis)
+```
+
+This family replaces `rray_split()`. Remove split in the same implementation
+change. There is no deprecation period and no private split engine left behind.
+
+They follow the main ideas of the Python Array API functions `concat()`,
+`stack()`, and `unstack()`:
+
+- `rray_combine()` joins arrays along an existing axis.
+- `rray_stack()` joins arrays along a new axis.
+- `rray_unstack()` removes one axis and returns its slices in a list.
+
+The Python references are:
+
+- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.concat.html&gt;
+- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.stack.html&gt;
+- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.unstack.html&gt;
+
+rray4 should differ in two deliberate ways:
+
+- Axes are one based and negative axes are not accepted.
+- `rray_combine()` and `rray_stack()` broadcast their inputs on every axis
+  except the axis being combined.
+
+`.axis` is required. Because it follows `...`, callers must name it. This
+matches the proposed R signatures and the package's existing axis-taking
+functions. Python uses the first axis as the default, so this is an intentional
+R API difference.
+
+## Decision summary
+
+- Implement broadcasting in the first version. It is well defined and fits
+  the rest of rray4.
+- Require callers to supply `.axis` by name. It has no default.
+- `rray_combine()` accepts `.axis` from 1 through the greatest input
+  dimensionality.
+- `rray_stack()` accepts `.axis` from 1 through the common input
+  dimensionality plus 1. For a 2D input, axes 1, 2, and 3 are all valid.
+- `rray_unstack()` accepts arrays with dimensionality 2 or greater. rray4 has
+  no 0D arrays, so unstacking a 1D array cannot return valid rray4 arrays.
+- Inputs use the common rray4 type. No `.ptype` argument is added.
+- Names on the combined axis are concatenated. Missing pieces are represented
+  by empty strings if another input supplies names.
+- Names of `...` become names on the new axis made by `rray_stack()`.
+- Names on the removed axis become names of the list returned by
+  `rray_unstack()`.
+- `rray_stack()` should be built as cheap dimension views followed by the
+  combine engine.
+- `rray_unstack()` replaces `rray_split()` and owns the slice engine directly.
+- Remove the old split API and all of its private name machinery.
+
+## Public behavior
+
+### `rray_combine()`
+
+`rray_combine()` joins one or more arrays along `.axis`. The selected axis
+keeps its dimension from each input, and those dimensions are added together.
+Every other axis is broadcast to a common dimension.
+
+For inputs with the same dimensionality:
+
+```text
+[2, 3] + [4, 3] along axis 1 -&gt; [6, 3]
+[2, 3] + [2, 5] along axis 2 -&gt; [2, 8]
+```
+
+The selected axis is not broadcast. A dimension of 1 on that axis contributes
+one position to the result. On all other axes, the usual rray4 rule applies:
+equal dimensions are compatible, and a dimension of 1 can expand.
+
+```text
+[2, 1, 3] + [3, 2] along axis 1
+
+pad the second input:       [3, 2, 1]
+broadcast the first chunk:  [2, 2, 3]
+broadcast the second chunk: [3, 2, 3]
+combine the chunks:         [5, 2, 3]
+```
+
+This confirms the example in the request. rray4 aligns dimensions from the
+first axis and adds missing singleton axes at the end. It does not use NumPy's
+right-aligned broadcasting rule.
+
+An axis that is missing from a lower-dimensional input is treated as an
+implicit dimension of 1. For example:
+
+```text
+[2] + [2, 3] along axis 2
+
+pad the first input: [2, 1]
+result:              [2, 4]
+```
+
+This follows directly from existing rray4 broadcasting. It should be shown in
+the documentation because it is less obvious than singleton broadcasting on
+an axis that is already present.
+
+One input is valid. It is normalized to an array and cast to its own common
+type. Its dimensions and names are otherwise unchanged.
+
+No inputs is an error. Named dots are used in error messages but do not add or
+prefix names on the combined axis.
+
+### `rray_stack()`
+
+`rray_stack()` first finds the common broadcast dimensions of its inputs. It
+then inserts a singleton axis into each input and combines along that axis.
+
+For two 2 by 3 arrays:
+
+```text
+axis 1: [2, 2, 3]
+axis 2: [2, 2, 3]
+axis 3: [2, 3, 2]
+```
+
+The first two results happen to have the same dimensions because there are two
+inputs. Their values are laid out differently. With three inputs the
+difference is clearer:
+
+```text
+three [2, 3] arrays on axis 1 -&gt; [3, 2, 3]
+three [2, 3] arrays on axis 2 -&gt; [2, 3, 3]
+three [2, 3] arrays on axis 3 -&gt; [2, 3, 3]
+```
+
+Again, the last two shapes happen to match because both an old dimension and
+the input count are 3. Indexing tests must check values, not just dimensions.
+
+The useful mechanical description is:
+
+```text
+stack [2, 3] on axis 1: [1, 2, 3], then combine on axis 1
+stack [2, 3] on axis 2: [2, 1, 3], then combine on axis 2
+stack [2, 3] on axis 3: [2, 3, 1], then combine on axis 3
+```
+
+For inputs with common dimensionality `D`, valid axes are `1` through `D + 1`.
+The output has dimensionality `D + 1`. This means the user's check was right:
+a 2D array may be stacked on axis 3 to put the new axis last.
+
+Broadcasting happens before the new axis is inserted:
+
+```text
+[2, 1, 3] and [1, 4, 3] -&gt; common dimensions [2, 4, 3]
+stack on axis 2              -&gt; [2, 2, 4, 3]
+```
+
+A useful feature of broadcasted stack is building feature planes over a grid:
+
+```r
+row &lt;- array(c(10, 20), c(2, 1))
+column &lt;- array(c(1, 2, 3), c(1, 3))
+
+out &lt;- rray_stack(
+  row = row,
+  column = column,
+  .axis = 3
+)
+```
+
+The inputs broadcast to `[2, 3]`, then stack to `[2, 3, 2]`:
+
+```text
+out[, , &quot;row&quot;]       out[, , &quot;column&quot;]
+
+10 10 10              1 2 3
+20 20 20              1 2 3
+```
+
+Each `out[i, j, ]` contains the row and column features for one grid position.
+The same pattern is useful for coordinate grids, model feature arrays, image
+channels, and parameter grids. Without broadcasted stack, callers must
+explicitly broadcast every input before packing them along the new axis.
+
+Use this as a main `rray_stack()` documentation example. It shows that
+broadcasting is a useful part of the function rather than only a relaxed shape
+check. It also shows dots names becoming names on the new axis.
+</pre><p class="cut">521 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning comprehensive implementation document</strong></p>
+<p><strong>Designing C-level dimensions_common argument addition</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning comprehensive implementation document</strong></p>
+<p><strong>Designing C-level dimensions_common argument addition</strong></p>
+<p><strong>Planning internal helper handling ignore axes argument</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning comprehensive implementation document</strong></p>
+<p><strong>Designing C-level dimensions_common argument addition</strong></p>
+<p><strong>Planning internal helper handling ignore axes argument</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n &quot;_opts\(|_impl\(|with_&quot; src/*.c src/*.h | sed -n '1,180p'</summary>
+<pre>$ rg -n &quot;_opts\(|_impl\(|with_&quot; src/*.c src/*.h | sed -n '1,180p'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Outlining implementation plan sections</strong></p>
+<p><strong>Clarifying dimensions common entry points and arg handling</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Outlining implementation plan sections</strong></p>
+<p><strong>Clarifying dimensions common entry points and arg handling</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/combine.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Add File: ~/files/r/packages/rray4/plans/combine.md</span>
+<span class="ins">+# Reuse common dimensions in `rray_combine()`</span>
+<span class="ins">+</span>
+<span class="ins">+## Status</span>
+<span class="ins">+</span>
+<span class="ins">+This document is an implementation plan. The implementation should be completed</span>
+<span class="ins">+in full, tested, committed, and pushed to the current `feature/combine` branch.</span>
+<span class="ins">+</span>
+<span class="ins">+Do not change the R API. This is an internal C refactor that removes the common</span>
+<span class="ins">+dimension loop duplicated in `src/combine.c`.</span>
+<span class="ins">+</span>
+<span class="ins">+## Goal</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_combine()` finds its output dimensions in two parts:</span>
+<span class="ins">+</span>
+<span class="ins">+1. Find common broadcast dimensions on every axis except `.axis`.</span>
+<span class="ins">+2. Sum the input dimensions on `.axis`.</span>
+<span class="ins">+</span>
+<span class="ins">+The first part is the same operation as `rray_dimensions_common()` if the</span>
+<span class="ins">+combine axis is ignored and returned with dimension `1`. Reuse the dimensions</span>
+<span class="ins">+common implementation for that part, then keep the checked sum in</span>
+<span class="ins">+`rray_combine()`.</span>
+<span class="ins">+</span>
+<span class="ins">+For example, combining `[2, 1, 3]` and `[4, 5]` on axis 1 should work as if the</span>
+<span class="ins">+dimensions common calculation saw `[1, 1, 3]` and `[1, 5, 1]`:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+common dimensions with axis 1 ignored: [1, 5, 3]</span>
+<span class="ins">+sum on axis 1:                       2 + 4 = 6</span>
+<span class="ins">+output dimensions:                    [6, 5, 3]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+Returning `1` on ignored axes is intentional. One is the identity dimension</span>
+<span class="ins">+for broadcasting. The ignored axes remain present and still contribute to the</span>
+<span class="ins">+dimensionality of the result.</span>
+<span class="ins">+</span>
+<span class="ins">+## C API changes</span>
+<span class="ins">+</span>
+<span class="ins">+Add `arg` to the internal `rray_dimensions_common()` signature:</span>
+<span class="ins">+</span>
+<span class="ins">+```c</span>
+<span class="ins">+r_obj* rray_dimensions_common(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  r_obj* dimensions,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+Use `arg` as the parent passed to both `new_subscript_arg()` calls inside the</span>
+<span class="ins">+common dimension calculation. This preserves the argument context when the</span>
+<span class="ins">+calculation is reused by `rray_combine()`.</span>
+<span class="ins">+</span>
+<span class="ins">+The FFI wrapper should pass `rray_args.empty` for `arg`. Update every other</span>
+<span class="ins">+caller of `rray_dimensions_common()` to pass the correct argument. In</span>
+<span class="ins">+particular, the existing broadcast common path should pass `rray_args.empty`.</span>
+<span class="ins">+</span>
+<span class="ins">+Do not add an R argument to `rray_dimensions_common()`. Its R signature and</span>
+<span class="ins">+`.Call` registration stay unchanged.</span>
+<span class="ins">+</span>
+<span class="ins">+## Internal helper with ignored axes</span>
+<span class="ins">+</span>
+<span class="ins">+Move the calculated common dimension path into an internal helper. A suitable</span>
+<span class="ins">+shape is:</span>
+<span class="ins">+</span>
+<span class="ins">+```c</span>
+<span class="ins">+r_obj* rray_dimensions_common_opts(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  r_obj* ignore,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The exact helper name may change if another name reads better, but it should be</span>
+<span class="ins">+declared in `src/dimensions.h` because `src/combine.c` calls it.</span>
+<span class="ins">+</span>
+<span class="ins">+The contracts are:</span>
+<span class="ins">+</span>
+<span class="ins">+- `ignore` is either `r_null` or an integer vector of one-based axes.</span>
+<span class="ins">+- This is an internal interface. Its callers must pass validated axes.</span>
+<span class="ins">+- `r_null` means no axes are ignored.</span>
+<span class="ins">+- Every ignored axis has dimension `1` in the result.</span>
+<span class="ins">+- Ignoring an axis does not remove it and does not lower the result</span>
+<span class="ins">+  dimensionality.</span>
+<span class="ins">+- Non-ignored axes use the existing broadcast common rules and existing error</span>
+<span class="ins">+  messages.</span>
+<span class="ins">+- The input list must still be nonempty.</span>
+<span class="ins">+</span>
+<span class="ins">+The ordinary `rray_dimensions_common()` entry point should keep its current</span>
+<span class="ins">+`.dimensions` behavior:</span>
+<span class="ins">+</span>
+<span class="ins">+- If `dimensions` is not `r_null`, validate and return that override.</span>
+<span class="ins">+- Otherwise call the internal helper with `ignore = r_null`.</span>
+<span class="ins">+</span>
+<span class="ins">+This keeps ignored axes out of the `.dimensions` override path. There is no</span>
+<span class="ins">+useful meaning for combining an explicit dimensions override with ignored axes</span>
+<span class="ins">+in the current API.</span>
+<span class="ins">+</span>
+<span class="ins">+Within the helper, initialize output dimensions to `1` as today. Convert</span>
+<span class="ins">+`ignore` into a small stack allocated lookup, or use another simple approach</span>
+<span class="ins">+that makes the merge loop clear. When an axis is ignored, skip its</span>
+<span class="ins">+`rray_dimension2()` call so its output dimension remains `1`. Still update the</span>
+<span class="ins">+common dimensionality from every input before processing its axes.</span>
+<span class="ins">+</span>
+<span class="ins">+Do not validate `ignore` through an R-facing axis parser. The normal entry</span>
+<span class="ins">+point always passes `r_null`, and `rray_combine()` has already validated its</span>
+<span class="ins">+axis with `check_axis()`.</span>
+<span class="ins">+</span>
+<span class="ins">+## Refactor `rray_combine()`</span>
+<span class="ins">+</span>
+<span class="ins">+Keep the existing order through type calculation, casting, maximum</span>
+<span class="ins">+dimensionality, and `check_axis()`. In particular, validate `.axis` before the</span>
+<span class="ins">+common dimension calculation. This preserves the current error precedence for</span>
+<span class="ins">+an invalid axis.</span>
+<span class="ins">+</span>
+<span class="ins">+After `check_axis()`:</span>
+<span class="ins">+</span>
+<span class="ins">+1. Allocate a protected integer scalar containing `axis`.</span>
+<span class="ins">+2. Call the internal common dimension helper with the cast `xs`, that scalar</span>
+<span class="ins">+   as `ignore`, the existing `arg`, and `error_call`.</span>
+<span class="ins">+3. Protect the returned dimensions.</span>
+<span class="ins">+4. Make a small pass over `xs` to sum the dimension on `axis`.</span>
+<span class="ins">+5. Treat a missing trailing axis as an implicit dimension of `1`, matching the</span>
+<span class="ins">+   current combine behavior.</span>
+<span class="ins">+6. Retain the current `INT_MAX` overflow check and its exact error message.</span>
+<span class="ins">+7. Store the checked sum into the ignored axis of the returned dimensions.</span>
+<span class="ins">+</span>
+<span class="ins">+The extra pass over the input list is acceptable. It only reads dimensions,</span>
+<span class="ins">+and the array filling work dominates it. Do not complicate the dimensions</span>
+<span class="ins">+common helper with a sum output or a callback to avoid this pass.</span>
+<span class="ins">+</span>
+<span class="ins">+Remove the duplicated common dimension state and merge code from</span>
+<span class="ins">+`src/combine.c`, including its local output argument tracking. The dimensions</span>
+<span class="ins">+helper now owns incompatible dimension errors and uses the parent `arg` from</span>
+<span class="ins">+combine, so named dots and nested arguments must continue to format correctly.</span>
+<span class="ins">+</span>
+<span class="ins">+Do not change the name handling, stride plans, fill kernels, output type, or</span>
+<span class="ins">+the layout of combined values.</span>
+<span class="ins">+</span>
+<span class="ins">+## Important cases</span>
+<span class="ins">+</span>
+<span class="ins">+The refactor must preserve all of these behaviors:</span>
+<span class="ins">+</span>
+<span class="ins">+- Different dimensions on the combine axis are accepted and summed.</span>
+<span class="ins">+- Incompatible dimensions on any other axis are rejected.</span>
+<span class="ins">+- A dimension of `1` broadcasts on non-combine axes.</span>
+<span class="ins">+- A lower-dimensional input has implicit trailing dimensions of `1`.</span>
+<span class="ins">+- A zero dimension on the combine axis contributes zero to the sum.</span>
+<span class="ins">+- A zero dimension on another axis follows the existing broadcasting rule.</span>
+<span class="ins">+- One input returns the same dimensions and values after normalization and</span>
+<span class="ins">+  casting.</span>
+<span class="ins">+- The combined axis sum errors before exceeding `INT_MAX`.</span>
+<span class="ins">+- Names on the combine axis are concatenated as before.</span>
+<span class="ins">+- Names on other axes continue to follow broadcast name rules.</span>
+<span class="ins">+</span>
+<span class="ins">+## Files</span>
+<span class="ins">+</span>
+<span class="ins">+At minimum, inspect and update:</span>
+<span class="ins">+</span>
+<span class="ins">+- `src/dimensions.c`</span>
+<span class="ins">+- `src/dimensions.h`</span>
+<span class="ins">+- `src/combine.c`</span>
+<span class="ins">+- `src/broadcast.c`</span>
+<span class="ins">+- `src/decl/dimensions-decl.h` if the helper declarations change</span>
+<span class="ins">+- `tests/testthat/test-dimensions.R`</span>
+<span class="ins">+- `tests/testthat/test-combine.R`</span>
+<span class="ins">+- snapshot files changed by intentional error output changes</span>
+<span class="ins">+</span>
+<span class="ins">+`src/init.c` should not need a registration change because no FFI signature is</span>
+<span class="ins">+changing. Confirm that this remains true.</span>
+<span class="ins">+</span>
+<span class="ins">+## Tests</span>
+<span class="ins">+</span>
+<span class="ins">+Keep all existing tests passing. Add focused coverage where the current tests</span>
+<span class="ins">+do not make the new contract obvious:</span>
+<span class="ins">+</span>
+<span class="ins">+- Public `rray_dimensions_common()` behavior is unchanged with positional and</span>
+<span class="ins">+  named inputs.</span>
+<span class="ins">+- Combine accepts conflicting dimensions on the ignored combine axis.</span>
+<span class="ins">+- The same dimensions fail when that axis is not the combine axis.</span>
+<span class="ins">+- Combine still broadcasts singleton dimensions on the other axes.</span>
+<span class="ins">+- Combine on an implicit trailing axis still treats the missing dimension as</span>
+<span class="ins">+  `1`.</span>
+<span class="ins">+- Zero dimensions on and off the combine axis still work.</span>
+<span class="ins">+- Named inputs still appear correctly in incompatible dimension errors.</span>
+<span class="ins">+</span>
+<span class="ins">+There is no R-facing test for `ignore` because it is intentionally not exposed.</span>
+<span class="ins">+Exercise it through `rray_combine()`.</span>
+<span class="ins">+</span>
+<span class="ins">+Run at least:</span>
+<span class="ins">+</span>
+<span class="ins">+```sh</span>
+<span class="ins">+Rscript -e &quot;devtools::test(filter = '^(dimensions|combine|broadcast)')&quot;</span>
+<span class="ins">+Rscript -e &quot;devtools::test()&quot;</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+No documentation should change because there is no R API change. If any</span>
+<span class="ins">+roxygen text is changed for an independent reason, run `devtools::document()`</span></pre><p class="cut">45 more lines cut</p><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,320p' plans/combine.md; git diff --check; git status --short</summary>
+<pre>$ sed -n '1,320p' plans/combine.md; git diff --check; git status --short</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+# Reuse common dimensions in `rray_combine()`
+
+## Status
+
+This document is an implementation plan. The implementation should be completed
+in full, tested, committed, and pushed to the current `feature/combine` branch.
+
+Do not change the R API. This is an internal C refactor that removes the common
+dimension loop duplicated in `src/combine.c`.
+
+## Goal
+
+`rray_combine()` finds its output dimensions in two parts:
+
+1. Find common broadcast dimensions on every axis except `.axis`.
+2. Sum the input dimensions on `.axis`.
+
+The first part is the same operation as `rray_dimensions_common()` if the
+combine axis is ignored and returned with dimension `1`. Reuse the dimensions
+common implementation for that part, then keep the checked sum in
+`rray_combine()`.
+
+For example, combining `[2, 1, 3]` and `[4, 5]` on axis 1 should work as if the
+dimensions common calculation saw `[1, 1, 3]` and `[1, 5, 1]`:
+
+```text
+common dimensions with axis 1 ignored: [1, 5, 3]
+sum on axis 1:                       2 + 4 = 6
+output dimensions:                    [6, 5, 3]
+```
+
+Returning `1` on ignored axes is intentional. One is the identity dimension
+for broadcasting. The ignored axes remain present and still contribute to the
+dimensionality of the result.
+
+## C API changes
+
+Add `arg` to the internal `rray_dimensions_common()` signature:
+
+```c
+r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+```
+
+Use `arg` as the parent passed to both `new_subscript_arg()` calls inside the
+common dimension calculation. This preserves the argument context when the
+calculation is reused by `rray_combine()`.
+
+The FFI wrapper should pass `rray_args.empty` for `arg`. Update every other
+caller of `rray_dimensions_common()` to pass the correct argument. In
+particular, the existing broadcast common path should pass `rray_args.empty`.
+
+Do not add an R argument to `rray_dimensions_common()`. Its R signature and
+`.Call` registration stay unchanged.
+
+## Internal helper with ignored axes
+
+Move the calculated common dimension path into an internal helper. A suitable
+shape is:
+
+```c
+r_obj* rray_dimensions_common_opts(
+  r_obj* xs,
+  r_obj* ignore,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+```
+
+The exact helper name may change if another name reads better, but it should be
+declared in `src/dimensions.h` because `src/combine.c` calls it.
+
+The contracts are:
+
+- `ignore` is either `r_null` or an integer vector of one-based axes.
+- This is an internal interface. Its callers must pass validated axes.
+- `r_null` means no axes are ignored.
+- Every ignored axis has dimension `1` in the result.
+- Ignoring an axis does not remove it and does not lower the result
+  dimensionality.
+- Non-ignored axes use the existing broadcast common rules and existing error
+  messages.
+- The input list must still be nonempty.
+
+The ordinary `rray_dimensions_common()` entry point should keep its current
+`.dimensions` behavior:
+
+- If `dimensions` is not `r_null`, validate and return that override.
+- Otherwise call the internal helper with `ignore = r_null`.
+
+This keeps ignored axes out of the `.dimensions` override path. There is no
+useful meaning for combining an explicit dimensions override with ignored axes
+in the current API.
+
+Within the helper, initialize output dimensions to `1` as today. Convert
+`ignore` into a small stack allocated lookup, or use another simple approach
+that makes the merge loop clear. When an axis is ignored, skip its
+`rray_dimension2()` call so its output dimension remains `1`. Still update the
+common dimensionality from every input before processing its axes.
+
+Do not validate `ignore` through an R-facing axis parser. The normal entry
+point always passes `r_null`, and `rray_combine()` has already validated its
+axis with `check_axis()`.
+
+## Refactor `rray_combine()`
+
+Keep the existing order through type calculation, casting, maximum
+dimensionality, and `check_axis()`. In particular, validate `.axis` before the
+common dimension calculation. This preserves the current error precedence for
+an invalid axis.
+
+After `check_axis()`:
+
+1. Allocate a protected integer scalar containing `axis`.
+2. Call the internal common dimension helper with the cast `xs`, that scalar
+   as `ignore`, the existing `arg`, and `error_call`.
+3. Protect the returned dimensions.
+4. Make a small pass over `xs` to sum the dimension on `axis`.
+5. Treat a missing trailing axis as an implicit dimension of `1`, matching the
+   current combine behavior.
+6. Retain the current `INT_MAX` overflow check and its exact error message.
+7. Store the checked sum into the ignored axis of the returned dimensions.
+
+The extra pass over the input list is acceptable. It only reads dimensions,
+and the array filling work dominates it. Do not complicate the dimensions
+common helper with a sum output or a callback to avoid this pass.
+
+Remove the duplicated common dimension state and merge code from
+`src/combine.c`, including its local output argument tracking. The dimensions
+helper now owns incompatible dimension errors and uses the parent `arg` from
+combine, so named dots and nested arguments must continue to format correctly.
+
+Do not change the name handling, stride plans, fill kernels, output type, or
+the layout of combined values.
+
+## Important cases
+
+The refactor must preserve all of these behaviors:
+
+- Different dimensions on the combine axis are accepted and summed.
+- Incompatible dimensions on any other axis are rejected.
+- A dimension of `1` broadcasts on non-combine axes.
+- A lower-dimensional input has implicit trailing dimensions of `1`.
+- A zero dimension on the combine axis contributes zero to the sum.
+- A zero dimension on another axis follows the existing broadcasting rule.
+- One input returns the same dimensions and values after normalization and
+  casting.
+- The combined axis sum errors before exceeding `INT_MAX`.
+- Names on the combine axis are concatenated as before.
+- Names on other axes continue to follow broadcast name rules.
+
+## Files
+
+At minimum, inspect and update:
+
+- `src/dimensions.c`
+- `src/dimensions.h`
+- `src/combine.c`
+- `src/broadcast.c`
+- `src/decl/dimensions-decl.h` if the helper declarations change
+- `tests/testthat/test-dimensions.R`
+- `tests/testthat/test-combine.R`
+- snapshot files changed by intentional error output changes
+
+`src/init.c` should not need a registration change because no FFI signature is
+changing. Confirm that this remains true.
+
+## Tests
+
+Keep all existing tests passing. Add focused coverage where the current tests
+do not make the new contract obvious:
+
+- Public `rray_dimensions_common()` behavior is unchanged with positional and
+  named inputs.
+- Combine accepts conflicting dimensions on the ignored combine axis.
+- The same dimensions fail when that axis is not the combine axis.
+- Combine still broadcasts singleton dimensions on the other axes.
+- Combine on an implicit trailing axis still treats the missing dimension as
+  `1`.
+- Zero dimensions on and off the combine axis still work.
+- Named inputs still appear correctly in incompatible dimension errors.
+
+There is no R-facing test for `ignore` because it is intentionally not exposed.
+Exercise it through `rray_combine()`.
+
+Run at least:
+
+```sh
+Rscript -e &quot;devtools::test(filter = '^(dimensions|combine|broadcast)')&quot;
+Rscript -e &quot;devtools::test()&quot;
+```
+</pre><p class="cut">47 more lines cut</p></details>
+<p>No further questions. I wrote the implementation plan at plans/combine.md.</p>
+<p>It covers the C signatures, <code>r_obj* ignore</code> contract, combine refactor, error context, protection review, tests, formatting, commit message, and push target. No implementation changes were made.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Push it as requested</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll commit only <code>plans/combine.md</code> with a one-sentence message, then push the current <code>feature/combine</code> branch.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch; git diff -- plans/combine.md; git diff --check</summary>
+<pre>$ git status --short --branch; git diff -- plans/combine.md; git diff --check</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine...origin/feature/combine
+?? plans/combine.md</pre></details>
+<details class="tool"><summary>Bash: git add plans/combine.md &amp;&amp; git commit -m &quot;Plan common dimensions reuse in combine&quot;</summary>
+<pre>$ git add plans/combine.md &amp;&amp; git commit -m &quot;Plan common dimensions reuse in combine&quot;</pre><pre class="output">Script completed
+Wall time 5.6 seconds
+Output:
+
+[feature/combine 91b2269] Plan common dimensions reuse in combine
+ 1 file changed, 242 insertions(+)
+ create mode 100644 plans/combine.md</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/combine</summary>
+<pre>$ git push origin feature/combine</pre><pre class="output">Script completed
+Wall time 6.3 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   be05d27..91b2269  feature/combine -&gt; feature/combine</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch; git log -1 --oneline</summary>
+<pre>$ git status --short --branch; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine...origin/feature/combine
+91b2269 Plan common dimensions reuse in combine</pre></details>
+<p>Pushed plans/combine.md to <code>origin/feature/combine</code>.</p>
+<p>Commit: <code>91b2269 Plan common dimensions reuse in combine</code></p>
+<p>The branch is clean and up to date.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>It would simplify to be v_ignore and ignore_size so do that actually</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>Agreed. I’ll revise the plan so the helper takes <code>const int* v_ignore</code> and <code>r_ssize ignore_size</code>; normal common passes <code>NULL, 0</code>, and combine passes <code>&amp;axis, 1</code>. I’ll amend this as a new commit and push it.</p>
+
+<details class="tool"><summary>Bash: rg -n &quot;ignore|scalar&quot; plans/combine.md</summary>
+<pre>$ rg -n &quot;ignore|scalar&quot; plans/combine.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+{&quot;chunk_id&quot;:&quot;cd80b8&quot;,&quot;wall_time_seconds&quot;:0.026685375,&quot;exit_code&quot;:0,&quot;original_token_count&quot;:396}
+19:combine axis is ignored and returned with dimension `1`. Reuse the dimensions
+27:common dimensions with axis 1 ignored: [1, 5, 3]
+32:Returning `1` on ignored axes is intentional. One is the identity dimension
+33:for broadcasting. The ignored axes remain present and still contribute to the
+60:## Internal helper with ignored axes
+68:  r_obj* ignore,
+79:- `ignore` is either `r_null` or an integer vector of one-based axes.
+81:- `r_null` means no axes are ignored.
+82:- Every ignored axis has dimension `1` in the result.
+85:- Non-ignored axes use the existing broadcast common rules and existing error
+93:- Otherwise call the internal helper with `ignore = r_null`.
+95:This keeps ignored axes out of the `.dimensions` override path. There is no
+96:useful meaning for combining an explicit dimensions override with ignored axes
+100:`ignore` into a small stack allocated lookup, or use another simple approach
+101:that makes the merge loop clear. When an axis is ignored, skip its
+105:Do not validate `ignore` through an R-facing axis parser. The normal entry
+118:1. Allocate a protected integer scalar containing `axis`.
+119:2. Call the internal common dimension helper with the cast `xs`, that scalar
+120:   as `ignore`, the existing `arg`, and `error_call`.
+126:7. Store the checked sum into the ignored axis of the returned dimensions.
+179:- Combine accepts conflicting dimensions on the ignored combine axis.
+187:There is no R-facing test for `ignore` because it is intentionally not exposed.
+215:the scalar `ignore` object, the common dimensions result, input names, and the</pre></details>
+<details class="tool"><summary>Edit plans/combine.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/combine.md</span>
+<span class="hunk">@@</span>
+ r_obj* rray_dimensions_common_opts(
+   r_obj* xs,
+<span class="del">-  r_obj* ignore,</span>
+<span class="ins">+  const int* v_ignore,</span>
+<span class="ins">+  r_ssize ignore_size,</span>
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ );
+<span class="hunk">@@</span>
+<span class="del">-The contracts are:</span>
+<span class="ins">+The contracts are:</span>
+ 
+<span class="del">-- `ignore` is either `r_null` or an integer vector of one-based axes.</span>
+<span class="ins">+- `v_ignore` points to an array of one-based axes.</span>
+<span class="ins">+- `ignore_size` is the number of axes in `v_ignore`.</span>
+ - This is an internal interface. Its callers must pass validated axes.
+<span class="del">-- `r_null` means no axes are ignored.</span>
+<span class="ins">+- `NULL` with `ignore_size = 0` means no axes are ignored.</span>
+ - Every ignored axis has dimension `1` in the result.
+<span class="hunk">@@</span>
+ - If `dimensions` is not `r_null`, validate and return that override.
+<span class="del">-- Otherwise call the internal helper with `ignore = r_null`.</span>
+<span class="ins">+- Otherwise call the internal helper with `v_ignore = NULL` and</span>
+<span class="ins">+  `ignore_size = 0`.</span>
+<span class="hunk">@@</span>
+<span class="del">-Within the helper, initialize output dimensions to `1` as today. Convert</span>
+<span class="del">-`ignore` into a small stack allocated lookup, or use another simple approach</span>
+<span class="del">-that makes the merge loop clear. When an axis is ignored, skip its</span>
+<span class="del">-`rray_dimension2()` call so its output dimension remains `1`. Still update the</span>
+<span class="del">-common dimensionality from every input before processing its axes.</span>
+<span class="ins">+Within the helper, initialize output dimensions to `1` as today. Convert</span>
+<span class="ins">+`v_ignore` into a small stack allocated lookup, or use another simple approach</span>
+<span class="ins">+that makes the merge loop clear. When an axis is ignored, skip its</span>
+<span class="ins">+`rray_dimension2()` call so its output dimension remains `1`. Still update the</span>
+<span class="ins">+common dimensionality from every input before processing its axes.</span>
+ 
+<span class="del">-Do not validate `ignore` through an R-facing axis parser. The normal entry</span>
+<span class="del">-point always passes `r_null`, and `rray_combine()` has already validated its</span>
+<span class="del">-axis with `check_axis()`.</span>
+<span class="ins">+Do not validate `v_ignore` through an R-facing axis parser. The normal entry</span>
+<span class="ins">+point always passes `NULL, 0`, and `rray_combine()` has already validated its</span>
+<span class="ins">+axis with `check_axis()`.</span>
+<span class="hunk">@@</span>
+<span class="del">-1. Allocate a protected integer scalar containing `axis`.</span>
+<span class="del">-2. Call the internal common dimension helper with the cast `xs`, that scalar</span>
+<span class="del">-   as `ignore`, the existing `arg`, and `error_call`.</span>
+<span class="del">-3. Protect the returned dimensions.</span>
+<span class="del">-4. Make a small pass over `xs` to sum the dimension on `axis`.</span>
+<span class="del">-5. Treat a missing trailing axis as an implicit dimension of `1`, matching the</span>
+<span class="ins">+1. Call the internal common dimension helper with the cast `xs`, `&amp;axis`, an</span>
+<span class="ins">+   `ignore_size` of `1`, the existing `arg`, and `error_call`.</span>
+<span class="ins">+2. Protect the returned dimensions.</span>
+<span class="ins">+3. Make a small pass over `xs` to sum the dimension on `axis`.</span>
+<span class="ins">+4. Treat a missing trailing axis as an implicit dimension of `1`, matching the</span>
+    current combine behavior.
+<span class="del">-6. Retain the current `INT_MAX` overflow check and its exact error message.</span>
+<span class="del">-7. Store the checked sum into the ignored axis of the returned dimensions.</span>
+<span class="ins">+5. Retain the current `INT_MAX` overflow check and its exact error message.</span>
+<span class="ins">+6. Store the checked sum into the ignored axis of the returned dimensions.</span>
+<span class="hunk">@@</span>
+<span class="del">-There is no R-facing test for `ignore` because it is intentionally not exposed.</span>
+<span class="del">-Exercise it through `rray_combine()`.</span>
+<span class="ins">+There is no R-facing test for `v_ignore` and `ignore_size` because they are</span>
+<span class="ins">+intentionally not exposed. Exercise them through `rray_combine()`.</span>
+<span class="hunk">@@</span>
+ identify the next function that reads it. Check whether that function can
+ allocate before protecting or consuming the value. Pay particular attention to
+<span class="del">-the scalar `ignore` object, the common dimensions result, input names, and the</span>
+<span class="del">-argument shelters constructed in the dimensions helper.</span>
+<span class="ins">+the common dimensions result, input names, and the argument shelters</span>
+<span class="ins">+constructed in the dimensions helper.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: git diff -- plans/combine.md; git diff --check; git status --short --branch</summary>
+<pre>$ git diff -- plans/combine.md; git diff --check; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+diff --git a/plans/combine.md b/plans/combine.md
+index 4f1e83f..538d787 100644
+--- a/plans/combine.md
++++ b/plans/combine.md
+@@ -65,7 +65,8 @@ shape is:
+ ```c
+ r_obj* rray_dimensions_common_opts(
+   r_obj* xs,
+-  r_obj* ignore,
++  const int* v_ignore,
++  r_ssize ignore_size,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ );
+@@ -76,9 +77,10 @@ declared in `src/dimensions.h` because `src/combine.c` calls it.
+ 
+ The contracts are:
+ 
+-- `ignore` is either `r_null` or an integer vector of one-based axes.
++- `v_ignore` points to an array of one-based axes.
++- `ignore_size` is the number of axes in `v_ignore`.
+ - This is an internal interface. Its callers must pass validated axes.
+-- `r_null` means no axes are ignored.
++- `NULL` with `ignore_size = 0` means no axes are ignored.
+ - Every ignored axis has dimension `1` in the result.
+ - Ignoring an axis does not remove it and does not lower the result
+   dimensionality.
+@@ -90,20 +92,21 @@ The ordinary `rray_dimensions_common()` entry point should keep its current
+ `.dimensions` behavior:
+ 
+ - If `dimensions` is not `r_null`, validate and return that override.
+-- Otherwise call the internal helper with `ignore = r_null`.
++- Otherwise call the internal helper with `v_ignore = NULL` and
++  `ignore_size = 0`.
+ 
+ This keeps ignored axes out of the `.dimensions` override path. There is no
+ useful meaning for combining an explicit dimensions override with ignored axes
+ in the current API.
+ 
+ Within the helper, initialize output dimensions to `1` as today. Convert
+-`ignore` into a small stack allocated lookup, or use another simple approach
++`v_ignore` into a small stack allocated lookup, or use another simple approach
+ that makes the merge loop clear. When an axis is ignored, skip its
+ `rray_dimension2()` call so its output dimension remains `1`. Still update the
+ common dimensionality from every input before processing its axes.
+ 
+-Do not validate `ignore` through an R-facing axis parser. The normal entry
+-point always passes `r_null`, and `rray_combine()` has already validated its
++Do not validate `v_ignore` through an R-facing axis parser. The normal entry
++point always passes `NULL, 0`, and `rray_combine()` has already validated its
+ axis with `check_axis()`.
+ 
+ ## Refactor `rray_combine()`
+@@ -115,15 +118,14 @@ an invalid axis.
+ 
+ After `check_axis()`:
+ 
+-1. Allocate a protected integer scalar containing `axis`.
+-2. Call the internal common dimension helper with the cast `xs`, that scalar
+-   as `ignore`, the existing `arg`, and `error_call`.
+-3. Protect the returned dimensions.
+-4. Make a small pass over `xs` to sum the dimension on `axis`.
+-5. Treat a missing trailing axis as an implicit dimension of `1`, matching the
++1. Call the internal common dimension helper with the cast `xs`, `&amp;axis`, an
++   `ignore_size` of `1`, the existing `arg`, and `error_call`.
++2. Protect the returned dimensions.
++3. Make a small pass over `xs` to sum the dimension on `axis`.
++4. Treat a missing trailing axis as an implicit dimension of `1`, matching the
+    current combine behavior.
+-6. Retain the current `INT_MAX` overflow check and its exact error message.
+-7. Store the checked sum into the ignored axis of the returned dimensions.
++5. Retain the current `INT_MAX` overflow check and its exact error message.
++6. Store the checked sum into the ignored axis of the returned dimensions.
+ 
+ The extra pass over the input list is acceptable. It only reads dimensions,
+ and the array filling work dominates it. Do not complicate the dimensions
+@@ -184,8 +186,8 @@ do not make the new contract obvious:
+ - Zero dimensions on and off the combine axis still work.
+ - Named inputs still appear correctly in incompatible dimension errors.
+ 
+-There is no R-facing test for `ignore` because it is intentionally not exposed.
+-Exercise it through `rray_combine()`.
++There is no R-facing test for `v_ignore` and `ignore_size` because they are
++intentionally not exposed. Exercise them through `rray_combine()`.
+ 
+ Run at least:
+ 
+@@ -212,8 +214,8 @@ After the code is complete:
+ For the protection pass, list every new or touched `r_obj*` in the diff and
+ identify the next function that reads it. Check whether that function can
+ allocate before protecting or consuming the value. Pay particular attention to
+-the scalar `ignore` object, the common dimensions result, input names, and the
+-argument shelters constructed in the dimensions helper.
++the common dimensions result, input names, and the argument shelters
++constructed in the dimensions helper.
+ 
+ Do not use `gctorture()` or `gctorture2()`.
+ 
+## feature/combine...origin/feature/combine
+ M plans/combine.md</pre></details>
+<details class="tool"><summary>Bash: git add plans/combine.md &amp;&amp; git commit -m &quot;Use C axes for ignored dimensions&quot;</summary>
+<pre>$ git add plans/combine.md &amp;&amp; git commit -m &quot;Use C axes for ignored dimensions&quot;</pre><pre class="output">Script completed
+Wall time 5.2 seconds
+Output:
+
+[feature/combine 6a139a4] Use C axes for ignored dimensions
+ 1 file changed, 21 insertions(+), 19 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/combine</summary>
+<pre>$ git push origin feature/combine</pre><pre class="output">Script completed
+Wall time 6.1 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   91b2269..6a139a4  feature/combine -&gt; feature/combine</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch; git log -1 --oneline</summary>
+<pre>$ git status --short --branch; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine...origin/feature/combine
+6a139a4 Use C axes for ignored dimensions</pre></details>
+<p>Updated and pushed the plan.</p>
+<p>The helper now takes:</p>
+<pre><code class="language-c">const int* v_ignore,
+r_ssize ignore_size
+</code></pre>
+<p>Normal common dimensions passes <code>NULL, 0</code>; combine passes <code>&amp;axis, 1</code>.</p>
+<p>Commit: <code>6a139a4 Use C axes for ignored dimensions</code></p>
+
+</section>
+</main>
+</body>
+</html>

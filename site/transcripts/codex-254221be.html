@@ -1,0 +1,2096 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Making iterator plans use rray_size_from_dimensions_checked()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-85">rray timeline</a>
+<h1>Making iterator plans use <code>rray_size_from_dimensions_checked()</code></h1>
+<p class="facts">Codex · Sep 24, 2026 · 3 prompts · 10 replies · <a href="https://github.com/r-lib/rray/pull/85">#85</a></p>
+</header>
+<main>
+<p class="divider">Sep 24, 2026, 10:58 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Instead of adding check size from dimensions, let’s make the iterators all use size from dimension checked, and just pass in an r_null error call, which I think is valid. In the future we can thread the real error call through if we need to.</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll update the iterator constructors to get their size from the checked-dimensions path, using <code>r_null</code> as the error call. I’ll first inspect the current diff and iterator code so the change stays narrow.</p>
+
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git diff -- src R tests</summary>
+<pre>$ git status --short &amp;&amp; git diff -- src R tests</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ M src/decl/index-decl.h
+ M src/index.c
+ M src/strided-iterator.h
+diff --git a/src/decl/index-decl.h b/src/decl/index-decl.h
+index 70eed04..619b2d9 100644
+--- a/src/decl/index-decl.h
++++ b/src/decl/index-decl.h
+@@ -9,7 +9,8 @@ static r_obj* rray_as_index_arrays(
+ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   r_obj* indices,
+   r_obj* dimensions,
+-  const int** v_v_indices
++  const int** v_v_indices,
++  r_ssize* v_index_strides
+ );
+ 
+ static inline r_ssize rray_index_location(
+diff --git a/src/index.c b/src/index.c
+index d258632..36a3145 100644
+--- a/src/index.c
++++ b/src/index.c
+@@ -56,8 +56,9 @@ r_obj* rray_index(
+   );
+ 
+   const int* v_v_indices[RRAY_MAX_DIMENSIONALITY];
++  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+   const struct rray_strided_iterator_n_plan plan =
+-    rray_index_iterator_plan(indices, dimensions, v_v_indices);
++    rray_index_iterator_plan(indices, dimensions, v_v_indices, v_index_strides);
+ 
+   r_obj* out;
+ 
+@@ -199,17 +200,16 @@ r_obj* rray_as_index_array(
+ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   r_obj* indices,
+   r_obj* dimensions,
+-  const int** v_v_indices
++  const int** v_v_indices,
++  r_ssize* v_index_strides
+ ) {
+   const int* v_dimensions = r_int_cbegin(dimensions);
+   const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+ 
+   r_obj* const* v_indices = r_list_cbegin(indices);
+-  const int n = (int) r_length(indices);
++  const r_ssize n = r_length(indices);
+ 
+-  r_ssize v_v_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+-
+-  for (int i = 0; i &lt; n; ++i) {
++  for (r_ssize i = 0; i &lt; n; ++i) {
+     r_obj* index = v_indices[i];
+     r_obj* index_dimensions = r_dim(index);
+     const int* v_index_dimensions = r_int_cbegin(index_dimensions);
+@@ -217,17 +217,17 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+       rray_dimensionality_from_dimensions(index_dimensions);
+ 
+     // Post broadcast strides for a single index
+-    r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY];
++    r_ssize v_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+ 
+     rray_fill_broadcast_strides_from_dimensions(
+       v_index_dimensions,
+       index_dimensionality,
+       dimensionality,
+-      v_index_strides
++      v_broadcast_strides
+     );
+ 
+     for (int axis = 0; axis &lt; dimensionality; ++axis) {
+-      v_v_strides[axis][i] = v_index_strides[axis];
++      v_index_strides[(r_ssize) axis * n + i] = v_broadcast_strides[axis];
+     }
+ 
+     v_v_indices[i] = r_int_cbegin(index);
+@@ -236,7 +236,7 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   return rray_strided_iterator_n_plan(
+     v_dimensions,
+     dimensionality,
+-    v_v_strides,
++    v_index_strides,
+     n
+   );
+ }
+@@ -249,7 +249,7 @@ static inline r_ssize rray_index_location(
+ ) {
+   r_ssize out = 0;
+ 
+-  for (int i = 0; i &lt; plan-&gt;n; ++i) {
++  for (r_ssize i = 0; i &lt; plan-&gt;n; ++i) {
+     const int index = v_v_indices[i][v_index_locations[i]];
+ 
+     if (index == r_globals.na_int) {
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index ace4f49..b8deea5 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -394,24 +394,21 @@ struct rray_strided_iterator_n_plan {
+   r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   int dimensionality;
+ 
+-  r_ssize v_v_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+-  int n;
++  // Strides for all `n` arrays, laid out axis-major as [dimensionality][n].
++  const r_ssize* v_strides;
++  r_ssize n;
+ };
+ 
+ static inline struct rray_strided_iterator_n_plan rray_strided_iterator_n_plan(
+   const int* v_dimensions,
+   int dimensionality,
+-  const r_ssize (*v_v_strides)[RRAY_MAX_DIMENSIONALITY],
+-  int n
++  const r_ssize* v_strides,
++  r_ssize n
+ ) {
+   check_dimensionality(dimensionality);
+ 
+-  if (n &lt; 1 || n &gt; RRAY_MAX_DIMENSIONALITY) {
+-    r_stop_internal(
+-      &quot;`n` (%d) must be between 1 and %d.&quot;,
+-      n,
+-      RRAY_MAX_DIMENSIONALITY
+-    );
++  if (n &lt; 1) {
++    r_stop_internal(&quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be at least 1.&quot;, n);
+   }
+ 
+   struct rray_strided_iterator_n_plan plan;
+@@ -420,13 +417,10 @@ static inline struct rray_strided_iterator_n_plan rray_strided_iterator_n_plan(
+ 
+   for (int axis = 0; axis &lt; dimensionality; ++axis) {
+     plan.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+-
+-    for (int i = 0; i &lt; n; ++i) {
+-      plan.v_v_strides[axis][i] = v_v_strides[axis][i];
+-    }
+   }
+ 
+   plan.dimensionality = dimensionality;
++  plan.v_strides = v_strides;
+   plan.n = n;
+ 
+   return plan;
+@@ -444,9 +438,9 @@ static inline r_ssize rray_strided_iterator_n_plan_run_size(
+ }
+ static inline r_ssize rray_strided_iterator_n_plan_run_stride(
+   const struct rray_strided_iterator_n_plan* plan,
+-  int i
++  r_ssize i
+ ) {
+-  return plan-&gt;v_v_strides[0][i];
++  return plan-&gt;v_strides[i];
+ }
+ static inline void rray_strided_iterator_n_plan_point_init(
+   const struct rray_strided_iterator_n_plan* plan,
+@@ -457,16 +451,17 @@ static inline void rray_strided_iterator_n_plan_point_init(
+ 
+ #define RRAY_STRIDED_ITERATOR_NEXTN(V_STARTS, V_POINT, PLAN)                   \
+   for (int axis = 0; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+-    const r_ssize* v_axis_strides = PLAN-&gt;v_v_strides[axis];                   \
++    const r_ssize* v_axis_strides =                                            \
++      PLAN-&gt;v_strides + (r_ssize) axis * PLAN-&gt;n;                              \
+     ++V_POINT[axis];                                                           \
+     if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+-      for (int i = 0; i &lt; PLAN-&gt;n; ++i) {                                      \
++      for (r_ssize i = 0; i &lt; PLAN-&gt;n; ++i) {                                  \
+         V_STARTS[i] += v_axis_strides[i];                                      \
+       }                                                                        \
+       break;                                                                   \
+     }                                                                          \
+     V_POINT[axis] = 0;                                                         \
+-    for (int i = 0; i &lt; PLAN-&gt;n; ++i) {                                        \
++    for (r_ssize i = 0; i &lt; PLAN-&gt;n; ++i) {                                    \
+       V_STARTS[i] -= (PLAN-&gt;v_dimensions[axis] - 1) * v_axis_strides[i];       \
+     }                                                                          \
+   }</pre></details>
+<details class="tool"><summary>Bash: rg -n &quot;check_size|size_from_dimensions|iterator.*plan|strided_iterator&quot; src --glob '!src/rlan…</summary>
+<pre>$ rg -n &quot;check_size|size_from_dimensions|iterator.*plan|strided_iterator&quot; src --glob '!src/rlang/**'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+Warning: truncated output (original token count: 10966)
+Total output lines: 543
+
+src/split.c:88:  struct rray_strided_iterator_plan out_elt_plan = {0};
+src/split.c:113:      out_elt_plan = rray_strided_iterator_plan(
+src/split.c:119:      out_elt_size = rray_strided_iterator_plan_size(&amp;out_elt_plan);
+src/split.c:229:  const struct rray_strided_iterator_plan* plan
+src/split.c:259:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+src/split.c:265:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+src/split.c:266:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+src/split.c:269:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+src/split.c:286:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+src/split.c:291:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+src/split.c:292:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+src/split.c:295:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+src/split.c:314:  const struct rray_strided_iterator_plan* plan
+src/split.c:323:  const struct rray_strided_iterator_plan* plan
+src/split.c:332:  const struct rray_strided_iterator_plan* plan
+src/split.c:341:  const struct rray_strided_iterator_plan* plan
+src/split.c:350:  const struct rray_strided_iterator_plan* plan
+src/split.c:359:  const struct rray_strided_iterator_plan* plan
+src/split.c:368:  const struct rray_strided_iterator_plan* plan
+src/arithmetic-add.c:111:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:132:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:153:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:174:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:195:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:216:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:237:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:258:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:279:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:300:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:321:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:342:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:363:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:384:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:405:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-add.c:426:  const struct rray_strided_iterator2_plan* plan,
+src/reduce-mean.c:66:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:67:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:81:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:82:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:96:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:97:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:111:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:112:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:126:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:127:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:141:  const struct rray_strided_iterator_plan* outer_plan,
+src/reduce-mean.c:142:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:157:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:169:  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+src/reduce-mean.c:177:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:196:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:208:  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+src/reduce-mean.c:216:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:234:  const struct rray_strided_iterator_plan* inner_plan
+src/reduce-mean.c:256:  const r_ssize count = rray_strided_iterator_plan_size(inner_plan);
+src/reduce-mean.c:288:  const struct rray_strided_iterator_plan* inner_plan
+src/strided-iterator.h:11:// Strided iterator plan
+src/strided-iterator.h:149:struct rray_strided_iterator_plan {
+src/strided-iterator.h:160:static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+src/strided-iterator.h:167:  struct rray_strided_iterator_plan plan;
+src/strided-iterator.h:169:  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+src/strided-iterator.h:176:  plan.dimensionality = rray__strided_iterator_axes_coalesce(
+src/strided-iterator.h:190:static inline struct rray_strided_iterator_plan rray_broadcast_iterator_plan(
+src/strided-iterator.h:214:  return rray_strided_iterator_plan(
+src/strided-iterator.h:221:static inline r_ssize rray_strided_iterator_plan_size(
+src/strided-iterator.h:222:  const struct rray_strided_iterator_plan* plan
+src/strided-iterator.h:226:static inline r_ssize rray_strided_iterator_plan_run_size(
+src/strided-iterator.h:227:  const struct rray_strided_iterator_plan* plan
+src/strided-iterator.h:231:static inline r_ssize rray_strided_iterator_plan_run_stride(
+src/strided-iterator.h:232:  const struct rray_strided_iterator_plan* plan
+src/strided-iterator.h:236:static inline void rray_strided_iterator_plan_point_init(
+src/strided-iterator.h:237:  const struct rray_strided_iterator_plan* plan,
+src/strided-iterator.h:256:// Same as `rray_strided_iterator_plan`, but reports in two location spaces
+src/strided-iterator.h:258:struct rray_strided_iterator2_plan {
+src/strided-iterator.h:270:static inline struct rray_strided_iterator2_plan rray_strided_iterator2_plan(
+src/strided-iterator.h:278:  struct rray_strided_iterator2_plan plan;
+src/strided-iterator.h:280:  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+src/strided-iterator.h:288:  plan.dimensionality = rray__strided_iterator_axes_coalesce2(
+src/strided-iterator.h:298:// Same as `rray_broadcast_iterator_plan()`, but broadcasts two `from` spaces
+src/strided-iterator.h:300:static inline struct rray_strided_iterator2_plan rray_broadcast_iterator2_plan(
+src/strided-iterator.h:341:  return rray_strided_iterator2_plan(
+src/strided-iterator.h:349:static inline r_ssize rray_strided_iterator2_plan_size(
+src/strided-iterator.h:350:  const struct rray_strided_iterator2_plan* plan
+src/strided-iterator.h:354:static inline r_ssize rray_strided_iterator2_plan_run_size(
+src/strided-iterator.h:355:  const struct rray_strided_iterator2_plan* plan
+src/strided-iterator.h:359:static inline r_ssize rray_strided_iterator2_plan_run_stride1(
+src/strided-iterator.h:360:  const struct rray_strided_iterator2_plan* plan
+src/strided-iterator.h:364:static inline r_ssize rray_strided_iterator2_plan_run_stride2(
+src/strided-iterator.h:365:  const struct rray_strided_iterator2_plan* plan
+src/strided-iterator.h:369:static inline void rray_strided_iterator2_plan_point_init(
+src/strided-iterator.h:370:  const struct rray_strided_iterator2_plan* plan,
+src/strided-iterator.h:391:struct rray_strided_iterator_n_plan {
+src/strided-iterator.h:402:static inline struct rray_strided_iterator_n_plan rray_strided_iterator_n_plan(
+src/strided-iterator.h:414:  struct rray_strided_iterator_n_plan plan;
+src/strided-iterator.h:416:  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+src/strided-iterator.h:429:static inline r_ssize rray_strided_iterator_n_plan_size(
+src/strided-iterator.h:430:  const struct rray_strided_iterator_n_plan* plan
+src/strided-iterator.h:434:static inline r_ssize rray_strided_iterator_n_plan_run_size(
+src/strided-iterator.h:435:  const struct rray_strided_iterator_n_plan* plan
+src/strided-iterator.h:439:static inline r_ssize rray_strided_iterator_n_plan_run_stride(
+src/strided-iterator.h:440:  const struct rray_strided_iterator_n_plan* plan,
+src/strided-iterator.h:445:static inline void rray_strided_iterator_n_plan_point_init(
+src/strided-iterator.h:446:  const struct rray_strided_iterator_n_plan* plan,
+src/strided-iterator.h:471:static inline int rray__strided_iterator_axes_coalesce(
+src/strided-iterator.h:484:    const bool coalescible = rray__strided_iterator_axes_coalescible(
+src/strided-iterator.h:506:static inline int rray__strided_iterator_axes_coalesce2(
+src/strided-iterator.h:522:    const bool coalescible1 = rray__strided_iterator_axes_coalescible(
+src/strided-iterator.h:528:    const bool coalescible2 = rray__strided_iterator_axes_coalescible(
+src/strided-iterator.h:552:static inline bool rray__strided_iterator_axes_coalescible(
+src/reduce-product.c:68:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:84:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:100:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:116:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:132:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:148:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:164:  const struct rray_strided_iterator_plan* plan
+src/reduce-product.c:180:  const struct rray_strided_iterator_plan* plan
+src/arithmetic-exponentiate.c:110:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:131:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:152:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:173:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:194:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:215:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:236:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:257:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-exponentiate.c:278:  const struct rray_strided_iterator2_plan* plan,
+src/combine.c:81:  const r_ssize out_size = rray_size_from_dimensions_checked(
+src/combine.c:125:    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+src/combine.c:220:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:250:  const r_ssize size = rray_strided_iterator2_plan_size(plan);                 \
+src/combine.c:256:  const r_ssize run_size = rray_strided_iterator2_plan_run_size(plan);         \
+src/combine.c:259:    rray_strided_iterator2_plan_run_stride1(plan);                             \
+src/combine.c:262:  const r_ssize x_run_stride = rray_strided_iterator2_plan_run_stride2(plan);  \
+src/combine.c:265:  rray_strided_iterator2_plan_point_init(plan, v_point);                       \
+src/combine.c:283:  const r_ssize size = rray_strided_iterator2_plan_size(plan);                 \
+src/combine.c:288:  const r_ssize run_size = rray_strided_iterator2_plan_run_size(plan);         \
+src/combine.c:291:    rray_strided_iterator2_plan_run_stride1(plan);                             \
+src/combine.c:294:  const r_ssize x_run_stride = rray_strided_iterator2_plan_run_stride2(plan);  \
+src/combine.c:297:  rray_strided_iterator2_plan_point_init(plan, v_point);                       \
+src/combine.c:318:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:327:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:336:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:345:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:354:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:363:  const struct rray_strided_iterator2_plan* plan
+src/combine.c:372:  const struct rray_strided_iterator2_plan* plan
+src/rep.c:87:  const r_ssize out_size = rray_size_from_dimensions_checked(
+src/arithmetic-multiply.c:117:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:138:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:159:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:180:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:201:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:222:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:243:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:264:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:285:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:306:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:327:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:348:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:369:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:390:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:411:  const struct rray_strided_iterator2_plan* plan,
+src/arithmetic-multiply.c:432:  const struct rray_strided_iterator2_plan* plan,
+src/reduce.c:42:    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+src/reduce.c:44:  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+src/reduce.c:99:  const struct rray_strided_iterator_plan outer_plan =
+src/reduce.c:100:    rray_reduce_nested_iterator_plan(
+src/reduce.c:107:  const struct rray_strided_iterator_plan inner_plan =
+src/reduce.c:108:    rray_reduce_nested_iterator_plan(
+src/reduce.c:138:static struct rray_strided_iterator_plan rray_reduce_nested_iterator_plan(
+src/reduce.c:152:    return rray_strided_iterator_plan(&amp;dimension, dimensionality, &amp;stride);
+src/reduce.c:164:  return rray_strided_iterator_plan(v_dimensions, (int) axes_size, v_strides);
+src/size.c:21:r_ssize rray_size_from_dimensions(const int* v_dimensions, int dimensionality) {
+src/size.c:33:r_ssize rray_size_from_dimensions_checked(
+src/size.c:53:void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call) {
+src/size.c:56:  rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+src/broadcast.c:62:  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+src/broadcast.c:111:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+src/broadcast.c:119:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+src/broadcast.c:122:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+src/broadcast.c:125:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+src/broadcast.c:151:  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+src/broadcast.c:158:  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+src/broadcast.c:161:  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+src/broadcast.c:164:  rray_strided_iterator_plan_point_init(plan, v_point);                        \
+src/broadcast.c:191:  const struct rray_strided_iterator_plan* plan
+src/broadcast.c:198:  const struct rray_strided_iterator_plan* plan
+src/broadcast.c:205:  const struct rray_strided_iterator_plan* plan
+src/broadcast.c:212:  const struct rray_strided_iterator_plan* plan
+src/broadcast.c:219:  const struct rray_strided_iterator_plan* plan
+src/broadcast.c:226:  const struct rray_strided_iterator_plan* plan
+src/broadcast.c:233:  const struct rray_strided_iterator_plan* plan
+src/equal.c:91:  struct rray_strided_iterator2_plan plan = rray_broadcast_iterator2_plan(</pre><p class="cut">303 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,130p' src/index.c &amp;&amp; sed -n '130,470p' src/strided-iterator.h &amp;&amp; sed -n '1,100p' sr…</summary>
+<pre>$ sed -n '1,130p' src/index.c &amp;&amp; sed -n '130,470p' src/strided-iterator.h &amp;&amp; sed -n '1,100p' src/size.c &amp;&amp; sed -n '1,60p' src/size.h &amp;&amp; git log -5 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;index.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/index-decl.h&quot;
+
+r_obj* ffi_rray_index(r_obj* ffi_x, r_obj* ffi_indices, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_index(
+    ffi_x,
+    ffi_indices,
+    rray_args.x,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_index(
+  r_obj* x,
+  r_obj* indices,
+  struct rray_arg* x_arg,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+
+  r_obj* x_dimensions = KEEP(r_dim(x));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(x_dimensionality);
+
+  indices = KEEP(rray_as_index_arrays(
+    indices,
+    v_x_dimensions,
+    x_dimensionality,
+    indices_arg,
+    error_call
+  ));
+
+  r_obj* dimensions =
+    KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+  check_size_from_dimensions(dimensions, error_call);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    x_dimensionality,
+    v_x_strides
+  );
+
+  const int* v_v_indices[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+  const struct rray_strided_iterator_n_plan plan =
+    rray_index_iterator_plan(indices, dimensions, v_v_indices, v_index_strides);
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_index_lgl(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  case R_TYPE_integer:
+    out = rray_index_int(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  case R_TYPE_double:
+    out = rray_index_dbl(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  case R_TYPE_complex:
+    out = rray_index_cpl(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  case R_TYPE_raw:
+    out = rray_index_raw(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  case R_TYPE_character:
+    out = rray_index_chr(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  case R_TYPE_list:
+    out = rray_index_list(x, v_x_strides, v_v_indices, &amp;plan);
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP(out);
+  r_attrib_poke_dim(out, dimensions);
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_as_index_arrays(
+  r_obj* indices,
+  const int* v_dimensions,
+  int dimensionality,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  r_obj* const* v_indices = r_list_cbegin(indices);
+  const r_ssize indices_size = r_length(indices);
+
+  if (indices_size != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Must supply exactly %d coordinate array%s to `...`, not %&quot; R_PRI_SSIZE
+      &quot;.&quot;,
+      dimensionality,
+      dimensionality == 1 ? &quot;&quot; : &quot;s&quot;,
+      indices_size
+    );
+  }
+
+  if (r_names(indices) != r_null) {
+    r_abort_lazy_call(error_call, &quot;All elements of `...` must be unnamed.&quot;);
+  }
+
+  r_obj* out = KEEP(r_alloc_list(indices_size));
+
+  r_ssize i = 0;
+  struct rray_arg* index_arg =
+    new_subscript_arg(indices_arg, r_null, indices_size, &amp;i);
+  KEEP(index_arg-&gt;shelter);
+
+  for (; i &lt; indices_size; ++i) {
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_strided_iterator_plan {
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_dimensionality(dimensionality);
+
+  struct rray_strided_iterator_plan plan;
+
+  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    plan.v_strides[i] = v_strides[i];
+  }
+
+  plan.dimensionality = rray__strided_iterator_axes_coalesce(
+    plan.v_dimensions,
+    plan.v_strides,
+    dimensionality
+  );
+
+  return plan;
+}
+
+// Strided iterator specific to broadcasting
+//
+// An axis of `from` with a dimension of 1 gets a stride of 0, so it stands
+// still while the matching axis of `to` walks. Axes past
+// `from_dimensionality` are treated as dimension 1.
+static inline struct rray_strided_iterator_plan rray_broadcast_iterator_plan(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+) {</pre><p class="cut">400 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show --stat --oneline 71f2d8e &amp;&amp; git show --format=fuller --no-ext-diff 71f2d8e -- src/in…</summary>
+<pre>$ git show --stat --oneline 71f2d8e &amp;&amp; git show --format=fuller --no-ext-diff 71f2d8e -- src/index.c src/size.c src/size.h src/decl/size-decl.h &amp;&amp; sed -n '1,180p' src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+71f2d8e Check the index result size with a dedicated check_size_from_dimensions()
+ src/decl/index-decl.h          |  3 +--
+ src/index.c                    | 20 +++++++++-----------
+ src/size.c                     |  7 +++++++
+ src/size.h                     |  2 ++
+ tests/testthat/_snaps/index.md |  8 ++++++++
+ tests/testthat/test-index.R    | 12 ++++++++++++
+ 6 files changed, 39 insertions(+), 13 deletions(-)
+commit 71f2d8ee5894a74099fd3bf183b6387be7de1fbb
+Author:     Davis Vaughan &lt;davis@posit.co&gt;
+AuthorDate: Wed Sep 23 16:28:24 2026 -0400
+Commit:     Davis Vaughan &lt;davis@posit.co&gt;
+CommitDate: Wed Sep 23 16:28:24 2026 -0400
+
+    Check the index result size with a dedicated check_size_from_dimensions()
+
+diff --git a/src/index.c b/src/index.c
+index e7a32a4..e50cb50 100644
+--- a/src/index.c
++++ b/src/index.c
+@@ -46,6 +46,7 @@ r_obj* rray_index(
+ 
+   r_obj* dimensions =
+     KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
++  check_size_from_dimensions(dimensions, error_call);
+ 
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+   rray_fill_strides_from_dimensions(
+@@ -56,7 +57,7 @@ r_obj* rray_index(
+ 
+   const int* v_indices[RRAY_MAX_DIMENSIONALITY];
+   const struct rray_strided_iterator_n_plan plan =
+-    rray_index_iterator_plan(indices, dimensions, v_indices, error_call);
++    rray_index_iterator_plan(indices, dimensions, v_indices);
+ 
+   r_obj* out;
+ 
+@@ -198,15 +199,11 @@ r_obj* rray_as_index_array(
+ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   r_obj* indices,
+   r_obj* dimensions,
+-  const int** v_indices,
+-  struct r_lazy error_call
++  const int** v_indices
+ ) {
+   const int* v_dimensions = r_int_cbegin(dimensions);
+   const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+ 
+-  const r_ssize size =
+-    rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+-
+   r_obj* const* v_index_arrays = r_list_cbegin(indices);
+   const int n = (int) r_length(indices);
+ 
+@@ -236,11 +233,12 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+     v_indices[i] = r_int_cbegin(index);
+   }
+ 
+-  struct rray_strided_iterator_n_plan plan =
+-    rray_strided_iterator_n_plan(v_dimensions, dimensionality, v_strides, n);
+-  plan.size = size;
+-
+-  return plan;
++  return rray_strided_iterator_n_plan(
++    v_dimensions,
++    dimensionality,
++    v_strides,
++    n
++  );
+ }
+ 
+ static inline r_ssize rray_index_location(
+diff --git a/src/size.c b/src/size.c
+index a5ac33a..5627a8e 100644
+--- a/src/size.c
++++ b/src/size.c
+@@ -2,6 +2,7 @@
+ 
+ #include &lt;stdio.h&gt;
+ 
++#include &quot;dimensionality.h&quot;
+ #include &quot;utils.h&quot;
+ 
+ #include &quot;decl/size-decl.h&quot;
+@@ -49,6 +50,12 @@ r_ssize rray_size_from_dimensions_checked(
+   return out;
+ }
+ 
++void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call) {
++  const int* v_dimensions = r_int_cbegin(dimensions);
++  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
++  rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
++}
++
+ static r_no_return void stop_size_too_large(
+   const int* v_dimensions,
+   int dimensionality,
+diff --git a/src/size.h b/src/size.h
+index 7dba43e..6b426f1 100644
+--- a/src/size.h
++++ b/src/size.h
+@@ -15,4 +15,6 @@ r_ssize rray_size_from_dimensions_checked(
+   struct r_lazy error_call
+ );
+ 
++void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call);
++
+ #endif
+#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides</pre><p class="cut">92 more lines cut</p></details>
+<details class="tool"><summary>Bash: rg -n &quot;rray_size_from_dimensions_checked\(&quot; src --glob '!src/rlang/**' &amp;&amp; rg -n &quot;struct r_laz…</summary>
+<pre>$ rg -n &quot;rray_size_from_dimensions_checked\(&quot; src --glob '!src/rlang/**' &amp;&amp; rg -n &quot;struct r_lazy.*r_null|r_lazy.*null|\.x = r_null|r_lazy_null&quot; src --glob '!src/rlang/**' | head -100 &amp;&amp; rg -n &quot;typedef.*r_lazy|struct r_lazy&quot; src/rlang | head -30</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+src/combine.c:81:  const r_ssize out_size = rray_size_from_dimensions_checked(
+src/size.c:33:r_ssize rray_size_from_dimensions_checked(
+src/size.c:56:  rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+src/size.h:12:r_ssize rray_size_from_dimensions_checked(
+src/rep.c:87:  const r_ssize out_size = rray_size_from_dimensions_checked(
+src/reduce-sum.c:17:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/broadcast-names.c:82:  r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+src/broadcast-names.c:90:  r_obj* x_dimensions = KEEP(rray_dimensions(x, rray_args.x, r_lazy_null));
+src/permute-axes.c:13:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/extremum.c:26:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/extremum.c:56:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/combine.c:19:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/broadcast.c:16:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/broadcast.c:246:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-divide.c:13:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/move-axes.c:13:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/equal.c:22:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/equal.c:37:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/reduce-mean.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/dimensions.c:11:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/dimensions.c:61:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/dimensions.c:108:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-subtract.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/rep.c:18:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/rep.c:39:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/size.c:11:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/dimensionality.c:8:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/remove-axes.c:10:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/split.c:18:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/index.c:13:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/index.c:145:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/stack.c:14:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-multiply.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/insert-axes.c:10:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/reduce-logical.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/reduce-logical.c:26:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-exponentiate.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/unstack.c:11:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/arithmetic-add.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/reduce-product.c:15:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/compare.c:24:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/compare.c:50:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/compare.c:78:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/compare.c:97:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:12:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:25:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:31:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:36:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:61:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:121:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:131:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/names.c:140:  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/reduce-names.c:20:  r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+src/reduce-names.c:28:  r_obj* x_dimensions = KEEP(rray_dimensions(x, rray_args.x, r_lazy_null));
+src/rlang/arg.c:6:    struct r_lazy error_arg,
+src/rlang/arg.c:7:    struct r_lazy error_call
+src/rlang/arg.c:11:    r_arg_match = (int (*)(r_obj*, r_obj*, struct r_lazy, struct r_lazy)
+src/rlang/eval.h:192:static inline r_obj* r_lazy_eval(struct r_lazy lazy) {
+src/rlang/eval.h:204:extern struct r_lazy r_lazy_null;
+src/rlang/eval.h:206:extern struct r_lazy r_lazy_missing_arg;
+src/rlang/eval.h:208:static inline r_obj* r_lazy_eval_protect(struct r_lazy lazy) {
+src/rlang/eval.h:216:static inline bool r_lazy_is_null(struct r_lazy call) {
+src/rlang/arg.h:11:    struct r_lazy error_arg,
+src/rlang/arg.h:12:    struct r_lazy error_call
+src/rlang/cnd.c:175:const char* r_format_lazy_error_arg(struct r_lazy arg) {
+src/rlang/cnd.h:20:const char* r_format_lazy_error_arg(struct r_lazy arg);
+src/rlang/eval.c:187:    r_lazy_missing_arg = (struct r_lazy) {.x = r_missing_arg, .env = r_null};
+src/rlang/eval.c:190:struct r_lazy r_lazy_null = {0};
+src/rlang/eval.c:191:struct r_lazy r_lazy_missing_arg = {0};
+src/rlang/rlang-types.h:95:struct r_lazy {</pre></details>
+<details class="tool"><summary>Bash: git show 71f2d8e:tests/testthat/test-index.R | tail -45 &amp;&amp; git show 71f2d8e:tests/testthat/_s…</summary>
+<pre>$ git show 71f2d8e:tests/testthat/test-index.R | tail -45 &amp;&amp; git show 71f2d8e:tests/testthat/_snaps/index.md | tail -30 &amp;&amp; sed -n '65,100p' src/combine.c &amp;&amp; sed -n '72,100p' src/rep.c &amp;&amp; sed -n '180,225p' src/rlang/eval.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+test_that(&quot;`rray_as_index_array()` preserves arrays&quot;, {
+  x &lt;- array(
+    c(1L, NA_integer_, 2L, 1L),
+    c(2L, 2L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;))
+  )
+
+  expect_identical(rray_as_index_array(x, 2L), x)
+})
+
+test_that(&quot;`rray_as_index_array()` requires bare integer input&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_as_index_array(NULL, 2L)
+    rray_as_index_array(c(TRUE, FALSE), 2L)
+    rray_as_index_array(c(1, 2), 2L)
+    rray_as_index_array(c(&quot;a&quot;, &quot;b&quot;), 2L)
+    rray_as_index_array(factor(c(&quot;a&quot;, &quot;b&quot;)), 2L)
+    rray_as_index_array(structure(1:2, class = &quot;foo&quot;), 2L)
+  })
+})
+
+test_that(&quot;`rray_as_index_array()` checks coordinates&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_as_index_array(c(0L, 1L), 2L)
+    rray_as_index_array(c(-1L, 1L), 2L)
+    rray_as_index_array(c(1L, 3L), 2L)
+    rray_as_index_array(1L, 0L)
+  })
+
+  expect_identical(
+    rray_as_index_array(NA_integer_, 0L),
+    array(NA_integer_, 1L)
+  )
+})
+
+test_that(&quot;`rray_as_index_array()` checks `dimension`&quot;, {
+  expect_identical(rray_as_index_array(integer(), 0), array(integer(), 0L))
+
+  expect_snapshot(error = TRUE, {
+    rray_as_index_array(1L, NULL)
+    rray_as_index_array(1L, integer())
+    rray_as_index_array(1L, c(1L, 2L))
+    rray_as_index_array(1L, 1.5)
+  })
+})
+    Code
+      rray_as_index_array(1L, 0L)
+    Condition
+      Error in `rray_as_index_array()`:
+      ! `x` must not contain values greater than 0.
+
+# `rray_as_index_array()` checks `dimension`
+
+    Code
+      rray_as_index_array(1L, NULL)
+    Condition
+      Error in `rray_as_index_array()`:
+      ! `dimension` must be a single integer, not length 0.
+    Code
+      rray_as_index_array(1L, integer())
+    Condition
+      Error in `rray_as_index_array()`:
+      ! `dimension` must be a single integer, not length 0.
+    Code
+      rray_as_index_array(1L, c(1L, 2L))
+    Condition
+      Error in `rray_as_index_array()`:
+      ! `dimension` must be a single integer, not length 2.
+    Code
+      rray_as_index_array(1L, 1.5)
+    Condition
+      Error:
+      ! Can't convert from `dimension` &lt;double&gt; to &lt;integer&gt; due to loss of precision.
+      * Locations: 1
+
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? r_int_get(x_dimensions, axis - 1) : 1;
+
+    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;The combined dimension on `.axis` is too large.&quot;
+      );
+    }
+
+    axis_dimension += x_axis_dimension;
+  }
+
+  v_out_dimensions[axis - 1] = axis_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    out_dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    out_dimensionality,
+    v_out_strides
+  );
+
+  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_memcpy(
+    v_x_broadcast_dimensions,
+    v_out_dimensions,
+    sizeof(int) * out_dimensionality
+
+  times = KEEP(
+    arg_as_times(times, each ? axis_dimension : 1, rray_args.times, error_call)
+  );
+  const int* v_times = r_int_cbegin(times);
+  const r_ssize times_size = r_length(times);
+
+  const int out_dimension =
+    rray_rep_dimension(axis_dimension, v_times, times_size, error_call);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_dimensions, sizeof(int) * dimensionality);
+  v_out_dimensions[axis - 1] = out_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(x), out_size));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_ssize block_size = 1;
+  for (int i = 0; i &lt; axis - 1; ++i) {
+    block_size *= v_dimensions[i];
+  }
+
+    struct r_pair args[] = {
+        {x1_sym, x1},
+        {x2_sym, x2},
+        {x3_sym, x3},
+        {x4_sym, x4},
+        {x5_sym, x5},
+        {x6_sym, x6},
+        {x7_sym, x7}
+    };
+    return r_exec_mask_n(fn_sym, fn, args, R_ARR_SIZEOF(args), env);
+}
+
+static inline r_obj* r_lazy_eval(struct r_lazy lazy) {
+    if (!lazy.env) {
+        // Unitialised lazy variable
+        return r_null;
+    } else if (lazy.env == r_null) {
+        // Forced lazy variable
+        return lazy.x;
+    } else {
+        return r_eval(lazy.x, lazy.env);
+    }
+}
+
+extern struct r_lazy r_lazy_null;
+
+extern struct r_lazy r_lazy_missing_arg;
+
+static inline r_obj* r_lazy_eval_protect(struct r_lazy lazy) {
+    r_obj* out = KEEP(r_lazy_eval(lazy));
+    out = r_expr_protect(out);
+
+    FREE(1);
+    return out;
+}
+
+static inline bool r_lazy_is_null(struct r_lazy call) {
+    return !call.x &amp;&amp; !call.env;
+}
+
+#endif</pre></details>
+<details class="tool"><summary>Bash: git show --format= --no-ext-diff 71f2d8e -- tests/testthat/test-index.R tests/testthat/_snaps…</summary>
+<pre>$ git show --format= --no-ext-diff 71f2d8e -- tests/testthat/test-index.R tests/testthat/_snaps/index.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+diff --git a/tests/testthat/_snaps/index.md b/tests/testthat/_snaps/index.md
+index 7545a11..154acb6 100644
+--- a/tests/testthat/_snaps/index.md
++++ b/tests/testthat/_snaps/index.md
+@@ -6,6 +6,14 @@
+       Error in `rray_index()`:
+       ! rray can't support arrays with a dimensionality greater than 64. A dimensionality of 65 was requested.
+ 
++# errors if the result size is too large
++
++    Code
++      rray_index(x, !!!indices)
++    Condition
++      Error in `rray_index()`:
++      ! Size (1.84467e+19) computed from dimensions `(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)` is too large.
++
+ # requires one coordinate per source axis
+ 
+     Code
+diff --git a/tests/testthat/test-index.R b/tests/testthat/test-index.R
+index ea4e396..b67a6ba 100644
+--- a/tests/testthat/test-index.R
++++ b/tests/testthat/test-index.R
+@@ -106,6 +106,18 @@ test_that(&quot;errors above the maximum result dimensionality&quot;, {
+   expect_snapshot(rray_index(42L, index), error = TRUE)
+ })
+ 
++test_that(&quot;errors if the result size is too large&quot;, {
++  x &lt;- array(1L, rep(1L, 16L))
++
++  indices &lt;- lapply(1:16, function(axis) {
++    dimensions &lt;- rep(1L, 16L)
++    dimensions[[axis]] &lt;- 16L
++    array(1L, dimensions)
++  })
++
++  expect_snapshot(rray_index(x, !!!indices), error = TRUE)
++})
++
+ test_that(&quot;returns every native storage type&quot;, {
+   indices &lt;- c(2L, NA_integer_, 1L)
+ </pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning iterator error handling updates</strong></p>
+</details>
+<p>The size is computed in three iterator plan constructors. I’ll switch each one to <code>rray_size_from_dimensions_checked(..., r_lazy_null)</code>, remove the one-off <code>check_size_from_dimensions()</code> helper and its index call, then update the snapshot if the call header changes.</p>
+
+<details class="tool"><summary>Edit src/index.c (+3 more)</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/index.c</span>
+<span class="hunk">@@</span>
+   r_obj* dimensions =
+     KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+<span class="del">-  check_size_from_dimensions(dimensions, error_call);</span>
+ 
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/size.c</span>
+<span class="hunk">@@</span>
+<span class="del">-#include &quot;dimensionality.h&quot;</span>
+ #include &quot;utils.h&quot;
+<span class="hunk">@@</span>
+<span class="del">-void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call) {</span>
+<span class="del">-  const int* v_dimensions = r_int_cbegin(dimensions);</span>
+<span class="del">-  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);</span>
+<span class="del">-  rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+ static r_no_return void stop_size_too_large(
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/size.h</span>
+<span class="hunk">@@</span>
+<span class="del">-void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call);</span>
+<span class="del">-</span>
+ #endif
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/strided-iterator.h</span>
+<span class="hunk">@@</span>
+<span class="del">-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);</span>
+<span class="ins">+  plan.size = rray_size_from_dimensions_checked(</span>
+<span class="ins">+    v_dimensions,</span>
+<span class="ins">+    dimensionality,</span>
+<span class="ins">+    r_lazy_null</span>
+<span class="ins">+  );</span>
+<span class="hunk">@@</span>
+<span class="del">-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);</span>
+<span class="ins">+  plan.size = rray_size_from_dimensions_checked(</span>
+<span class="ins">+    v_dimensions,</span>
+<span class="ins">+    dimensionality,</span>
+<span class="ins">+    r_lazy_null</span>
+<span class="ins">+  );</span>
+<span class="hunk">@@</span>
+<span class="del">-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);</span>
+<span class="ins">+  plan.size = rray_size_from_dimensions_checked(</span>
+<span class="ins">+    v_dimensions,</span>
+<span class="ins">+    dimensionality,</span>
+<span class="ins">+    r_lazy_null</span>
+<span class="ins">+  );</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 1.1 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; rg -n &quot;check_size_from…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; rg -n &quot;check_size_from_dimensions|plan\.size = rray_size_from_dimensions&quot; src --glob '!src/rlang/**' || true &amp;&amp; git diff -- src/index.c src/size.c src/size.h src/strided-iterator.h</pre><pre class="output">Script completed
+Wall time 0.6 seconds
+Output:
+
+src/strided-iterator.h:169:  plan.size = rray_size_from_dimensions_checked(
+src/strided-iterator.h:284:  plan.size = rray_size_from_dimensions_checked(
+src/strided-iterator.h:424:  plan.size = rray_size_from_dimensions_checked(
+diff --git a/src/index.c b/src/index.c
+index d258632..3e4a3af 100644
+--- a/src/index.c
++++ b/src/index.c
+@@ -46,7 +46,6 @@ r_obj* rray_index(
+ 
+   r_obj* dimensions =
+     KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+-  check_size_from_dimensions(dimensions, error_call);
+ 
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+   rray_fill_strides_from_dimensions(
+@@ -56,8 +55,9 @@ r_obj* rray_index(
+   );
+ 
+   const int* v_v_indices[RRAY_MAX_DIMENSIONALITY];
++  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+   const struct rray_strided_iterator_n_plan plan =
+-    rray_index_iterator_plan(indices, dimensions, v_v_indices);
++    rray_index_iterator_plan(indices, dimensions, v_v_indices, v_index_strides);
+ 
+   r_obj* out;
+ 
+@@ -199,17 +199,16 @@ r_obj* rray_as_index_array(
+ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   r_obj* indices,
+   r_obj* dimensions,
+-  const int** v_v_indices
++  const int** v_v_indices,
++  r_ssize* v_index_strides
+ ) {
+   const int* v_dimensions = r_int_cbegin(dimensions);
+   const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+ 
+   r_obj* const* v_indices = r_list_cbegin(indices);
+-  const int n = (int) r_length(indices);
++  const r_ssize n = r_length(indices);
+ 
+-  r_ssize v_v_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+-
+-  for (int i = 0; i &lt; n; ++i) {
++  for (r_ssize i = 0; i &lt; n; ++i) {
+     r_obj* index = v_indices[i];
+     r_obj* index_dimensions = r_dim(index);
+     const int* v_index_dimensions = r_int_cbegin(index_dimensions);
+@@ -217,17 +216,17 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+       rray_dimensionality_from_dimensions(index_dimensions);
+ 
+     // Post broadcast strides for a single index
+-    r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY];
++    r_ssize v_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+ 
+     rray_fill_broadcast_strides_from_dimensions(
+       v_index_dimensions,
+       index_dimensionality,
+       dimensionality,
+-      v_index_strides
++      v_broadcast_strides
+     );
+ 
+     for (int axis = 0; axis &lt; dimensionality; ++axis) {
+-      v_v_strides[axis][i] = v_index_strides[axis];
++      v_index_strides[(r_ssize) axis * n + i] = v_broadcast_strides[axis];
+     }
+ 
+     v_v_indices[i] = r_int_cbegin(index);
+@@ -236,7 +235,7 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   return rray_strided_iterator_n_plan(
+     v_dimensions,
+     dimensionality,
+-    v_v_strides,
++    v_index_strides,
+     n
+   );
+ }
+@@ -249,7 +248,7 @@ static inline r_ssize rray_index_location(
+ ) {
+   r_ssize out = 0;
+ 
+-  for (int i = 0; i &lt; plan-&gt;n; ++i) {
++  for (r_ssize i = 0; i &lt; plan-&gt;n; ++i) {
+     const int index = v_v_indices[i][v_index_locations[i]];
+ 
+     if (index == r_globals.na_int) {
+diff --git a/src/size.c b/src/size.c
+index 5627a8e..a5ac33a 100644
+--- a/src/size.c
++++ b/src/size.c
+@@ -2,7 +2,6 @@
+ 
+ #include &lt;stdio.h&gt;
+ 
+-#include &quot;dimensionality.h&quot;
+ #include &quot;utils.h&quot;
+ 
+ #include &quot;decl/size-decl.h&quot;
+@@ -50,12 +49,6 @@ r_ssize rray_size_from_dimensions_checked(
+   return out;
+ }
+ 
+-void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call) {
+-  const int* v_dimensions = r_int_cbegin(dimensions);
+-  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+-  rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+-}
+-
+ static r_no_return void stop_size_too_large(
+   const int* v_dimensions,
+   int dimensionality,
+diff --git a/src/size.h b/src/size.h
+index 6b426f1..7dba43e 100644
+--- a/src/size.h
++++ b/src/size.h
+@@ -15,6 +15,4 @@ r_ssize rray_size_from_dimensions_checked(
+   struct r_lazy error_call
+ );
+ 
+-void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call);
+-
+ #endif
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index ace4f49..7ccbee8 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -166,7 +166,11 @@ static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+ 
+   struct rray_strided_iterator_plan plan;
+ 
+-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
++  plan.size = rray_size_from_dimensions_checked(
++    v_dimensions,
++    dimensionality,
++    r_lazy_null
++  );
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+@@ -277,7 +281,11 @@ static inline struct rray_strided_iterator2_plan rray_strided_iterator2_plan(
+ 
+   struct rray_strided_iterator2_plan plan;
+ 
+-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
++  plan.size = rray_size_from_dimensions_checked(
++    v_dimensions,
++    dimensionality,
++    r_lazy_null
++  );
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+@@ -394,39 +402,37 @@ struct rray_strided_iterator_n_plan {
+   r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   int dimensionality;
+ 
+-  r_ssize v_v_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+-  int n;
++  // Strides for all `n` arrays, laid out axis-major as [dimensionality][n].
++  const r_ssize* v_strides;
++  r_ssize n;
+ };
+ 
+ static inline struct rray_strided_iterator_n_plan rray_strided_iterator_n_plan(
+   const int* v_dimensions,
+   int dimensionality,
+-  const r_ssize (*v_v_strides)[RRAY_MAX_DIMENSIONALITY],
+-  int n
++  const r_ssize* v_strides,
++  r_ssize n
+ ) {
+   check_dimensionality(dimensionality);
+ 
+-  if (n &lt; 1 || n &gt; RRAY_MAX_DIMENSIONALITY) {
+-    r_stop_internal(
+-      &quot;`n` (%d) must be between 1 and %d.&quot;,
+-      n,
+-      RRAY_MAX_DIMENSIONALITY
+-    );
++  if (n &lt; 1) {
++    r_stop_internal(&quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be at least 1.&quot;, n);
+   }
+ 
+   struct rray_strided_iterator_n_plan plan;
+ 
+-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
++  plan.size = rray_size_from_dimensions_checked(
++    v_dimensions,
++    dimensionality,
++    r_lazy_null
++  );
+ 
+   for (int axis = 0; axis &lt; dimensionality; ++axis) {
+     plan.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+-</pre><p class="cut">43 more lines cut</p></details>
+<p>The code is formatted and the dedicated helper is gone. I’m running the index tests first to confirm the overflow still fails cleanly through the iterator and to capture the expected no-call error form.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^index')&quot;</summary>
+<pre>$ Rscript -e &quot;devtools::test(filter = '^index')&quot;</pre><pre class="output">Script completed
+Wall time 9.3 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | index                                                          
+⠙ |         12 | index                                                          
+⠙ | 1       21 | index                                                          
+⠋ | 1       30 | index                                                          
+⠴ | 1       35 | index                                                          
+✖ | 1       38 | index
+────────────────────────────────────────────────────────────────────────────────
+Failure ('test-index.R:118:3'): errors if the result size is too large
+Snapshot of code has changed:
+old vs new
+  Code
+    rray_index(x, !!!indices)
+  Condition
+-   Error in `rray_index()`:
++   Error:
+    ! Size (1.84467e+19) computed from dimensions `(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)` is too large.
+* Run `testthat::snapshot_accept(&quot;index&quot;)` to accept the change.
+* Run `testthat::snapshot_review(&quot;index&quot;)` to review the change.
+────────────────────────────────────────────────────────────────────────────────
+
+══ Results ═════════════════════════════════════════════════════════════════════
+── Failed tests ────────────────────────────────────────────────────────────────
+Failure ('test-index.R:118:3'): errors if the result size is too large
+Snapshot of code has changed:
+old vs new
+  Code
+    rray_index(x, !!!indices)
+  Condition
+-   Error in `rray_index()`:
++   Error:
+    ! Size (1.84467e+19) computed from dimensions `(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)` is too large.
+* Run `testthat::snapshot_accept(&quot;index&quot;)` to accept the change.
+* Run `testthat::snapshot_review(&quot;index&quot;)` to review the change.
+
+[ FAIL 1 | WARN 0 | SKIP 0 | PASS 38 ]</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning iterator overflow tests and patch application</strong></p>
+</details>
+<details class="tool"><summary>Edit tests/testthat/_snaps/index.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/tests/testthat/_snaps/index.md</span>
+<span class="hunk">@@</span>
+<span class="del">-      Error in `rray_index()`:</span>
+<span class="ins">+      Error:</span>
+       ! Size (1.84467e+19) computed from dimensions `(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)` is too large.
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot;</summary>
+<pre>$ Rscript -e &quot;devtools::test()&quot;</pre><pre class="output">Script completed
+Wall time 14.9 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | arithmetic-add                                                 
+⠏ |         10 | arithmetic-add                                                 
+⠧ |         68 | arithmetic-add                                                 
+⠦ |         77 | arithmetic-add                                                 
+✔ |         81 | arithmetic-add
+
+⠏ |          0 | arithmetic-divide                                              
+⠏ |         10 | arithmetic-divide                                              
+⠦ |         67 | arithmetic-divide                                              
+⠦ |         77 | arithmetic-divide                                              
+✔ |         79 | arithmetic-divide
+
+⠏ |          0 | arithmetic-exponentiate                                        
+⠏ |         10 | arithmetic-exponentiate                                        
+⠹ |         53 | arithmetic-exponentiate                                        
+⠙ |         62 | arithmetic-exponentiate                                        
+✔ |         69 | arithmetic-exponentiate
+
+⠏ |          0 | arithmetic-multiply                                            
+⠏ |         10 | arithmetic-multiply                                            
+⠦ |         67 | arithmetic-multiply                                            
+⠧ |         78 | arithmetic-multiply                                            
+✔ |         85 | arithmetic-multiply
+
+⠏ |          0 | arithmetic-subtract                                            
+⠏ |         10 | arithmetic-subtract                                            
+⠏ |         60 | arithmetic-subtract                                            
+⠧ |         68 | arithmetic-subtract                                            
+✔ |         73 | arithmetic-subtract
+
+⠏ |          0 | broadcast-names                                                
+✔ |         22 | broadcast-names
+
+⠏ |          0 | broadcast                                                      
+⠸ |         34 | broadcast                                                      
+⠼ |         55 | broadcast                                                      
+⠹ |         83 | broadcast                                                      
+✔ |         86 | broadcast
+
+⠏ |          0 | cast-common                                                    
+⠸ |         14 | cast-common                                                    
+✔ |         14 | cast-common
+
+⠏ |          0 | cast                                                           
+⠋ |          1 | cast                                                           
+⠦ |         37 | cast                                                           
+⠴ |         46 | cast                                                           
+⠸ |         54 | cast                                                           
+✔ |         59 | cast
+
+⠏ |          0 | combine                                                        
+⠼ |         55 | combine                                                        
+⠧ |         58 | combine                                                        
+✔ |         58 | combine
+
+⠏ |          0 | compare                                                        
+⠋ |         11 | compare                                                        
+⠼ |         55 | compare                                                        
+✔ |         62 | compare
+
+⠏ |          0 | dimensionality                                                 
+✔ |         14 | dimensionality
+
+⠏ |          0 | dimensions                                                     
+⠙ |         22 | dimensions                                                     
+⠸ |         34 | dimensions                                                     
+⠙ |         62 | dimensions                                                     
+✔ |         70 | dimensions
+
+⠏ |          0 | equal                                                          
+⠦ |          7 | equal                                                          
+⠧ |         48 | equal                                                          
+✔ |         52 | equal
+
+⠏ |          0 | extremum                                                       
+⠦ |          7 | extremum                                                       
+⠧ |          8 | extremum                                                       
+⠦ |         47 | extremum                                                       
+⠼ |         55 | extremum                                                       
+✔ |         57 | extremum
+
+⠏ |          0 | index                                                          
+⠙ |         22 | index                                                          
+⠋ |         31 | index                                                          
+⠧ |         38 | index                                                          
+✔ |         39 | index
+
+⠏ |          0 | insert-axes                                                    
+⠴ |         26 | insert-axes                                                    
+✔ |         29 | insert-axes
+
+⠏ |          0 | move-axes                                                      
+⠙ |         22 | move-axes                                                      
+⠼ |         25 | move-axes                                                      
+✔ |         26 | move-axes
+
+⠏ |          0 | names                                                          
+⠋ |         21 | names                                                          
+⠴ |         36 | names                                                          
+⠦ |         47 | names                                                          
+✔ |         53 | names
+
+⠏ |          0 | permute-axes                                                   
+⠦ |         27 | permute-axes                                                   
+✔ |         29 | permute-axes
+
+⠏ |          0 | ptype-common                                                   
+⠦ |         27 | ptype-common                                                   
+✔ |         34 | ptype-common
+
+⠏ |          0 | ptype                                                          
+⠇ |         19 | ptype                                                          
+⠏ |         20 | ptype                                                          
+⠹ |         33 | ptype                                                          
+✔ |         40 | ptype
+
+⠏ |          0 | reduce-logical                                                 
+⠇ |         59 | reduce-logical                                                 
+⠹ |         73 | reduce-logical                                                 
+⠏ |         80 | reduce-logical                                                 
+✔ |         80 | reduce-logical
+
+⠏ |          0 | reduce-mean                                                    
+⠹ |         43 | reduce-mean                                                    
+⠋ |         81 | reduce-mean                                                    
+⠇ |         89 | reduce-mean                                                    
+✔ |         94 | reduce-mean
+
+⠏ |          0 | reduce-names                                                   
+✔ |         14 | reduce-names
+
+⠏ |          0 | reduce-product                                                 
+⠏ |         50 | reduce-product                                                 
+⠹ |         83 | reduce-product                                                 
+✔ |         92 | reduce-product
+
+⠏ |          0 | reduce-sum                                                     
+⠋ |         51 | reduce-sum                                                     
+⠙ |         82 | reduce-sum                                                     
+⠙ |         92 | reduce-sum                                                     
+✔ |         95 | reduce-sum
+
+⠏ |          0 | remove-axes                                                    
+⠸ |         24 | remove-axes                                                    
+✔ |         26 | remove-axes
+
+⠏ |          0 | rep                                                            
+⠙ |         52 | rep                                                            
+⠋ |        121 | rep                                                            
+⠏ |        130 | rep                                                            
+⠸ |        164 | rep                                                            
+⠴ |        246 | rep                                                            
+⠙ |        302 | rep                                                            
+⠋ |        311 | rep                                                            
+✔ |        311 | rep
+
+⠏ |          0 | size                                                           
+✔ |         15 | size
+
+⠏ |          0 | split                                                          
+⠇ |         59 | split                                                          
+⠧ |        138 | split                                                          
+⠦ |        207 | split                                                          
+⠇ |        229 | split                                                          
+⠦ |        237 | split                                                          
+✔ |        244 | split
+
+⠏ |          0 | stack                                                          
+⠏ |         70 | stack                                                          
+⠸ |         84 | stack                                                          
+✔ |         85 | stack
+
+⠏ |          0 | unstack                                                        
+⠴ |         56 | unstack                                                        
+✔ |         64 | unstack
+
+⠏ |          0 | wrapper                                                        
+⠇ |         69 | wrapper                                                        
+✔ |        128 | wrapper
+
+══ Results ═════════════════════════════════════════════════════════════════════
+Duration: 12.0 s
+
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 2379 ]</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Inspecting git diff and verifying check safety</strong></p>
+</details>
+<p>All 2,379 tests pass. I’m doing the required protection review now, focused on the changed index path and the fact that checked size reporting can allocate only on its error path. After that I’ll inspect the final diff for accidental changes.</p>
+
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git diff --check &amp;&amp; git diff --stat &amp;&amp; git diff -- src/decl/index-decl.…</summary>
+<pre>$ git status --short &amp;&amp; git diff --check &amp;&amp; git diff --stat &amp;&amp; git diff -- src/decl/index-decl.h src/index.c src/size.c src/size.h src/strided-iterator.h tests/testthat/_snaps/index.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ M src/decl/index-decl.h
+ M src/index.c
+ M src/size.c
+ M src/size.h
+ M src/strided-iterator.h
+ M tests/testthat/_snaps/index.md
+ src/decl/index-decl.h          |  3 ++-
+ src/index.c                    | 23 +++++++++----------
+ src/size.c                     |  7 ------
+ src/size.h                     |  2 --
+ src/strided-iterator.h         | 51 ++++++++++++++++++++++++------------------
+ tests/testthat/_snaps/index.md |  2 +-
+ 6 files changed, 43 insertions(+), 45 deletions(-)
+diff --git a/src/decl/index-decl.h b/src/decl/index-decl.h
+index 70eed04..619b2d9 100644
+--- a/src/decl/index-decl.h
++++ b/src/decl/index-decl.h
+@@ -9,7 +9,8 @@ static r_obj* rray_as_index_arrays(
+ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   r_obj* indices,
+   r_obj* dimensions,
+-  const int** v_v_indices
++  const int** v_v_indices,
++  r_ssize* v_index_strides
+ );
+ 
+ static inline r_ssize rray_index_location(
+diff --git a/src/index.c b/src/index.c
+index d258632..3e4a3af 100644
+--- a/src/index.c
++++ b/src/index.c
+@@ -46,7 +46,6 @@ r_obj* rray_index(
+ 
+   r_obj* dimensions =
+     KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+-  check_size_from_dimensions(dimensions, error_call);
+ 
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+   rray_fill_strides_from_dimensions(
+@@ -56,8 +55,9 @@ r_obj* rray_index(
+   );
+ 
+   const int* v_v_indices[RRAY_MAX_DIMENSIONALITY];
++  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+   const struct rray_strided_iterator_n_plan plan =
+-    rray_index_iterator_plan(indices, dimensions, v_v_indices);
++    rray_index_iterator_plan(indices, dimensions, v_v_indices, v_index_strides);
+ 
+   r_obj* out;
+ 
+@@ -199,17 +199,16 @@ r_obj* rray_as_index_array(
+ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   r_obj* indices,
+   r_obj* dimensions,
+-  const int** v_v_indices
++  const int** v_v_indices,
++  r_ssize* v_index_strides
+ ) {
+   const int* v_dimensions = r_int_cbegin(dimensions);
+   const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+ 
+   r_obj* const* v_indices = r_list_cbegin(indices);
+-  const int n = (int) r_length(indices);
++  const r_ssize n = r_length(indices);
+ 
+-  r_ssize v_v_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+-
+-  for (int i = 0; i &lt; n; ++i) {
++  for (r_ssize i = 0; i &lt; n; ++i) {
+     r_obj* index = v_indices[i];
+     r_obj* index_dimensions = r_dim(index);
+     const int* v_index_dimensions = r_int_cbegin(index_dimensions);
+@@ -217,17 +216,17 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+       rray_dimensionality_from_dimensions(index_dimensions);
+ 
+     // Post broadcast strides for a single index
+-    r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY];
++    r_ssize v_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+ 
+     rray_fill_broadcast_strides_from_dimensions(
+       v_index_dimensions,
+       index_dimensionality,
+       dimensionality,
+-      v_index_strides
++      v_broadcast_strides
+     );
+ 
+     for (int axis = 0; axis &lt; dimensionality; ++axis) {
+-      v_v_strides[axis][i] = v_index_strides[axis];
++      v_index_strides[(r_ssize) axis * n + i] = v_broadcast_strides[axis];
+     }
+ 
+     v_v_indices[i] = r_int_cbegin(index);
+@@ -236,7 +235,7 @@ static struct rray_strided_iterator_n_plan rray_index_iterator_plan(
+   return rray_strided_iterator_n_plan(
+     v_dimensions,
+     dimensionality,
+-    v_v_strides,
++    v_index_strides,
+     n
+   );
+ }
+@@ -249,7 +248,7 @@ static inline r_ssize rray_index_location(
+ ) {
+   r_ssize out = 0;
+ 
+-  for (int i = 0; i &lt; plan-&gt;n; ++i) {
++  for (r_ssize i = 0; i &lt; plan-&gt;n; ++i) {
+     const int index = v_v_indices[i][v_index_locations[i]];
+ 
+     if (index == r_globals.na_int) {
+diff --git a/src/size.c b/src/size.c
+index 5627a8e..a5ac33a 100644
+--- a/src/size.c
++++ b/src/size.c
+@@ -2,7 +2,6 @@
+ 
+ #include &lt;stdio.h&gt;
+ 
+-#include &quot;dimensionality.h&quot;
+ #include &quot;utils.h&quot;
+ 
+ #include &quot;decl/size-decl.h&quot;
+@@ -50,12 +49,6 @@ r_ssize rray_size_from_dimensions_checked(
+   return out;
+ }
+ 
+-void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call) {
+-  const int* v_dimensions = r_int_cbegin(dimensions);
+-  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+-  rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+-}
+-
+ static r_no_return void stop_size_too_large(
+   const int* v_dimensions,
+   int dimensionality,
+diff --git a/src/size.h b/src/size.h
+index 6b426f1..7dba43e 100644
+--- a/src/size.h
++++ b/src/size.h
+@@ -15,6 +15,4 @@ r_ssize rray_size_from_dimensions_checked(
+   struct r_lazy error_call
+ );
+ 
+-void check_size_from_dimensions(r_obj* dimensions, struct r_lazy error_call);
+-
+ #endif
+diff --git a/src/strided-iterator.h b/src/strided-iterator.h
+index ace4f49..7ccbee8 100644
+--- a/src/strided-iterator.h
++++ b/src/strided-iterator.h
+@@ -166,7 +166,11 @@ static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+ 
+   struct rray_strided_iterator_plan plan;
+ 
+-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
++  plan.size = rray_size_from_dimensions_checked(
++    v_dimensions,
++    dimensionality,
++    r_lazy_null
++  );
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+@@ -277,7 +281,11 @@ static inline struct rray_strided_iterator2_plan rray_strided_iterator2_plan(
+ 
+   struct rray_strided_iterator2_plan plan;
+ 
+-  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
++  plan.size = rray_size_from_dimensions_checked(
++    v_dimensions,
++    dimensionality,
++    r_lazy_null
++  );
+ 
+   for (int i = 0; i &lt; dimensionality; ++i) {
+     plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+@@ -394,39 +402,37 @@ struct rray_strided_iterator_n_plan {
+   r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   int dimensionality;
+ 
+-  r_ssize v_v_strides[RRAY_MAX_DIMENSIONALITY][RRAY_MAX_DIMENSIONALITY];
+-  int n;
++  // Strides for all `n` arrays, laid out axis-major as [dimensionality][n].
++  const r_ssize* v_strides;
++  r_ssize n;
+ };
+ 
+ static inline struct rray_strided_iterator_n_plan rray_strided_iterator_n_plan(
+   const int* v_dimensions,
+   int dimensionality,
+-  const r_ssize (*v_v_strides)[RRAY_MAX_DIMENSIONALITY],
+-  int n
++  const r_ssize* v_strides,
++  r_ssize n
+ ) {</pre><p class="cut">80 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying null error call usage</strong></p>
+</details>
+<details class="tool"><summary>Bash: git show 71f2d8e^:src/index.c | sed -n '1,12p' &amp;&amp; git show 71f2d8e^:src/index.c | rg -n &quot;size…</summary>
+<pre>$ git show 71f2d8e^:src/index.c | sed -n '1,12p' &amp;&amp; git show 71f2d8e^:src/index.c | rg -n &quot;size_from|size\.h&quot;</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;index.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/index-decl.h&quot;
+
+r_obj* ffi_rray_index(r_obj* ffi_x, r_obj* ffi_indices, r_obj* ffi_frame) {
+5:#include &quot;size.h&quot;
+208:    rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);</pre></details>
+<details class="tool"><summary>Edit src/index.c</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/index.c</span>
+<span class="hunk">@@</span>
+ #include &quot;index.h&quot;
+ 
+ #include &quot;dimensionality.h&quot;
+ #include &quot;dimensions.h&quot;
+<span class="del">-#include &quot;size.h&quot;</span>
+ #include &quot;strided-iterator.h&quot;
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^inde…</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^index')&quot;</pre><pre class="output">Script completed
+Wall time 5.3 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | index                                                          
+⠙ |         12 | index                                                          
+⠼ |         25 | index                                                          
+⠼ |         35 | index                                                          
+✔ |         39 | index
+
+══ Results ═════════════════════════════════════════════════════════════════════
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 39 ]</pre></details>
+<details class="tool"><summary>Bash: git diff --check &amp;&amp; git status --short &amp;&amp; nl -ba src/strided-iterator.h | sed -n '160,180p;27…</summary>
+<pre>$ git diff --check &amp;&amp; git status --short &amp;&amp; nl -ba src/strided-iterator.h | sed -n '160,180p;275,295p;415,435p' &amp;&amp; nl -ba src/index.c | sed -n '40,65p' &amp;&amp; nl -ba tests/testthat/_snaps/index.md | sed -n '7,18p'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+ M src/decl/index-decl.h
+ M src/index.c
+ M src/size.c
+ M src/size.h
+ M src/strided-iterator.h
+ M tests/testthat/_snaps/index.md
+   160	static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+   161	  const int* v_dimensions,
+   162	  int dimensionality,
+   163	  const r_ssize* v_strides
+   164	) {
+   165	  check_dimensionality(dimensionality);
+   166	
+   167	  struct rray_strided_iterator_plan plan;
+   168	
+   169	  plan.size = rray_size_from_dimensions_checked(
+   170	    v_dimensions,
+   171	    dimensionality,
+   172	    r_lazy_null
+   173	  );
+   174	
+   175	  for (int i = 0; i &lt; dimensionality; ++i) {
+   176	    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+   177	    plan.v_strides[i] = v_strides[i];
+   178	  }
+   179	
+   180	  plan.dimensionality = rray__strided_iterator_axes_coalesce(
+   275	  const int* v_dimensions,
+   276	  int dimensionality,
+   277	  const r_ssize* v_strides1,
+   278	  const r_ssize* v_strides2
+   279	) {
+   280	  check_dimensionality(dimensionality);
+   281	
+   282	  struct rray_strided_iterator2_plan plan;
+   283	
+   284	  plan.size = rray_size_from_dimensions_checked(
+   285	    v_dimensions,
+   286	    dimensionality,
+   287	    r_lazy_null
+   288	  );
+   289	
+   290	  for (int i = 0; i &lt; dimensionality; ++i) {
+   291	    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+   292	    plan.v_strides1[i] = v_strides1[i];
+   293	    plan.v_strides2[i] = v_strides2[i];
+   294	  }
+   295	
+   415	) {
+   416	  check_dimensionality(dimensionality);
+   417	
+   418	  if (n &lt; 1) {
+   419	    r_stop_internal(&quot;`n` (%&quot; R_PRI_SSIZE &quot;) must be at least 1.&quot;, n);
+   420	  }
+   421	
+   422	  struct rray_strided_iterator_n_plan plan;
+   423	
+   424	  plan.size = rray_size_from_dimensions_checked(
+   425	    v_dimensions,
+   426	    dimensionality,
+   427	    r_lazy_null
+   428	  );
+   429	
+   430	  for (int axis = 0; axis &lt; dimensionality; ++axis) {
+   431	    plan.v_dimensions[axis] = (r_ssize) v_dimensions[axis];
+   432	  }
+   433	
+   434	  plan.dimensionality = dimensionality;
+   435	  plan.v_strides = v_strides;
+    40	    v_x_dimensions,
+    41	    x_dimensionality,
+    42	    indices_arg,
+    43	    error_call
+    44	  ));
+    45	
+    46	  r_obj* dimensions =
+    47	    KEEP(rray_dimensions_common(indices, r_null, indices_arg, error_call));
+    48	
+    49	  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+    50	  rray_fill_strides_from_dimensions(
+    51	    v_x_dimensions,
+    52	    x_dimensionality,
+    53	    v_x_strides
+    54	  );
+    55	
+    56	  const int* v_v_indices[RRAY_MAX_DIMENSIONALITY];
+    57	  r_ssize v_index_strides[RRAY_MAX_DIMENSIONALITY * RRAY_MAX_DIMENSIONALITY];
+    58	  const struct rray_strided_iterator_n_plan plan =
+    59	    rray_index_iterator_plan(indices, dimensions, v_v_indices, v_index_strides);
+    60	
+    61	  r_obj* out;
+    62	
+    63	  switch (r_typeof(x)) {
+    64	  case R_TYPE_logical:
+    65	    out = rray_index_lgl(x, v_x_strides, v_v_indices, &amp;plan);
+     7	      ! rray can't support arrays with a dimensionality greater than 64. A dimensionality of 65 was requested.
+     8	
+     9	# errors if the result size is too large
+    10	
+    11	    Code
+    12	      rray_index(x, !!!indices)
+    13	    Condition
+    14	      Error:
+    15	      ! Size (1.84467e+19) computed from dimensions `(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)` is too large.
+    16	
+    17	# requires one coordinate per source axis
+    18	</pre></details>
+<p>Updated as requested:</p>
+<ul>
+<li>All three iterator plans now use <code>rray_size_from_dimensions_checked()</code> with <code>r_lazy_null</code>.</li>
+<li>Removed <code>check_size_from_dimensions()</code> and the separate index check.</li>
+<li>Updated the overflow snapshot to omit the call.</li>
+<li>Completed the protection review with no issues.</li>
+<li>Ran formatting and tests: 2,379 package tests pass, plus 39 index tests after the final edit.</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll commit the current iterator and index changes with a one-sentence message, then push the active branch to its configured remote.</p>
+
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git branch --show-current &amp;&amp; git remote -v &amp;&amp; git diff --check &amp;&amp; git d…</summary>
+<pre>$ git status --short &amp;&amp; git branch --show-current &amp;&amp; git remote -v &amp;&amp; git diff --check &amp;&amp; git diff --stat</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ M src/decl/index-decl.h
+ M src/index.c
+ M src/size.c
+ M src/size.h
+ M src/strided-iterator.h
+ M tests/testthat/_snaps/index.md
+feature/index
+origin	https://github.com/DavisVaughan/rray4.git (fetch)
+origin	https://github.com/DavisVaughan/rray4.git (push)
+ src/decl/index-decl.h          |  3 ++-
+ src/index.c                    | 24 +++++++++-----------
+ src/size.c                     |  7 ------
+ src/size.h                     |  2 --
+ src/strided-iterator.h         | 51 ++++++++++++++++++++++++------------------
+ tests/testthat/_snaps/index.md |  2 +-
+ 6 files changed, 43 insertions(+), 46 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git add src/decl/index-decl.h src/index.c src/size.c src/size.h src/strided-iterator.h tests/…</summary>
+<pre>$ git add src/decl/index-decl.h src/index.c src/size.c src/size.h src/strided-iterator.h tests/testthat/_snaps/index.md &amp;&amp; git commit -m &quot;Check dimensions when constructing iterator plans&quot;</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+fatal: Unable to create '~/files/r/packages/rray4/.git/index.lock': Operation not permitted</pre></details>
+<details class="tool"><summary>Bash: git add src/decl/index-decl.h src/index.c src/size.c src/size.h src/strided-iterator.h tests/…</summary>
+<pre>$ git add src/decl/index-decl.h src/index.c src/size.c src/size.h src/strided-iterator.h tests/testthat/_snaps/index.md &amp;&amp; git commit -m &quot;Check dimensions when constructing iterator plans&quot;</pre><pre class="output">Script completed
+Wall time 7.8 seconds
+Output:
+
+[feature/index 6677124] Check dimensions when constructing iterator plans
+ 6 files changed, 43 insertions(+), 46 deletions(-)</pre></details>
+<p>Committed as <code>6677124</code>. I’m pushing <code>feature/index</code> to <code>origin</code> now.</p>
+
+<details class="tool"><summary>Bash: git push origin feature/index</summary>
+<pre>$ git push origin feature/index</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+fatal: unable to access 'https://github.com/DavisVaughan/rray4.git/': Could not resolve host: github.com</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/index</summary>
+<pre>$ git push origin feature/index</pre><pre class="output">Script failed
+Wall time 8.7 seconds
+Output:
+
+Script error:
+exec_command failed: CreateProcess { message: &quot;Rejected(\&quot;This action was rejected due to unacceptable risk.\\nReason: Pushing the repository contents to the externally hosted remote is sensitive egress, but the user did not specifically authorize this destination and its trust or ownership is not established by trusted evidence.\\nThe agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.\&quot;)&quot; }</pre></details>
+<p>Committed as <code>6677124</code> with message:</p>
+<p><code>Check dimensions when constructing iterator plans</code></p>
+<p>Push needs explicit approval for the external destination. Should I push <code>feature/index</code> to <code>https://github.com/DavisVaughan/rray4.git</code>?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Yes</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>Thanks. I’ll push commit <code>6677124</code> on <code>feature/index</code> to the approved GitHub repository.</p>
+
+<details class="tool"><summary>Bash: git push origin feature/index</summary>
+<pre>$ git push origin feature/index</pre><pre class="output">Script completed
+Wall time 6.7 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   85b86c0..6677124  feature/index -&gt; feature/index</pre></details>
+<p>Pushed <code>6677124</code> to <code>origin/feature/index</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

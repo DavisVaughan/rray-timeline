@@ -1,0 +1,4276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Implementing rray_max() and rray_min() with cores shared with pmax</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-99">rray timeline</a>
+<h1>Implementing <code>rray_max()</code> and <code>rray_min()</code> with cores shared with pmax</h1>
+<p class="facts">Claude · Sep 30, 2026 · 3 prompts · 21 replies · <a href="https://github.com/r-lib/rray/pull/99">#99</a></p>
+</header>
+<main>
+<p class="divider">Sep 30, 2026, 21:55 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/min-max</p>
+<p>Implement rray_min/max from the plan<br />
+I’m expecting reduce-extremum.c</p>
+<p>Ideally you would share the “cores” with rray_pmin and pmax because they are the same operation. We’ve done something similar with any/all and or/and</p>
+<p>Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Remove this section from the plan<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls &amp;&amp; ls src R tests/testthat plans &amp;&amp; git log --oneline | head -20</summary>
+<pre>ls &amp;&amp; ls src R tests/testthat plans &amp;&amp; git log --oneline | head -20</pre><pre class="output">_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+CLAUDE.md
+compile_commands.json
+DESCRIPTION
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+plans
+R
+rray4.Rproj
+src
+tests
+plans:
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+sum.md
+
+R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extract-subscript.R
+extract.R
+extremum.R
+index.R
+insert-axes.R
+logical.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+reverse.R
+roll.R
+rray4-package.R
+size.R
+slice-subscript.R
+slice.R
+split.R
+stack.R
+unstack.R
+zzz.R
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-prod.c
+reduce-prod.h
+reduce-prod.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rep-each.c
+rep-each.h
+rep-each.o
+rep.c
+rep.h
+rep.o
+reverse.c
+reverse.h
+reverse.o
+rlang
+rlang.c
+rlang.o
+roll-each.c
+roll-each.h
+roll-each.o
+roll.c
+roll.h
+roll.o</pre><p class="cut">121 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat plans/implementation.md &amp;&amp; cat plans/index.md | head -50</summary>
+<pre>cat plans/implementation.md &amp;&amp; cat plans/index.md | head -50</pre><pre class="output"># rray4 implementation plan
+
+## What this is
+
+rray4 is a reimagining of rray, written in pure C with no xtensor. It is a
+toolkit of `rray_*()` functions that broadcast, reshape, reduce and index base R
+arrays.
+
+It works on bare arrays only. There is no rray class, and classed input is an
+error. The extension system that would let other packages plug their own array
+classes in is deliberately deferred, and is written up separately in
+`plans/extensions.md`.
+
+This document is the guide for agents working on rray4 across many sessions.
+Part 4 is the catalogue of functions still to build.
+
+## How to use this plan
+
+Read Part 1 and Part 2 before starting any pull request. They are short on
+purpose.
+
+Then find your function in Part 4. Each entry says what to build, which files
+to touch, and what &quot;done&quot; means.
+
+One pull request per entry. Keep them small.
+
+---
+
+# Part 1: Conventions
+
+Terminology (size, axis, dimension, dimensions, dimensionality) is defined in
+`CLAUDE.md`. Use it exactly.
+
+## Files
+
+Each feature is a `src/{name}.c` and `src/{name}.h` pair, with an R file at
+`R/{name}.R` and tests at `tests/testthat/test-{name}.R`.
+
+Functions that need per type code split into a shell and a core, both living in
+`src/{name}.c`. Copy the shape of `src/broadcast.c`.
+
+The shell is ordinary C, written once. It holds everything that does not depend
+on the type: argument checks, dimension arithmetic, iterator setup and names. It
+ends in a `switch` on `r_typeof(x)` that hands off to the core.
+
+The core is one small function per type. It takes `x`, the output size and the
+iterator, allocates the output at its own type, fills it, and returns it.
+Allocation belongs to the core because the type is the one thing the shell does
+not know.
+
+Putting the core behind a function call costs nothing. It was benchmarked across
+five types and four shapes, and every case landed within 1%, which is the run to
+run noise, because the call happens once per array rather than once per element.
+Do not re-open this.
+
+Two families vary from this.
+
+`rray_split()` returns a list of arrays rather than one array, and `r_typeof(x)`
+is enough to allocate every element at the right type, so the shell builds the
+list and the core fills what it is handed.
+
+The binary arithmetic operators share one shell across many files, so the shell
+lives in `src/arithmetic.c` and each operator gets its own
+`src/arithmetic-{op}.c`. They switch on the type pair rather than on one type,
+and the switch returns the core instead of calling it. 2.4 covers why.
+
+The reducers that take `(x, axes, ..., na_rm = FALSE)` share the same shape of
+shell for the same reason. `rray_reduce()` and the `RRAY_REDUCE` macro live in
+`src/reduce.c`/`src/reduce.h`, and each reducer gets its own
+`src/reduce-{name}.c`, switching on `rray_typeof(x)` and returning the core.
+`rray_sum()` is the first of these, in `src/reduce-sum.c`.
+
+Each core's whole body is a call into a macro, following `SLICE` in vctrs'
+`src/slice.c`. There are usually two. `RRAY_{NAME}_ATOMIC` covers `lgl`, `int`,
+`dbl`, `cpl` and `raw`, which write straight to a data pointer.
+`RRAY_{NAME}_BARRIER` covers `chr` and `list`, which write through the barrier.
+Undefine both once the cores are written.
+
+The arithmetic family needs only one macro, since it has no `chr` or `list`
+cores, but several files share it. So `RRAY_ARITHMETIC` lives in
+`src/arithmetic.h` and nothing undefines it. Only undefine a macro the file
+defined itself.
+
+Write each core's parameter list out in full. Do not hide it behind a macro.
+
+A flag that swaps the scalar operation, like `na_rm`, is folded into the same
+switch that dispatches on type, returning the core instead of calling it:
+
+```c
+case RRAY_TYPE_double:
+  return na_rm ? rray_sum_dbl_na_rm : rray_sum_dbl;
+```
+
+So there is one core per type per variant, the flag stays off the core's
+parameter list, and the loop is written once. `rray_max()` and
+`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s
+shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+`axes` and return positions rather than reduced values, so whether they fit this
+shell at all is still an open question for whoever picks them up.
+
+A `.c` file reads top down: the main entry point first, its helpers below, in
+the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+`rray_broadcast()`, the `rray_broadcast_lgl()` family, `rray_broadcast_names()`,
+then everything else. You should meet the shell before the cores it dispatches
+to.
+
+`src/decl/{name}-decl.h` is what makes that ordering work. Declare every helper
+there, so the `.c` file never needs a forward declaration of its own.
+
+A decl header has no includes and no include guard. It is included last, from
+exactly one `.c` file, so everything it names is already in scope and there is
+nothing to guard against. It could not reach a sibling header in `src/` anyway,
+since only `src/rlang` is on the include path.
+
+## Naming
+
+- Internal C: `rray_{name}()`, returns C types.
+
+- FFI wrappers: `ffi_rray_{name}()`, thin SEXP bridges, placed above the
+  internal functions in the `.c` file.
+
+- Typed cores are file static, and keep the prefix with a type suffix, e.g.
+  `rray_broadcast_dbl()`. A binary core carries both input types, `x` first, so
+  `rray_add_int_dbl()` reads integers from `x` and doubles from `y`.
+
+- Headers declare internal functions only, never FFI wrappers.
+
+- `src/init.c` uses `extern` declarations, it does not include feature headers.
+
+- An `arg` is a `struct rray_arg*`, the argument tag ported from vctrs. Tags
+  nest, and nothing is materialised until an error is actually raised, so
+  carrying one through a loop costs nothing. `src/arg.c` is the whole of it.
+
+  `rray_args` holds the fixed ones, so `check_unclassed(x, rray_args.x, ...)`.
+  A function taking `...` builds one tag with `new_subscript_arg()`, which reads
+  a pointer to the caller's loop index and gives an input's name when it has one
+  and `..2` otherwise. `rray_arg_format()` turns a tag into a string with the
+  backticks already on, so messages write `%s` and not `` `%s` ``.
+
+## C style
+
+Follow vctrs and rlang closely. Prefer an rlang wrapper over the raw R API every
+time (`r_globals.na_int`, `r_length()`, `r_attrib_get()`).
+
+Prefer `r_ssize` over `int`. Mark variables `const` where you can. Grab a data
+pointer before a loop rather than indexing the `r_obj*`.
+
+Protect anything that allocates with `KEEP()` and `FREE()`.
+
+**Ruthlessly avoid protection issues.** A value that allocates is unprotected
+the instant it exists, including one built inline as a function argument, e.g.
+`f(x, r_chr(arg))`. If the callee allocates anything before it uses that
+argument, a GC in that window can collect it out from under you. Trace every
+allocation forward to its last use and make sure something on the protection
+stack covers it the whole way, not just at the call site that looks risky. This
+class of bug compiles fine, passes tests that don't happen to trigger a GC, and
+only shows up as a rare crash or corrupted value. Check for it explicitly in
+every pull request that touches C code, don't wait for it to be caught in
+review.
+
+Allocate a names list only once an axis actually survives, so the common case
+where nothing survives allocates nothing:
+
+```c
+r_obj* out = r_null;
+r_keep_loc out_loc;
+KEEP_HERE(out, &amp;out_loc);
+```
+
+Allocate inside the loop, right before the first assignment, and reprotect with
+`KEEP_AT()`. `rray_broadcast_names()` is the example.
+
+`#include &quot;decl/{name}-decl.h&quot;` always goes last, after every other include,
+separated from them by one blank line.
+
+Never touch `src/rlang/`.
+
+Run `clang-format -i src/*.c src/*.h` over all files after any C change.
+
+## Comments
+
+**Do not write comments.** Not in C, not in R. The only exception is roxygen2 on
+exported R functions. This overrides the usual defaults.
+
+This is not &quot;write fewer comments&quot;, it is &quot;write none&quot;. Do not explain what the
+code does, do not justify a choice, do not label a section, do not flag a tricky
+line. Not even one short line. If you think your comment is the exception
+because it explains something genuinely non-obvious, it is not.
+
+Comments already in the code stay. Leave them exactly as they are, and do not
+add new ones next to them. Anything that needs explaining goes in the pull
+request, not the source.
+
+## R style
+
+Run `air format .` after any R change. Use `|&gt;`, not `%&gt;%`. Use `\() ...` for one
+line anonymous functions and `function() {...}` otherwise. The package must work
+on R 4.1, so no `_$x`.
+
+## Prose</pre><p class="cut">893 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat plans/implementation.md</summary>
+<pre>cat plans/implementation.md</pre><pre class="output"># rray4 implementation plan
+
+## What this is
+
+rray4 is a reimagining of rray, written in pure C with no xtensor. It is a
+toolkit of `rray_*()` functions that broadcast, reshape, reduce and index base R
+arrays.
+
+It works on bare arrays only. There is no rray class, and classed input is an
+error. The extension system that would let other packages plug their own array
+classes in is deliberately deferred, and is written up separately in
+`plans/extensions.md`.
+
+This document is the guide for agents working on rray4 across many sessions.
+Part 4 is the catalogue of functions still to build.
+
+## How to use this plan
+
+Read Part 1 and Part 2 before starting any pull request. They are short on
+purpose.
+
+Then find your function in Part 4. Each entry says what to build, which files
+to touch, and what &quot;done&quot; means.
+
+One pull request per entry. Keep them small.
+
+---
+
+# Part 1: Conventions
+
+Terminology (size, axis, dimension, dimensions, dimensionality) is defined in
+`CLAUDE.md`. Use it exactly.
+
+## Files
+
+Each feature is a `src/{name}.c` and `src/{name}.h` pair, with an R file at
+`R/{name}.R` and tests at `tests/testthat/test-{name}.R`.
+
+Functions that need per type code split into a shell and a core, both living in
+`src/{name}.c`. Copy the shape of `src/broadcast.c`.
+
+The shell is ordinary C, written once. It holds everything that does not depend
+on the type: argument checks, dimension arithmetic, iterator setup and names. It
+ends in a `switch` on `r_typeof(x)` that hands off to the core.
+
+The core is one small function per type. It takes `x`, the output size and the
+iterator, allocates the output at its own type, fills it, and returns it.
+Allocation belongs to the core because the type is the one thing the shell does
+not know.
+
+Putting the core behind a function call costs nothing. It was benchmarked across
+five types and four shapes, and every case landed within 1%, which is the run to
+run noise, because the call happens once per array rather than once per element.
+Do not re-open this.
+
+Two families vary from this.
+
+`rray_split()` returns a list of arrays rather than one array, and `r_typeof(x)`
+is enough to allocate every element at the right type, so the shell builds the
+list and the core fills what it is handed.
+
+The binary arithmetic operators share one shell across many files, so the shell
+lives in `src/arithmetic.c` and each operator gets its own
+`src/arithmetic-{op}.c`. They switch on the type pair rather than on one type,
+and the switch returns the core instead of calling it. 2.4 covers why.
+
+The reducers that take `(x, axes, ..., na_rm = FALSE)` share the same shape of
+shell for the same reason. `rray_reduce()` and the `RRAY_REDUCE` macro live in
+`src/reduce.c`/`src/reduce.h`, and each reducer gets its own
+`src/reduce-{name}.c`, switching on `rray_typeof(x)` and returning the core.
+`rray_sum()` is the first of these, in `src/reduce-sum.c`.
+
+Each core's whole body is a call into a macro, following `SLICE` in vctrs'
+`src/slice.c`. There are usually two. `RRAY_{NAME}_ATOMIC` covers `lgl`, `int`,
+`dbl`, `cpl` and `raw`, which write straight to a data pointer.
+`RRAY_{NAME}_BARRIER` covers `chr` and `list`, which write through the barrier.
+Undefine both once the cores are written.
+
+The arithmetic family needs only one macro, since it has no `chr` or `list`
+cores, but several files share it. So `RRAY_ARITHMETIC` lives in
+`src/arithmetic.h` and nothing undefines it. Only undefine a macro the file
+defined itself.
+
+Write each core's parameter list out in full. Do not hide it behind a macro.
+
+A flag that swaps the scalar operation, like `na_rm`, is folded into the same
+switch that dispatches on type, returning the core instead of calling it:
+
+```c
+case RRAY_TYPE_double:
+  return na_rm ? rray_sum_dbl_na_rm : rray_sum_dbl;
+```
+
+So there is one core per type per variant, the flag stays off the core's
+parameter list, and the loop is written once. `rray_max()` and
+`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s
+shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+`axes` and return positions rather than reduced values, so whether they fit this
+shell at all is still an open question for whoever picks them up.
+
+A `.c` file reads top down: the main entry point first, its helpers below, in
+the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+`rray_broadcast()`, the `rray_broadcast_lgl()` family, `rray_broadcast_names()`,
+then everything else. You should meet the shell before the cores it dispatches
+to.
+
+`src/decl/{name}-decl.h` is what makes that ordering work. Declare every helper
+there, so the `.c` file never needs a forward declaration of its own.
+
+A decl header has no includes and no include guard. It is included last, from
+exactly one `.c` file, so everything it names is already in scope and there is
+nothing to guard against. It could not reach a sibling header in `src/` anyway,
+since only `src/rlang` is on the include path.
+
+## Naming
+
+- Internal C: `rray_{name}()`, returns C types.
+
+- FFI wrappers: `ffi_rray_{name}()`, thin SEXP bridges, placed above the
+  internal functions in the `.c` file.
+
+- Typed cores are file static, and keep the prefix with a type suffix, e.g.
+  `rray_broadcast_dbl()`. A binary core carries both input types, `x` first, so
+  `rray_add_int_dbl()` reads integers from `x` and doubles from `y`.
+
+- Headers declare internal functions only, never FFI wrappers.
+
+- `src/init.c` uses `extern` declarations, it does not include feature headers.
+
+- An `arg` is a `struct rray_arg*`, the argument tag ported from vctrs. Tags
+  nest, and nothing is materialised until an error is actually raised, so
+  carrying one through a loop costs nothing. `src/arg.c` is the whole of it.
+
+  `rray_args` holds the fixed ones, so `check_unclassed(x, rray_args.x, ...)`.
+  A function taking `...` builds one tag with `new_subscript_arg()`, which reads
+  a pointer to the caller's loop index and gives an input's name when it has one
+  and `..2` otherwise. `rray_arg_format()` turns a tag into a string with the
+  backticks already on, so messages write `%s` and not `` `%s` ``.
+
+## C style
+
+Follow vctrs and rlang closely. Prefer an rlang wrapper over the raw R API every
+time (`r_globals.na_int`, `r_length()`, `r_attrib_get()`).
+
+Prefer `r_ssize` over `int`. Mark variables `const` where you can. Grab a data
+pointer before a loop rather than indexing the `r_obj*`.
+
+Protect anything that allocates with `KEEP()` and `FREE()`.
+
+**Ruthlessly avoid protection issues.** A value that allocates is unprotected
+the instant it exists, including one built inline as a function argument, e.g.
+`f(x, r_chr(arg))`. If the callee allocates anything before it uses that
+argument, a GC in that window can collect it out from under you. Trace every
+allocation forward to its last use and make sure something on the protection
+stack covers it the whole way, not just at the call site that looks risky. This
+class of bug compiles fine, passes tests that don't happen to trigger a GC, and
+only shows up as a rare crash or corrupted value. Check for it explicitly in
+every pull request that touches C code, don't wait for it to be caught in
+review.
+
+Allocate a names list only once an axis actually survives, so the common case
+where nothing survives allocates nothing:
+
+```c
+r_obj* out = r_null;
+r_keep_loc out_loc;
+KEEP_HERE(out, &amp;out_loc);
+```
+
+Allocate inside the loop, right before the first assignment, and reprotect with
+`KEEP_AT()`. `rray_broadcast_names()` is the example.
+
+`#include &quot;decl/{name}-decl.h&quot;` always goes last, after every other include,
+separated from them by one blank line.
+
+Never touch `src/rlang/`.
+
+Run `clang-format -i src/*.c src/*.h` over all files after any C change.
+
+## Comments
+
+**Do not write comments.** Not in C, not in R. The only exception is roxygen2 on
+exported R functions. This overrides the usual defaults.
+
+This is not &quot;write fewer comments&quot;, it is &quot;write none&quot;. Do not explain what the
+code does, do not justify a choice, do not label a section, do not flag a tricky
+line. Not even one short line. If you think your comment is the exception
+because it explains something genuinely non-obvious, it is not.
+
+Comments already in the code stay. Leave them exactly as they are, and do not
+add new ones next to them. Anything that needs explaining goes in the pull
+request, not the source.
+
+## R style
+
+Run `air format .` after any R change. Use `|&gt;`, not `%&gt;%`. Use `\() ...` for one
+line anonymous functions and `function() {...}` otherwise. The package must work
+on R 4.1, so no `_$x`.
+
+## Prose</pre><p class="cut">844 more lines cut</p></details>
+<details class="tool"><summary>Read plans/implementation.md</summary>
+<pre class="output">1	# rray4 implementation plan
+2	
+3	## What this is
+4	
+5	rray4 is a reimagining of rray, written in pure C with no xtensor. It is a
+6	toolkit of `rray_*()` functions that broadcast, reshape, reduce and index base R
+7	arrays.
+8	
+9	It works on bare arrays only. There is no rray class, and classed input is an
+10	error. The extension system that would let other packages plug their own array
+11	classes in is deliberately deferred, and is written up separately in
+12	`plans/extensions.md`.
+13	
+14	This document is the guide for agents working on rray4 across many sessions.
+15	Part 4 is the catalogue of functions still to build.
+16	
+17	## How to use this plan
+18	
+19	Read Part 1 and Part 2 before starting any pull request. They are short on
+20	purpose.
+21	
+22	Then find your function in Part 4. Each entry says what to build, which files
+23	to touch, and what &quot;done&quot; means.
+24	
+25	One pull request per entry. Keep them small.
+26	
+27	---
+28	
+29	# Part 1: Conventions
+30	
+31	Terminology (size, axis, dimension, dimensions, dimensionality) is defined in
+32	`CLAUDE.md`. Use it exactly.
+33	
+34	## Files
+35	
+36	Each feature is a `src/{name}.c` and `src/{name}.h` pair, with an R file at
+37	`R/{name}.R` and tests at `tests/testthat/test-{name}.R`.
+38	
+39	Functions that need per type code split into a shell and a core, both living in
+40	`src/{name}.c`. Copy the shape of `src/broadcast.c`.
+41	
+42	The shell is ordinary C, written once. It holds everything that does not depend
+43	on the type: argument checks, dimension arithmetic, iterator setup and names. It
+44	ends in a `switch` on `r_typeof(x)` that hands off to the core.
+45	
+46	The core is one small function per type. It takes `x`, the output size and the
+47	iterator, allocates the output at its own type, fills it, and returns it.
+48	Allocation belongs to the core because the type is the one thing the shell does
+49	not know.
+50	
+51	Putting the core behind a function call costs nothing. It was benchmarked across
+52	five types and four shapes, and every case landed within 1%, which is the run to
+53	run noise, because the call happens once per array rather than once per element.
+54	Do not re-open this.
+55	
+56	Two families vary from this.
+57	
+58	`rray_split()` returns a list of arrays rather than one array, and `r_typeof(x)`
+59	is enough to allocate every element at the right type, so the shell builds the
+60	list and the core fills what it is handed.
+61	
+62	The binary arithmetic operators share one shell across many files, so the shell
+63	lives in `src/arithmetic.c` and each operator gets its own
+64	`src/arithmetic-{op}.c`. They switch on the type pair rather than on one type,
+65	and the switch returns the core instead of calling it. 2.4 covers why.
+66	
+67	The reducers that take `(x, axes, ..., na_rm = FALSE)` share the same shape of
+68	shell for the same reason. `rray_reduce()` and the `RRAY_REDUCE` macro live in
+69	`src/reduce.c`/`src/reduce.h`, and each reducer gets its own
+70	`src/reduce-{name}.c`, switching on `rray_typeof(x)` and returning the core.
+71	`rray_sum()` is the first of these, in `src/reduce-sum.c`.
+72	
+73	Each core's whole body is a call into a macro, following `SLICE` in vctrs'
+74	`src/slice.c`. There are usually two. `RRAY_{NAME}_ATOMIC` covers `lgl`, `int`,
+75	`dbl`, `cpl` and `raw`, which write straight to a data pointer.
+76	`RRAY_{NAME}_BARRIER` covers `chr` and `list`, which write through the barrier.
+77	Undefine both once the cores are written.
+78	
+79	The arithmetic family needs only one macro, since it has no `chr` or `list`
+80	cores, but several files share it. So `RRAY_ARITHMETIC` lives in
+81	`src/arithmetic.h` and nothing undefines it. Only undefine a macro the file
+82	defined itself.
+83	
+84	Write each core's parameter list out in full. Do not hide it behind a macro.
+85	
+86	A flag that swaps the scalar operation, like `na_rm`, is folded into the same
+87	switch that dispatches on type, returning the core instead of calling it:
+88	
+89	```c
+90	case RRAY_TYPE_double:
+91	  return na_rm ? rray_sum_dbl_na_rm : rray_sum_dbl;
+92	```
+93	
+94	So there is one core per type per variant, the flag stays off the core's
+95	parameter list, and the loop is written once. `rray_max()` and
+96	`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s
+97	shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+98	`axes` and return positions rather than reduced values, so whether they fit this
+99	shell at all is still an open question for whoever picks them up.
+100	
+101	A `.c` file reads top down: the main entry point first, its helpers below, in
+102	the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+103	`rray_broadcast()`, the `rray_broadcast_lgl()` family, `rray_broadcast_names()`,
+104	then everything else. You should meet the shell before the cores it dispatches
+105	to.
+106	
+107	`src/decl/{name}-decl.h` is what makes that ordering work. Declare every helper
+108	there, so the `.c` file never needs a forward declaration of its own.
+109	
+110	A decl header has no includes and no include guard. It is included last, from
+111	exactly one `.c` file, so everything it names is already in scope and there is
+112	nothing to guard against. It could not reach a sibling header in `src/` anyway,
+113	since only `src/rlang` is on the include path.
+114	
+115	## Naming
+116	
+117	- Internal C: `rray_{name}()`, returns C types.
+118	
+119	- FFI wrappers: `ffi_rray_{name}()`, thin SEXP bridges, placed above the
+120	  internal functions in the `.c` file.
+121	
+122	- Typed cores are file static, and keep the prefix with a type suffix, e.g.
+123	  `rray_broadcast_dbl()`. A binary core carries both input types, `x` first, so
+124	  `rray_add_int_dbl()` reads integers from `x` and doubles from `y`.
+125	
+126	- Headers declare internal functions only, never FFI wrappers.
+127	
+128	- `src/init.c` uses `extern` declarations, it does not include feature headers.
+129	
+130	- An `arg` is a `struct rray_arg*`, the argument tag ported from vctrs. Tags
+131	  nest, and nothing is materialised until an error is actually raised, so
+132	  carrying one through a loop costs nothing. `src/arg.c` is the whole of it.
+133	
+134	  `rray_args` holds the fixed ones, so `check_unclassed(x, rray_args.x, ...)`.
+135	  A function taking `...` builds one tag with `new_subscript_arg()`, which reads
+136	  a pointer to the caller's loop index and gives an input's name when it has one
+137	  and `..2` otherwise. `rray_arg_format()` turns a tag into a string with the
+138	  backticks already on, so messages write `%s` and not `` `%s` ``.
+139	
+140	## C style
+141	
+142	Follow vctrs and rlang closely. Prefer an rlang wrapper over the raw R API every
+143	time (`r_globals.na_int`, `r_length()`, `r_attrib_get()`).
+144	
+145	Prefer `r_ssize` over `int`. Mark variables `const` where you can. Grab a data
+146	pointer before a loop rather than indexing the `r_obj*`.
+147	
+148	Protect anything that allocates with `KEEP()` and `FREE()`.
+149	
+150	**Ruthlessly avoid protection issues.** A value that allocates is unprotected
+151	the instant it exists, including one built inline as a function argument, e.g.
+152	`f(x, r_chr(arg))`. If the callee allocates anything before it uses that
+153	argument, a GC in that window can collect it out from under you. Trace every
+154	allocation forward to its last use and make sure something on the protection
+155	stack covers it the whole way, not just at the call site that looks risky. This
+156	class of bug compiles fine, passes tests that don't happen to trigger a GC, and
+157	only shows up as a rare crash or corrupted value. Check for it explicitly in
+158	every pull request that touches C code, don't wait for it to be caught in
+159	review.
+160	
+161	Allocate a names list only once an axis actually survives, so the common case
+162	where nothing survives allocates nothing:
+163	
+164	```c
+165	r_obj* out = r_null;
+166	r_keep_loc out_loc;
+167	KEEP_HERE(out, &amp;out_loc);
+168	```
+169	
+170	Allocate inside the loop, right before the first assignment, and reprotect with
+171	`KEEP_AT()`. `rray_broadcast_names()` is the example.
+172	
+173	`#include &quot;decl/{name}-decl.h&quot;` always goes last, after every other include,
+174	separated from them by one blank line.
+175	
+176	Never touch `src/rlang/`.
+177	
+178	Run `clang-format -i src/*.c src/*.h` over all files after any C change.
+179	
+180	## Comments
+181	
+182	**Do not write comments.** Not in C, not in R. The only exception is roxygen2 on
+183	exported R functions. This overrides the usual defaults.
+184	
+185	This is not &quot;write fewer comments&quot;, it is &quot;write none&quot;. Do not explain what the
+186	code does, do not justify a choice, do not label a section, do not flag a tricky
+187	line. Not even one short line. If you think your comment is the exception
+188	because it explains something genuinely non-obvious, it is not.
+189	
+190	Comments already in the code stay. Leave them exactly as they are, and do not
+191	add new ones next to them. Anything that needs explaining goes in the pull
+192	request, not the source.
+193	
+194	## R style
+195	
+196	Run `air format .` after any R change. Use `|&gt;`, not `%&gt;%`. Use `\() ...` for one
+197	line anonymous functions and `function() {...}` otherwise. The package must work
+198	on R 4.1, so no `_$x`.
+199	
+200	## Prose</pre><p class="cut">845 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/extremum.c src/extremum.h src/decl/extremum-decl.h R/extremum.R</summary>
+<pre>cat src/extremum.c src/extremum.h src/decl/extremum-decl.h R/extremum.R</pre><pre class="output">#include &quot;extremum.h&quot;
+
+#include &quot;binary.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;type.h&quot;
+#include &quot;typeof2.h&quot;
+#include &quot;utils.h&quot;
+
+enum rray_extremum_op {
+  RRAY_EXTREMUM_max,
+  RRAY_EXTREMUM_min
+};
+
+#include &quot;decl/extremum-decl.h&quot;
+
+r_obj* ffi_rray_pmax(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_pmax(ffi_x, ffi_y, na_rm, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_pmax(
+  r_obj* x,
+  r_obj* y,
+  bool na_rm,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_extremum(
+    x,
+    y,
+    na_rm,
+    RRAY_EXTREMUM_max,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+r_obj* ffi_rray_pmin(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_pmin(ffi_x, ffi_y, na_rm, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_pmin(
+  r_obj* x,
+  r_obj* y,
+  bool na_rm,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_extremum(
+    x,
+    y,
+    na_rm,
+    RRAY_EXTREMUM_min,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+static r_obj* rray_extremum(
+  r_obj* x,
+  r_obj* y,
+  bool na_rm,
+  enum rray_extremum_op op,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  check_unclassed(y, y_arg, error_call);
+
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+  y = KEEP(arg_as_array(y, y_arg, error_call));
+
+  r_obj* x_dimensions = r_dim(x);
+  r_obj* y_dimensions = r_dim(y);
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int y_dimensionality =
+    rray_dimensionality_from_dimensions(y_dimensions);
+
+  r_obj* dimensions = KEEP(rray_dimensions2(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    x_arg,
+    y_arg,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  struct rray_strided_iterator2_plan plan = rray_broadcast_iterator2_plan(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    v_dimensions,
+    dimensionality
+  );
+
+  r_obj* out = KEEP(
+    rray_extremum_switch(x, y, op, &amp;plan, na_rm, x_arg, y_arg, error_call)
+  );
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_extremum_switch(
+  r_obj* x,
+  r_obj* y,
+  enum rray_extremum_op op,
+  const struct rray_strided_iterator2_plan* plan,
+  bool na_rm,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  const enum rray_type x_type = rray_typeof(x);
+  const enum rray_type y_type = rray_typeof(y);
+
+  enum rray_side side;
+
+  switch (rray_typeof2(x_type, y_type, &amp;side)) {
+  case RRAY_TYPE2_logical_logical:
+    switch (op) {
+    case RRAY_EXTREMUM_max:
+      return rray_pmax_lgl_lgl(x, y, plan, na_rm, error_call);
+    case RRAY_EXTREMUM_min:
+      return rray_pmin_lgl_lgl(x, y, plan, na_rm, error_call);
+    }
+  case RRAY_TYPE2_logical_integer:
+    switch (op) {
+    case RRAY_EXTREMUM_max:
+      if (side == RRAY_SIDE_right) {
+        return rray_pmax_lgl_int(x, y, plan, na_rm, error_call);
+      } else {
+        return rray_pmax_int_lgl(x, y, plan, na_rm, error_call);
+      }
+    case RRAY_EXTREMUM_min:
+      if (side == RRAY_SIDE_right) {
+        return rray_pmin_lgl_int(x, y, plan, na_rm, error_call);
+      } else {
+        return rray_pmin_int_lgl(x, y, plan, na_rm, error_call);
+      }
+    }
+  case RRAY_TYPE2_logical_double:
+    switch (op) {
+    case RRAY_EXTREMUM_max:
+      if (side == RRAY_SIDE_right) {
+        return rray_pmax_lgl_dbl(x, y, plan, na_rm, error_call);
+      } else {
+        return rray_pmax_dbl_lgl(x, y, plan, na_rm, error_call);
+      }
+    case RRAY_EXTREMUM_min:
+      if (side == RRAY_SIDE_right) {
+        return rray_pmin_lgl_dbl(x, y, plan, na_rm, error_call);
+      } else {
+        return rray_pmin_dbl_lgl(x, y, plan, na_rm, error_call);
+      }
+    }
+  case RRAY_TYPE2_integer_integer:
+    switch (op) {
+    case RRAY_EXTREMUM_max:
+      return rray_pmax_int_int(x, y, plan, na_rm, error_call);
+    case RRAY_EXTREMUM_min:
+      return rray_pmin_int_int(x, y, plan, na_rm, error_call);</pre><p class="cut">890 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/logical.c src/logical.h src/reduce-logical.c src/reduce-logical.h src/decl/reduce-log…</summary>
+<pre>cat src/logical.c src/logical.h src/reduce-logical.c src/reduce-logical.h src/decl/reduce-logical-decl.h src/decl/logical-decl.h</pre><pre class="output">#include &quot;logical.h&quot;
+
+#include &quot;binary.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+enum rray_logical_op {
+  RRAY_LOGICAL_and,
+  RRAY_LOGICAL_or,
+  RRAY_LOGICAL_xor
+};
+
+#include &quot;decl/logical-decl.h&quot;
+
+r_obj* ffi_rray_and(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_and(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_and(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_logical(x, y, RRAY_LOGICAL_and, x_arg, y_arg, error_call);
+}
+
+r_obj* ffi_rray_or(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_or(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_or(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_logical(x, y, RRAY_LOGICAL_or, x_arg, y_arg, error_call);
+}
+
+r_obj* ffi_rray_xor(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_xor(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_xor(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_logical(x, y, RRAY_LOGICAL_xor, x_arg, y_arg, error_call);
+}
+
+static r_obj* rray_logical(
+  r_obj* x,
+  r_obj* y,
+  enum rray_logical_op op,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  check_unclassed(y, y_arg, error_call);
+
+  check_logical(x, x_arg, error_call);
+  check_logical(y, y_arg, error_call);
+
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+  y = KEEP(arg_as_array(y, y_arg, error_call));
+
+  r_obj* x_dimensions = r_dim(x);
+  r_obj* y_dimensions = r_dim(y);
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int y_dimensionality =
+    rray_dimensionality_from_dimensions(y_dimensions);
+
+  r_obj* dimensions = KEEP(rray_dimensions2(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    x_arg,
+    y_arg,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  struct rray_strided_iterator2_plan plan = rray_broadcast_iterator2_plan(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    v_dimensions,
+    dimensionality
+  );
+
+  r_obj* out = KEEP(rray_logical_lgl_lgl(x, y, &amp;plan, op));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_logical_lgl_lgl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  enum rray_logical_op op
+) {
+  switch (op) {
+  case RRAY_LOGICAL_and: {
+    RRAY_BINARY(
+      int,
+      r_lgl_cbegin,
+      rray_cast_lgl_to_lgl_one,
+      int,
+      r_lgl_cbegin,
+      rray_cast_lgl_to_lgl_one,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      rray_and_lgl_one,
+      RRAY_BINARY_NO_ARGS
+    );
+  }
+  case RRAY_LOGICAL_or: {
+    RRAY_BINARY(
+      int,
+      r_lgl_cbegin,
+      rray_cast_lgl_to_lgl_one,
+      int,
+      r_lgl_cbegin,
+      rray_cast_lgl_to_lgl_one,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      rray_or_lgl_one,
+      RRAY_BINARY_NO_ARGS
+    );
+  }
+  case RRAY_LOGICAL_xor: {
+    RRAY_BINARY(
+      int,
+      r_lgl_cbegin,
+      rray_cast_lgl_to_lgl_one,
+      int,
+      r_lgl_cbegin,
+      rray_cast_lgl_to_lgl_one,
+      R_TYPE_logical,
+      int,
+      r_lgl_begin,
+      rray_xor_lgl_one,
+      RRAY_BINARY_NO_ARGS
+    );
+  }
+  }
+
+  r_stop_unreachable();
+}
+#ifndef RRAY_LOGICAL_H
+#define RRAY_LOGICAL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;missing.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* rray_and(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_or(
+  r_obj* x,</pre><p class="cut">273 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/reduce.c src/reduce.h src/reduce-sum.c src/decl/reduce-sum-decl.h src/decl/reduce-dec…</summary>
+<pre>cat src/reduce.c src/reduce.h src/reduce-sum.c src/decl/reduce-sum-decl.h src/decl/reduce-decl.h src/reduce-prod.c</pre><pre class="output">#include &quot;reduce.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-decl.h&quot;
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * dimensionality);
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out_dimensions[v_axes[i] - 1] = 1;
+  }
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+    v_out_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    dimensionality
+  );
+
+  const rray_reduce_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, out_size, &amp;plan));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* retained_axes =
+    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+  const int* v_retained_axes = r_int_cbegin(retained_axes);
+  const r_ssize retained_axes_size = r_length(retained_axes);
+
+  const struct rray_strided_iterator_plan outer_plan =
+    rray_reduce_nested_iterator_plan(
+      v_x_dimensions,
+      v_x_strides,
+      v_retained_axes,
+      retained_axes_size
+    );
+
+  const struct rray_strided_iterator_plan inner_plan =
+    rray_reduce_nested_iterator_plan(
+      v_x_dimensions,
+      v_x_strides,
+      v_axes,
+      axes_size
+    );
+
+  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * dimensionality);
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out_dimensions[v_axes[i] - 1] = 1;
+  }
+
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(7);
+  return out;
+}
+
+static struct rray_strided_iterator_plan rray_reduce_nested_iterator_plan(
+  const int* v_x_dimensions,
+  const r_ssize* v_x_strides,
+  const int* v_axes,
+  r_ssize axes_size
+) {
+  // An empty axes set is a byproduct of dividing an array's axes into
+  // complements. If a user reduces over all axes, the retained complement
+  // technically has 0 axes and 1 element. We normalize to 1 axis with 1 element
+  // so R can actually represent it.
+  if (axes_size == 0) {
+    const int dimensionality = 1;
+    const int dimension = 1;
+    const r_ssize stride = 0;
+    return rray_strided_iterator_plan(&amp;dimension, dimensionality, &amp;stride);
+  }
+
+  int v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+    v_dimensions[i] = v_x_dimensions[axis - 1];
+    v_strides[i] = v_x_strides[axis - 1];
+  }
+
+  return rray_strided_iterator_plan(v_dimensions, (int) axes_size, v_strides);
+}
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't compute the %s of %s.&quot;,
+    op,
+    rray_arg_type_format(arg, rray_typeof(x))
+  );
+}
+#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+// --------------------------------------------------------------------------
+// rray_reduce
+
+// Flat reduction is useful when the output element is the only state carried
+// between input elements. It walks `x` once in storage order, updating the
+// output element that each input contributes to. This is faster than nested
+// reduction because it reads `x` linearly and avoids a separate inner traversal
+// for each output element.
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan</pre><p class="cut">785 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat R/reduce.R R/logical.R &amp;&amp; cat src/reduce-mean.c | head -120 &amp;&amp; cat tests/testthat/test-re…</summary>
+<pre>cat R/reduce.R R/logical.R &amp;&amp; cat src/reduce-mean.c | head -120 &amp;&amp; cat tests/testthat/test-reduce-prod.R &amp;&amp; ls tests/testthat/_snaps &amp;&amp; grep -n &quot;sum\|prod\|mean\|reduce\|extremum\|logical\|pmin\|any\|all&quot; src/init.c _pkgdown.yml NAMESPACE</pre><pre class="output">#' Reduce an array along axes
+#'
+#' @description
+#' - `rray_sum()` computes the sum along the specified `axes`.
+#'
+#' - `rray_prod()` computes the product along the specified `axes`.
+#'
+#' - `rray_mean()` computes the mean along the specified `axes`.
+#'
+#' - `rray_all()` checks if all values are `TRUE` along the specified `axes`.
+#'
+#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.
+#'
+#' @details
+#' The dimensionality of `x` is retained in the result, with the reduced axes
+#' collapsed to size 1.
+#'
+#' If summing an integer array would overflow, an error is thrown.
+#'
+#' @section Casting:
+#' Certain inputs are upcast, changing the return type:
+#'
+#' - `rray_prod()`: logicals and integers are cast to double.
+#'
+#' - `rray_mean()`: logicals and integers are cast to double.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to reduce over. `1` reduces
+#'   rows, `2` reduces columns, and so on.
+#'
+#' @param na_rm If `TRUE`, missing values are removed before reducing.
+#'
+#' @returns
+#' An array with the same dimensionality as `x`, but with the dimensions along
+#' `axes` reduced to 1.
+#'
+#' @name reduce
+#' @examples
+#' x &lt;- array(1:10, c(5L, 2L))
+#'
+#' # Sum along rows
+#' rray_sum(x, 1L)
+#'
+#' # Sum along columns
+#' rray_sum(x, 2L)
+#'
+#' # Sum along both axes
+#' rray_sum(x, c(1L, 2L))
+#'
+#' # Product along rows
+#' rray_prod(x, 1L)
+#'
+#' # Mean along rows
+#' rray_mean(x, 1L)
+#'
+#' y &lt;- array(c(TRUE, TRUE, FALSE, TRUE), c(2L, 2L))
+#'
+#' rray_all(y, 1L)
+#' rray_any(y, 1L)
+NULL
+
+#' @rdname reduce
+#' @export
+rray_sum &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_sum, x, axes, na_rm, environment())
+}
+
+#' @rdname reduce
+#' @export
+rray_prod &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_prod, x, axes, na_rm, environment())
+}
+
+#' @rdname reduce
+#' @export
+rray_mean &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_mean, x, axes, na_rm, environment())
+}
+
+#' @rdname reduce
+#' @export
+rray_all &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_all, x, axes, na_rm, environment())
+}
+
+#' @rdname reduce
+#' @export
+rray_any &lt;- function(x, axes, ..., na_rm = FALSE) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_any, x, axes, na_rm, environment())
+}
+#' Logical operations
+#'
+#' @description
+#' - `rray_and()` tests whether both `x` and `y` are `TRUE`.
+#'
+#' - `rray_or()` tests whether at least one of `x` and `y` is `TRUE`.
+#'
+#' - `rray_xor()` tests whether exactly one of `x` and `y` is `TRUE`.
+#'
+#' @details
+#' The arrays are broadcast to common dimensions before the operation is
+#' applied.
+#'
+#' Missing values are handled the same way as `&amp;`, `|`, and [xor()].
+#'
+#' @param x,y Logical arrays.
+#'
+#' @returns
+#' A logical array with the common dimensions of `x` and `y`.
+#'
+#' @name rray-logical
+#' @examples
+#' x &lt;- array(c(TRUE, FALSE, TRUE), c(3L, 1L))
+#' y &lt;- array(c(TRUE, FALSE), c(1L, 2L))
+#'
+#' rray_and(x, y)
+#' rray_or(x, y)
+#' rray_xor(x, y)
+#'
+#' rray_and(NA, FALSE)
+#' rray_or(NA, TRUE)
+#' rray_xor(NA, TRUE)
+NULL
+
+#' @rdname rray-logical
+#' @export
+rray_and &lt;- function(x, y) {
+  .Call(ffi_rray_and, x, y, environment())
+}
+
+#' @rdname rray-logical
+#' @export
+rray_or &lt;- function(x, y) {
+  .Call(ffi_rray_or, x, y, environment())
+}
+
+#' @rdname rray-logical
+#' @export
+rray_xor &lt;- function(x, y) {
+  .Call(ffi_rray_xor, x, y, environment())
+}
+#include &quot;reduce-mean.h&quot;
+
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-mean-decl.h&quot;
+
+r_obj* ffi_rray_mean(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_mean(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_mean(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce_nested(x, axes, na_rm, rray_mean_switch, arg, error_call);
+}
+
+static rray_reduce_nested_fn rray_mean_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return na_rm ? rray_mean_lgl_na_rm : rray_mean_lgl;
+  case RRAY_TYPE_integer:
+    return na_rm ? rray_mean_int_na_rm : rray_mean_int;
+  case RRAY_TYPE_double:
+    return na_rm ? rray_mean_dbl_na_rm : rray_mean_dbl;
+
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;mean&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);</pre><p class="cut">485 more lines cut</p></details>
+<p>Reading the existing pmax/pmin and reducer code, then R's own <code>max()</code>/<code>pmax()</code> sources, so I can ask focused questions before writing anything.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;static Rboolean rmax\|static Rboolean rmin…</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;static Rboolean rmax\|static Rboolean rmin\|static Rboolean imax\|static Rboolean imin&quot; summary.c; sed -n &quot;$(grep -n 'static Rboolean rmax' summary.c | cut -d: -f1),+30p&quot; summary.c; grep -n &quot;do_pmin&quot; summary.c</pre><pre class="output">sed: 1: &quot;,+30p&quot;: invalid command code ,
+1200:attribute_hidden SEXP do_pmin(SEXP call, SEXP op, SEXP args, SEXP rho)
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;rmax\|rmin\|imax\|imin&quot; summary.c | head -…</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;rmax\|rmin\|imax\|imin&quot; summary.c | head -30</pre><pre class="output">34:#define imax2(x, y) ((x &lt; y) ? y : x)
+192:static bool imin(SEXP sx, int *value, bool narm)
+215:static bool rmin(SEXP sx, double *value, bool narm)
+264:static bool imax(SEXP sx, int *value, bool narm)
+286:static bool rmax(SEXP sx, double *value, bool narm)
+714:		    if (iop == 2) updated = imin(a, &amp;itmp, narm);
+715:		    else	  updated = imax(a, &amp;itmp, narm);
+723:		    if (iop == 2) updated = rmin(a, &amp;tmp, narm);
+724:		    else	  updated = rmax(a, &amp;tmp, narm);
+1245:	len = imax2(len, n);
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; sed -n 190,310p summary.c; sed -n 1280,1330p summar…</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; sed -n 190,310p summary.c; sed -n 1280,1330p summary.c</pre><pre class="output">}
+
+static bool imin(SEXP sx, int *value, bool narm)
+{
+    bool updated = false;
+    int s = 0;
+
+    ITERATE_BY_REGION(sx, x, i, nbatch, int, INTEGER, {
+	    for (R_xlen_t k = 0; k &lt; nbatch; k++) {
+		if (x[k] != NA_INTEGER) {
+		    if (!updated || s &gt; x[k]) {
+			s = x[k];
+			if(!updated) updated = true;
+		    }
+		}
+		else if (!narm) {
+		    *value = NA_INTEGER;
+		    return(true);
+		}
+	    }
+	});
+    *value = s;
+    return updated;
+}
+
+static bool rmin(SEXP sx, double *value, bool narm)
+{
+    double s = 0.0; /* -Wall */
+    bool updated = false;
+
+    /* s = R_PosInf; */
+    ITERATE_BY_REGION(sx, x, i, nbatch, double, REAL, {
+	    for (R_xlen_t k = 0; k &lt; nbatch; k++) {
+		if (ISNAN(x[k])) {/* Na(N) */
+		    if (!narm) {
+			if(!ISNA(s)) s = x[k]; /* so any NA trumps all NaNs */
+			if(!updated) updated = true;
+		    }
+		}
+		else if (!updated || x[k] &lt; s) { /* Never true if s is NA/NaN */
+		    s = x[k];
+		    if(!updated) updated = true;
+		}
+	    }
+	});
+    *value = s;
+    return updated;
+}
+
+static bool smin(SEXP x, SEXP *value, bool narm)
+{
+    SEXP s = NA_STRING; /* -Wall */
+    bool updated = false;
+    const void *vmax = vmaxget(); // precautionary for Scollate
+
+    for (R_xlen_t i = 0; i &lt; XLENGTH(x); i++) {
+	if (STRING_ELT(x, i) != NA_STRING) {
+	    if (!updated ||
+		(s != STRING_ELT(x, i) &amp;&amp; Scollate(s, STRING_ELT(x, i)) &gt; 0)) {
+		s = STRING_ELT(x, i);
+		if(!updated) updated = true;
+	    }
+	}
+	else if (!narm) {
+	    *value = NA_STRING;
+	    return(true);
+	}
+    }
+    *value = s;
+
+    vmaxset(vmax);
+    return updated;
+}
+
+static bool imax(SEXP sx, int *value, bool narm)
+{
+    int s = 0 /* -Wall */;
+    bool updated = false;
+
+    ITERATE_BY_REGION(sx, x, i, nbatch, int, INTEGER, {
+	    for (R_xlen_t k = 0; k &lt; nbatch; k++) {
+		if (x[k] != NA_INTEGER) {
+		    if (!updated || s &lt; x[k]) {
+			s = x[k];
+			if(!updated) updated = true;
+		    }
+		} else if (!narm) {
+		    *value = NA_INTEGER;
+		    return(true);
+		}
+	    }
+	});
+    *value = s;
+    return updated;
+}
+
+static bool rmax(SEXP sx, double *value, bool narm)
+{
+    double s = 0.0 /* -Wall */;
+    bool updated = false;
+
+    ITERATE_BY_REGION(sx, x, iii, nbatch, double, REAL, {
+	    for (R_xlen_t k = 0; k &lt; nbatch; k++) {
+		if (ISNAN(x[k])) {/* Na(N) */
+		    if (!narm) {
+			if(!ISNA(s)) s = x[k]; /* so any NA trumps all NaNs */
+			if(!updated) updated = true;
+		    }
+		}
+		else if (!updated || x[k] &gt; s) { /* Never true if s is NA/NaN */
+		    s = x[k];
+		    if(!updated) updated = true;
+		}
+	    }
+	});
+    *value = s;
+    return updated;
+}
+
+static bool smax(SEXP x, SEXP *value, bool narm)
+{
+			ra[i] = tmp;
+		} else {
+		    if( (narm &amp;&amp; ra[i] == NA_INTEGER) ||
+			(ra[i] != NA_INTEGER &amp;&amp; tmp != NA_INTEGER
+			 &amp;&amp; tmp &lt; ra[i]) ||
+			(!narm &amp;&amp; tmp == NA_INTEGER) )
+			ra[i] = tmp;
+		}
+	    });
+	    UNPROTECT(1);
+	}
+    }
+	break;
+    case REALSXP:
+    {
+	double *r, *ra = REAL(ans), tmp;
+	PROTECT(x = coerceVector(CAR(args), anstype));
+	r = REAL(x);
+	n = XLENGTH(x);
+	xcopyRealWithRecycle(ra, r, 0, len, n);
+	UNPROTECT(1);
+	for(a = CDR(args); a != R_NilValue; a = CDR(a)) {
+	    PROTECT(x = coerceVector(CAR(a), anstype));
+	    n = XLENGTH(x);
+	    r = REAL(x);
+	    MOD_ITERATE1(len, n, i, i1, {
+		tmp = r[i1];
+		if(PRIMVAL(op) == 1) {
+		    if( (narm &amp;&amp; ISNAN(ra[i])) ||
+			(!ISNAN(ra[i]) &amp;&amp; !ISNAN(tmp) &amp;&amp; tmp &gt; ra[i]) ||
+			(!narm &amp;&amp; ISNAN(tmp)) )
+			ra[i] = tmp;
+		} else {
+		    if( (narm &amp;&amp; ISNAN(ra[i])) ||
+			(!ISNAN(ra[i]) &amp;&amp; !ISNAN(tmp) &amp;&amp; tmp &lt; ra[i]) ||
+			(!narm &amp;&amp; ISNAN(tmp)) )
+			ra[i] = tmp;
+		}
+	    });
+	    UNPROTECT(1);
+	}
+    }
+	break;
+    case STRSXP:
+    {
+	PROTECT(x = coerceVector(CAR(args), anstype));
+	n = XLENGTH(x);
+	xcopyStringWithRecycle(ans, x, 0, len, n);
+	UNPROTECT(1);
+	for(a = CDR(args); a != R_NilValue; a = CDR(a)) {
+	    SEXP tmp, t2;
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; grep -rn &quot;rray_max\b\|rray_max &lt;-\|rray_min &lt;-&quot; R | head; grep …</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; grep -rn &quot;rray_max\b\|rray_max &lt;-\|rray_min &lt;-&quot; R | head; grep -rln &quot;rray_max&quot; tests | head; sed -n 1,80p R/max.R 2&gt;/dev/null | head -80</pre><pre class="output">R/reducers.R:108:#' `rray_max()` computes the maximum along a given axis or axes. The
+R/reducers.R:122:#' rray_max(x)
+R/reducers.R:124:#' rray_max(x, 1)
+R/reducers.R:126:#' rray_max(x, 2)
+R/reducers.R:130:rray_max &lt;- function(x, axes = NULL) {
+R/reducers.R:158:rray_min &lt;- function(x, axes = NULL) {
+tests/testthat/test-reducers.R
+tests/testthat/test-max-pos.R
+tests/testthat/test-extremum.R
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; sed -n 100,170p R/reducers.R; grep -n &quot;max\|min&quot; tests/testthat…</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; sed -n 100,170p R/reducers.R; grep -n &quot;max\|min&quot; tests/testthat/test-reducers.R | head -40</pre><pre class="output">#' @export
+#' @family reducers
+rray_mean &lt;- function(x, axes = NULL) {
+  rray_reducer_base(rray__mean, x, axes)
+}
+
+#' Calculate the maximum along an axis
+#'
+#' `rray_max()` computes the maximum along a given axis or axes. The
+#' dimensionality of `x` is retained in the result.
+#'
+#' @inheritParams rray_sum
+#'
+#' @return
+#'
+#' The result of the reduction with the same shape as `x`, except
+#' along `axes`, which have been reduced to size 1.
+#'
+#' @examples
+#'
+#' x &lt;- rray(1:10, c(5, 2))
+#'
+#' rray_max(x)
+#'
+#' rray_max(x, 1)
+#'
+#' rray_max(x, 2)
+#'
+#' @export
+#' @family reducers
+rray_max &lt;- function(x, axes = NULL) {
+  rray_reducer_base(rray__max, x, axes)
+}
+
+#' Calculate the minimum along an axis
+#'
+#' `rray_min()` computes the minimum along a given axis or axes. The
+#' dimensionality of `x` is retained in the result.
+#'
+#' @inheritParams rray_sum
+#'
+#' @return
+#'
+#' The result of the reduction with the same shape as `x`, except
+#' along `axes`, which have been reduced to size 1.
+#'
+#' @examples
+#'
+#' x &lt;- rray(1:10, c(5, 2))
+#'
+#' rray_min(x)
+#'
+#' rray_min(x, 1)
+#'
+#' rray_min(x, 2)
+#'
+#' @export
+#' @family reducers
+rray_min &lt;- function(x, axes = NULL) {
+  rray_reducer_base(rray__min, x, axes)
+}
+
+# ------------------------------------------------------------------------------
+
+rray_reducer_base &lt;- function(f, x, axes) {
+  axes &lt;- vec_cast(axes, integer())
+  validate_axes(axes, x)
+
+  out &lt;- f(x, as_cpp_idx(axes))
+
+  vec_cast_container(out, x)
+312:# amax
+314:context(&quot;test-reducer-amax&quot;)
+319:    as.vector(rray_max(y, 1)),
+320:    vapply(seq_len(ncol(y)), function(i) max(as.vector(y[,i])), numeric(1))
+324:    as.vector(rray_max(y, 2)),
+325:    vapply(seq_len(nrow(y)), function(i) max(as.vector(y[i,])), numeric(1))
+331:    as.vector(rray_max(y)),
+332:    max(vec_data(y))
+336:    rray_dim_n(rray_max(y)),
+342:  expect_equal(rray_dim(rray_max(y, 1)), c(1, 2))
+343:  expect_equal(rray_dim(rray_max(y, 2)), c(5, 1))
+351:  expect_equal(rray_col_names(rray_max(yy, 1)), c(&quot;c1&quot;, &quot;c2&quot;))
+352:  expect_equal(rray_row_names(rray_max(yy, 2)), letters[1:5])
+356:  out &lt;- rray_max(rray(1, c(2, 3, 4)), c(1,2))
+365:  ..1D &lt;- rray_max(x, 1)
+366:  ..2D &lt;- rray_max(x_mat, c(1, 2))
+371:  expect_equal(as.vector(..1D), max(vec_data(x)))
+372:  expect_equal(as.vector(..2D), max(vec_data(x)))
+384:  expect_is(rray_max(x_mat, 1), &quot;matrix&quot;)
+385:  expect_equal(storage.mode(rray_max(x_arr, 1)), &quot;integer&quot;)
+388:  expect_equal(rray_dim(rray_max(x_mat, 1)), c(1, 1))
+390:  expect_equal(rray_col_names(rray_max(x_mat_cnames, 1)), &quot;x&quot;)
+391:  expect_equal(rray_col_names(rray_max(x_mat_cnames, 2)), &quot;x&quot;)
+396:  expect_equal(rray_max(x), new_matrix(-Inf, c(1, 1)))
+397:  expect_equal(rray_max(x, c(1, 2)), new_matrix(-Inf, c(1, 1)))
+404:  expect_equal(rray_max(x, 1L), new_matrix(-Inf, c(1, 2)))
+407:  expect_equal(rray_max(x, 2L), new_matrix(numeric(), c(0, 1)))
+411:# amin
+413:context(&quot;test-reducer-amin&quot;)
+418:    as.vector(rray_min(y, 1)),
+419:    vapply(seq_len(ncol(y)), function(i) min(as.vector(y[,i])), numeric(1))
+423:    as.vector(rray_min(y, 2)),
+424:    vapply(seq_len(nrow(y)), function(i) min(as.vector(y[i,])), numeric(1))
+430:    as.vector(rray_min(y)),
+431:    min(vec_data(y))
+435:    rray_dim_n(rray_min(y)),
+441:  expect_equal(rray_dim(rray_min(y, 1)), c(1, 2))
+442:  expect_equal(rray_dim(rray_min(y, 2)), c(5, 1))
+450:  expect_equal(rray_col_names(rray_min(yy, 1)), c(&quot;c1&quot;, &quot;c2&quot;))
+451:  expect_equal(rray_row_names(rray_min(yy, 2)), letters[1:5])
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; sed -n 392,410p tests/testthat/test-reducers.R; cd ~…</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; sed -n 392,410p tests/testthat/test-reducers.R; cd ~/files/r/packages/rray4 &amp;&amp; cat tests/testthat/test-extremum.R | head -80; grep -n &quot;rray_max\|rray_min\b&quot; -r R src plans | grep -v &quot;max_pos\|min_pos&quot; | head</pre><pre class="output">})
+
+test_that(&quot;can reduce over multiple axes if one is length 0&quot;, {
+  x &lt;- matrix(numeric(), 0, 2)
+  expect_equal(rray_max(x), new_matrix(-Inf, c(1, 1)))
+  expect_equal(rray_max(x, c(1, 2)), new_matrix(-Inf, c(1, 1)))
+})
+
+test_that(&quot;reducing with length 0 axis produces the correct result dim&quot;, {
+  x &lt;- matrix(numeric(), 0, 2)
+
+  # (0, 2) -&gt; (1, 2) b/c reducers always &quot;reduce&quot; `axis` to length 1
+  expect_equal(rray_max(x, 1L), new_matrix(-Inf, c(1, 2)))
+
+  # (0, 2) -&gt; (0, 1)
+  expect_equal(rray_max(x, 2L), new_matrix(numeric(), c(0, 1)))
+})
+
+# ------------------------------------------------------------------------------
+test_that(&quot;computes parallel maxima and minima&quot;, {
+  x &lt;- array(1:6, c(3L, 2L))
+  y &lt;- array(6:1, c(3L, 2L))
+
+  expect_identical(rray_pmax(x, y), array(c(6L, 5L, 4L, 4L, 5L, 6L), dim(x)))
+  expect_identical(rray_pmin(x, y), array(c(1L, 2L, 3L, 3L, 2L, 1L), dim(x)))
+})
+
+test_that(&quot;broadcasts both inputs to common dimensions&quot;, {
+  x &lt;- array(1:3, c(3L, 1L))
+  y &lt;- array(c(2L, 4L), c(1L, 2L))
+
+  expect_identical(
+    rray_pmax(x, y),
+    array(c(2L, 2L, 3L, 4L, 4L, 4L), c(3L, 2L))
+  )
+  expect_identical(
+    rray_pmin(x, y),
+    array(c(1L, 2L, 2L, 1L, 2L, 3L), c(3L, 2L))
+  )
+})
+
+test_that(&quot;plain vectors are normalized to 1D arrays&quot;, {
+  expect_identical(rray_pmax(1:3, 2L), array(c(2L, 2L, 3L), 3L))
+  expect_identical(rray_pmin(1:3, 2L), array(c(1L, 2L, 2L), 3L))
+})
+
+test_that(&quot;the output type of every pair of native types&quot;, {
+  expect_snapshot(native_ptype_matrix(rray_pmax, c(&quot;x&quot;, &quot;y&quot;)))
+  expect_snapshot(native_ptype_matrix(rray_pmin, c(&quot;x&quot;, &quot;y&quot;)))
+})
+
+test_that(&quot;logical inputs stay logical&quot;, {
+  expect_identical(rray_pmax(TRUE, FALSE), array(TRUE, 1L))
+  expect_identical(rray_pmin(TRUE, FALSE), array(FALSE, 1L))
+})
+
+test_that(&quot;integer wins over logical, in either position&quot;, {
+  expect_identical(rray_pmax(TRUE, 2L), array(2L, 1L))
+  expect_identical(rray_pmax(2L, TRUE), array(2L, 1L))
+  expect_identical(rray_pmin(TRUE, 2L), array(1L, 1L))
+  expect_identical(rray_pmin(2L, TRUE), array(1L, 1L))
+})
+
+test_that(&quot;double wins over logical and integer, in either position&quot;, {
+  expect_identical(rray_pmax(TRUE, 2.5), array(2.5, 1L))
+  expect_identical(rray_pmax(2.5, TRUE), array(2.5, 1L))
+  expect_identical(rray_pmin(1L, 2.5), array(1, 1L))
+  expect_identical(rray_pmin(2.5, 1L), array(1, 1L))
+})
+
+test_that(&quot;native extrema match base R across special values&quot;, {
+  integer_values &lt;- c(NA_integer_, -1L, 0L, 1L)
+  double_values &lt;- c(NA_real_, NaN, -Inf, -1, -0, 0, 1, Inf)
+
+  make_case &lt;- function(x_values, y_values = x_values, cast = identity) {
+    list(
+      x = rep(x_values, each = length(y_values)),
+      y = rep(y_values, times = length(x_values)),
+      cast = cast
+    )
+  }
+
+  cases &lt;- list(
+    logical = make_case(c(NA, FALSE, TRUE), cast = as.logical),
+    integer = make_case(integer_values),
+    double = make_case(double_values),
+    integer_double = make_case(integer_values, double_values),
+    double_integer = make_case(double_values, integer_values)
+  )
+
+  for (case in cases) {
+    for (na_rm in c(FALSE, TRUE)) {
+      expect_identical(
+        as.vector(rray_pmax(case$x, case$y, na_rm = na_rm)),
+        case$cast(pmax(case$x, case$y, na.rm = na_rm))
+      )
+      expect_identical(
+        as.vector(rray_pmin(case$x, case$y, na_rm = na_rm)),
+        case$cast(pmin(case$x, case$y, na.rm = na_rm))
+plans/implementation.md:95:parameter list, and the loop is written once. `rray_max()` and
+plans/implementation.md:96:`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s
+plans/implementation.md:923:| `rray_max(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |
+plans/implementation.md:924:| `rray_min(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |
+plans/implementation.md:935:`rray_max()` and `rray_min()` share `rray_sum()`'s</pre></details>
+<p>I've read the pmax/pmin and reducer code plus R's own <code>max()</code> and <code>pmax()</code> sources. Four questions before I start:</p>
+
+<details class="tool"><summary>Question: What should an empty reduction (or an all-missing one with na_rm = TRUE) return? Base R r…</summary>
+<p>What should an empty reduction (or an all-missing one with na_rm = TRUE) return? Base R returns -Inf/Inf as a double with a warning, which breaks the preserved type for integers. The shared pmax/pmin cores need a starting value that is not NA, so an integer needs a real number here.</p>
+<ul>
+<li>Extreme int (Recommended)</li>
+<li>Error on empty int</li>
+</ul>
+<p>Sharing the pmax/pmin double cores means <code>rray_max(c(NA, NaN), 1)</code> returns NaN (the last missing value wins, like pmax() and Reduce(pmax, ...)). Base max() returns NA, since NA beats NaN there, and rray_sum() follows base. Which do you want?</p>
+<ul>
+<li>Share, last wins (Recommended)</li>
+<li>Match base max()</li>
+</ul>
+<p>The shared scalar helpers move from src/extremum.c into src/extremum.h (like rray_and_lgl_one() in src/logical.h). Should I rename them to match logical.h's naming?</p>
+<ul>
+<li>Rename to _na_rm (Recommended)</li>
+<li>Keep current names</li>
+</ul>
+<p>Error wording for unsupported types (complex, character, raw, list) via stop_unsupported_reduce()?</p>
+<ul>
+<li>maximum / minimum (Recommended)</li>
+<li>max / min</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;What should an empty reduction (or an all-missing one with na_rm = TRUE) return? Base R returns -Inf/Inf as a double with a warning, which breaks the preserved type for integers. The shared pmax/pmin cores need a starting value that is not NA, so an integer needs a real number here.&quot;=&quot;Extreme int (Recommended)&quot;, &quot;Sharing the pmax/pmin double cores means `rray_max(c(NA, NaN), 1)` returns NaN (the last missing value wins, like pmax() and Reduce(pmax, ...)). Base max() returns NA, since NA beats NaN there, and rray_sum() follows base. Which do you want?&quot;=&quot;Share, last wins (Recommended)&quot;, &quot;The shared scalar helpers move from src/extremum.c into src/extremum.h (like rray_and_lgl_one() in src/logical.h). Should I rename them to match logical.h's naming?&quot;=&quot;Rename to _na_rm (Recommended)&quot;, &quot;Error wording for unsupported types (complex, character, raw, list) via stop_unsupported_reduce()?&quot;=&quot;maximum / minimum (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<p>Answers noted. Creating the branch and looking at the remaining pieces (init.c, the reduce-logical tests, header includes).</p>
+
+<details class="tool"><summary>Bash: git checkout -b feature/min-max &amp;&amp; sed -n 190,262p src/init.c &amp;&amp; sed -n 340,365p src/init.c &amp;…</summary>
+<pre>git checkout -b feature/min-max &amp;&amp; sed -n 190,262p src/init.c &amp;&amp; sed -n 340,365p src/init.c &amp;&amp; cat src/reduce-sum.h &amp;&amp; cat tests/testthat/test-reduce-logical.R &amp;&amp; grep -rn &quot;R_NegInf\|R_PosInf\|r_globals.inf&quot; src --include=*.c --include=*.h | grep -v rlang/ | head</pre><pre class="output">Switched to a new branch 'feature/min-max'
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_move_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_to,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_sum(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_prod(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_mean(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_all(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_any(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_ptype(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_ptype2(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+extern r_obj* ffi_rray_ptype_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_ptype,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_cast(r_obj* ffi_x, r_obj* ffi_to, r_obj* ffi_frame);
+extern r_obj* ffi_rray_cast_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_to,
+  r_obj* ffi_frame
+);
+
+extern r_obj* ffi_rray_add(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+extern r_obj* ffi_rray_divide(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+extern r_obj* ffi_rray_exponentiate(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_multiply(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+extern r_obj* ffi_rray_subtract(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+extern r_obj* ffi_rray_pmax(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_pmin(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+  {&quot;ffi_rray_roll_each&quot;, (DL_FUNC) &amp;ffi_rray_roll_each, 4},
+  {&quot;ffi_rray_reverse&quot;, (DL_FUNC) &amp;ffi_rray_reverse, 3},
+  {&quot;ffi_rray_remove_axes&quot;, (DL_FUNC) &amp;ffi_rray_remove_axes, 3},
+  {&quot;ffi_rray_insert_axes&quot;, (DL_FUNC) &amp;ffi_rray_insert_axes, 3},
+  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+  {&quot;ffi_rray_move_axes&quot;, (DL_FUNC) &amp;ffi_rray_move_axes, 4},
+  {&quot;ffi_rray_sum&quot;, (DL_FUNC) &amp;ffi_rray_sum, 4},
+  {&quot;ffi_rray_prod&quot;, (DL_FUNC) &amp;ffi_rray_prod, 4},
+  {&quot;ffi_rray_mean&quot;, (DL_FUNC) &amp;ffi_rray_mean, 4},
+  {&quot;ffi_rray_all&quot;, (DL_FUNC) &amp;ffi_rray_all, 4},
+  {&quot;ffi_rray_any&quot;, (DL_FUNC) &amp;ffi_rray_any, 4},
+  {&quot;ffi_rray_ptype&quot;, (DL_FUNC) &amp;ffi_rray_ptype, 2},
+  {&quot;ffi_rray_ptype2&quot;, (DL_FUNC) &amp;ffi_rray_ptype2, 3},
+  {&quot;ffi_rray_ptype_common&quot;, (DL_FUNC) &amp;ffi_rray_ptype_common, 3},
+  {&quot;ffi_rray_cast&quot;, (DL_FUNC) &amp;ffi_rray_cast, 3},
+  {&quot;ffi_rray_cast_common&quot;, (DL_FUNC) &amp;ffi_rray_cast_common, 3},
+  {&quot;ffi_rray_add&quot;, (DL_FUNC) &amp;ffi_rray_add, 3},
+  {&quot;ffi_rray_divide&quot;, (DL_FUNC) &amp;ffi_rray_divide, 3},
+  {&quot;ffi_rray_exponentiate&quot;, (DL_FUNC) &amp;ffi_rray_exponentiate, 3},
+  {&quot;ffi_rray_multiply&quot;, (DL_FUNC) &amp;ffi_rray_multiply, 3},
+  {&quot;ffi_rray_subtract&quot;, (DL_FUNC) &amp;ffi_rray_subtract, 3},
+  {&quot;ffi_rray_pmax&quot;, (DL_FUNC) &amp;ffi_rray_pmax, 4},
+  {&quot;ffi_rray_pmin&quot;, (DL_FUNC) &amp;ffi_rray_pmin, 4},
+  {&quot;ffi_rray_equal&quot;, (DL_FUNC) &amp;ffi_rray_equal, 3},
+  {&quot;ffi_rray_not_equal&quot;, (DL_FUNC) &amp;ffi_rray_not_equal, 3},
+  {&quot;ffi_rray_greater_than&quot;, (DL_FUNC) &amp;ffi_rray_greater_than, 3},
+#ifndef RRAY_REDUCE_SUM_H
+#define RRAY_REDUCE_SUM_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_sum(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+test_that(&quot;can reduce along axis 1&quot;, {
+  x &lt;- array(c(TRUE, TRUE, FALSE, TRUE), c(2L, 2L))
+  expect_identical(as.vector(rray_all(x, 1L)), c(TRUE, FALSE))
+  expect_identical(as.vector(rray_any(x, 1L)), c(TRUE, TRUE))
+})
+
+test_that(&quot;can reduce along axis 2&quot;, {
+  x &lt;- array(c(TRUE, TRUE, FALSE, TRUE), c(2L, 2L))
+  expect_identical(as.vector(rray_all(x, 2L)), c(FALSE, TRUE))
+  expect_identical(as.vector(rray_any(x, 2L)), c(TRUE, TRUE))
+})
+
+test_that(&quot;reduced axes become size 1&quot;, {
+  x &lt;- array(TRUE, c(5L, 2L))
+  expect_identical(rray_dimensions(rray_all(x, 1L)), c(1L, 2L))
+  expect_identical(rray_dimensions(rray_any(x, 2L)), c(5L, 1L))
+})
+
+test_that(&quot;can reduce over all axes&quot;, {
+  x &lt;- array(c(TRUE, FALSE, TRUE, TRUE), c(2L, 2L))
+
+  out &lt;- rray_all(x, c(1L, 2L))
+  expect_identical(as.vector(out), FALSE)
+  expect_identical(rray_dimensions(out), c(1L, 1L))
+
+  out &lt;- rray_any(x, c(1L, 2L))
+  expect_identical(as.vector(out), TRUE)
+  expect_identical(rray_dimensions(out), c(1L, 1L))
+})
+
+test_that(&quot;reducing over no axes returns the input unchanged&quot;, {
+  x &lt;- array(c(TRUE, FALSE, NA, TRUE), c(2L, 2L))
+  expect_identical(rray_all(x, integer()), x)
+  expect_identical(rray_any(x, integer()), x)
+})
+
+test_that(&quot;can reduce axis 3&quot;, {
+  x &lt;- array(c(TRUE, FALSE), c(2L, 3L, 4L))
+  expect_identical(rray_dimensions(rray_all(x, 3L)), c(2L, 3L, 1L))
+  expect_identical(as.vector(rray_all(x, 3L)), rep(c(TRUE, FALSE), 3L))
+  expect_identical(as.vector(rray_any(x, 3L)), rep(c(TRUE, FALSE), 3L))
+})
+
+test_that(&quot;coalesces reduction axes&quot;, {
+  x &lt;- array(rep(c(TRUE, FALSE, NA), 8L), c(1L, 3L, 2L, 4L))
+
+  expected &lt;- function(fn, axes) {
+    dimensions &lt;- dim(x)
+    dimensions[axes] &lt;- 1L
+    kept_axes &lt;- setdiff(seq_along(dimensions), axes)
+
+    values &lt;- if (length(kept_axes)) {
+      apply(x, kept_axes, fn)
+    } else {
+      fn(x)
+    }
+
+    array(values, dimensions)
+  }
+
+  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)
+
+  for (axis in axes) {
+    expect_identical(rray_all(x, axis), expected(all, axis))
+    expect_identical(rray_any(x, axis), expected(any, axis))
+  }
+})
+
+test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+  x &lt;- array(TRUE, c(5L, 2L), dimnames = list(letters[1:5], c(&quot;c1&quot;, &quot;c2&quot;)))
+  expect_identical(dimnames(rray_all(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+  expect_identical(dimnames(rray_any(x, 2L)), list(letters[1:5], NULL))
+})
+
+test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+  x &lt;- array(TRUE, c(5L, 2L), dimnames = list(letters[1:5], NULL))
+  expect_null(dimnames(rray_all(x, 1L)))
+  expect_null(dimnames(rray_any(x, 1L)))
+})
+
+test_that(&quot;output type is always logical&quot;, {
+  expect_identical(storage.mode(rray_all(array(TRUE), 1L)), &quot;logical&quot;)
+  expect_identical(storage.mode(rray_any(array(TRUE), 1L)), &quot;logical&quot;)
+})</pre><p class="cut">122 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;NegInf\|PosInf\|INFINITY\|HUGE_VAL&quot; src/*.c src/*.h | head; grep -n &quot;inf\b\|Inf&quot; sr…</summary>
+<pre>grep -rn &quot;NegInf\|PosInf\|INFINITY\|HUGE_VAL&quot; src/*.c src/*.h | head; grep -n &quot;inf\b\|Inf&quot; src/rlang/globals.h src/rlang/*.h | head</pre><pre class="output">src/subscript.c:244:    .min = INFINITY,
+src/subscript.c:245:    .max = -INFINITY,
+src/subscript.c:272:    .min = INFINITY,
+src/subscript.c:273:    .max = -INFINITY,</pre></details>
+<p>Now the refactor: rename the scalar helpers and move them into <code>src/extremum.h</code>.</p>
+
+<details class="tool tool-error"><summary>Bash: grep -n &quot;include&quot; src/subscript.c | head; for f in src/extremum.c src/decl/extremum-decl.h; d…</summary>
+<pre>grep -n &quot;include&quot; src/subscript.c | head; for f in src/extremum.c src/decl/extremum-decl.h; do sed -i '' -E 's/(rray_p(max|min)_(int|dbl)_one)_propagate_na/\1/g; s/(rray_p(max|min)_(int|dbl)_one)_remove_na/\1_na_rm/g; s/ONE_PROPAGATE_NA/ONE/g; s/ONE_REMOVE_NA/ONE_NA_RM/g' $f; done; grep -n &quot;propagate\|remove_na\|REMOVE\|PROPAGATE&quot; src/extremum.c src/decl/extremum-decl.h; grep -n &quot;ONE&quot; src/extremum.c | head; grep -n &quot;#undef RRAY_EXTREMUM&quot; src/extremum.c</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a sed in-place edit. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/extremum.c</summary>
+<pre class="output">300	  OUT_DEREF,                                                                   \
+301	  ONE_PROPAGATE_NA,                                                            \
+302	  ONE_REMOVE_NA                                                                \
+303	)                                                                              \
+304	  if (na_rm) {                                                                 \
+305	    RRAY_BINARY(                                                               \
+306	      X_CTYPE,                                                                 \
+307	      X_CONST_DEREF,                                                           \
+308	      X_CAST,                                                                  \
+309	      Y_CTYPE,                                                                 \
+310	      Y_CONST_DEREF,                                                           \
+311	      Y_CAST,                                                                  \
+312	      OUT_RTYPE,                                                               \
+313	      OUT_CTYPE,                                                               \
+314	      OUT_DEREF,                                                               \
+315	      ONE_REMOVE_NA,                                                           \
+316	      RRAY_BINARY_NO_ARGS                                                      \
+317	    );                                                                         \
+318	  } else {                                                                     \
+319	    RRAY_BINARY(                                                               \
+320	      X_CTYPE,                                                                 \
+321	      X_CONST_DEREF,                                                           \
+322	      X_CAST,                                                                  \
+323	      Y_CTYPE,                                                                 \
+324	      Y_CONST_DEREF,                                                           \
+325	      Y_CAST,                                                                  \
+326	      OUT_RTYPE,                                                               \
+327	      OUT_CTYPE,                                                               \
+328	      OUT_DEREF,                                                               \
+329	      ONE_PROPAGATE_NA,                                                        \
+330	      RRAY_BINARY_NO_ARGS                                                      \
+331	    );                                                                         \
+332	  }
+333	
+334	static r_obj* rray_pmax_lgl_lgl(
+335	  r_obj* x,
+336	  r_obj* y,
+337	  const struct rray_strided_iterator2_plan* plan,
+338	  bool na_rm,
+339	  struct r_lazy error_call
+340	) {
+341	  RRAY_EXTREMUM(
+342	    int,
+343	    r_lgl_cbegin,
+344	    rray_cast_int_to_int_one,
+345	    int,
+346	    r_lgl_cbegin,
+347	    rray_cast_int_to_int_one,
+348	    R_TYPE_logical,
+349	    int,
+350	    r_lgl_begin,
+351	    rray_pmax_int_one_propagate_na,
+352	    rray_pmax_int_one_remove_na
+353	  );
+354	}
+355	
+356	static r_obj* rray_pmax_lgl_int(
+357	  r_obj* x,
+358	  r_obj* y,
+359	  const struct rray_strided_iterator2_plan* plan,</pre></details>
+<details class="tool"><summary>Read src/decl/extremum-decl.h</summary>
+<pre class="output">150	static r_obj* rray_pmin_dbl_dbl(
+151	  r_obj* x,
+152	  r_obj* y,
+153	  const struct rray_strided_iterator2_plan* plan,
+154	  bool na_rm,
+155	  struct r_lazy error_call
+156	);
+157	
+158	static inline int rray_pmax_int_one_propagate_na(int x, int y);
+159	static inline int rray_pmax_int_one_remove_na(int x, int y);
+160	static inline double rray_pmax_dbl_one_propagate_na(double x, double y);
+161	static inline double rray_pmax_dbl_one_remove_na(double x, double y);
+162	static inline int rray_pmin_int_one_propagate_na(int x, int y);
+163	static inline int rray_pmin_int_one_remove_na(int x, int y);
+164	static inline double rray_pmin_dbl_one_propagate_na(double x, double y);
+165	static inline double rray_pmin_dbl_one_remove_na(double x, double y);
+166	</pre></details>
+<p>Remove the helper declarations from the decl header (they'll be defined in <code>src/extremum.h</code>):</p>
+
+<details class="tool"><summary>Edit src/decl/extremum-decl.h</summary>
+<pre class="diff"><span class="del">-  struct r_lazy error_call</span>
+<span class="del">-);</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_pmax_int_one_propagate_na(int x, int y);</span>
+<span class="del">-static inline int rray_pmax_int_one_remove_na(int x, int y);</span>
+<span class="del">-static inline double rray_pmax_dbl_one_propagate_na(double x, double y);</span>
+<span class="del">-static inline double rray_pmax_dbl_one_remove_na(double x, double y);</span>
+<span class="del">-static inline int rray_pmin_int_one_propagate_na(int x, int y);</span>
+<span class="del">-static inline int rray_pmin_int_one_remove_na(int x, int y);</span>
+<span class="del">-static inline double rray_pmin_dbl_one_propagate_na(double x, double y);</span>
+<span class="del">-static inline double rray_pmin_dbl_one_remove_na(double x, double y);</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/extremum-decl.h has been updated successfully.</pre></details>
+<p>Decl-header diagnostics are expected (no includes, by design). Now rename in <code>src/extremum.c</code>:</p>
+
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-  ONE_PROPAGATE_NA,                                                            \</span>
+<span class="del">-  ONE_REMOVE_NA                                                                \</span>
+<span class="del">-)                                                                              \</span>
+<span class="ins">+  ONE,                                                                         \</span>
+<span class="ins">+  ONE_NA_RM                                                                    \</span>
+<span class="ins">+)                                                                              \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-      ONE_REMOVE_NA,                                                           \</span>
+<span class="ins">+      ONE_NA_RM,                                                               \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-      ONE_PROPAGATE_NA,                                                        \</span>
+<span class="ins">+      ONE,                                                                     \</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmax_int_one_propagate_na</span>
+<span class="ins">+rray_pmax_int_one</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmax_int_one_remove_na</span>
+<span class="ins">+rray_pmax_int_one_na_rm</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmax_dbl_one_propagate_na</span>
+<span class="ins">+rray_pmax_dbl_one</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmax_dbl_one_remove_na</span>
+<span class="ins">+rray_pmax_dbl_one_na_rm</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmin_int_one_propagate_na</span>
+<span class="ins">+rray_pmin_int_one</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmin_int_one_remove_na</span>
+<span class="ins">+rray_pmin_int_one_na_rm</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmin_dbl_one_propagate_na</span>
+<span class="ins">+rray_pmin_dbl_one</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-rray_pmin_dbl_one_remove_na</span>
+<span class="ins">+rray_pmin_dbl_one_na_rm</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated. All occurrences were successfully replaced.</pre></details>
+<p>Now cut the helper block out of <code>src/extremum.c</code> and put it in <code>src/extremum.h</code>.</p>
+
+<details class="tool"><summary>Bash: n=$(grep -n &quot;#undef RRAY_EXTREMUM&quot; src/extremum.c | cut -d: -f1); echo $n; wc -l src/extremum…</summary>
+<pre>n=$(grep -n &quot;#undef RRAY_EXTREMUM&quot; src/extremum.c | cut -d: -f1); echo $n; wc -l src/extremum.c; tail -n +$n src/extremum.c &gt; /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/74056202-042f-465d-9a66-eee9848a06f8/scratchpad/helpers.txt; cat /private/tmp/claude-502/-Users-davis-files-r-packages-rray4/74056202-042f-465d-9a66-eee9848a06f8/scratchpad/helpers.txt</pre><pre class="output">730
+     852 src/extremum.c
+#undef RRAY_EXTREMUM
+
+// Each of the &quot;one&quot; functions below is carefully tuned to maximize
+// the chance of the resulting loop being vectorized by the compiler.
+// Anecdotally tested on an M2 Mac, where the assembly was analyzed.
+
+// Bitwise `|` improves efficiency here
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `has_na = false`).
+// - `x = 1`, `y = NA`: returns `NA` (`out = 1`, `has_na = true`).
+// - `x = NA`, `y = 1`: returns `NA` (`out = 1`, `has_na = true`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, `has_na = true`).
+static inline int rray_pmax_int_one(int x, int y) {
+  const int out = x &lt; y ? y : x;
+  const int na = r_globals.na_int;
+  const bool has_na = (x == na) | (y == na);
+  return has_na ? na : out;
+}
+
+// Integer `NA` is `INT_MIN`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`).
+// - `x = 1`, `y = NA`: returns `1` (`out = 1`).
+// - `x = NA`, `y = 1`: returns `1` (`out = 1`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).
+static inline int rray_pmax_int_one_na_rm(int x, int y) {
+  return x &lt; y ? y : x;
+}
+
+// A C comparison involving a `NaN`/`NA_real_` is false, so `out` selects `x`.
+// `ISNAN(y)` propagates missing `y` and also ensures the second missing value
+// wins when both inputs are missing (matching R):
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(y) = false`).
+// - `x = 1`, `y = NaN`: returns `NaN` (`out = 1`, `ISNAN(y) = true`).
+// - `x = 1`, `y = NA_real_`: returns `NA_real_` (`out = 1`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = 1`: returns `NaN` (`out = NaN`, `ISNAN(y) = false`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `NA_real_` (`out = NA_real_`, `ISNAN(y) =
+// false`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(y) = true`).
+static inline double rray_pmax_dbl_one(double x, double y) {
+  const double out = x &lt; y ? y : x;
+  return ISNAN(y) ? y : out;
+}
+
+// A C comparison involving a `NaN`/`NA_real_` is false, so `out` selects `x`.
+// `ISNAN(x)` replaces `out` with `y` when `x` is missing but `y` is not and
+// when both inputs are missing (matching R):
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NaN`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NA_real_`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = NaN`, `y = 1`: returns `1` (`out = NaN`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `1` (`out = NA_real_`, `ISNAN(x) = true`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(x) = true`).
+static inline double rray_pmax_dbl_one_na_rm(double x, double y) {
+  const double out = x &lt; y ? y : x;
+  return ISNAN(x) ? y : out;
+}
+
+// Integer `NA` is `INT_MIN`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`).
+// - `x = 1`, `y = NA`: returns `NA` (`out = NA`).
+// - `x = NA`, `y = 1`: returns `NA` (`out = NA`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).
+static inline int rray_pmin_int_one(int x, int y) {
+  return x &gt; y ? y : x;
+}
+
+// A regular minimum selects `NA`, so each missing operand is replaced by the
+// other operand:
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, neither replacement applies).
+// - `x = 1`, `y = NA`: returns `1` (`out = NA`, replace `y` with `x`).
+// - `x = NA`, `y = 1`: returns `1` (`out = NA`, replace `x` with `y`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, both replacements are `NA`).
+static inline int rray_pmin_int_one_na_rm(int x, int y) {
+  const int na = r_globals.na_int;
+  int out = x &gt; y ? y : x;
+  out = y == na ? x : out;
+  out = x == na ? y : out;
+  return out;
+}
+
+// Same as `rray_pmax_dbl_one()`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(y) = false`).
+// - `x = 1`, `y = NaN`: returns `NaN` (`out = 1`, `ISNAN(y) = true`).
+// - `x = 1`, `y = NA_real_`: returns `NA_real_` (`out = 1`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = 1`: returns `NaN` (`out = NaN`, `ISNAN(y) = false`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `NA_real_` (`out = NA_real_`, `ISNAN(y) =
+// false`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(y) = true`).
+static inline double rray_pmin_dbl_one(double x, double y) {
+  const double out = x &gt; y ? y : x;
+  return ISNAN(y) ? y : out;
+}
+
+// Same as `rray_pmax_dbl_one_na_rm()`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NaN`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NA_real_`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = NaN`, `y = 1`: returns `1` (`out = NaN`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `1` (`out = NA_real_`, `ISNAN(x) = true`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(x) = true`).
+static inline double rray_pmin_dbl_one_na_rm(double x, double y) {
+  const double out = x &gt; y ? y : x;
+  return ISNAN(x) ? y : out;
+}</pre></details>
+<details class="tool"><summary>Write src/extremum.h</summary>
+<pre>#ifndef RRAY_EXTREMUM_H
+#define RRAY_EXTREMUM_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_pmax(
+  r_obj* x,
+  r_obj* y,
+  bool na_rm,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_pmin(
+  r_obj* x,
+  r_obj* y,
+  bool na_rm,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+// Each of the &quot;one&quot; functions below is carefully tuned to maximize
+// the chance of the resulting loop being vectorized by the compiler.
+// Anecdotally tested on an M2 Mac, where the assembly was analyzed.
+
+// Bitwise `|` improves efficiency here
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `has_na = false`).
+// - `x = 1`, `y = NA`: returns `NA` (`out = 1`, `has_na = true`).
+// - `x = NA`, `y = 1`: returns `NA` (`out = 1`, `has_na = true`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, `has_na = true`).
+static inline int rray_pmax_int_one(int x, int y) {
+  const int out = x &lt; y ? y : x;
+  const int na = r_globals.na_int;
+  const bool has_na = (x == na) | (y == na);
+  return has_na ? na : out;
+}
+
+// Integer `NA` is `INT_MIN`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`).
+// - `x = 1`, `y = NA`: returns `1` (`out = 1`).
+// - `x = NA`, `y = 1`: returns `1` (`out = 1`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).
+static inline int rray_pmax_int_one_na_rm(int x, int y) {
+  return x &lt; y ? y : x;
+}
+
+// A C comparison involving a `NaN`/`NA_real_` is false, so `out` selects `x`.
+// `ISNAN(y)` propagates missing `y` and also ensures the second missing value
+// wins when both inputs are missing (matching R):
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(y) = false`).
+// - `x = 1`, `y = NaN`: returns `NaN` (`out = 1`, `ISNAN(y) = true`).
+// - `x = 1`, `y = NA_real_`: returns `NA_real_` (`out = 1`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = 1`: returns `NaN` (`out = NaN`, `ISNAN(y) = false`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `NA_real_` (`out = NA_real_`, `ISNAN(y) =
+// false`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(y) = true`).
+static inline double rray_pmax_dbl_one(double x, double y) {
+  const double out = x &lt; y ? y : x;
+  return ISNAN(y) ? y : out;
+}
+
+// A C comparison involving a `NaN`/`NA_real_` is false, so `out` selects `x`.
+// `ISNAN(x)` replaces `out` with `y` when `x` is missing but `y` is not and
+// when both inputs are missing (matching R):
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NaN`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NA_real_`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = NaN`, `y = 1`: returns `1` (`out = NaN`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `1` (`out = NA_real_`, `ISNAN(x) = true`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(x) = true`).
+static inline double rray_pmax_dbl_one_na_rm(double x, double y) {
+  const double out = x &lt; y ? y : x;
+  return ISNAN(x) ? y : out;
+}
+
+// Integer `NA` is `INT_MIN`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`).
+// - `x = 1`, `y = NA`: returns `NA` (`out = NA`).
+// - `x = NA`, `y = 1`: returns `NA` (`out = NA`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).
+static inline int rray_pmin_int_one(int x, int y) {
+  return x &gt; y ? y : x;
+}
+
+// A regular minimum selects `NA`, so each missing operand is replaced by the
+// other operand:
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, neither replacement applies).
+// - `x = 1`, `y = NA`: returns `1` (`out = NA`, replace `y` with `x`).
+// - `x = NA`, `y = 1`: returns `1` (`out = NA`, replace `x` with `y`).
+// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, both replacements are `NA`).
+static inline int rray_pmin_int_one_na_rm(int x, int y) {
+  const int na = r_globals.na_int;
+  int out = x &gt; y ? y : x;
+  out = y == na ? x : out;
+  out = x == na ? y : out;
+  return out;
+}
+
+// Same as `rray_pmax_dbl_one()`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(y) = false`).
+// - `x = 1`, `y = NaN`: returns `NaN` (`out = 1`, `ISNAN(y) = true`).
+// - `x = 1`, `y = NA_real_`: returns `NA_real_` (`out = 1`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = 1`: returns `NaN` (`out = NaN`, `ISNAN(y) = false`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(y) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `NA_real_` (`out = NA_real_`, `ISNAN(y) =
+// false`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(y) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(y) = true`).
+static inline double rray_pmin_dbl_one(double x, double y) {
+  const double out = x &gt; y ? y : x;
+  return ISNAN(y) ? y : out;
+}
+
+// Same as `rray_pmax_dbl_one_na_rm()`
+// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NaN`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = 1`, `y = NA_real_`: returns `1` (`out = 1`, `ISNAN(x) = false`).
+// - `x = NaN`, `y = 1`: returns `1` (`out = NaN`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(x) = true`).
+// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = 1`: returns `1` (`out = NA_real_`, `ISNAN(x) = true`).
+// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(x) =
+// true`).
+// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(x) = true`).
+static inline double rray_pmin_dbl_one_na_rm(double x, double y) {
+  const double out = x &gt; y ? y : x;
+  return ISNAN(x) ? y : out;
+}
+
+#endif</pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Read src/extremum.c</summary>
+<pre class="output">726	    rray_pmin_dbl_one_na_rm
+727	  );
+728	}
+729	
+730	#undef RRAY_EXTREMUM
+731	
+732	// Each of the &quot;one&quot; functions below is carefully tuned to maximize
+733	// the chance of the resulting loop being vectorized by the compiler.
+734	// Anecdotally tested on an M2 Mac, where the assembly was analyzed.
+735	</pre></details>
+<details class="tool"><summary>Edit src/extremum.c</summary>
+<pre class="diff"><span class="del">-#undef RRAY_EXTREMUM</span>
+<span class="del">-</span>
+<span class="del">-// Each of the &quot;one&quot; functions below is carefully tuned to maximize</span>
+<span class="del">-// the chance of the resulting loop being vectorized by the compiler.</span>
+<span class="del">-// Anecdotally tested on an M2 Mac, where the assembly was analyzed.</span>
+<span class="del">-</span>
+<span class="del">-// Bitwise `|` improves efficiency here</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `has_na = false`).</span>
+<span class="del">-// - `x = 1`, `y = NA`: returns `NA` (`out = 1`, `has_na = true`).</span>
+<span class="del">-// - `x = NA`, `y = 1`: returns `NA` (`out = 1`, `has_na = true`).</span>
+<span class="del">-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, `has_na = true`).</span>
+<span class="del">-static inline int rray_pmax_int_one(int x, int y) {</span>
+<span class="del">-  const int out = x &lt; y ? y : x;</span>
+<span class="del">-  const int na = r_globals.na_int;</span>
+<span class="del">-  const bool has_na = (x == na) | (y == na);</span>
+<span class="del">-  return has_na ? na : out;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// Integer `NA` is `INT_MIN`</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`).</span>
+<span class="del">-// - `x = 1`, `y = NA`: returns `1` (`out = 1`).</span>
+<span class="del">-// - `x = NA`, `y = 1`: returns `1` (`out = 1`).</span>
+<span class="del">-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).</span>
+<span class="del">-static inline int rray_pmax_int_one_na_rm(int x, int y) {</span>
+<span class="del">-  return x &lt; y ? y : x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// A C comparison involving a `NaN`/`NA_real_` is false, so `out` selects `x`.</span>
+<span class="del">-// `ISNAN(y)` propagates missing `y` and also ensures the second missing value</span>
+<span class="del">-// wins when both inputs are missing (matching R):</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(y) = false`).</span>
+<span class="del">-// - `x = 1`, `y = NaN`: returns `NaN` (`out = 1`, `ISNAN(y) = true`).</span>
+<span class="del">-// - `x = 1`, `y = NA_real_`: returns `NA_real_` (`out = 1`, `ISNAN(y) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = 1`: returns `NaN` (`out = NaN`, `ISNAN(y) = false`).</span>
+<span class="del">-// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(y) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(y) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = 1`: returns `NA_real_` (`out = NA_real_`, `ISNAN(y) =</span>
+<span class="del">-// false`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(y) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(y) = true`).</span>
+<span class="del">-static inline double rray_pmax_dbl_one(double x, double y) {</span>
+<span class="del">-  const double out = x &lt; y ? y : x;</span>
+<span class="del">-  return ISNAN(y) ? y : out;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// A C comparison involving a `NaN`/`NA_real_` is false, so `out` selects `x`.</span>
+<span class="del">-// `ISNAN(x)` replaces `out` with `y` when `x` is missing but `y` is not and</span>
+<span class="del">-// when both inputs are missing (matching R):</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(x) = false`).</span>
+<span class="del">-// - `x = 1`, `y = NaN`: returns `1` (`out = 1`, `ISNAN(x) = false`).</span>
+<span class="del">-// - `x = 1`, `y = NA_real_`: returns `1` (`out = 1`, `ISNAN(x) = false`).</span>
+<span class="del">-// - `x = NaN`, `y = 1`: returns `1` (`out = NaN`, `ISNAN(x) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(x) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(x) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = 1`: returns `1` (`out = NA_real_`, `ISNAN(x) = true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(x) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(x) = true`).</span>
+<span class="del">-static inline double rray_pmax_dbl_one_na_rm(double x, double y) {</span>
+<span class="del">-  const double out = x &lt; y ? y : x;</span>
+<span class="del">-  return ISNAN(x) ? y : out;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// Integer `NA` is `INT_MIN`</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`).</span>
+<span class="del">-// - `x = 1`, `y = NA`: returns `NA` (`out = NA`).</span>
+<span class="del">-// - `x = NA`, `y = 1`: returns `NA` (`out = NA`).</span>
+<span class="del">-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).</span>
+<span class="del">-static inline int rray_pmin_int_one(int x, int y) {</span>
+<span class="del">-  return x &gt; y ? y : x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// A regular minimum selects `NA`, so each missing operand is replaced by the</span>
+<span class="del">-// other operand:</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, neither replacement applies).</span>
+<span class="del">-// - `x = 1`, `y = NA`: returns `1` (`out = NA`, replace `y` with `x`).</span>
+<span class="del">-// - `x = NA`, `y = 1`: returns `1` (`out = NA`, replace `x` with `y`).</span>
+<span class="del">-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, both replacements are `NA`).</span>
+<span class="del">-static inline int rray_pmin_int_one_na_rm(int x, int y) {</span>
+<span class="del">-  const int na = r_globals.na_int;</span>
+<span class="del">-  int out = x &gt; y ? y : x;</span>
+<span class="del">-  out = y == na ? x : out;</span>
+<span class="del">-  out = x == na ? y : out;</span>
+<span class="del">-  return out;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// Same as `rray_pmax_dbl_one()`</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(y) = false`).</span>
+<span class="del">-// - `x = 1`, `y = NaN`: returns `NaN` (`out = 1`, `ISNAN(y) = true`).</span>
+<span class="del">-// - `x = 1`, `y = NA_real_`: returns `NA_real_` (`out = 1`, `ISNAN(y) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = 1`: returns `NaN` (`out = NaN`, `ISNAN(y) = false`).</span>
+<span class="del">-// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(y) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(y) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = 1`: returns `NA_real_` (`out = NA_real_`, `ISNAN(y) =</span>
+<span class="del">-// false`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(y) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(y) = true`).</span>
+<span class="del">-static inline double rray_pmin_dbl_one(double x, double y) {</span>
+<span class="del">-  const double out = x &gt; y ? y : x;</span>
+<span class="del">-  return ISNAN(y) ? y : out;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-// Same as `rray_pmax_dbl_one_na_rm()`</span>
+<span class="del">-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `ISNAN(x) = false`).</span>
+<span class="del">-// - `x = 1`, `y = NaN`: returns `1` (`out = 1`, `ISNAN(x) = false`).</span>
+<span class="del">-// - `x = 1`, `y = NA_real_`: returns `1` (`out = 1`, `ISNAN(x) = false`).</span>
+<span class="del">-// - `x = NaN`, `y = 1`: returns `1` (`out = NaN`, `ISNAN(x) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = NaN`: returns `y` (`out = x`, `ISNAN(x) = true`).</span>
+<span class="del">-// - `x = NaN`, `y = NA_real_`: returns `NA_real_` (`out = NaN`, `ISNAN(x) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = 1`: returns `1` (`out = NA_real_`, `ISNAN(x) = true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NaN`: returns `NaN` (`out = NA_real_`, `ISNAN(x) =</span>
+<span class="del">-// true`).</span>
+<span class="del">-// - `x = NA_real_`, `y = NA_real_`: returns `y` (`out = x`, `ISNAN(x) = true`).</span>
+<span class="del">-static inline double rray_pmin_dbl_one_na_rm(double x, double y) {</span>
+<span class="del">-  const double out = x &gt; y ? y : x;</span>
+<span class="del">-  return ISNAN(x) ? y : out;</span>
+<span class="del">-}</span>
+<span class="ins">+#undef RRAY_EXTREMUM</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/extremum.c has been updated successfully.</pre></details>
+<p>Verify the moved helpers match the originals exactly (apart from the renames):</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/74056202-042f-465d-9a66-eee9848…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray4/74056202-042f-465d-9a66-eee9848a06f8/scratchpad; git show HEAD:src/extremum.c | sed -n '/^#undef RRAY_EXTREMUM/,$p' | tail -n +3 | sed -E 's/_propagate_na//g; s/_remove_na/_na_rm/g' &gt; $S/orig.txt; sed -n '/^\/\/ Each of the/,/^#endif/p' src/extremum.h | sed '$d' | sed '$d' &gt; $S/new.txt; diff $S/orig.txt $S/new.txt &amp;&amp; echo IDENTICAL; git diff --stat; grep -n &quot;include&quot; src/subscript.c | head -12; grep -rn &quot;stop_scalar_input&quot; src/*.h</pre><pre class="output">IDENTICAL
+ src/decl/extremum-decl.h |   9 ---
+ src/extremum.c           | 202 ++++++++++-------------------------------------
+ src/extremum.h           | 122 ++++++++++++++++++++++++++++
+ 3 files changed, 162 insertions(+), 171 deletions(-)
+1:#include &quot;subscript.h&quot;
+3:#include &lt;math.h&gt;
+5:#include &quot;decl/subscript-decl.h&quot;
+src/utils.h:39:r_no_return void stop_scalar_input(</pre></details>
+<p>Now the new <code>src/reduce-extremum.c</code>, following <code>src/reduce-logical.c</code>'s layout:</p>
+
+<details class="tool"><summary>Write src/reduce-extremum.c</summary>
+<pre>#include &quot;reduce-extremum.h&quot;
+
+#include &lt;limits.h&gt;
+#include &lt;math.h&gt;
+
+#include &quot;extremum.h&quot;
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-extremum-decl.h&quot;
+
+r_obj* ffi_rray_max(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_max(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_min(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_min(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_max(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_max_switch, arg, error_call);
+}
+
+r_obj* rray_min(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_min_switch, arg, error_call);
+}
+
+static rray_reduce_fn rray_max_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return na_rm ? rray_max_lgl_na_rm : rray_max_lgl;
+  case RRAY_TYPE_integer:
+    return na_rm ? rray_max_int_na_rm : rray_max_int;
+  case RRAY_TYPE_double:
+    return na_rm ? rray_max_dbl_na_rm : rray_max_dbl;
+
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;maximum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static rray_reduce_fn rray_min_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return na_rm ? rray_min_lgl_na_rm : rray_min_lgl;
+  case RRAY_TYPE_integer:
+    return na_rm ? rray_min_int_na_rm : rray_min_int;
+  case RRAY_TYPE_double:
+    return na_rm ? rray_min_dbl_na_rm : rray_min_dbl;
+
+  case RRAY_TYPE_complex:
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;minimum&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_max_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_logical,
+    int,
+    r_lgl_begin,
+    0,
+    rray_pmax_int_one
+  );
+}
+
+static r_obj* rray_max_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    int,
+    r_lgl_cbegin,
+    R_TYPE_logical,
+    int,
+    r_lgl_begin,
+    0,
+    rray_pmax_int_one_na_rm
+  );
+}
+
+static r_obj* rray_max_int(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    int,
+    r_int_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    -INT_MAX,
+    rray_pmax_int_one
+  );
+}
+
+static r_obj* rray_max_int_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    int,
+    r_int_cbegin,
+    R_TYPE_integer,
+    int,
+    r_int_begin,
+    -INT_MAX,
+    rray_pmax_int_one_na_rm
+  );
+}
+
+static r_obj* rray_max_dbl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    double,
+    r_dbl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    -INFINITY,
+    rray_pmax_dbl_one
+  );
+}
+
+static r_obj* rray_max_dbl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_REDUCE(
+    double,
+    r_dbl_cbegin,
+    R_TYPE_double,
+    double,
+    r_dbl_begin,
+    -INFINITY,</pre><p class="cut">99 more lines cut</p><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/reduce-extremum.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/reduce-extremum.h</summary>
+<pre>#ifndef RRAY_REDUCE_EXTREMUM_H
+#define RRAY_REDUCE_EXTREMUM_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_max(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_min(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/reduce-extremum.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/decl/reduce-extremum-decl.h</summary>
+<pre>static rray_reduce_fn rray_max_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+static rray_reduce_fn rray_min_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_max_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_max_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_max_int(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_max_int_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_max_dbl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_max_dbl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+
+static r_obj* rray_min_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_min_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_min_int(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_min_int_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_min_dbl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_min_dbl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/decl/reduce-extremum-decl.h (file state is current in your context — no need to Read it back)</pre></details>
+<p>Stale diagnostics from write order. Now register in <code>src/init.c</code>:</p>
+
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-extern r_obj* ffi_rray_any(</span>
+<span class="del">-  r_obj* ffi_x,</span>
+<span class="del">-  r_obj* ffi_axes,</span>
+<span class="del">-  r_obj* ffi_na_rm,</span>
+<span class="del">-  r_obj* ffi_frame</span>
+<span class="del">-);</span>
+<span class="ins">+extern r_obj* ffi_rray_any(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axes,</span>
+<span class="ins">+  r_obj* ffi_na_rm,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span>
+<span class="ins">+extern r_obj* ffi_rray_max(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axes,</span>
+<span class="ins">+  r_obj* ffi_na_rm,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span>
+<span class="ins">+extern r_obj* ffi_rray_min(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axes,</span>
+<span class="ins">+  r_obj* ffi_na_rm,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/init.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-  {&quot;ffi_rray_any&quot;, (DL_FUNC) &amp;ffi_rray_any, 4},</span>
+<span class="ins">+  {&quot;ffi_rray_any&quot;, (DL_FUNC) &amp;ffi_rray_any, 4},</span>
+<span class="ins">+  {&quot;ffi_rray_max&quot;, (DL_FUNC) &amp;ffi_rray_max, 4},</span>
+<span class="ins">+  {&quot;ffi_rray_min&quot;, (DL_FUNC) &amp;ffi_rray_min, 4},</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/init.c has been updated successfully.</pre></details>
+<p>Now the R side in <code>R/reduce.R</code>:</p>
+
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.</span>
+<span class="del">-#'</span>
+<span class="del">-#' @details</span>
+<span class="del">-#' The dimensionality of `x` is retained in the result, with the reduced axes</span>
+<span class="del">-#' collapsed to size 1.</span>
+<span class="del">-#'</span>
+<span class="del">-#' If summing an integer array would overflow, an error is thrown.</span>
+<span class="del">-#'</span>
+<span class="ins">+#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' - `rray_max()` computes the maximum along the specified `axes`.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' - `rray_min()` computes the minimum along the specified `axes`.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @details</span>
+<span class="ins">+#' The dimensionality of `x` is retained in the result, with the reduced axes</span>
+<span class="ins">+#' collapsed to size 1.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' If summing an integer array would overflow, an error is thrown.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,</span>
+<span class="ins">+#' such as an axis of dimension 0, `rray_max()` returns the smallest value of</span>
+<span class="ins">+#' that type and `rray_min()` returns the largest:</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' | type    | `rray_max()`            | `rray_min()`           |</span>
+<span class="ins">+#' |---------|-------------------------|------------------------|</span>
+<span class="ins">+#' | logical | `FALSE`                 | `TRUE`                 |</span>
+<span class="ins">+#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |</span>
+<span class="ins">+#' | double  | `-Inf`                  | `Inf`                  |</span>
+<span class="ins">+#'</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-#' rray_all(y, 1L)</span>
+<span class="del">-#' rray_any(y, 1L)</span>
+<span class="del">-NULL</span>
+<span class="ins">+#' rray_all(y, 1L)</span>
+<span class="ins">+#' rray_any(y, 1L)</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' # Maximum and minimum along columns</span>
+<span class="ins">+#' rray_max(x, 2L)</span>
+<span class="ins">+#' rray_min(x, 2L)</span>
+<span class="ins">+NULL</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-rray_any &lt;- function(x, axes, ..., na_rm = FALSE) {</span>
+<span class="del">-  check_dots_empty0(...)</span>
+<span class="del">-  .Call(ffi_rray_any, x, axes, na_rm, environment())</span>
+<span class="del">-}</span>
+<span class="ins">+rray_any &lt;- function(x, axes, ..., na_rm = FALSE) {</span>
+<span class="ins">+  check_dots_empty0(...)</span>
+<span class="ins">+  .Call(ffi_rray_any, x, axes, na_rm, environment())</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+#' @rdname reduce</span>
+<span class="ins">+#' @export</span>
+<span class="ins">+rray_max &lt;- function(x, axes, ..., na_rm = FALSE) {</span>
+<span class="ins">+  check_dots_empty0(...)</span>
+<span class="ins">+  .Call(ffi_rray_max, x, axes, na_rm, environment())</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+#' @rdname reduce</span>
+<span class="ins">+#' @export</span>
+<span class="ins">+rray_min &lt;- function(x, axes, ..., na_rm = FALSE) {</span>
+<span class="ins">+  check_dots_empty0(...)</span>
+<span class="ins">+  .Call(ffi_rray_min, x, axes, na_rm, environment())</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -15 &amp;&amp; Rscript -e &quot;devtools::load_all(quiet = TRUE); x &lt;- array(c(3L, NA, 1L, 5L, 2L, 4L), c(3, 2), dimnames = list(letters[1:3], c('p','q'))); print(rray_max(x, 1)); print(rray_min(x, 1, na_rm = TRUE)); print(rray_max(c(NA, NaN), 1)); print(rray_min(matrix(integer(), 0, 2), 1)); print(rray_max(c(NA,NA), 1, na_rm=TRUE))&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output"> M R/reduce.R
+ M src/decl/extremum-decl.h
+ M src/extremum.c
+ M src/extremum.h
+ M src/init.c
+?? src/decl/reduce-extremum-decl.h
+?? src/reduce-extremum.c
+?? src/reduce-extremum.h
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c stack.c -o stack.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c strides.c -o strides.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c subscript.c -o subscript.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c syms.c -o syms.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c type.c -o type.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c typeof2.c -o typeof2.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c unstack.c -o unstack.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c utils.c -o utils.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c wrapper.c -o wrapper.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray4.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o clone.o combine.o compare.o dimensionality.o dimensions.o equal.o extract-assign.o extract-subscript.o extract.o extremum.o index.o init.o insert-axes.o logical.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-extremum.o reduce-logical.o reduce-mean.o reduce-names.o reduce-prod.o reduce-sum.o reduce.o remove-axes.o rep-each.o rep.o reverse.o rlang.o roll-each.o roll.o size.o slice-assign.o slice-axis.o slice-subscript.o slice.o split.o stack.o strides.o subscript.o syms.o type.o typeof2.o unstack.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/Rtmpn0rNeJ/devtools_install_1216731ce58bb/00LOCK-rray4/00new/rray4/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray4)
+Writing 'NAMESPACE'
+Writing 'reduce.Rd'
+      p q
+[1,] NA 5
+     p q
+[1,] 1 2
+[1] NaN
+           [,1]       [,2]
+[1,] 2147483647 2147483647
+[1] FALSE</pre></details>
+<p>Works. Checking for compile warnings and that the doc table rendered:</p>
+
+<details class="tool"><summary>Bash: grep -i roxygen DESCRIPTION; grep -n &quot;tabular&quot; -A6 man/reduce.Rd; touch src/extremum.c src/re…</summary>
+<pre>grep -i roxygen DESCRIPTION; grep -n &quot;tabular&quot; -A6 man/reduce.Rd; touch src/extremum.c src/reduce-extremum.c; cd src &amp;&amp; for f in extremum reduce-extremum; do clang -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -I./rlang -Wall -Wextra -pedantic -fsyntax-only $f.c 2&gt;&amp;1 | grep -v &quot;rlang/&quot; | grep -i &quot;warning\|error&quot; | head; done; echo done</pre><pre class="output">Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+61:that type and \code{rray_min()} returns the largest:\tabular{lll}{
+62-   type \tab \code{rray_max()} \tab \code{rray_min()} \cr
+63-   logical \tab \code{FALSE} \tab \code{TRUE} \cr
+64-   integer \tab \code{-.Machine$integer.max} \tab \code{.Machine$integer.max} \cr
+65-   double \tab \code{-Inf} \tab \code{Inf} \cr
+66-}
+67-}
+extremum.c:339:17: warning: unused parameter 'error_call' [-Wunused-parameter]
+  339 |   struct r_lazy error_call
+extremum.c:361:17: warning: unused parameter 'error_call' [-Wunused-parameter]
+  361 |   struct r_lazy error_call
+extremum.c:383:17: warning: unused parameter 'error_call' [-Wunused-parameter]
+  383 |   struct r_lazy error_call
+extremum.c:405:17: warning: unused parameter 'error_call' [-Wunused-parameter]
+  405 |   struct r_lazy error_call
+extremum.c:427:17: warning: unused parameter 'error_call' [-Wunused-parameter]
+  427 |   struct r_lazy error_call
+done</pre></details>
+<p>Only pre-existing <code>-Wextra</code> warnings in untouched pmax cores (not in the package's flags). Now the tests:</p>
+
+<details class="tool"><summary>Write tests/testthat/test-reduce-extremum.R</summary>
+<pre>test_that(&quot;can reduce along axis 1&quot;, {
+  x &lt;- array(c(3L, 1L, 2L, 4L, 6L, 5L), c(3L, 2L))
+  expect_identical(rray_max(x, 1L), array(c(3L, 6L), c(1L, 2L)))
+  expect_identical(rray_min(x, 1L), array(c(1L, 4L), c(1L, 2L)))
+})
+
+test_that(&quot;can reduce along axis 2&quot;, {
+  x &lt;- array(c(3L, 1L, 2L, 4L, 6L, 5L), c(3L, 2L))
+  expect_identical(rray_max(x, 2L), array(c(4L, 6L, 5L), c(3L, 1L)))
+  expect_identical(rray_min(x, 2L), array(c(3L, 1L, 2L), c(3L, 1L)))
+})
+
+test_that(&quot;can reduce over all axes&quot;, {
+  x &lt;- array(c(3L, 1L, 2L, 4L, 6L, 5L), c(3L, 2L))
+  expect_identical(rray_max(x, c(1L, 2L)), array(6L, c(1L, 1L)))
+  expect_identical(rray_min(x, c(1L, 2L)), array(1L, c(1L, 1L)))
+})
+
+test_that(&quot;reducing over no axes returns the input unchanged&quot;, {
+  x &lt;- array(c(3, NA, NaN, -Inf), c(2L, 2L))
+  expect_identical(rray_max(x, integer()), x)
+  expect_identical(rray_min(x, integer()), x)
+})
+
+test_that(&quot;can reduce axis 3&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+  expect_identical(rray_max(x, 3L), array(19:24, c(2L, 3L, 1L)))
+  expect_identical(rray_min(x, 3L), array(1:6, c(2L, 3L, 1L)))
+})
+
+test_that(&quot;coalesces reduction axes&quot;, {
+  x &lt;- array((1:24 * 7L) %% 11L, c(1L, 3L, 2L, 4L))
+
+  expected &lt;- function(fn, axes) {
+    dimensions &lt;- dim(x)
+    dimensions[axes] &lt;- 1L
+    kept_axes &lt;- setdiff(seq_along(dimensions), axes)
+
+    values &lt;- if (length(kept_axes)) {
+      apply(x, kept_axes, fn)
+    } else {
+      fn(x)
+    }
+
+    array(values, dimensions)
+  }
+
+  axes &lt;- list(1L, 2L, 3L, 4L, c(1L, 3L), c(2L, 4L), 1:4)
+
+  for (axis in axes) {
+    expect_identical(rray_max(x, axis), expected(max, axis))
+    expect_identical(rray_min(x, axis), expected(min, axis))
+  }
+})
+
+test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], c(&quot;c1&quot;, &quot;c2&quot;)))
+  expect_identical(dimnames(rray_max(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+  expect_identical(dimnames(rray_min(x, 2L)), list(letters[1:5], NULL))
+})
+
+test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+  x &lt;- array(1:10, c(5L, 2L), dimnames = list(letters[1:5], NULL))
+  expect_null(dimnames(rray_max(x, 1L)))
+  expect_null(dimnames(rray_min(x, 1L)))
+})
+
+test_that(&quot;output type is the input type&quot;, {
+  expect_identical(rray_max(c(TRUE, FALSE), 1L), array(TRUE, 1L))
+  expect_identical(rray_min(c(TRUE, FALSE), 1L), array(FALSE, 1L))
+  expect_identical(rray_max(c(1L, 2L), 1L), array(2L, 1L))
+  expect_identical(rray_min(c(1L, 2L), 1L), array(1L, 1L))
+  expect_identical(rray_max(c(1, 2), 1L), array(2, 1L))
+  expect_identical(rray_min(c(1, 2), 1L), array(1, 1L))
+})
+
+test_that(&quot;matches repeated `pmax()` and `pmin()` across special values&quot;, {
+  cases &lt;- list(
+    list(
+      values = c(NA, FALSE, TRUE),
+      cast = as.logical,
+      lowest = FALSE,
+      highest = TRUE
+    ),
+    list(
+      values = c(NA, -1L, 0L, 1L),
+      cast = as.integer,
+      lowest = -.Machine$integer.max,
+      highest = .Machine$integer.max
+    ),
+    list(
+      values = c(NA, NaN, -Inf, -1, -0, 0, 1, Inf),
+      cast = as.double,
+      lowest = -Inf,
+      highest = Inf
+    )
+  )
+
+  for (case in cases) {
+    x &lt;- unname(t(as.matrix(expand.grid(rep(list(case$values), 3L)))))
+    rows &lt;- lapply(1:3, \(i) x[i, ])
+
+    for (na_rm in c(FALSE, TRUE)) {
+      pmax_na_rm &lt;- \(x, y) pmax(x, y, na.rm = na_rm)
+      pmin_na_rm &lt;- \(x, y) pmin(x, y, na.rm = na_rm)
+
+      expect_identical(
+        as.vector(rray_max(x, 1L, na_rm = na_rm)),
+        case$cast(Reduce(pmax_na_rm, rows, case$lowest))
+      )
+      expect_identical(
+        as.vector(rray_min(x, 1L, na_rm = na_rm)),
+        case$cast(Reduce(pmin_na_rm, rows, case$highest))
+      )
+    }
+  }
+})
+
+test_that(&quot;missing values propagate&quot;, {
+  expect_identical(as.vector(rray_max(c(TRUE, NA), 1L)), NA)
+  expect_identical(as.vector(rray_min(c(NA, FALSE), 1L)), NA)
+  expect_identical(as.vector(rray_max(c(1L, NA), 1L)), NA_integer_)
+  expect_identical(as.vector(rray_min(c(NA, 1L), 1L)), NA_integer_)
+  expect_identical(as.vector(rray_max(c(1, NaN), 1L)), NaN)
+  expect_identical(as.vector(rray_min(c(NA, 1), 1L)), NA_real_)
+})
+
+test_that(&quot;the last missing double wins, like `pmax()` and `pmin()`&quot;, {
+  expect_identical(as.vector(rray_max(c(NA, NaN), 1L)), NaN)
+  expect_identical(as.vector(rray_max(c(NaN, NA), 1L)), NA_real_)
+  expect_identical(as.vector(rray_min(c(NA, NaN), 1L)), NaN)
+  expect_identical(as.vector(rray_min(c(NaN, NA), 1L)), NA_real_)
+})
+
+test_that(&quot;na_rm removes missing values&quot;, {
+  expect_identical(as.vector(rray_max(c(NA, FALSE), 1L, na_rm = TRUE)), FALSE)
+  expect_identical(as.vector(rray_min(c(TRUE, NA), 1L, na_rm = TRUE)), TRUE)
+  expect_identical(as.vector(rray_max(c(NA, -1L), 1L, na_rm = TRUE)), -1L)
+  expect_identical(as.vector(rray_min(c(1L, NA), 1L, na_rm = TRUE)), 1L)
+  expect_identical(as.vector(rray_max(c(NaN, -1, NA), 1L, na_rm = TRUE)), -1)
+  expect_identical(as.vector(rray_min(c(NA, 1, NaN), 1L, na_rm = TRUE)), 1)
+})
+
+test_that(&quot;na_rm with all missing returns the identity value&quot;, {
+  expect_identical(as.vector(rray_max(c(NA, NA), 1L, na_rm = TRUE)), FALSE)
+  expect_identical(as.vector(rray_min(c(NA, NA), 1L, na_rm = TRUE)), TRUE)
+
+  x &lt;- c(NA_integer_, NA_integer_)
+  expect_identical(
+    as.vector(rray_max(x, 1L, na_rm = TRUE)),
+    -.Machine$integer.max
+  )
+  expect_identical(
+    as.vector(rray_min(x, 1L, na_rm = TRUE)),
+    .Machine$integer.max
+  )
+
+  x &lt;- c(NA, NaN)
+  expect_identical(as.vector(rray_max(x, 1L, na_rm = TRUE)), -Inf)
+  expect_identical(as.vector(rray_min(x, 1L, na_rm = TRUE)), Inf)
+})
+
+test_that(&quot;na_rm with no missing values matches default&quot;, {
+  x &lt;- array(c(3L, 1L, 2L, 4L, 6L, 5L), c(3L, 2L))
+  expect_identical(rray_max(x, 1L, na_rm = TRUE), rray_max(x, 1L))
+  expect_identical(rray_min(x, 1L, na_rm = TRUE), rray_min(x, 1L))
+})
+
+test_that(&quot;the most extreme values of each type are reachable&quot;, {
+  x &lt;- c(-.Machine$integer.max, -.Machine$integer.max)
+  expect_identical(as.vector(rray_max(x, 1L)), -.Machine$integer.max)
+
+  x &lt;- c(.Machine$integer.max, .Machine$integer.max)
+  expect_identical(as.vector(rray_min(x, 1L)), .Machine$integer.max)
+
+  expect_identical(as.vector(rray_max(c(-Inf, -Inf), 1L)), -Inf)
+  expect_identical(as.vector(rray_min(c(Inf, Inf), 1L)), Inf)
+})
+
+test_that(&quot;plain vector input works&quot;, {
+  expect_identical(rray_max(c(1L, 3L, 2L), 1L), array(3L, 1L))
+  expect_identical(rray_min(c(1L, 3L, 2L), 1L), array(1L, 1L))
+})
+
+test_that(&quot;axes are coerced to integer&quot;, {
+  x &lt;- array(1:4, c(2L, 2L))
+  expect_identical(rray_max(x, 1), rray_max(x, 1L))
+  expect_identical(rray_min(x, 1), rray_min(x, 1L))
+})
+
+test_that(&quot;reducing a zero-length axis gives the identity value&quot;, {
+  zero_size &lt;- function(x) array(x, c(0L, 2L))
+
+  expect_identical(
+    rray_max(zero_size(logical()), 1L),
+    array(FALSE, c(1L, 2L))
+  )
+  expect_identical(
+    rray_min(zero_size(logical()), 1L),
+    array(TRUE, c(1L, 2L))</pre><p class="cut">67 more lines cut</p><pre class="output">File created successfully at: ~/files/r/packages/rray4/tests/testthat/test-reduce-extremum.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4 &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::test(filter =…</summary>
+<pre>cd ~/files/r/packages/rray4 &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^reduce-extremum|^extremum')&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">  rray_max(quote(x), 1L)
+Condition
+  Error in `rray_max()`:
+  ! `x` must be an array, not a symbol.
+
+WARNING: 'test-reduce-extremum.R:260:3' -----------
+Adding new snapshot:
+Code
+  rray_min(quote(x), 1L)
+Condition
+  Error in `rray_min()`:
+  ! `x` must be an array, not a symbol.
+
+WARNING: 'test-reduce-extremum.R:265:3' -----------
+Adding new snapshot:
+Code
+  rray_max(x, 1L)
+Condition
+  Error in `rray_max()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+WARNING: 'test-reduce-extremum.R:266:3' -----------
+Adding new snapshot:
+Code
+  rray_min(x, 1L)
+Condition
+  Error in `rray_min()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+[ FAIL 0 | WARN 13 | SKIP 0 | PASS 158 ]</pre></details>
+<details class="tool"><summary>Bash: cat tests/testthat/_snaps/reduce-extremum.md | head -80; git diff tests/testthat/test-reduce-…</summary>
+<pre>cat tests/testthat/_snaps/reduce-extremum.md | head -80; git diff tests/testthat/test-reduce-extremum.R | head -0; git status --short</pre><pre class="output"># errors on axes out of range
+
+    Code
+      rray_max(x, 3L)
+    Condition
+      Error in `rray_max()`:
+      ! `axes` must contain values less than or equal to the dimensionality of 2, not 3.
+
+---
+
+    Code
+      rray_min(x, 3L)
+    Condition
+      Error in `rray_min()`:
+      ! `axes` must contain values less than or equal to the dimensionality of 2, not 3.
+
+# `na_rm` must be `TRUE` or `FALSE`
+
+    Code
+      rray_max(x, 1L, na_rm = NA)
+    Condition
+      Error in `rray_max()`:
+      ! `na_rm` must be `TRUE` or `FALSE`.
+
+---
+
+    Code
+      rray_min(x, 1L, na_rm = 1)
+    Condition
+      Error in `rray_min()`:
+      ! `na_rm` must be `TRUE` or `FALSE`.
+
+# errors on unsupported types
+
+    Code
+      rray_max(array(0+1i, c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_max()`:
+      ! Can't compute the maximum of `x` &lt;complex&gt;.
+
+---
+
+    Code
+      rray_max(array(&quot;a&quot;, c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_max()`:
+      ! Can't compute the maximum of `x` &lt;character&gt;.
+
+---
+
+    Code
+      rray_max(array(as.raw(1:4), c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_max()`:
+      ! Can't compute the maximum of `x` &lt;raw&gt;.
+
+---
+
+    Code
+      rray_max(array(list(1, 2, 3, 4), c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_max()`:
+      ! Can't compute the maximum of `x` &lt;list&gt;.
+
+---
+
+    Code
+      rray_min(array(0+1i, c(2L, 2L)), 1L)
+    Condition
+      Error in `rray_min()`:
+      ! Can't compute the minimum of `x` &lt;complex&gt;.
+
+# errors on scalar input
+
+    Code
+      rray_max(quote(x), 1L)
+    Condition
+      Error in `rray_max()`:
+      ! `x` must be an array, not a symbol.
+
+head: illegal line count -- 0
+ M NAMESPACE
+ M R/reduce.R
+ M man/reduce.Rd
+ M src/decl/extremum-decl.h
+ M src/extremum.c
+ M src/extremum.h
+ M src/init.c
+?? src/decl/reduce-extremum-decl.h
+?? src/reduce-extremum.c
+?? src/reduce-extremum.h
+?? tests/testthat/_snaps/reduce-extremum.md
+?? tests/testthat/test-reduce-extremum.R</pre></details>
+<p>All 158 pass. Now the plan. Checking every mention of <code>rray_max()</code>/<code>rray_min()</code> in <code>plans/</code>:</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;rray_max\b\|rray_min\b\|rray_max()\|rray_min()\|rray_max(x\|rray_min(x&quot; plans | gre…</summary>
+<pre>grep -rn &quot;rray_max\b\|rray_min\b\|rray_max()\|rray_min()\|rray_max(x\|rray_min(x&quot; plans | grep -v &quot;_pos&quot;</pre><pre class="output">plans/implementation.md:95:parameter list, and the loop is written once. `rray_max()` and
+plans/implementation.md:96:`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s
+plans/implementation.md:923:| `rray_max(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |
+plans/implementation.md:924:| `rray_min(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |
+plans/implementation.md:935:`rray_max()` and `rray_min()` share `rray_sum()`'s</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-parameter list, and the loop is written once. `rray_max()` and</span>
+<span class="del">-`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s</span>
+<span class="del">-shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than</span>
+<span class="ins">+parameter list, and the loop is written once. `rray_max_pos()` and</span>
+<span class="ins">+`rray_min_pos()` take a single `axis` rather than</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-Names: reduce.</span>
+<span class="del">-</span>
+<span class="del">-| function | op | type rule |</span>
+<span class="del">-|---|---|---|</span>
+<span class="del">-| `rray_max(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |</span>
+<span class="del">-| `rray_min(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |</span>
+<span class="del">-</span>
+<span class="del">-`rray_max_pos(x, axis)`</span>
+<span class="ins">+Names: reduce.</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_max_pos(x, axis)`</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-`rray_max()` and `rray_min()` share `rray_sum()`'s</span>
+<span class="del">-`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to</span>
+<span class="del">-`R/reduce.R` and their own `src/reduce-{name}.c` beside it, on top of the</span>
+<span class="del">-`rray_reduce()` shell in `src/reduce.c`/`src/reduce.h`.</span>
+<span class="del">-</span>
+<span class="del">-`rray_max_pos()`</span>
+<span class="ins">+`rray_max_pos()`</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: sed -n 90,100p plans/implementation.md; sed -n 905,935p plans/implementation.md</summary>
+<pre>sed -n 90,100p plans/implementation.md; sed -n 905,935p plans/implementation.md</pre><pre class="output">case RRAY_TYPE_double:
+  return na_rm ? rray_sum_dbl_na_rm : rray_sum_dbl;
+```
+
+So there is one core per type per variant, the flag stays off the core's
+parameter list, and the loop is written once. `rray_max_pos()` and
+`rray_min_pos()` take a single `axis` rather than
+`axes` and return positions rather than reduced values, so whether they fit this
+shell at all is still an open question for whoever picks them up.
+
+A `.c` file reads top down: the main entry point first, its helpers below, in
+
+Signature: `rray_full_like(x, value)`, `rray_ones_like(x)`, `rray_zeros_like(x)`.
+
+Files: `R/full-like.R`, `src/full-like.c`, `src/full-like.h`.
+
+## 4.2 Reductions
+
+All use the reduction iterator. All keep dimensionality, with reduced axes
+collapsed to a dimension of 1. There is no `keep_dimensions` argument.
+
+`axes` is **required** on every one of them. The original defaulted it to `NULL`
+meaning &quot;all axes&quot;. We do not.
+
+Names: reduce.
+
+`rray_max_pos(x, axis)` and `rray_min_pos(x, axis)` give the position of the
+maximum or minimum along a single axis. Type: fixed, integer output.
+
+```r
+x &lt;- array(c(1:10, 20:11), c(5, 2, 2))
+rray_max_pos(x, 1)     # position of the max along the rows
+rray_max_pos(x, 2)     # along the columns
+```
+
+`rray_max_pos()` and `rray_min_pos()` take `axis` rather than `axes` and return
+positions rather than reduced values, so they do not match `rray_reduce()`'s
+shape. They need their own file and topic, `R/max-pos.R`, with its own C pair.
+Whether any part of `rray_reduce()` can be shared with them is a design question
+for whoever picks them up.
+
+---</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; grep -n &quot;rray_max_pos &lt;-\|rray_min_pos &lt;-&quot; -A3 R/*.R</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; grep -n &quot;rray_max_pos &lt;-\|rray_min_pos &lt;-&quot; -A3 R/*.R</pre><pre class="output">R/max-pos.R:31:rray_max_pos &lt;- function(x, axis = NULL) {
+R/max-pos.R-32-
+R/max-pos.R-33-  axis &lt;- vec_cast(axis, integer())
+R/max-pos.R-34-  validate_axis(axis, x)
+R/min-pos.R:27:rray_min_pos &lt;- function(x, axis = NULL) {
+R/min-pos.R-28-
+R/min-pos.R-29-  axis &lt;- vec_cast(axis, integer())
+R/min-pos.R-30-  validate_axis(axis, x)
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>The original <code>rray_max_pos()</code> also defaulted <code>axis = NULL</code>, so I'll make the 4.2 intro talk about <code>axis</code> now that only the <code>_pos</code> pair remains:</p>
+
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-All use the reduction iterator. All keep dimensionality, with reduced axes</span>
+<span class="del">-collapsed to a dimension of 1. There is no `keep_dimensions` argument.</span>
+<span class="del">-</span>
+<span class="del">-`axes` is **required** on every one of them. The original defaulted it to `NULL`</span>
+<span class="del">-meaning &quot;all axes&quot;. We do not.</span>
+<span class="ins">+Both use the reduction iterator. Both keep dimensionality, with the reduced</span>
+<span class="ins">+axis collapsed to a dimension of 1. There is no `keep_dimensions` argument.</span>
+<span class="ins">+</span>
+<span class="ins">+`axis` is **required** on both. The original defaulted it to `NULL` meaning &quot;all</span>
+<span class="ins">+axes&quot;. We do not.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-parameter list, and the loop is written once. `rray_max_pos()` and</span>
+<span class="del">-`rray_min_pos()` take a single `axis` rather than</span>
+<span class="del">-`axes` and return positions rather than reduced values, so whether they fit this</span>
+<span class="del">-shell at all is still an open question for whoever picks them up.</span>
+<span class="ins">+parameter list, and the loop is written once. `rray_max()` and `rray_min()`</span>
+<span class="ins">+share this shell in `src/reduce-extremum.c`, reusing the scalar helpers of</span>
+<span class="ins">+`rray_pmax()` and `rray_pmin()` from `src/extremum.h`. `rray_max_pos()` and</span>
+<span class="ins">+`rray_min_pos()` take a single `axis` rather than `axes` and return positions</span>
+<span class="ins">+rather than reduced values, so whether they fit this shell at all is still an</span>
+<span class="ins">+open question for whoever picks them up.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The diff doesn't introduce any new allocations—ffi_rray_max()/ffi_rray_min() pass R-protected arguments straight through to the unchanged rray_reduce(), with the only allocation being the already-KEEP()'d out in the existing macro. Now I'll run the full test suite, pkgdown, and examples.</p>
+</details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | ta…</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -2; Rscript -e &quot;devtools::run_examples(run_donttest = TRUE, document = FALSE)&quot; 2&gt;&amp;1 | grep -i &quot;error\|warn&quot; | head</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 3488 ]
+✔ No problems found.
+Error in rray_set_dimensions(x, c(6L, 2L)) :</pre></details>
+<details class="tool"><summary>Bash: git stash -q &amp;&amp; Rscript -e &quot;devtools::run_examples(run_donttest = TRUE, document = FALSE)&quot; 2&gt;…</summary>
+<pre>git stash -q &amp;&amp; Rscript -e &quot;devtools::run_examples(run_donttest = TRUE, document = FALSE)&quot; 2&gt;&amp;1 | grep -B3 -A3 &quot;Error in&quot; | head; git stash pop -q &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::load_all(quiet=TRUE); example_file &lt;- 'man/reduce.Rd'; tools::Rd2ex(example_file, f &lt;- tempfile()); source(f, echo = TRUE)&quot; 2&gt;&amp;1 | tail -25</pre><pre class="output">make: *** Waiting for unfinished jobs....
+ERROR: compilation failed for package ‘rray4’
+* removing ‘/private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpX3SO5g/devtools_install_1263b7e4d183a/rray4’
+Error in `(function (command = NULL, args = character(), error_on_status = TRUE, …`:
+! System command 'R' failed
+---
+Exit status: 1
+ M NAMESPACE
+ M R/reduce.R
+ M man/reduce.Rd
+ M plans/implementation.md
+ M src/decl/extremum-decl.h
+ M src/extremum.c
+ M src/extremum.h
+ M src/init.c
+?? src/decl/reduce-extremum-decl.h
+?? src/reduce-extremum.c
+?? src/reduce-extremum.h
+?? tests/testthat/_snaps/reduce-extremum.md
+?? tests/testthat/test-reduce-extremum.R
+&gt; y &lt;- array(c(TRUE, TRUE, FALSE, TRUE), c(2, 2))
+
+&gt; rray_all(y, 1)
+     [,1]  [,2]
+[1,] TRUE FALSE
+
+&gt; rray_any(y, 1)
+     [,1] [,2]
+[1,] TRUE TRUE
+
+&gt; rray_max(x, 2)
+     [,1]
+[1,]    6
+[2,]    7
+[3,]    8
+[4,]    9
+[5,]   10
+
+&gt; rray_min(x, 2)
+     [,1]
+[1,]    1
+[2,]    2
+[3,]    3
+[4,]    4
+[5,]    5</pre></details>
+<p>Reduce examples run. The <code>rray_set_dimensions()</code> example error is elsewhere; confirming it's untouched by this branch:</p>
+
+<details class="tool"><summary>Bash: grep -rln &quot;rray_set_dimensions(x, c(6L, 2L))&quot; R man; git diff --stat main -- R/dimensions.R m…</summary>
+<pre>grep -rln &quot;rray_set_dimensions(x, c(6L, 2L))&quot; R man; git diff --stat main -- R/dimensions.R man/</pre><pre class="output">R/dimensions.R
+man/rray_set_dimensions.Rd
+ man/reduce.Rd | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)</pre></details>
+<p>Pre-existing and unrelated. Final look at the diff before committing:</p>
+
+<details class="tool"><summary>Bash: git diff src/extremum.c | head -60; git diff NAMESPACE plans/</summary>
+<pre>git diff src/extremum.c | head -60; git diff NAMESPACE plans/</pre><pre class="output">diff --git a/src/extremum.c b/src/extremum.c
+index 088977b..5fd30a0 100644
+--- a/src/extremum.c
++++ b/src/extremum.c
+@@ -298,8 +298,8 @@ static r_no_return void stop_unsupported_extremum(
+   OUT_RTYPE,                                                                   \
+   OUT_CTYPE,                                                                   \
+   OUT_DEREF,                                                                   \
+-  ONE_PROPAGATE_NA,                                                            \
+-  ONE_REMOVE_NA                                                                \
++  ONE,                                                                         \
++  ONE_NA_RM                                                                    \
+ )                                                                              \
+   if (na_rm) {                                                                 \
+     RRAY_BINARY(                                                               \
+@@ -312,7 +312,7 @@ static r_no_return void stop_unsupported_extremum(
+       OUT_RTYPE,                                                               \
+       OUT_CTYPE,                                                               \
+       OUT_DEREF,                                                               \
+-      ONE_REMOVE_NA,                                                           \
++      ONE_NA_RM,                                                               \
+       RRAY_BINARY_NO_ARGS                                                      \
+     );                                                                         \
+   } else {                                                                     \
+@@ -326,7 +326,7 @@ static r_no_return void stop_unsupported_extremum(
+       OUT_RTYPE,                                                               \
+       OUT_CTYPE,                                                               \
+       OUT_DEREF,                                                               \
+-      ONE_PROPAGATE_NA,                                                        \
++      ONE,                                                                     \
+       RRAY_BINARY_NO_ARGS                                                      \
+     );                                                                         \
+   }
+@@ -348,8 +348,8 @@ static r_obj* rray_pmax_lgl_lgl(
+     R_TYPE_logical,
+     int,
+     r_lgl_begin,
+-    rray_pmax_int_one_propagate_na,
+-    rray_pmax_int_one_remove_na
++    rray_pmax_int_one,
++    rray_pmax_int_one_na_rm
+   );
+ }
+ 
+@@ -370,8 +370,8 @@ static r_obj* rray_pmax_lgl_int(
+     R_TYPE_integer,
+     int,
+     r_int_begin,
+-    rray_pmax_int_one_propagate_na,
+-    rray_pmax_int_one_remove_na
++    rray_pmax_int_one,
++    rray_pmax_int_one_na_rm
+   );
+ }
+ 
+@@ -392,8 +392,8 @@ static r_obj* rray_pmax_int_lgl(
+     R_TYPE_integer,
+     int,
+     r_int_begin,
+-    rray_pmax_int_one_propagate_na,
+diff --git a/NAMESPACE b/NAMESPACE
+index 11a6d23..5f388ad 100644
+--- a/NAMESPACE
++++ b/NAMESPACE
+@@ -23,7 +23,9 @@ export(rray_index)
+ export(rray_insert_axes)
+ export(rray_less_than)
+ export(rray_less_than_or_equal)
++export(rray_max)
+ export(rray_mean)
++export(rray_min)
+ export(rray_move_axes)
+ export(rray_multiply)
+ export(rray_names)
+diff --git a/plans/implementation.md b/plans/implementation.md
+index 87fe812..eb0eca3 100644
+--- a/plans/implementation.md
++++ b/plans/implementation.md
+@@ -92,11 +92,12 @@ case RRAY_TYPE_double:
+ ```
+ 
+ So there is one core per type per variant, the flag stays off the core's
+-parameter list, and the loop is written once. `rray_max()` and
+-`rray_min()` want the same shape when they land, sharing `rray_reduce()`'s
+-shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+-`axes` and return positions rather than reduced values, so whether they fit this
+-shell at all is still an open question for whoever picks them up.
++parameter list, and the loop is written once. `rray_max()` and `rray_min()`
++share this shell in `src/reduce-extremum.c`, reusing the scalar helpers of
++`rray_pmax()` and `rray_pmin()` from `src/extremum.h`. `rray_max_pos()` and
++`rray_min_pos()` take a single `axis` rather than `axes` and return positions
++rather than reduced values, so whether they fit this shell at all is still an
++open question for whoever picks them up.
+ 
+ A `.c` file reads top down: the main entry point first, its helpers below, in
+ the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+@@ -910,19 +911,14 @@ Files: `R/full-like.R`, `src/full-like.c`, `src/full-like.h`.
+ 
+ ## 4.2 Reductions
+ 
+-All use the reduction iterator. All keep dimensionality, with reduced axes
+-collapsed to a dimension of 1. There is no `keep_dimensions` argument.
++Both use the reduction iterator. Both keep dimensionality, with the reduced
++axis collapsed to a dimension of 1. There is no `keep_dimensions` argument.
+ 
+-`axes` is **required** on every one of them. The original defaulted it to `NULL`
+-meaning &quot;all axes&quot;. We do not.
++`axis` is **required** on both. The original defaulted it to `NULL` meaning &quot;all
++axes&quot;. We do not.
+ 
+ Names: reduce.
+ 
+-| function | op | type rule |
+-|---|---|---|
+-| `rray_max(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |
+-| `rray_min(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |
+-
+ `rray_max_pos(x, axis)` and `rray_min_pos(x, axis)` give the position of the
+ maximum or minimum along a single axis. Type: fixed, integer output.
+ 
+@@ -932,11 +928,6 @@ rray_max_pos(x, 1)     # position of the max along the rows
+ rray_max_pos(x, 2)     # along the columns
+ ```
+ 
+-`rray_max()` and `rray_min()` share `rray_sum()`'s
+-`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to
+-`R/reduce.R` and their own `src/reduce-{name}.c` beside it, on top of the
+-`rray_reduce()` shell in `src/reduce.c`/`src/reduce.h`.
+-
+ `rray_max_pos()` and `rray_min_pos()` take `axis` rather than `axes` and return
+ positions rather than reduced values, so they do not match `rray_reduce()`'s
+ shape. They need their own file and topic, `R/max-pos.R`, with its own C pair.</pre></details>
+<p>Committing (one sentence, no trailer, per your CLAUDE.md) and pushing:</p>
+
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git status --short &amp;&amp; git commit -q -m &quot;Add \`rray_max()\` and \`rray_min()\`, …</summary>
+<pre>git add -A &amp;&amp; git status --short &amp;&amp; git commit -q -m &quot;Add \`rray_max()\` and \`rray_min()\`, sharing cores with \`rray_pmax()\` and \`rray_pmin()\`&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/min-max 2&gt;&amp;1 | tail -3</pre><pre class="output">M  NAMESPACE
+M  R/reduce.R
+M  man/reduce.Rd
+M  plans/implementation.md
+M  src/decl/extremum-decl.h
+A  src/decl/reduce-extremum-decl.h
+M  src/extremum.c
+M  src/extremum.h
+M  src/init.c
+A  src/reduce-extremum.c
+A  src/reduce-extremum.h
+A  tests/testthat/_snaps/reduce-extremum.md
+A  tests/testthat/test-reduce-extremum.R
+e13cdd7 Add `rray_max()` and `rray_min()`, sharing cores with `rray_pmax()` and `rray_pmin()`
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/min-max -&gt; feature/min-max
+branch 'feature/min-max' set up to track 'origin/feature/min-max'.</pre></details>
+<p><code>rray_max()</code> and <code>rray_min()</code> are done. I committed them on <code>feature/min-max</code> and pushed as <code>e13cdd7</code>. All 3488 tests pass and <code>pkgdown::check_pkgdown()</code> finds no problems.</p>
+<p><strong>How the cores are shared</strong></p>
+<ul>
+<li>
+<p>The eight scalar helpers moved from <code>src/extremum.c</code> into <code>src/extremum.h</code>, the same way <code>rray_and_lgl_one()</code> sits in <code>src/logical.h</code>.</p>
+</li>
+<li>
+<p>Both <code>rray_pmax()</code>/<code>rray_pmin()</code> and the new reducers now call them. I checked that the moved code and comments are identical to the originals apart from the renames.</p>
+</li>
+<li>
+<p>The renames: <code>_propagate_na</code> became nothing and <code>_remove_na</code> became <code>_na_rm</code>, so <code>rray_pmax_int_one()</code> and <code>rray_pmax_int_one_na_rm()</code>. The macro parameters became <code>ONE</code> and <code>ONE_NA_RM</code>. Inside your comments, only the function names changed.</p>
+</li>
+</ul>
+<p><strong>The new file</strong></p>
+<ul>
+<li>
+<p><code>src/reduce-extremum.c</code> follows the layout of <code>src/reduce-logical.c</code>: two FFI wrappers, two entry points, two type switches on top of <code>rray_reduce()</code>, and 12 cores. Each core is a single <code>RRAY_REDUCE()</code> call.</p>
+</li>
+<li>
+<p>There is no new reduction logic. Each core passes a pmax/pmin helper plus a starting value: <code>FALSE</code>/<code>TRUE</code>, <code>-INT_MAX</code>/<code>INT_MAX</code>, or <code>-Inf</code>/<code>Inf</code>.</p>
+</li>
+<li>
+<p>Complex, character, raw and list give &quot;Can't compute the maximum of <code>x</code> &lt;complex&gt;.&quot; (or &quot;minimum&quot;).</p>
+</li>
+</ul>
+<p><strong>Behaviour to know about</strong></p>
+<ul>
+<li>
+<p><strong>Nothing to reduce:</strong> an axis of dimension 0, or all values missing with <code>na_rm = TRUE</code>, returns the starting value above. There is a table for this in the <code>?reduce</code> details.</p>
+</li>
+<li>
+<p><strong>Differs from base <code>max()</code>:</strong> <code>rray_max(c(NA, NaN), 1)</code> returns <code>NaN</code>, because the last missing value wins, as in <code>pmax()</code>. Base <code>max()</code> returns <code>NA</code>. A test pins this.</p>
+</li>
+<li>
+<p><strong>Tests:</strong> one test checks every triple of special values for all three types, with and without <code>na_rm</code>, against repeated base <code>pmax()</code>/<code>pmin()</code>.</p>
+</li>
+</ul>
+<p><strong>Plan:</strong> I removed the <code>rray_max()</code>/<code>rray_min()</code> table row and paragraph from 4.2. The 4.2 intro now says <code>axis</code> instead of <code>axes</code>, since only the <code>_pos</code> pair is left, and the original <code>rray_max_pos()</code> also defaulted <code>axis = NULL</code>. The Part 1 sentence now says where <code>rray_max()</code>/<code>rray_min()</code> live.</p>
+<p>The commit message is 89 characters, over your 80 target. I didn't amend it because it's already pushed; say if you want a shorter one.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Make a note in the Details section of the doc about the NaN difference and note that it is for consistency with rray_pmin/pmax rather than with  base R. Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read R/reduce.R</summary>
+<pre class="output">18	#' @details
+19	#' The dimensionality of `x` is retained in the result, with the reduced axes
+20	#' collapsed to size 1.
+21	#'
+22	#' If summing an integer array would overflow, an error is thrown.
+23	#'
+24	#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,
+25	#' such as an axis of dimension 0, `rray_max()` returns the smallest value of
+26	#' that type and `rray_min()` returns the largest:
+27	#'
+28	#' | type    | `rray_max()`            | `rray_min()`           |
+29	#' |---------|-------------------------|------------------------|
+30	#' | logical | `FALSE`                 | `TRUE`                 |
+31	#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |
+32	#' | double  | `-Inf`                  | `Inf`                  |
+33	#'
+34	#' @section Casting:
+35	#' Certain inputs are upcast, changing the return type:
+36	#'
+37	#' - `rray_prod()`: logicals and integers are cast to double.</pre></details>
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-#' | double  | `-Inf`                  | `Inf`                  |</span>
+<span class="del">-#'</span>
+<span class="del">-#' @section Casting:</span>
+<span class="ins">+#' | double  | `-Inf`                  | `Inf`                  |</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' When `NA` and `NaN` are both present, `rray_max()` and `rray_min()` return</span>
+<span class="ins">+#' whichever comes last. This matches [rray_pmax()] and [rray_pmin()], rather</span>
+<span class="ins">+#' than base R's [max()] and [min()], where `NA` always wins:</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' ```r</span>
+<span class="ins">+#' rray_max(c(NA, NaN), 1L) # NaN</span>
+<span class="ins">+#' rray_max(c(NaN, NA), 1L) # NA</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' max(c(NA, NaN)) # NA</span>
+<span class="ins">+#' ```</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Casting:</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; Rscript -e &quot;pkgdown::chec…</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; Rscript -e &quot;devtools::load_all(quiet=TRUE); print(as.vector(rray_max(c(NA, NaN), 1L))); print(as.vector(rray_max(c(NaN, NA), 1L)))&quot; &amp;&amp; grep -n &quot;whichever&quot; -A12 man/reduce.Rd &amp;&amp; git status --short</pre><pre class="output">ℹ Loading rray4
+Writing 'reduce.Rd'
+✔ No problems found.
+[1] NaN
+[1] NA
+70:whichever comes last. This matches \code{\link[=rray_pmax]{rray_pmax()}} and \code{\link[=rray_pmin]{rray_pmin()}}, rather
+71-than base R's \code{\link[=max]{max()}} and \code{\link[=min]{min()}}, where \code{NA} always wins:
+72-
+73-\if{html}{\out{&lt;div class=&quot;sourceCode r&quot;&gt;}}\preformatted{rray_max(c(NA, NaN), 1L) # NaN
+74-rray_max(c(NaN, NA), 1L) # NA
+75-
+76-max(c(NA, NaN)) # NA
+77-}\if{html}{\out{&lt;/div&gt;}}
+78-}
+79-\section{Casting}{
+80-
+81-Certain inputs are upcast, changing the return type:
+82-\itemize{
+ M R/reduce.R
+ M man/reduce.Rd</pre></details>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m &quot;Document the \`NA\` and \`NaN\` ordering of \`rray_max()\` an…</summary>
+<pre>git add -A &amp;&amp; git commit -q -m &quot;Document the \`NA\` and \`NaN\` ordering of \`rray_max()\` and \`rray_min()\`&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push 2&gt;&amp;1 | tail -1</pre><pre class="output">95d1c4b Document the `NA` and `NaN` ordering of `rray_max()` and `rray_min()`
+   e13cdd7..95d1c4b  feature/min-max -&gt; feature/min-max</pre></details>
+<p>I added the note to the Details section of <code>?reduce</code>, then committed and pushed it as <code>95d1c4b</code> on <code>feature/min-max</code>.</p>
+<p>It says that when <code>NA</code> and <code>NaN</code> are both present, <code>rray_max()</code> and <code>rray_min()</code> return whichever comes last. It says this is to match <code>rray_pmax()</code> and <code>rray_pmin()</code>, not base R's <code>max()</code> and <code>min()</code>, where <code>NA</code> always wins. It ends with a short example:</p>
+<pre><code class="language-r">rray_max(c(NA, NaN), 1L) # NaN
+rray_max(c(NaN, NA), 1L) # NA
+
+max(c(NA, NaN)) # NA
+</code></pre>
+<p>I ran the two <code>rray_max()</code> lines and they give <code>NaN</code> and <code>NA</code> as shown. After re-documenting, <code>pkgdown::check_pkgdown()</code> finds no problems.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Rewrite the docs so that each reducer gets its own @section Min / Max (for example) if there are extra details for it</p>
+<p>This includes</p>
+<ul>
+<li>the sum int note</li>
+<li>the whole casting section</li>
+<li>the new min max notes</li>
+</ul>
+<p>And push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read R/reduce.R</summary>
+<pre class="output">1	#' Reduce an array along axes
+2	#'
+3	#' @description
+4	#' - `rray_sum()` computes the sum along the specified `axes`.
+5	#'
+6	#' - `rray_prod()` computes the product along the specified `axes`.
+7	#'
+8	#' - `rray_mean()` computes the mean along the specified `axes`.
+9	#'
+10	#' - `rray_all()` checks if all values are `TRUE` along the specified `axes`.
+11	#'
+12	#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.
+13	#'
+14	#' - `rray_max()` computes the maximum along the specified `axes`.
+15	#'
+16	#' - `rray_min()` computes the minimum along the specified `axes`.
+17	#'
+18	#' @details
+19	#' The dimensionality of `x` is retained in the result, with the reduced axes
+20	#' collapsed to size 1.
+21	#'
+22	#' If summing an integer array would overflow, an error is thrown.
+23	#'
+24	#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,
+25	#' such as an axis of dimension 0, `rray_max()` returns the smallest value of
+26	#' that type and `rray_min()` returns the largest:
+27	#'
+28	#' | type    | `rray_max()`            | `rray_min()`           |
+29	#' |---------|-------------------------|------------------------|
+30	#' | logical | `FALSE`                 | `TRUE`                 |
+31	#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |
+32	#' | double  | `-Inf`                  | `Inf`                  |
+33	#'
+34	#' When `NA` and `NaN` are both present, `rray_max()` and `rray_min()` return
+35	#' whichever comes last. This matches [rray_pmax()] and [rray_pmin()], rather
+36	#' than base R's [max()] and [min()], where `NA` always wins:
+37	#'
+38	#' ```r
+39	#' rray_max(c(NA, NaN), 1L) # NaN
+40	#' rray_max(c(NaN, NA), 1L) # NA
+41	#'
+42	#' max(c(NA, NaN)) # NA
+43	#' ```
+44	#'
+45	#' @section Casting:
+46	#' Certain inputs are upcast, changing the return type:
+47	#'
+48	#' - `rray_prod()`: logicals and integers are cast to double.
+49	#'
+50	#' - `rray_mean()`: logicals and integers are cast to double.
+51	#'
+52	#' @inheritParams rlang::args_dots_empty
+53	#'
+54	#' @param x An array.
+55	#'
+56	#' @param axes An integer vector of axes to reduce over. `1` reduces
+57	#'   rows, `2` reduces columns, and so on.
+58	#'
+59	#' @param na_rm If `TRUE`, missing values are removed before reducing.
+60	#'</pre></details>
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-#' collapsed to size 1.</span>
+<span class="del">-#'</span>
+<span class="del">-#' If summing an integer array would overflow, an error is thrown.</span>
+<span class="del">-#'</span>
+<span class="del">-#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,</span>
+<span class="del">-#' such as an axis of dimension 0, `rray_max()` returns the smallest value of</span>
+<span class="del">-#' that type and `rray_min()` returns the largest:</span>
+<span class="del">-#'</span>
+<span class="ins">+#' collapsed to size 1.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Sum:</span>
+<span class="ins">+#' If summing an integer array would overflow, an error is thrown.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Product:</span>
+<span class="ins">+#' Logicals and integers are cast to double.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Mean:</span>
+<span class="ins">+#' Logicals and integers are cast to double.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Min / Max:</span>
+<span class="ins">+#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,</span>
+<span class="ins">+#' such as an axis of dimension 0, `rray_max()` returns the smallest value of</span>
+<span class="ins">+#' that type and `rray_min()` returns the largest:</span>
+<span class="ins">+#'</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-#' ```</span>
+<span class="del">-#'</span>
+<span class="del">-#' @section Casting:</span>
+<span class="del">-#' Certain inputs are upcast, changing the return type:</span>
+<span class="del">-#'</span>
+<span class="del">-#' - `rray_prod()`: logicals and integers are cast to double.</span>
+<span class="del">-#'</span>
+<span class="del">-#' - `rray_mean()`: logicals and integers are cast to double.</span>
+<span class="del">-#'</span>
+<span class="del">-#' @inheritParams</span>
+<span class="ins">+#' ```</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @inheritParams</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; Rscript -e &quot;pkgdown::chec…</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -1 &amp;&amp; sed -n '/\\details{/,/\\examples{/p' man/reduce.Rd &amp;&amp; git status --short</pre><pre class="output">Writing 'reduce.Rd'
+✔ No problems found.
+\details{
+The dimensionality of \code{x} is retained in the result, with the reduced axes
+collapsed to size 1.
+}
+\section{Sum}{
+
+If summing an integer array would overflow, an error is thrown.
+}
+
+\section{Product}{
+
+Logicals and integers are cast to double.
+}
+
+\section{Mean}{
+
+Logicals and integers are cast to double.
+}
+
+\section{Min / Max}{
+
+\code{rray_max()} and \code{rray_min()} keep the type of \code{x}. With nothing to reduce,
+such as an axis of dimension 0, \code{rray_max()} returns the smallest value of
+that type and \code{rray_min()} returns the largest:\tabular{lll}{
+   type \tab \code{rray_max()} \tab \code{rray_min()} \cr
+   logical \tab \code{FALSE} \tab \code{TRUE} \cr
+   integer \tab \code{-.Machine$integer.max} \tab \code{.Machine$integer.max} \cr
+   double \tab \code{-Inf} \tab \code{Inf} \cr
+}
+
+
+When \code{NA} and \code{NaN} are both present, \code{rray_max()} and \code{rray_min()} return
+whichever comes last. This matches \code{\link[=rray_pmax]{rray_pmax()}} and \code{\link[=rray_pmin]{rray_pmin()}}, rather
+than base R's \code{\link[=max]{max()}} and \code{\link[=min]{min()}}, where \code{NA} always wins:
+
+\if{html}{\out{&lt;div class=&quot;sourceCode r&quot;&gt;}}\preformatted{rray_max(c(NA, NaN), 1L) # NaN
+rray_max(c(NaN, NA), 1L) # NA
+
+max(c(NA, NaN)) # NA
+}\if{html}{\out{&lt;/div&gt;}}
+}
+
+\examples{
+ M R/reduce.R
+ M man/reduce.Rd</pre></details>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m &quot;Give each reducer with extra details its own documentation se…</summary>
+<pre>git add -A &amp;&amp; git commit -q -m &quot;Give each reducer with extra details its own documentation section&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push 2&gt;&amp;1 | tail -1</pre><pre class="output">2bcce0e Give each reducer with extra details its own documentation section
+   95d1c4b..2bcce0e  feature/min-max -&gt; feature/min-max</pre></details>
+<p>The <code>?reduce</code> page now has a separate section for each reducer that has extra details. I committed and pushed it as <code>2bcce0e</code> on <code>feature/min-max</code>.</p>
+<ul>
+<li>
+<p><strong>Details</strong> now only says that the dimensionality is kept, with the reduced axes collapsed to size 1.</p>
+</li>
+<li>
+<p><strong>Sum</strong> holds the integer overflow note.</p>
+</li>
+<li>
+<p><strong>Product</strong> and <strong>Mean</strong> each hold their own line from the old Casting section: logicals and integers are cast to double. The Casting section is gone.</p>
+</li>
+<li>
+<p><strong>Min / Max</strong> holds the type-preserved sentence, the table of values returned when there is nothing to reduce, and the <code>NA</code>/<code>NaN</code> note with its example.</p>
+</li>
+</ul>
+<p><code>rray_all()</code> and <code>rray_any()</code> have no extra details, so they don't get a section. After re-documenting, <code>pkgdown::check_pkgdown()</code> finds no problems.</p>
+
+</section>
+</main>
+</body>
+</html>

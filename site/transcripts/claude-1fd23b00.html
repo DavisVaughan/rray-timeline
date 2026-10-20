@@ -1,0 +1,1259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keeping titles in rray_set_axis_names() via r_clone()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-158">rray timeline</a>
+<h1>Keeping titles in <code>rray_set_axis_names()</code> via <code>r_clone()</code></h1>
+<p class="facts">Claude · Oct 18, 2026 · 3 prompts · 9 replies · <a href="https://github.com/r-lib/rray/pull/158">#158</a></p>
+</header>
+<main>
+<p class="divider">Oct 18, 2026, 19:54 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/titles<br />
+Implement plans/titles.md part 5<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Check this section off in the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status &amp;&amp; git branch -a &amp;&amp; cat plans/titles.md</summary>
+<pre>git status &amp;&amp; git branch -a &amp;&amp; cat plans/titles.md</pre><pre class="output">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+* main
+  remotes/origin/HEAD -&gt; origin/main
+  remotes/origin/gh-pages
+  remotes/origin/main
+# Titles plan
+
+## Goal
+
+Every function that takes one array and returns one array should keep the
+titles of `x` wherever its axes keep their meaning. Titles are the names on
+the dimnames list:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+
+rray_titles(x)
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+```
+
+Binary and n-ary functions are out of scope until we settle how names combine
+across inputs. See [Out of scope](#out-of-scope).
+
+## Rules
+
+These were decided up front and apply to every step.
+
+- A title labels an axis, not its positions. An axis that keeps its identity
+  keeps its title, even when it loses its names. `rray_sum(x, axes = 2)` keeps
+  title `&quot;B&quot;` on axis 2.
+
+- The result has a titles vector exactly when `x` has one. A new axis gets
+  the title `&quot;&quot;`. An all `&quot;&quot;` titles vector is never turned into `NULL`. This
+  matches `rray_set_axis_title(x, axis, NULL)`, which already leaves `&quot;&quot;` in
+  place.
+
+- Titles can exist with no axis names at all. The dimnames list is then all
+  `NULL` elements, like `list(A = NULL, B = NULL)`. Every helper must handle
+  this case, which is the main trap: most names helpers only allocate their
+  output list when some axis has names.
+
+- A function that drops all names drops all titles. Today that is
+  `rray_extract()`, `rray_index()`, and `rray_set_dimensions()`.
+
+- `rray_set_names(x, names)` replaces the whole dimnames list. The names of
+  `names` become the titles of `x`, so an unnamed list drops them and `NULL`
+  clears everything.
+
+- `rray_broadcast()` is left alone for now, see [Out of scope](#out-of-scope).
+
+## Current state
+
+From running each function on `x` above:
+
+| Function | Titles today | After this plan |
+|---|---|---|
+| `rray_slice()`, `rray_slice_axis()`, `rray_slice_rows()`, `rray_slice_columns()` | Dropped | Kept |
+| `rray_reverse()`, `rray_roll()`, `rray_rep()`, `rray_rep_each()` | Dropped | Kept |
+| `rray_sum()`, `rray_prod()`, `rray_mean()`, `rray_min()`, `rray_max()`, `rray_all()`, `rray_any()` | Dropped | Kept, including on reduced axes |
+| `rray_locate_max()`, `rray_locate_min()` | Dropped | Kept, including on the located axis |
+| `rray_roll_each()` | Dropped | Kept, including on `axis` |
+| `rray_permute_axes()`, `rray_move_axes()` | Dropped | Reordered with the axes |
+| `rray_insert_axes()` | Dropped | Kept, `&quot;&quot;` on new axes |
+| `rray_remove_axes()` | Dropped | Kept, removed axes lose theirs |
+| `rray_split()` | Kept only when `axis` has no names | Always kept |
+| `rray_unstack()` | Kept only when `axis` has no names | Always kept, minus `axis` |
+| `rray_set_axis_names()`, `rray_set_row_names()`, `rray_set_column_names()` | Dropped | Kept |
+| `rray_set_names()` | Taken from `names` | Unchanged, now documented and tested |
+| `rray_cumulative_*()` | Kept | Unchanged, already tested |
+| `rray_cast()` | Kept | Unchanged, add a test |
+| `rray_slice_assign()` and friends, `rray_extract_assign()` | Kept | Unchanged, add a test |
+| `rray_extract()`, `rray_index()`, `rray_set_dimensions()` | Dropped | Unchanged, add a test |
+| `rray_broadcast()` | Kept only on a no-op | Unchanged |
+
+## Implementation pattern
+
+Each step adds titles to an existing names helper rather than adding a new
+code path. The pattern is the same everywhere:
+
+1. Read `x_titles = r_names(x_names)` next to the existing `x_names`. It is
+   protected through `x`.
+
+2. If `x_titles != r_null`, allocate the output names list up front instead of
+   lazily, so a titles-only input still gets a list.
+
+3. Either reuse `x_titles` unchanged (when the result has the same axes as
+   `x`) or build an `out_titles` character vector in the same loop that builds
+   the output names (when axes move, appear, or disappear).
+
+4. Poke the titles onto the output list with `r_attrib_poke_names()`.
+
+`r_alloc_character()` fills with `&quot;&quot;`, so new axes need no explicit poke.
+
+Per the `AGENTS.md` protection review, `out_titles` is allocated while the
+output list is live, so `KEEP()` it until it is poked onto the list.
+
+## Steps
+
+Each step is one pull request, merged before the next one starts. Every step
+adds a `&quot;titles are kept&quot;` test next to the existing names tests for each
+function it touches, following the existing cumulative tests. Each test covers
+two inputs:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+y &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = NULL, B = NULL, C = NULL))
+```
+
+`y` is the titles-only case. It catches helpers that skip allocating their
+output list when no axis has names.
+
+Where a function's roxygen already describes what happens to names, add one
+short sentence about titles next to it.
+
+### 1. Slice names
+
+`rray_slice_names()` in `src/slice.c` covers every function built on
+`rray_slice()`:
+
+- `rray_slice()`
+
+- `rray_slice_axis()`, `rray_slice_rows()`, `rray_slice_columns()`
+
+- `rray_reverse()`
+
+- `rray_roll()`
+
+- `rray_rep()`, `rray_rep_each()`
+
+Slicing never adds, removes, or moves axes, so the titles of `x` are reused
+unchanged. `rray_slice_names()` takes `x_names` instead of `v_x_names` and
+pokes `r_names(x_names)` onto its output. It already allocates its output
+whenever `x_names` exists, so the titles-only case needs no extra work.
+
+```r
+rray_titles(rray_slice(x, 1, TRUE, TRUE))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+
+rray_titles(rray_rep(x, times = 2, axes = 1))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+```
+
+Tests go in `test-slice.R`, `test-reverse.R`, `test-roll.R`, and
+`test-rep.R`.
+
+### 2. Reduce names
+
+`rray_reduce_names()` in `src/reduce-names.c` covers:
+
+- `rray_sum()`, `rray_prod()`, `rray_mean()`, `rray_min()`, `rray_max()`,
+  `rray_all()`, `rray_any()`
+
+- `rray_locate_max()`, `rray_locate_min()`
+
+- `rray_roll_each()`
+
+Reduced axes stay at dimension 1, so the result has the same axes as `x` and
+reuses its titles unchanged. The output list is allocated lazily today, so it
+moves up front when `x_titles` exists.
+
+```r
+rray_titles(rray_sum(x, axes = 2))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+
+rray_names(rray_sum(y, axes = 2))
+# $A
+# NULL
+#
+# $B
+# NULL
+#
+# $C
+# NULL
+```
+
+`rray_reduce_names()` has its own internal tests in `test-reduce-names.R`. Add
+titles cases there, and one test per family in `test-reduce-sum.R`,
+`test-reduce-mean.R`, `test-reduce-prod.R`, `test-reduce-extremum.R`,
+`test-reduce-logical.R`, `test-locate.R`, and `test-roll.R`.
+
+### 3. Axis reshaping
+
+These move axes around, so each builds `out_titles` in the loop it already
+uses for names.
+
+#### `rray_permute_axes()`
+
+`rray_permute_axes_names()` in `src/permute-axes.c` already allocates its
+output whenever `x_names` exists. Add the titles in the same loop:
+
+```text
+out_titles[i] = x_titles[axes[i] - 1]
+```
+
+```r
+rray_titles(rray_permute_axes(x, c(3, 1, 2)))
+# [1] &quot;C&quot; &quot;A&quot; &quot;B&quot;</pre><p class="cut">163 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/names.c &amp;&amp; cat R/names.R &amp;&amp; git show 7ec9cb0 --stat &amp;&amp; git show 9642413 -- plans/titl…</summary>
+<pre>cat src/names.c &amp;&amp; cat R/names.R &amp;&amp; git show 7ec9cb0 --stat &amp;&amp; git show 9642413 -- plans/titles.md</pre><pre class="output">#include &quot;names.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;view.h&quot;
+
+#include &quot;decl/names-decl.h&quot;
+
+r_obj* ffi_rray_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_names(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_names(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim_names(x);
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_axis_names(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_axis_names(ffi_x, axis, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_row_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_axis_names(ffi_x, 1, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_column_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_axis_names(ffi_x, 2, rray_args.x, error_call);
+}
+
+r_obj* rray_axis_names(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  r_obj* names = rray_names(x, arg, error_call);
+
+  r_obj* out = (names == r_null) ? r_null : r_list_get(names, axis - 1);
+
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_set_names(r_obj* ffi_x, r_obj* ffi_names, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_names(ffi_x, ffi_names, rray_args.x, error_call);
+}
+
+r_obj* rray_set_names(
+  r_obj* x,
+  r_obj* names,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  if (names != r_null) {
+    if (r_typeof(names) != R_TYPE_list) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must be a list or `NULL`, not %s.&quot;,
+        rray_arg_format(rray_args.names),
+        r_obj_type_friendly(names)
+      );
+    }
+
+    r_obj* dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    const int* v_dimensions = r_int_cbegin(dimensions);
+    const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+    if (r_length(names) != dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must have length %d to match the dimensionality of %s, &quot;
+        &quot;not length %&quot; R_PRI_SSIZE &quot;.&quot;,
+        rray_arg_format(rray_args.names),
+        dimensionality,
+        rray_arg_format(arg),
+        r_length(names)
+      );
+    }
+
+    r_obj* const* v_names = r_list_cbegin(names);
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      check_axis_names(v_names[i], i + 1, v_dimensions[i], error_call);
+    }
+
+    FREE(1);
+  }
+
+  r_obj* out = KEEP(r_view(x));
+  r_attrib_poke_dim(out, r_dim(x));
+  r_attrib_poke_dim_names(out, names);
+
+  FREE(2);
+  return out;
+}
+
+r_obj* ffi_rray_set_axis_names(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_set_axis_names(ffi_x, axis, ffi_names, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_set_row_names(
+  r_obj* ffi_x,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_axis_names(ffi_x, 1, ffi_names, rray_args.x, error_call);
+}
+
+r_obj* ffi_rray_set_column_names(
+  r_obj* ffi_x,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_axis_names(ffi_x, 2, ffi_names, rray_args.x, error_call);
+}
+
+r_obj* rray_set_axis_names(
+  r_obj* x,
+  int axis,
+  r_obj* names,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  const int dimension = rray_dimension(x, axis, arg, error_call);
+  check_axis_names(names, axis, dimension, error_call);
+
+  r_obj* old_names = KEEP(rray_names(x, arg, error_call));
+
+  r_obj* new_names = KEEP(r_alloc_list(dimensionality));
+  if (old_names != r_null) {
+    r_obj* const* v_old_names = r_list_cbegin(old_names);
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      r_list_poke(new_names, i, v_old_names[i]);
+    }
+  }
+  r_list_poke(new_names, axis - 1, names);
+
+  r_obj* out = KEEP(r_view(x));
+  r_attrib_poke_dim(out, r_dim(x));
+  r_attrib_poke_dim_names(out, new_names);
+
+  FREE(4);
+  return out;
+}
+
+static inline void check_axis_names(
+  r_obj* names,
+  int axis,
+  int dimension,
+  struct r_lazy error_call
+) {
+  if (names == r_null) {
+    return;
+  }
+
+  if (r_typeof(names) != R_TYPE_character) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Names for axis %d must be a character vector or `NULL`, not %s.&quot;,
+      axis,
+      r_obj_type_friendly(names)
+    );
+  }
+
+  if (r_length(names) != dimension) {
+    r_abort_lazy_call(</pre><p class="cut">178 more lines cut</p></details>
+<details class="tool"><summary>Bash: git show 7ec9cb0 -- tests R &amp;&amp; cat tests/testthat/test-names.R &amp;&amp; grep -rn &quot;r_clone\b\|r_clon…</summary>
+<pre>git show 7ec9cb0 -- tests R &amp;&amp; cat tests/testthat/test-names.R &amp;&amp; grep -rn &quot;r_clone\b\|r_clone(&quot; src/rlang/*.h | head; grep -rn &quot;r_clone(&quot; src/*.c | head</pre><pre class="output">commit 7ec9cb0131a4a07fc1275a7f8ad3c38d8b30e112
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 18 15:53:58 2026 -0400
+
+    Keep titles in `rray_split()` and `rray_unstack()` (#157)
+
+diff --git a/R/unstack.R b/R/unstack.R
+index d27cc70..761a4e8 100644
+--- a/R/unstack.R
++++ b/R/unstack.R
+@@ -9,7 +9,7 @@
+ #'
+ #' @details
+ #' Names along `axis` become the names of the returned list. Names on the
+-#' surviving axes are carried over to their new locations.
++#' surviving axes are carried over to their new locations, as are their titles.
+ #'
+ #' Because the dimensionality is reduced by 1, `x` must have a dimensionality
+ #' of at least 2 to begin with.
+diff --git a/tests/testthat/test-split.R b/tests/testthat/test-split.R
+index 35ede29..89fcca5 100644
+--- a/tests/testthat/test-split.R
++++ b/tests/testthat/test-split.R
+@@ -226,6 +226,26 @@ test_that(&quot;NULL dimension names are handled&quot;, {
+   )
+ })
+ 
++test_that(&quot;titles are kept&quot;, {
++  x &lt;- array(
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
++  )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
++
++  out &lt;- rray_split(x, axis = 1, dimensions = 1)
++  expect_identical(dimnames(out[[1]]), list(A = &quot;a&quot;, B = NULL, C = NULL))
++  expect_identical(dimnames(out[[2]]), list(A = &quot;b&quot;, B = NULL, C = NULL))
++
++  out &lt;- rray_split(x, axis = 2, dimensions = c(0, 3))
++  expect_identical(rray_titles(out[[1]]), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))
++  expect_identical(rray_titles(out[[2]]), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))
++
++  out &lt;- rray_split(y, axis = 1, dimensions = 1)
++  expect_identical(dimnames(out[[1]]), list(A = NULL, B = NULL, C = NULL))
++})
++
+ test_that(&quot;the result list is unnamed&quot;, {
+   x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+   expect_null(names(rray_split(x, axis = 1, dimensions = 1)))
+diff --git a/tests/testthat/test-unstack.R b/tests/testthat/test-unstack.R
+index 8f04627..b657d27 100644
+--- a/tests/testthat/test-unstack.R
++++ b/tests/testthat/test-unstack.R
+@@ -94,6 +94,26 @@ test_that(&quot;names on the surviving axes move to their new locations&quot;, {
+   expect_identical(dimnames(out[[1]]), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+ })
+ 
++test_that(&quot;titles on the surviving axes are kept&quot;, {
++  x &lt;- array(
++    1:24,
++    c(2L, 3L, 4L),
++    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)
++  )
++  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))
++
++  out &lt;- rray_unstack(x, axis = 1)
++  expect_named(out, c(&quot;a&quot;, &quot;b&quot;))
++  expect_identical(dimnames(out$a), list(B = NULL, C = NULL))
++  expect_identical(dimnames(out$b), list(B = NULL, C = NULL))
++
++  out &lt;- rray_unstack(x, axis = 2)
++  expect_identical(dimnames(out[[1]]), list(A = c(&quot;a&quot;, &quot;b&quot;), C = NULL))
++
++  out &lt;- rray_unstack(y, axis = 1)
++  expect_identical(dimnames(out[[1]]), list(B = NULL, C = NULL))
++})
++
+ test_that(&quot;partial dimension names are handled&quot;, {
+   x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+ 
+# ------------------------------------------------------------------------------
+# rray_names()
+
+test_that(&quot;returns NULL for unnamed plain vectors&quot;, {
+  expect_null(rray_names(1:3))
+  expect_null(rray_names(&quot;a&quot;))
+})
+
+test_that(&quot;returns names for named plain vectors&quot;, {
+  expect_identical(rray_names(c(a = 1, b = 2)), list(c(&quot;a&quot;, &quot;b&quot;)))
+  expect_identical(rray_names(c(x = 1L)), list(&quot;x&quot;))
+})
+
+test_that(&quot;returns dimnames for arrays&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  expect_identical(
+    rray_names(x),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+test_that(&quot;returns NULL for unnamed arrays&quot;, {
+  expect_null(rray_names(array(1:6, c(2, 3))))
+  expect_null(rray_names(array(1:24, c(2, 3, 4))))
+})
+
+test_that(&quot;handles partially named dimnames&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+  expect_identical(rray_names(x), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+})
+
+test_that(&quot;errors on non-vector types&quot;, {
+  expect_snapshot(rray_names(NULL), error = TRUE)
+  expect_snapshot(rray_names(mean), error = TRUE)
+})
+
+test_that(&quot;errors on classed input&quot;, {
+  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+  expect_snapshot(rray_names(x), error = TRUE)
+})
+
+# ------------------------------------------------------------------------------
+# rray_axis_names()
+
+test_that(&quot;rray_axis_names() gets names for a single axis&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  expect_identical(rray_axis_names(x, 1), c(&quot;r1&quot;, &quot;r2&quot;))
+  expect_identical(rray_axis_names(x, 2), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+})
+
+test_that(&quot;rray_axis_names() works with 3+ dimensional arrays&quot;, {
+  x &lt;- array(1:24, c(2, 3, 4))
+  expect_null(rray_axis_names(x, 3))
+
+  x &lt;- rray_set_axis_names(x, 3, letters[1:4])
+  expect_identical(rray_axis_names(x, 3), letters[1:4])
+})
+
+test_that(&quot;rray_axis_names() returns NULL for an unnamed axis&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+  expect_null(rray_axis_names(x, 2))
+})
+
+test_that(&quot;rray_axis_names() returns NULL when there are no names at all&quot;, {
+  expect_null(rray_axis_names(array(1:6, c(2, 3)), 1))
+})
+
+test_that(&quot;rray_axis_names() coerces axis to integer&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+  expect_identical(rray_axis_names(x, 1), rray_axis_names(x, 1L))
+})
+
+test_that(&quot;rray_axis_names() errors on an invalid axis&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  expect_snapshot(rray_axis_names(x, 0), error = TRUE)
+  expect_snapshot(rray_axis_names(x, 3), error = TRUE)
+  expect_snapshot(rray_axis_names(x, NA_integer_), error = TRUE)
+  expect_snapshot(rray_axis_names(x, c(1, 2)), error = TRUE)
+  expect_snapshot(rray_axis_names(x, integer()), error = TRUE)
+})
+
+test_that(&quot;rray_axis_names() errors on classed input&quot;, {
+  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+  expect_snapshot(rray_axis_names(x, 1), error = TRUE)
+})
+
+test_that(&quot;rray_row_names() and rray_column_names() are axis shortcuts&quot;, {
+  x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  expect_identical(rray_row_names(x), rray_axis_names(x, 1))
+  expect_identical(rray_column_names(x), rray_axis_names(x, 2))
+})
+
+test_that(&quot;rray_column_names() errors if `x` doesn't have a second axis&quot;, {
+  expect_snapshot(rray_column_names(1:5), error = TRUE)
+})
+
+test_that(&quot;rray_row_names() and rray_column_names() error on classed input&quot;, {
+  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+  expect_snapshot(rray_row_names(x), error = TRUE)
+  expect_snapshot(rray_column_names(x), error = TRUE)
+})
+
+# ------------------------------------------------------------------------------
+# rray_set_names()
+
+test_that(&quot;rray_set_names() sets names for every axis&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  out &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+  expect_identical(
+    dimnames(out),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+})
+
+test_that(&quot;rray_set_names() allows some axes to be unnamed&quot;, {
+  x &lt;- array(1:6, c(2, 3))
+  out &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+  expect_identical(dimnames(out), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+})</pre><p class="cut">155 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 150,230p src/titles.c</summary>
+<pre>sed -n 150,230p src/titles.c</pre><pre class="output">      error_call,
+      &quot;%s must have length 1, not length %&quot; R_PRI_SSIZE &quot;.&quot;,
+      rray_arg_format(rray_args.title),
+      r_length(title)
+    );
+  }
+
+  r_obj* names = r_dim_names(x);
+  r_obj* old_titles = names == r_null ? r_null : r_names(names);
+
+  r_obj* new_titles = KEEP(r_alloc_character(dimensionality));
+
+  if (old_titles != r_null) {
+    r_obj* const* v_old_titles = r_chr_cbegin(old_titles);
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      r_chr_poke(new_titles, i, v_old_titles[i]);
+    }
+  }
+
+  r_chr_poke(new_titles, axis - 1, r_chr_get(title, 0));
+
+  r_obj* out = KEEP(rray_set_titles(x, new_titles, arg, error_call));
+
+  FREE(3);
+  return out;
+}
+
+static r_obj* rray_clear_titles(r_obj* x) {
+  r_obj* names = r_dim_names(x);
+
+  if (names == r_null || r_names(names) == r_null) {
+    return x;
+  }
+
+  r_obj* new_names = KEEP(r_clone(names));
+  r_attrib_poke_names(new_names, r_null);
+
+  r_obj* out = KEEP(r_view(x));
+  r_attrib_poke_dim(out, r_dim(x));
+  r_attrib_poke_dim_names(out, new_names);
+
+  FREE(2);
+  return out;
+}
+
+static r_obj* rray_clear_axis_title(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* names = r_dim_names(x);
+  r_obj* old_titles = names == r_null ? r_null : r_names(names);
+
+  if (old_titles == r_null) {
+    return x;
+  }
+
+  r_obj* new_titles = KEEP(r_clone(old_titles));
+  r_chr_poke(new_titles, axis - 1, r_strs.empty);
+
+  r_obj* out = KEEP(rray_set_titles(x, new_titles, arg, error_call));
+
+  FREE(2);
+  return out;
+}</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;arg_as_array&quot; -A40 src/utils.c | head -70; grep -rn &quot;r_dim_names(x)&quot; src/*.c | head …</summary>
+<pre>grep -n &quot;arg_as_array&quot; -A40 src/utils.c | head -70; grep -rn &quot;r_dim_names(x)&quot; src/*.c | head -20</pre><pre class="output">53:r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+54-  if (rray_typeof(x) == RRAY_TYPE_scalar) {
+55-    stop_scalar_input(x, arg, error_call);
+56-  }
+57-
+58-  return vec_as_array(x);
+59-}
+60-
+61-r_no_return void stop_scalar_input(
+62-  r_obj* x,
+63-  struct rray_arg* arg,
+64-  struct r_lazy error_call
+65-) {
+66-  r_abort_lazy_call(
+67-    error_call,
+68-    &quot;%s must be an array, not %s.&quot;,
+69-    rray_arg_format_input(arg),
+70-    r_obj_type_friendly(x)
+71-  );
+72-}
+73-
+74-r_no_return void stop_int_overflow(struct r_lazy error_call) {
+75-  r_abort_lazy_call(error_call, &quot;Integer overflow.&quot;);
+76-}
+77-
+78-r_obj* arg_as_bare_integer(
+79-  r_obj* x,
+80-  struct rray_arg* arg,
+81-  struct r_lazy error_call
+82-) {
+83-  if (r_attrib_has_any(x)) {
+84-    r_abort_lazy_call(
+85-      error_call,
+86-      &quot;%s can't have attributes.&quot;,
+87-      rray_arg_format(arg)
+88-    );
+89-  }
+90-
+91-  return arg_as_integer(x, arg, error_call);
+92-}
+93-
+src/combine.c:194:    r_obj* names = r_dim_names(x);
+src/cast.c:138:  r_obj* names = r_dim_names(x);                                               \
+src/cast.c:169:  r_obj* names = r_dim_names(x);                                               \
+src/dimensionality.c:62:  r_obj* x_names = r_dim_names(x);
+src/cumulative.c:54:  r_obj* names = r_dim_names(x);
+src/extract-assign.c:79:  r_obj* names = r_dim_names(x);
+src/insert-axes.c:40:  r_obj* x_names = r_dim_names(x);
+src/permute-axes.c:262:  r_obj* x_names = r_dim_names(x);
+src/names.c:19:  r_obj* out = r_dim_names(x);
+src/remove-axes.c:40:  r_obj* x_names = r_dim_names(x);
+src/slice.c:44:  r_obj* x_names = r_dim_names(x);
+src/slice-assign.c:56:  r_obj* x_names = r_dim_names(x);
+src/split.c:62:  r_obj* x_names = r_dim_names(x);
+src/titles.c:89:  r_obj* old_names = r_dim_names(x);
+src/titles.c:157:  r_obj* names = r_dim_names(x);
+src/titles.c:178:  r_obj* names = r_dim_names(x);
+src/titles.c:201:  r_obj* names = r_dim_names(x);</pre></details>
+<p>I've read the plan and <code>src/names.c</code>. Next I'm checking one helper before I make the change.</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;vec_as_array&quot; -A30 src/*.c | grep -v &quot;^src/utils.c:5&quot; | head -45</summary>
+<pre>grep -rn &quot;vec_as_array&quot; -A30 src/*.c | grep -v &quot;^src/utils.c:5&quot; | head -45</pre><pre class="output">src/cast.c:38:      return vec_as_array(x);
+src/cast.c-39-    case RRAY_TYPE_integer:
+src/cast.c-40-      return rray_cast_lgl_to_int(x, x_arg, error_call);
+src/cast.c-41-    case RRAY_TYPE_double:
+src/cast.c-42-      return rray_cast_lgl_to_dbl(x, x_arg, error_call);
+src/cast.c-43-    case RRAY_TYPE_complex:
+src/cast.c-44-      return rray_cast_lgl_to_cpl(x, x_arg, error_call);
+src/cast.c-45-    case RRAY_TYPE_scalar:
+src/cast.c-46-      stop_scalar_input(to, to_arg, error_call);
+src/cast.c-47-    default:
+src/cast.c-48-      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+src/cast.c-49-    }
+src/cast.c-50-  case RRAY_TYPE_integer:
+src/cast.c-51-    switch (to_type) {
+src/cast.c-52-    case RRAY_TYPE_logical:
+src/cast.c-53-      return rray_cast_int_to_lgl(x, x_arg, error_call);
+src/cast.c-54-    case RRAY_TYPE_integer:
+src/cast.c:55:      return vec_as_array(x);
+src/cast.c-56-    case RRAY_TYPE_double:
+src/cast.c-57-      return rray_cast_int_to_dbl(x, x_arg, error_call);
+src/cast.c-58-    case RRAY_TYPE_complex:
+src/cast.c-59-      return rray_cast_int_to_cpl(x, x_arg, error_call);
+src/cast.c-60-    case RRAY_TYPE_scalar:
+src/cast.c-61-      stop_scalar_input(to, to_arg, error_call);
+src/cast.c-62-    default:
+src/cast.c-63-      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+src/cast.c-64-    }
+src/cast.c-65-  case RRAY_TYPE_double:
+src/cast.c-66-    switch (to_type) {
+src/cast.c-67-    case RRAY_TYPE_logical:
+src/cast.c-68-      return rray_cast_dbl_to_lgl(x, x_arg, error_call);
+src/cast.c-69-    case RRAY_TYPE_integer:
+src/cast.c-70-      return rray_cast_dbl_to_int(x, x_arg, error_call);
+src/cast.c-71-    case RRAY_TYPE_double:
+src/cast.c:72:      return vec_as_array(x);
+src/cast.c-73-    case RRAY_TYPE_complex:
+src/cast.c-74-      return rray_cast_dbl_to_cpl(x, x_arg, error_call);
+src/cast.c-75-    case RRAY_TYPE_scalar:
+src/cast.c-76-      stop_scalar_input(to, to_arg, error_call);
+src/cast.c-77-    default:
+src/cast.c-78-      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+src/cast.c-79-    }
+src/cast.c-80-  case RRAY_TYPE_complex:
+src/cast.c-81-    switch (to_type) {
+src/cast.c-82-    case RRAY_TYPE_complex:</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;^r_obj\* vec_as_array&quot; -A30 src/*.c</summary>
+<pre>grep -rn &quot;^r_obj\* vec_as_array&quot; -A30 src/*.c</pre><pre class="output">src/utils.c:18:r_obj* vec_as_array(r_obj* x) {
+src/utils.c-19-  if (r_dim(x) != r_null) {
+src/utils.c-20-    return x;
+src/utils.c-21-  }
+src/utils.c-22-
+src/utils.c-23-  r_obj* out = KEEP(r_view(x));
+src/utils.c-24-
+src/utils.c-25-  const r_ssize size = r_length(x);
+src/utils.c-26-  r_obj* dimensions = r_int(r_ssize_as_integer(size));
+src/utils.c-27-  r_attrib_poke_dim(out, dimensions);
+src/utils.c-28-
+src/utils.c-29-  r_obj* axis_names = r_names(x);
+src/utils.c-30-  if (axis_names != r_null) {
+src/utils.c-31-    KEEP(axis_names);
+src/utils.c-32-    r_obj* names = KEEP(r_alloc_list(1));
+src/utils.c-33-    r_list_poke(names, 0, axis_names);
+src/utils.c-34-    r_attrib_poke_dim_names(out, names);
+src/utils.c-35-    FREE(2);
+src/utils.c-36-  }
+src/utils.c-37-
+src/utils.c-38-  FREE(1);
+src/utils.c-39-  return out;
+src/utils.c-40-}
+src/utils.c-41-
+src/utils.c-42-void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+src/utils.c-43-  if (r_is_object(x)) {
+src/utils.c-44-    r_abort_lazy_call(
+src/utils.c-45-      error_call,
+src/utils.c-46-      &quot;%s must be a bare array, not %s.&quot;,
+src/utils.c-47-      rray_arg_format_input(arg),
+src/utils.c-48-      r_obj_type_friendly(x)</pre></details>
+<p>x is already an array at that point, so I'll read <code>r_dim_names(x)</code> directly and use <code>r_clone()</code>, which keeps the titles and replaces the copy loop. <code>rray_clear_titles()</code> uses the same pattern.</p>
+
+<details class="tool"><summary>Edit src/names.c</summary>
+<pre class="diff"><span class="del">-  r_obj* old_names = KEEP(rray_names(x, arg, error_call));</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* new_names = KEEP(r_alloc_list(dimensionality));</span>
+<span class="del">-  if (old_names != r_null) {</span>
+<span class="del">-    r_obj* const* v_old_names = r_list_cbegin(old_names);</span>
+<span class="del">-    for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-      r_list_poke(new_names, i, v_old_names[i]);</span>
+<span class="del">-    }</span>
+<span class="del">-  }</span>
+<span class="del">-  r_list_poke(new_names, axis - 1, names);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out = KEEP(r_view(x));</span>
+<span class="del">-  r_attrib_poke_dim(out, r_dim(x));</span>
+<span class="del">-  r_attrib_poke_dim_names(out, new_names);</span>
+<span class="del">-</span>
+<span class="del">-  FREE(4);</span>
+<span class="ins">+  r_obj* old_names = r_dim_names(x);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* new_names = KEEP(</span>
+<span class="ins">+    old_names == r_null ? r_alloc_list(dimensionality) : r_clone(old_names)</span>
+<span class="ins">+  );</span>
+<span class="ins">+  r_list_poke(new_names, axis - 1, names);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out = KEEP(r_view(x));</span>
+<span class="ins">+  r_attrib_poke_dim(out, r_dim(x));</span>
+<span class="ins">+  r_attrib_poke_dim_names(out, new_names);</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(3);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/names.c has been updated successfully.</pre></details>
+<p>Now the roxygen. Checking how earlier steps phrased titles in the docs:</p>
+
+<details class="tool"><summary>Bash: grep -rn -i &quot;title&quot; R/*.R | grep -v &quot;^R/titles.R&quot; ; grep -n &quot;@param\|^#'&quot; R/titles.R | head -…</summary>
+<pre>grep -rn -i &quot;title&quot; R/*.R | grep -v &quot;^R/titles.R&quot; ; grep -n &quot;@param\|^#'&quot; R/titles.R | head -60</pre><pre class="output">R/insert-axes.R:32:#' Inserted axes have no names and an empty title. The axes of `x` keep their
+R/insert-axes.R:33:#' names and titles and carry them to their new locations.
+R/move-axes.R:8:#' Names and titles travel with their axis to its new position.
+R/permute-axes.R:6:#' Names and titles travel with their axis to its new position.
+R/remove-axes.R:6:#' Removed axes lose their names and titles.
+R/remove-axes.R:7:#' Surviving axes keep their names and titles and carry them to their new
+R/reverse.R:8:#' untouched. The titles of `x` are kept.
+R/rep.R:19:#' duplicate names. Every other axis keeps its names untouched. The titles of
+R/roll.R:48:#' untouched. The titles of `x` are kept.
+R/roll.R:63:#' all titles. When rows move by different amounts, the output's column 1 can
+R/slice.R:71:#'   the values. The titles of `x` are kept.
+R/unstack.R:12:#' surviving axes are carried over to their new locations, as are their titles.
+1:#' Array titles
+2:#'
+3:#' @description
+4:#' Titles are the names on an array's list of names. They appear in
+5:#' array print output.
+6:#'
+7:#' - `rray_titles()` returns the titles for every axis.
+8:#'
+9:#' - `rray_axis_title()` returns the title for one axis.
+10:#'
+11:#' - `rray_set_titles()` sets the titles for every axis.
+12:#'
+13:#' - `rray_set_axis_title()` sets the title for one axis.
+14:#'
+15:#' @param x An array.
+16:#'
+17:#' @param axis A single integer. The axis to get or set the title for.
+18:#'
+19:#' @param titles A character vector with one title per axis, or `NULL` to
+20:#'   remove all titles.
+21:#'
+22:#' @param title A single character string, or `NULL` to remove the title for
+23:#'   `axis`.
+24:#'
+25:#' @returns
+26:#' - `rray_titles()` returns a character vector, or `NULL` if there are no
+27:#'   titles.
+28:#' - `rray_axis_title()` returns one character string, or `NULL` if there are
+29:#'   no titles. It returns `&quot;&quot;` when the titles vector exists but that axis
+30:#'   has no title.
+31:#' - The setters return `x` with new titles. Plain vectors become
+32:#'   one-dimensional arrays.
+33:#'
+34:#' @name rray-titles
+35:#' @examples
+36:#' x &lt;- matrix(1:6, 2, 3)
+37:#' x &lt;- rray_set_titles(x, c(&quot;Row&quot;, &quot;Column&quot;))
+38:#' rray_titles(x)
+39:#' rray_axis_title(x, 2)
+40:#' rray_set_axis_title(x, 1, NULL)
+43:#' @rdname rray-titles
+44:#' @export
+49:#' @rdname rray-titles
+50:#' @export
+55:#' @rdname rray-titles
+56:#' @export
+61:#' @rdname rray-titles
+62:#' @export</pre></details>
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+p='R/names.R'
+s=open(p).read()
+old=&quot;&quot;&quot;#' @param names A list with length equal to the dimensionality of `x`, where
+#'   each element is either a character vector of names for that axis or
+#'   `NULL`. Can also be `NULL` to remove all names from `x`.
+&quot;&quot;&quot;
+new=&quot;&quot;&quot;#' @param names A list with length equal to the dimensionality of `x`, where
+#'   each element is either a character vector of names for that axis or
+#'   `NULL`. Can also be `NULL` to remove all names from `x`. The names of
+#'   `names` become the titles of `x`, so an unnamed list removes them.
+&quot;&quot;&quot;
+assert s.count(old)==1; s=s.replace(old,new)
+old=&quot;&quot;&quot;#' - `rray_set_axis_names()` sets the names for a single `axis` of an array,
+#'   leaving every other axis untouched.
+&quot;&quot;&quot;
+new=&quot;&quot;&quot;#' - `rray_set_axis_names()` sets the names for a single `axis` of an array,
+#'   leaving every other axis untouched. The titles of `x` are kept.
+&quot;&quot;&quot;
+assert s.count(old)==1; s=s.replace(old,new)
+open(p,'w').write(s)
+EOF</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read R/names.R</summary>
+<pre class="output">70	#' Set names for every axis of an array
+71	#'
+72	#' `rray_set_names()` sets the names for every axis of an array at once.
+73	#'
+74	#' @param x An array.
+75	#'
+76	#' @param names A list with length equal to the dimensionality of `x`, where
+77	#'   each element is either a character vector of names for that axis or
+78	#'   `NULL`. Can also be `NULL` to remove all names from `x`.
+79	#'
+80	#' @returns
+81	#' `x` with new names.
+82	#'
+83	#' @export
+84	#' @examples
+85	#' x &lt;- array(1:6, c(2, 3))
+86	#'
+87	#' rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+88	#'
+89	#' # `NULL` clears all names
+90	#' y &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+91	#' rray_set_names(y, NULL)
+92	rray_set_names &lt;- function(x, names) {
+93	  .Call(ffi_rray_set_names, x, names, environment())
+94	}
+95	
+96	#' Set names for a single axis of an array
+97	#'
+98	#' @description
+99	#' - `rray_set_axis_names()` sets the names for a single `axis` of an array,
+100	#'   leaving every other axis untouched.
+101	#'
+102	#' - `rray_set_row_names()` and `rray_set_column_names()` are shortcuts for
+103	#'   `rray_set_axis_names(x, 1, names)` and `rray_set_axis_names(x, 2, names)`.
+104	#'
+105	#' @param x An array.
+106	#'
+107	#' @param axis A single integer. The axis to set names for.
+108	#'
+109	#' @param names A character vector of names for `axis`, the same length as</pre></details>
+<details class="tool"><summary>Edit R/names.R</summary>
+<pre class="diff"><span class="del">-#'   `NULL`. Can also be `NULL` to remove all names from `x`.</span>
+<span class="ins">+#'   `NULL`. Can also be `NULL` to remove all names from `x`. The names of</span>
+<span class="ins">+#'   `names` become the titles of `x`, so an unnamed list removes them.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/names.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/names.R</summary>
+<pre class="diff"><span class="del">-#'   leaving every other axis untouched.</span>
+<span class="ins">+#'   leaving every other axis untouched. The titles of `x` are kept.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/names.R has been updated successfully.</pre></details>
+<p>Now the tests, placed next to the existing names tests for each setter.</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-names.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;rray_set_names() doesn't touch the data&quot;, {</span>
+<span class="ins">+test_that(&quot;rray_set_names() takes titles from `names`&quot;, {</span>
+<span class="ins">+  x &lt;- array(</span>
+<span class="ins">+    1:24,</span>
+<span class="ins">+    c(2L, 3L, 4L),</span>
+<span class="ins">+    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_names(x, list(NULL, NULL, NULL))</span>
+<span class="ins">+  expect_null(rray_titles(out))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_names(x, list(D = NULL, E = NULL, F = NULL))</span>
+<span class="ins">+  expect_identical(dimnames(out), list(D = NULL, E = NULL, F = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_names(y, list(c(&quot;a&quot;, &quot;b&quot;), NULL, NULL))</span>
+<span class="ins">+  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), NULL, NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_null(dimnames(rray_set_names(y, NULL)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rray_set_names() doesn't touch the data&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-names.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-names.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;rray_set_axis_names() drops other attributes&quot;, {</span>
+<span class="ins">+test_that(&quot;rray_set_axis_names() keeps titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(</span>
+<span class="ins">+    1:24,</span>
+<span class="ins">+    c(2L, 3L, 4L),</span>
+<span class="ins">+    dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_axis_names(x, 2, c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    dimnames(out),</span>
+<span class="ins">+    list(A = c(&quot;a&quot;, &quot;b&quot;), B = c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;), C = NULL)</span>
+<span class="ins">+  )</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_axis_names(x, 1, NULL)</span>
+<span class="ins">+  expect_identical(dimnames(out), list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_axis_names(y, 3, c(&quot;f&quot;, &quot;g&quot;, &quot;h&quot;, &quot;i&quot;))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    dimnames(out),</span>
+<span class="ins">+    list(A = NULL, B = NULL, C = c(&quot;f&quot;, &quot;g&quot;, &quot;h&quot;, &quot;i&quot;))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rray_set_axis_names() doesn't modify `x`&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL))</span>
+<span class="ins">+  rray_set_axis_names(x, 1, c(&quot;c&quot;, &quot;d&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(x), list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rray_set_axis_names() drops other attributes&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-names.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-names.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;rray_set_row_names() and rray_set_column_names() error on classed input&quot;, {</span>
+<span class="ins">+test_that(&quot;rray_set_row_names() and rray_set_column_names() keep titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(A = NULL, B = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_row_names(x, c(&quot;a&quot;, &quot;b&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(out), list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_set_column_names(x, c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(out), list(A = NULL, B = c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rray_set_row_names() and rray_set_column_names() error on classed input&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-names.R has been updated successfully.</pre></details>
+<p>Checking off the plan, then running the formatters, docs, and tests.</p>
+
+<details class="tool"><summary>Edit plans/titles.md</summary>
+<pre class="diff"><span class="del">-- [ ] 5. Names setters</span>
+<span class="ins">+- [x] 5. Names setters</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/titles.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | t…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -5 &amp;&amp; Rscript -e &quot;devtools::test(filter = '^names')&quot; 2&gt;&amp;1 | tail -8 &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE); x &lt;- c(a = 1, b = 2); print(rray_set_axis_names(x, 1, c(&quot;c&quot;, &quot;d&quot;))); print(x); z &lt;- array(1:4, c(2,2)); print(rray_set_axis_names(z, 2, c(&quot;u&quot;,&quot;v&quot;)))'</pre><pre class="output">installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpUNEjvG/devtools_install_66572f609b8b/00LOCK-rray/00new/rray/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray)
+Writing 'rray_set_names.Rd'
+Writing 'rray_set_axis_names.Rd'
+ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 66 ]
+c d 
+1 2 
+a b 
+1 2 
+     u v
+[1,] 1 3
+[2,] 2 4</pre></details>
+<p>Focused tests pass. Running the full suite and reviewing the diff:</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4 &amp;&amp; git status --short &amp;&amp; git diff src R man</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4 &amp;&amp; git status --short &amp;&amp; git diff src R man</pre><pre class="output">SKIP: 'test-reduce-sum.R:518:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 7753 ]
+ M R/names.R
+ M man/rray_set_axis_names.Rd
+ M man/rray_set_names.Rd
+ M plans/titles.md
+ M src/names.c
+ M tests/testthat/test-names.R
+diff --git a/R/names.R b/R/names.R
+index 00cd52e..1d3a063 100644
+--- a/R/names.R
++++ b/R/names.R
+@@ -75,7 +75,8 @@ rray_column_names &lt;- function(x) {
+ #'
+ #' @param names A list with length equal to the dimensionality of `x`, where
+ #'   each element is either a character vector of names for that axis or
+-#'   `NULL`. Can also be `NULL` to remove all names from `x`.
++#'   `NULL`. Can also be `NULL` to remove all names from `x`. The names of
++#'   `names` become the titles of `x`, so an unnamed list removes them.
+ #'
+ #' @returns
+ #' `x` with new names.
+@@ -97,7 +98,7 @@ rray_set_names &lt;- function(x, names) {
+ #'
+ #' @description
+ #' - `rray_set_axis_names()` sets the names for a single `axis` of an array,
+-#'   leaving every other axis untouched.
++#'   leaving every other axis untouched. The titles of `x` are kept.
+ #'
+ #' - `rray_set_row_names()` and `rray_set_column_names()` are shortcuts for
+ #'   `rray_set_axis_names(x, 1, names)` and `rray_set_axis_names(x, 2, names)`.
+diff --git a/man/rray_set_axis_names.Rd b/man/rray_set_axis_names.Rd
+index 374b8b7..507b486 100644
+--- a/man/rray_set_axis_names.Rd
++++ b/man/rray_set_axis_names.Rd
+@@ -26,7 +26,7 @@ the dimension of \code{axis}. Can also be \code{NULL} to remove names from \code
+ \description{
+ \itemize{
+ \item \code{rray_set_axis_names()} sets the names for a single \code{axis} of an array,
+-leaving every other axis untouched.
++leaving every other axis untouched. The titles of \code{x} are kept.
+ \item \code{rray_set_row_names()} and \code{rray_set_column_names()} are shortcuts for
+ \code{rray_set_axis_names(x, 1, names)} and \code{rray_set_axis_names(x, 2, names)}.
+ }
+diff --git a/man/rray_set_names.Rd b/man/rray_set_names.Rd
+index b130bf7..b2b50b0 100644
+--- a/man/rray_set_names.Rd
++++ b/man/rray_set_names.Rd
+@@ -11,7 +11,8 @@ rray_set_names(x, names)
+ 
+ \item{names}{A list with length equal to the dimensionality of \code{x}, where
+ each element is either a character vector of names for that axis or
+-\code{NULL}. Can also be \code{NULL} to remove all names from \code{x}.}
++\code{NULL}. Can also be \code{NULL} to remove all names from \code{x}. The names of
++\code{names} become the titles of \code{x}, so an unnamed list removes them.}
+ }
+ \value{
+ \code{x} with new names.
+diff --git a/src/names.c b/src/names.c
+index f2b26b0..452deda 100644
+--- a/src/names.c
++++ b/src/names.c
+@@ -158,22 +158,18 @@ r_obj* rray_set_axis_names(
+   const int dimension = rray_dimension(x, axis, arg, error_call);
+   check_axis_names(names, axis, dimension, error_call);
+ 
+-  r_obj* old_names = KEEP(rray_names(x, arg, error_call));
++  r_obj* old_names = r_dim_names(x);
+ 
+-  r_obj* new_names = KEEP(r_alloc_list(dimensionality));
+-  if (old_names != r_null) {
+-    r_obj* const* v_old_names = r_list_cbegin(old_names);
+-    for (int i = 0; i &lt; dimensionality; ++i) {
+-      r_list_poke(new_names, i, v_old_names[i]);
+-    }
+-  }
++  r_obj* new_names = KEEP(
++    old_names == r_null ? r_alloc_list(dimensionality) : r_clone(old_names)
++  );
+   r_list_poke(new_names, axis - 1, names);
+ 
+   r_obj* out = KEEP(r_view(x));
+   r_attrib_poke_dim(out, r_dim(x));
+   r_attrib_poke_dim_names(out, new_names);
+ 
+-  FREE(4);
++  FREE(3);
+   return out;
+ }</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>All 7753 tests pass, and I've verified the protection logic in the diff is correct—<code>old_names</code>, <code>new_names</code>, and <code>out</code> are properly protected with <code>FREE(3)</code> matching. Now I'll create the branch, commit, and push.</p>
+</details>
+<details class="tool"><summary>Bash: git checkout -b feature/titles &amp;&amp; git add -A &amp;&amp; git commit -q -m 'Keep titles in `rray_set_ax…</summary>
+<pre>git checkout -b feature/titles &amp;&amp; git add -A &amp;&amp; git commit -q -m 'Keep titles in `rray_set_axis_names()` and document them in `rray_set_names()`' &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/titles 2&gt;&amp;1 | tail -3</pre><pre class="output">Switched to a new branch 'feature/titles'
+ecf7958 Keep titles in `rray_set_axis_names()` and document them in `rray_set_names()`
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/titles -&gt; feature/titles
+branch 'feature/titles' set up to track 'origin/feature/titles'.</pre></details>
+<p>I've finished part 5 of the plan: <code>rray_set_axis_names()</code> (and so <code>rray_set_row_names()</code> and <code>rray_set_column_names()</code>) now keeps the titles of <code>x</code>. The full test suite passes (7753 passed, 0 failed, 6 skipped). It's committed as <code>ecf7958</code> and pushed to the new branch <code>feature/titles</code>. I had no questions, so I went ahead without asking.</p>
+<p><strong>C change (<code>src/names.c</code>).</strong> I didn't add the titles step the plan describes. Instead, <code>rray_set_axis_names()</code> now makes a shallow copy of the old names list with <code>r_clone()</code>. The copy keeps the list's names, which are the titles, so the copy loop could go. When <code>x</code> has no names it still allocates a fresh list. Two smaller simplifications:</p>
+<ul>
+<li>It reads <code>r_dim_names(x)</code> directly instead of calling <code>rray_names()</code> again, because <code>x</code> is already an array at that point. One <code>KEEP()</code> goes with it.</li>
+<li>The pattern matches <code>rray_clear_titles()</code> in <code>src/titles.c</code>.</li>
+</ul>
+<p>The copy is a new list, so changing it never alters the names on the original <code>x</code>. I added a test for that.</p>
+<p>I did the protection pass on the diff and found no problems. I ran <code>clang-format</code>, <code>air format .</code> and <code>devtools::document()</code>.</p>
+<p><strong>Docs:</strong></p>
+<ul>
+<li>On <code>rray_set_names()</code>, the <code>@param names</code> entry now says the names of <code>names</code> become the titles, so an unnamed list removes them.</li>
+<li><code>rray_set_axis_names()</code> now says &quot;The titles of <code>x</code> are kept.&quot;</li>
+</ul>
+<p><strong>Tests (<code>test-names.R</code>).</strong> Each new test sits next to the existing tests for the same function:</p>
+<ul>
+<li><code>rray_set_names()</code>: an unnamed list drops the titles, a named list sets new ones, a titles-only input works, and <code>NULL</code> clears everything.</li>
+<li><code>rray_set_axis_names()</code>: titles are kept when setting names on an axis, when clearing them with <code>NULL</code>, and on a titles-only input. Plus the test that <code>x</code> is not modified.</li>
+<li><code>rray_set_row_names()</code> and <code>rray_set_column_names()</code>: titles are kept.</li>
+</ul>
+<p>Step 5 is checked off in <code>plans/titles.md</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Remove “so an unnamed list removes them”</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit R/names.R</summary>
+<pre class="diff"><span class="del">-`names` become the titles of `x`, so an unnamed list removes them.</span>
+<span class="ins">+`names` become the titles of `x`.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/names.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; git diff --stat</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -2 &amp;&amp; git diff --stat</pre><pre class="output">ℹ Loading rray
+Writing 'rray_set_names.Rd'
+ R/names.R             | 2 +-
+ man/rray_set_names.Rd | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)</pre></details>
+<p>I removed &quot;so an unnamed list removes them&quot; from the <code>rray_set_names()</code> docs. The <code>@param names</code> entry now ends with &quot;The names of <code>names</code> become the titles of <code>x</code>.&quot; I regenerated <code>man/rray_set_names.Rd</code> to match.</p>
+<p>The change is not committed yet. Should I add it to the existing commit or make a new one, and then push?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m 'Simplify the titles note in `rray_set_names()` docs' &amp;&amp; git p…</summary>
+<pre>git add -A &amp;&amp; git commit -q -m 'Simplify the titles note in `rray_set_names()` docs' &amp;&amp; git push -u origin feature/titles 2&gt;&amp;1 | tail -2 &amp;&amp; git log --oneline -2</pre><pre class="output">   ecf7958..2292801  feature/titles -&gt; feature/titles
+branch 'feature/titles' set up to track 'origin/feature/titles'.
+2292801 Simplify the titles note in `rray_set_names()` docs
+ecf7958 Keep titles in `rray_set_axis_names()` and document them in `rray_set_names()`</pre></details>
+<p>I committed the doc change as a new commit, <code>2292801</code>, and pushed it to <code>feature/titles</code>. I didn't fold it into the earlier commit, because that would have needed a force push.</p>
+
+</section>
+</main>
+</body>
+</html>

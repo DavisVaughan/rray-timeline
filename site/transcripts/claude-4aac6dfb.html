@@ -1,0 +1,1601 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adding ptype and arg parameters to C-level rray_combine()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-71">rray timeline</a>
+<h1>Adding <code>ptype</code> and <code>arg</code> parameters to C-level <code>rray_combine()</code></h1>
+<p class="facts">Claude · Sep 16, 2026 · 4 prompts · 6 replies · <a href="https://github.com/r-lib/rray/pull/71">#71</a></p>
+</header>
+<main>
+<p class="divider">Sep 16, 2026, 21:22 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Give the C level version of rray_combine a ptype and arg argument that can be used for ptype common and error messaging throughout. Don’t expose via the R side yet. Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll start by looking at the current combine implementation.</p>
+
+<details class="tool"><summary>Bash: ls ~/files/r/packages/rray4/src/</summary>
+<pre>ls ~/files/r/packages/rray4/src/</pre><pre class="output">arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extremum.c
+extremum.h
+extremum.o
+init.c
+init.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+split-names.c
+split-names.h
+split-names.o
+split.c
+split.h
+split.o
+squeeze.c
+squeeze.h
+squeeze.o
+stack.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+unstack.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o</pre></details>
+<details class="tool"><summary>Read src/combine.c</summary>
+<pre class="output">1	#include &quot;combine.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	
+5	#include &quot;axes.h&quot;
+6	#include &quot;broadcast-names.h&quot;
+7	#include &quot;cast-common.h&quot;
+8	#include &quot;dimensionality.h&quot;
+9	#include &quot;dimensions.h&quot;
+10	#include &quot;ptype-common.h&quot;
+11	#include &quot;strided-iterator.h&quot;
+12	#include &quot;strides.h&quot;
+13	#include &quot;utils.h&quot;
+14	
+15	#include &quot;decl/combine-decl.h&quot;
+16	
+17	r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+18	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+19	
+20	  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+21	  return rray_combine(ffi_xs, axis, error_call);
+22	}
+23	
+24	r_obj* rray_combine(r_obj* xs, int axis, struct r_lazy error_call) {
+25	  if (r_length(xs) == 0) {
+26	    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+27	  }
+28	
+29	  r_obj* ptype =
+30	    KEEP(rray_ptype_common(xs, r_null, NULL, rray_args.empty, error_call));
+31	
+32	  xs = KEEP(rray_cast_common(xs, ptype, NULL, rray_args.empty, error_call));
+33	
+34	  const r_ssize xs_size = r_length(xs);
+35	  r_obj* const* v_xs = r_list_cbegin(xs);
+36	
+37	  int dimensionality = 1;
+38	
+39	  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+40	    const int x_dimensionality =
+41	      rray_dimensionality(v_xs[i], rray_args.empty, error_call);
+42	    if (x_dimensionality &gt; dimensionality) {
+43	      dimensionality = x_dimensionality;
+44	    }
+45	  }
+46	
+47	  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+48	
+49	  r_obj* xs_names = KEEP(r_names(xs));
+50	
+51	  r_ssize x_i = 0;
+52	  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, xs_size, &amp;x_i);
+53	  KEEP(x_arg-&gt;shelter);
+54	
+55	  r_ssize out_i = 0;
+56	  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, xs_size, &amp;out_i);
+57	  KEEP(out_arg-&gt;shelter);
+58	
+59	  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+60	  int* v_out_dimensions = r_int_begin(out_dimensions);
+61	
+62	  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+63	
+64	  for (int i = 0; i &lt; dimensionality; ++i) {
+65	    v_out_dimensions[i] = 1;
+66	    v_out_args[i] = 0;
+67	  }
+68	
+69	  r_ssize axis_dimension = 0;
+70	
+71	  for (; x_i &lt; xs_size; ++x_i) {
+72	    r_obj* x_dimensions = r_dim(v_xs[x_i]);
+73	    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+74	    const int x_dimensionality = (int) r_length(x_dimensions);
+75	
+76	    for (int i = 0; i &lt; dimensionality; ++i) {
+77	      const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;
+78	
+79	      if (i == axis - 1) {
+80	        if (axis_dimension &gt; INT_MAX - x_dimension) {
+81	          r_abort_lazy_call(
+82	            error_call,
+83	            &quot;The combined dimension on `.axis` is too large.&quot;
+84	          );
+85	        }
+86	        axis_dimension += x_dimension;
+87	        continue;
+88	      }
+89	
+90	      const int out_dimension = v_out_dimensions[i];
+91	
+92	      if (out_dimension == x_dimension || x_dimension == 1) {
+93	        continue;
+94	      }
+95	
+96	      if (out_dimension == 1) {
+97	        v_out_dimensions[i] = x_dimension;
+98	        v_out_args[i] = x_i;
+99	        continue;
+100	      }
+101	
+102	      out_i = v_out_args[i];
+103	      r_abort_lazy_call(
+104	        error_call,
+105	        &quot;Can't find common dimensions at axis %d. &quot;
+106	        &quot;%s has dimension %d and %s has dimension %d.&quot;,
+107	        i + 1,
+108	        rray_arg_format(out_arg),
+109	        out_dimension,
+110	        rray_arg_format(x_arg),
+111	        x_dimension
+112	      );
+113	    }
+114	  }
+115	
+116	  v_out_dimensions[axis - 1] = (int) axis_dimension;
+117	  const r_ssize out_size =
+118	    rray_combine_size(v_out_dimensions, dimensionality, error_call);
+119	
+120	  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+121	
+122	  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+123	  rray_fill_strides_from_dimensions(
+124	    v_out_dimensions,
+125	    dimensionality,
+126	    v_out_strides
+127	  );
+128	
+129	  r_ssize axis_offset = 0;
+130	
+131	  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
+132	    r_obj* x = v_xs[x_i];
+133	    r_obj* x_dimensions = r_dim(x);
+134	    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+135	    const int x_dimensionality = (int) r_length(x_dimensions);
+136	    const int x_axis_dimension =
+137	      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+138	
+139	    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+140	    r_memcpy(
+141	      v_x_broadcast_dimensions,
+142	      v_out_dimensions,
+143	      sizeof(int) * dimensionality
+144	    );
+145	    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+146	
+147	    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+148	    rray__fill_broadcast_strides(
+149	      v_x_dimensions,
+150	      x_dimensionality,
+151	      dimensionality,
+152	      v_x_strides
+153	    );
+154	
+155	    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+156	      v_x_broadcast_dimensions,
+157	      dimensionality,
+158	      v_out_strides,
+159	      v_x_strides
+160	    );
+161	
+162	    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+163	    rray_combine_copy(x, out, out_start, &amp;plan);
+164	    axis_offset += x_axis_dimension;
+165	  }
+166	
+167	  r_obj* out_names = KEEP(rray_combine_names(xs, out_dimensions, axis));
+168	
+169	  r_attrib_poke_dim(out, out_dimensions);
+170	  if (out_names != r_null) {
+171	    r_attrib_poke_dim_names(out, out_names);
+172	  }
+173	
+174	  FREE(8);
+175	  return out;
+176	}
+177	
+178	static r_ssize rray_combine_size(
+179	  const int* v_dimensions,
+180	  int dimensionality,
+181	  struct r_lazy error_call
+182	) {
+183	  r_ssize out = 1;
+184	
+185	  for (int i = 0; i &lt; dimensionality; ++i) {
+186	    const int dimension = v_dimensions[i];
+187	    if (dimension != 0 &amp;&amp; out &gt; R_SSIZE_MAX / dimension) {
+188	      r_abort_lazy_call(error_call, &quot;The result is too large.&quot;);
+189	    }
+190	    out *= dimension;
+191	  }
+192	
+193	  return out;
+194	}
+195	
+196	static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {
+197	  r_obj* out = rray_broadcast_names_common(xs, dimensions);
+198	  r_keep_loc out_loc;
+199	  KEEP_HERE(out, &amp;out_loc);
+200	</pre><p class="cut">239 more lines cut</p></details>
+<details class="tool"><summary>Read src/combine.h</summary>
+<pre class="output">1	#ifndef RRAY_COMBINE_H
+2	#define RRAY_COMBINE_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	r_obj* rray_combine(r_obj* xs, int axis, struct r_lazy error_call);
+7	
+8	#endif
+9	</pre></details>
+<details class="tool"><summary>Read src/decl/combine-decl.h</summary>
+<pre class="output">1	static r_ssize rray_combine_size(
+2	  const int* v_dimensions,
+3	  int dimensionality,
+4	  struct r_lazy error_call
+5	);
+6	static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis);
+7	static r_obj* rray_combine_axis_names(r_obj* xs, int axis);
+8	static void rray_combine_copy(
+9	  r_obj* x,
+10	  r_obj* out,
+11	  r_ssize out_start,
+12	  const struct rray_strided_iterator2_plan* plan
+13	);
+14	static void rray_combine_lgl(
+15	  r_obj* x,
+16	  r_obj* out,
+17	  r_ssize out_start,
+18	  const struct rray_strided_iterator2_plan* plan
+19	);
+20	static void rray_combine_int(
+21	  r_obj* x,
+22	  r_obj* out,
+23	  r_ssize out_start,
+24	  const struct rray_strided_iterator2_plan* plan
+25	);
+26	static void rray_combine_dbl(
+27	  r_obj* x,
+28	  r_obj* out,
+29	  r_ssize out_start,
+30	  const struct rray_strided_iterator2_plan* plan
+31	);
+32	static void rray_combine_cpl(
+33	  r_obj* x,
+34	  r_obj* out,
+35	  r_ssize out_start,
+36	  const struct rray_strided_iterator2_plan* plan
+37	);
+38	static void rray_combine_raw(
+39	  r_obj* x,
+40	  r_obj* out,
+41	  r_ssize out_start,
+42	  const struct rray_strided_iterator2_plan* plan
+43	);
+44	static void rray_combine_chr(
+45	  r_obj* x,
+46	  r_obj* out,
+47	  r_ssize out_start,
+48	  const struct rray_strided_iterator2_plan* plan
+49	);
+50	static void rray_combine_list(
+51	  r_obj* x,
+52	  r_obj* out,
+53	  r_ssize out_start,
+54	  const struct rray_strided_iterator2_plan* plan
+55	);
+56	</pre></details>
+<details class="tool"><summary>Read src/ptype-common.h</summary>
+<pre class="output">1	#ifndef RRAY_PTYPE_COMMON_H
+2	#define RRAY_PTYPE_COMMON_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	
+8	r_obj* rray_ptype_common(
+9	  r_obj* xs,
+10	  r_obj* ptype,
+11	  struct rray_arg* arg,
+12	  struct rray_arg* ptype_arg,
+13	  struct r_lazy error_call
+14	);
+15	
+16	#endif
+17	</pre></details>
+<details class="tool"><summary>Read src/arg.h</summary>
+<pre class="output">1	#ifndef RRAY_ARG_H
+2	#define RRAY_ARG_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	struct rray_arg {
+7	  r_obj* shelter;
+8	  struct rray_arg* parent;
+9	  r_ssize (*fill)(void* data, char* buf, r_ssize remaining);
+10	  void* data;
+11	};
+12	
+13	struct rray_args {
+14	  struct rray_arg* empty;
+15	  struct rray_arg* x;
+16	  struct rray_arg* y;
+17	  struct rray_arg* names;
+18	  struct rray_arg* axis;
+19	  struct rray_arg* dot_axis;
+20	  struct rray_arg* axes;
+21	  struct rray_arg* to;
+22	  struct rray_arg* dimensions;
+23	  struct rray_arg* dot_dimensions;
+24	};
+25	
+26	extern struct rray_args rray_args;
+27	
+28	r_obj* rray_arg(struct rray_arg* arg);
+29	
+30	const char* rray_arg_format(struct rray_arg* arg);
+31	
+32	const char* rray_arg_format_input(struct rray_arg* arg);
+33	
+34	bool rray_arg_is_empty(struct rray_arg* arg);
+35	
+36	struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+37	
+38	struct rray_arg new_lazy_arg(struct r_lazy* arg);
+39	
+40	struct rray_arg* new_subscript_arg(
+41	  struct rray_arg* parent,
+42	  r_obj* names,
+43	  r_ssize n,
+44	  r_ssize* p_i
+45	);
+46	
+47	#endif
+48	</pre></details>
+<details class="tool"><summary>Read src/ptype-common.c</summary>
+<pre class="output">1	#include &quot;ptype-common.h&quot;
+2	
+3	#include &quot;ptype.h&quot;
+4	#include &quot;syms.h&quot;
+5	#include &quot;utils.h&quot;
+6	
+7	r_obj* ffi_rray_ptype_common(
+8	  r_obj* ffi_xs,
+9	  r_obj* ffi_ptype,
+10	  r_obj* ffi_frame
+11	) {
+12	  struct r_lazy error_call = {.x = rray_syms.dot_call, .env = ffi_frame};
+13	
+14	  struct r_lazy arg_lazy = {.x = rray_syms.dot_arg, .env = ffi_frame};
+15	  struct rray_arg arg = new_lazy_arg(&amp;arg_lazy);
+16	
+17	  struct r_lazy ptype_arg_lazy = {
+18	    .x = rray_syms.dot_ptype_arg,
+19	    .env = ffi_frame
+20	  };
+21	  struct rray_arg ptype_arg = new_lazy_arg(&amp;ptype_arg_lazy);
+22	
+23	  return rray_ptype_common(ffi_xs, ffi_ptype, &amp;arg, &amp;ptype_arg, error_call);
+24	}
+25	
+26	r_obj* rray_ptype_common(
+27	  r_obj* xs,
+28	  r_obj* ptype,
+29	  struct rray_arg* arg,
+30	  struct rray_arg* ptype_arg,
+31	  struct r_lazy error_call
+32	) {
+33	  if (ptype != r_null) {
+34	    return rray_ptype(ptype, ptype_arg, error_call);
+35	  }
+36	
+37	  const r_ssize n = r_length(xs);
+38	
+39	  if (n == 0) {
+40	    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+41	  }
+42	
+43	  r_obj* const* v_xs = r_list_cbegin(xs);
+44	  r_obj* xs_names = KEEP(r_names(xs));
+45	
+46	  r_ssize x_i = 0;
+47	  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;x_i);
+48	  KEEP(x_arg-&gt;shelter);
+49	
+50	  r_ssize out_i = 0;
+51	  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, n, &amp;out_i);
+52	  KEEP(out_arg-&gt;shelter);
+53	
+54	  r_keep_loc out_pi;
+55	  r_obj* out = rray_ptype(v_xs[0], x_arg, error_call);
+56	  KEEP_HERE(out, &amp;out_pi);
+57	
+58	  for (x_i = 1; x_i &lt; n; ++x_i) {
+59	    enum rray_side side;
+60	    out = rray_ptype2(out, v_xs[x_i], &amp;side, out_arg, x_arg, error_call);
+61	    KEEP_AT(out, out_pi);
+62	
+63	    if (side == RRAY_SIDE_right) {
+64	      out_i = x_i;
+65	    }
+66	  }
+67	
+68	  FREE(4);
+69	  return out;
+70	}
+71	</pre></details>
+<details class="tool"><summary>Read src/cast-common.c</summary>
+<pre class="output">1	#include &quot;cast-common.h&quot;
+2	
+3	#include &quot;cast.h&quot;
+4	#include &quot;ptype-common.h&quot;
+5	#include &quot;syms.h&quot;
+6	
+7	r_obj* ffi_rray_cast_common(r_obj* ffi_xs, r_obj* ffi_to, r_obj* ffi_frame) {
+8	  struct r_lazy error_call = {.x = rray_syms.dot_call, .env = ffi_frame};
+9	
+10	  struct r_lazy arg_lazy = {.x = rray_syms.dot_arg, .env = ffi_frame};
+11	  struct rray_arg arg = new_lazy_arg(&amp;arg_lazy);
+12	
+13	  struct r_lazy to_arg_lazy = {.x = rray_syms.dot_to_arg, .env = ffi_frame};
+14	  struct rray_arg to_arg = new_lazy_arg(&amp;to_arg_lazy);
+15	
+16	  return rray_cast_common(ffi_xs, ffi_to, &amp;arg, &amp;to_arg, error_call);
+17	}
+18	
+19	r_obj* rray_cast_common(
+20	  r_obj* xs,
+21	  r_obj* to,
+22	  struct rray_arg* arg,
+23	  struct rray_arg* to_arg,
+24	  struct r_lazy error_call
+25	) {
+26	  to = KEEP(rray_ptype_common(xs, to, arg, to_arg, error_call));
+27	
+28	  const r_ssize n = r_length(xs);
+29	  r_obj* const* v_xs = r_list_cbegin(xs);
+30	  r_obj* xs_names = KEEP(r_names(xs));
+31	
+32	  r_obj* out = KEEP(r_alloc_list(n));
+33	  r_attrib_poke_names(out, xs_names);
+34	
+35	  r_ssize i = 0;
+36	  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;i);
+37	  KEEP(x_arg-&gt;shelter);
+38	
+39	  for (; i &lt; n; ++i) {
+40	    r_list_poke(out, i, rray_cast(v_xs[i], to, x_arg, to_arg, error_call));
+41	  }
+42	
+43	  FREE(4);
+44	  return out;
+45	}
+46	</pre></details>
+<details class="tool"><summary>Read src/arg.c</summary>
+<pre class="output">1	#include &quot;arg.h&quot;
+2	
+3	#include &lt;stdio.h&gt;
+4	#include &lt;string.h&gt;
+5	
+6	#include &quot;utils.h&quot;
+7	
+8	#include &quot;decl/arg-decl.h&quot;
+9	
+10	#define RRAY_ARG_BUFFER_SIZE 100
+11	
+12	r_obj* rray_arg(struct rray_arg* arg) {
+13	  if (arg == NULL) {
+14	    return r_chrs.empty_string;
+15	  }
+16	
+17	  r_ssize size = RRAY_ARG_BUFFER_SIZE;
+18	
+19	  while (true) {
+20	    r_obj* shelter = KEEP(r_alloc_raw(size));
+21	    char* buf = (char*) r_raw_begin(shelter);
+22	
+23	    if (fill_arg_buffer(arg, buf, 0, size) &gt;= 0) {
+24	      r_obj* out = r_chr(buf);
+25	      FREE(1);
+26	      return out;
+27	    }
+28	
+29	    FREE(1);
+30	    size += size / 2;
+31	  }
+32	}
+33	
+34	const char* rray_arg_format(struct rray_arg* arg) {
+35	  r_obj* chr = KEEP(rray_arg(arg));
+36	  const char* out = r_format_error_arg(chr);
+37	  FREE(1);
+38	  return out;
+39	}
+40	
+41	const char* rray_arg_format_input(struct rray_arg* arg) {
+42	  if (rray_arg_is_empty(arg)) {
+43	    return &quot;Input&quot;;
+44	  }
+45	
+46	  return rray_arg_format(arg);
+47	}
+48	
+49	static r_ssize fill_arg_buffer(
+50	  struct rray_arg* arg,
+51	  char* buf,
+52	  r_ssize cur_size,
+53	  r_ssize tot_size
+54	) {
+55	  if (arg-&gt;parent != NULL) {
+56	    cur_size = fill_arg_buffer(arg-&gt;parent, buf, cur_size, tot_size);
+57	
+58	    if (cur_size &lt; 0) {
+59	      return cur_size;
+60	    }
+61	  }
+62	
+63	  const r_ssize written =
+64	    arg-&gt;fill(arg-&gt;data, buf + cur_size, tot_size - cur_size);
+65	
+66	  if (written &lt; 0) {
+67	    return written;
+68	  }
+69	
+70	  return cur_size + written;
+71	}
+72	
+73	static r_ssize str_arg_fill(const char* data, char* buf, r_ssize remaining) {
+74	  const r_ssize len = (r_ssize) strlen(data);
+75	
+76	  if (len &gt;= remaining) {
+77	    return -1;
+78	  }
+79	
+80	  r_memcpy(buf, data, len);
+81	  buf[len] = '\0';
+82	
+83	  return len;
+84	}
+85	
+86	struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg) {
+87	  struct rray_arg out =
+88	    {.parent = parent, .fill = &amp;wrapper_arg_fill, .data = (void*) arg};
+89	  return out;
+90	}
+91	
+92	static r_ssize wrapper_arg_fill(void* data, char* buf, r_ssize remaining) {
+93	  return str_arg_fill((const char*) data, buf, remaining);
+94	}
+95	
+96	struct rray_arg new_lazy_arg(struct r_lazy* arg) {
+97	  return (struct rray_arg){.fill = &amp;lazy_arg_fill, .data = arg};
+98	}
+99	
+100	static r_ssize lazy_arg_fill(void* data, char* buf, r_ssize remaining) {
+101	  r_obj* arg = KEEP(r_lazy_eval(*(struct r_lazy*) data));
+102	
+103	  const char* string = &quot;&quot;;
+104	
+105	  if (r_is_string(arg)) {
+106	    string = r_chr_get_c_string(arg, 0);
+107	  } else if (arg != r_null) {
+108	    r_abort(
+109	      &quot;`arg` must be a string or `NULL`, not %s.&quot;,
+110	      r_obj_type_friendly(arg)
+111	    );
+112	  }
+113	
+114	  const r_ssize out = str_arg_fill(string, buf, remaining);
+115	
+116	  FREE(1);
+117	  return out;
+118	}
+119	
+120	struct subscript_arg_data {
+121	  struct rray_arg self;
+122	  r_obj* names;
+123	  r_ssize n;
+124	  r_ssize* p_i;
+125	};
+126	
+127	struct rray_arg* new_subscript_arg(
+128	  struct rray_arg* parent,
+129	  r_obj* names,
+130	  r_ssize n,
+131	  r_ssize* p_i
+132	) {
+133	  r_obj* shelter = KEEP(r_alloc_list(2));
+134	  r_list_poke(shelter, 0, r_alloc_raw(sizeof(struct subscript_arg_data)));
+135	  r_list_poke(shelter, 1, names);
+136	
+137	  struct subscript_arg_data* p_data = r_raw_begin(r_list_get(shelter, 0));
+138	
+139	  p_data-&gt;self = (struct rray_arg){
+140	    .shelter = shelter,
+141	    .parent = parent,
+142	    .fill = &amp;subscript_arg_fill,
+143	    .data = p_data
+144	  };
+145	  p_data-&gt;names = names;
+146	  p_data-&gt;n = n;
+147	  p_data-&gt;p_i = p_i;
+148	
+149	  FREE(1);
+150	  return (struct rray_arg*) p_data;
+151	}
+152	
+153	static r_ssize subscript_arg_fill(void* data, char* buf, r_ssize remaining) {
+154	  struct subscript_arg_data* p_data = (struct subscript_arg_data*) data;
+155	
+156	  const r_ssize i = *p_data-&gt;p_i;
+157	  const r_ssize n = p_data-&gt;n;
+158	  r_obj* names = p_data-&gt;names;
+159	
+160	  if (i &gt;= n) {
+161	    r_stop_internal(
+162	      &quot;`i` of %&quot; R_PRI_SSIZE &quot; can't be past the end of %&quot; R_PRI_SSIZE &quot;.&quot;,
+163	      i,
+164	      n
+165	    );
+166	  }
+167	
+168	  const size_t space = (size_t) remaining;
+169	  const bool named = r_has_name_at(names, i);
+170	  const bool child = !rray_arg_is_empty(p_data-&gt;self.parent);
+171	
+172	  int len;
+173	
+174	  if (child) {
+175	    if (named) {
+176	      len = snprintf(buf, space, &quot;$%s&quot;, r_chr_get_c_string(names, i));
+177	    } else {
+178	      len = snprintf(buf, space, &quot;[[%&quot; R_PRI_SSIZE &quot;]]&quot;, i + 1);
+179	    }
+180	  } else {
+181	    if (named) {
+182	      len = snprintf(buf, space, &quot;%s&quot;, r_chr_get_c_string(names, i));
+183	    } else {
+184	      len = snprintf(buf, space, &quot;..%&quot; R_PRI_SSIZE, i + 1);
+185	    }
+186	  }
+187	
+188	  if (len &gt;= remaining) {
+189	    return -1;
+190	  }
+191	
+192	  return len;
+193	}
+194	
+195	bool rray_arg_is_empty(struct rray_arg* arg) {
+196	  if (arg == NULL) {
+197	    return true;
+198	  }
+199	
+200	  char buf[1];</pre><p class="cut">28 more lines cut</p></details>
+<details class="tool"><summary>Read src/dimensionality.c</summary>
+<pre class="output">1	#include &quot;dimensionality.h&quot;
+2	
+3	#include &quot;dimensions.h&quot;
+4	
+5	r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+6	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+7	  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+8	}
+9	
+10	int rray_dimensionality(
+11	  r_obj* x,
+12	  struct rray_arg* arg,
+13	  struct r_lazy error_call
+14	) {
+15	  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+16	  return rray_dimensionality_from_dimensions(dimensions);
+17	}
+18	
+19	int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+20	  return (int) r_length(dimensions);
+21	}
+22	
+23	void check_max_dimensionality(int dimensionality) {
+24	  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+25	    r_abort(
+26	      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+27	      &quot;A dimensionality of %d was requested.&quot;,
+28	      RRAY_MAX_DIMENSIONALITY,
+29	      dimensionality
+30	    );
+31	  }
+32	}
+33	</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_combine&quot; --include=*.c --include=*.h --include=*.R . | grep -v &quot;^./src/combine…</summary>
+<pre>grep -rn &quot;rray_combine&quot; --include=*.c --include=*.h --include=*.R . | grep -v &quot;^./src/combine.c&quot; </pre><pre class="output">(eval):1: no matches found: --include=*.c</pre></details>
+<details class="tool"><summary>Bash: cat R/combine.R 2&gt;/dev/null; ls R/ | head -50</summary>
+<pre>cat R/combine.R 2&gt;/dev/null; ls R/ | head -50</pre><pre class="output">#' Combine arrays along an existing axis
+#'
+#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+#' other axis are broadcast to common dimensions.
+#'
+#' @param ... Arrays to combine.
+#'
+#' @param .axis A single integer between 1 and the greatest input
+#'   dimensionality.
+#'
+#' @returns
+#' An array with the following dimensions:
+#' - Along `.axis`, the input dimensions are added together.
+#' - Along all other axes, the common dimensions are taken via broadcasting.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:6, c(2, 3))
+#' y &lt;- array(7:12, c(2, 3))
+#'
+#' rray_combine(x, y, .axis = 1)
+#' rray_combine(x, y, .axis = 2)
+#'
+#' # Missing trailing axes have an implicit dimension of 1
+#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+rray_combine &lt;- function(..., .axis) {
+  .Call(ffi_rray_combine, list2(...), .axis, environment())
+}
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+rray4-package.R
+size.R
+split-names.R
+split.R
+squeeze.R
+zzz.R</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_combine&quot; src/*.c src/*.h src/decl/*.h R/*.R | grep -v &quot;^src/combine.c&quot;</summary>
+<pre>grep -rn &quot;rray_combine&quot; src/*.c src/*.h src/decl/*.h R/*.R | grep -v &quot;^src/combine.c&quot;</pre><pre class="output">src/init.c:70:extern r_obj* ffi_rray_combine(
+src/init.c:203:  {&quot;ffi_rray_combine&quot;, (DL_FUNC) &amp;ffi_rray_combine, 3},
+src/combine.h:6:r_obj* rray_combine(r_obj* xs, int axis, struct r_lazy error_call);
+src/decl/combine-decl.h:1:static r_ssize rray_combine_size(
+src/decl/combine-decl.h:6:static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis);
+src/decl/combine-decl.h:7:static r_obj* rray_combine_axis_names(r_obj* xs, int axis);
+src/decl/combine-decl.h:8:static void rray_combine_copy(
+src/decl/combine-decl.h:14:static void rray_combine_lgl(
+src/decl/combine-decl.h:20:static void rray_combine_int(
+src/decl/combine-decl.h:26:static void rray_combine_dbl(
+src/decl/combine-decl.h:32:static void rray_combine_cpl(
+src/decl/combine-decl.h:38:static void rray_combine_raw(
+src/decl/combine-decl.h:44:static void rray_combine_chr(
+src/decl/combine-decl.h:50:static void rray_combine_list(
+R/combine.R:3:#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+R/combine.R:21:#' rray_combine(x, y, .axis = 1)
+R/combine.R:22:#' rray_combine(x, y, .axis = 2)
+R/combine.R:25:#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+R/combine.R:26:rray_combine &lt;- function(..., .axis) {
+R/combine.R:27:  .Call(ffi_rray_combine, list2(...), .axis, environment())</pre></details>
+<details class="tool"><summary>Read src/dimensions.c</summary>
+<pre class="output">1	#include &quot;dimensions.h&quot;
+2	
+3	#include &quot;dimensionality.h&quot;
+4	#include &quot;size.h&quot;
+5	#include &quot;utils.h&quot;
+6	#include &quot;wrapper.h&quot;
+7	
+8	#include &quot;decl/dimensions-decl.h&quot;
+9	
+10	r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+11	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+12	  return rray_dimensions(ffi_x, rray_args.x, error_call);
+13	}
+14	
+15	r_obj* rray_dimensions(
+16	  r_obj* x,
+17	  struct rray_arg* arg,
+18	  struct r_lazy error_call
+19	) {
+20	  check_unclassed(x, arg, error_call);
+21	  x = KEEP(arg_as_array(x, arg, error_call));
+22	  r_obj* out = r_dim(x);
+23	  FREE(1);
+24	  return out;
+25	}
+26	
+27	int rray_dimension(
+28	  r_obj* x,
+29	  int axis,
+30	  struct rray_arg* arg,
+31	  struct r_lazy error_call
+32	) {
+33	  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+34	  return r_int_get(dimensions, axis - 1);
+35	}
+36	
+37	bool rray_dimensions_are_equal(
+38	  const int* v_x_dimensions,
+39	  int x_dimensionality,
+40	  const int* v_y_dimensions,
+41	  int y_dimensionality
+42	) {
+43	  if (x_dimensionality != y_dimensionality) {
+44	    return false;
+45	  }
+46	
+47	  for (int i = 0; i &lt; x_dimensionality; ++i) {
+48	    if (v_x_dimensions[i] != v_y_dimensions[i]) {
+49	      return false;
+50	    }
+51	  }
+52	
+53	  return true;
+54	}
+55	
+56	r_obj* ffi_rray_set_dimensions(
+57	  r_obj* ffi_x,
+58	  r_obj* ffi_dimensions,
+59	  r_obj* ffi_frame
+60	) {
+61	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+62	  return rray_set_dimensions(ffi_x, ffi_dimensions, rray_args.x, error_call);
+63	}
+64	
+65	r_obj* rray_set_dimensions(
+66	  r_obj* x,
+67	  r_obj* dimensions,
+68	  struct rray_arg* arg,
+69	  struct r_lazy error_call
+70	) {</pre></details>
+<details class="tool"><summary>Read src/axes.c</summary>
+<pre class="output">1	#include &quot;axes.h&quot;
+2	
+3	#include &quot;dimensionality.h&quot;
+4	#include &quot;utils.h&quot;
+5	
+6	r_obj* arg_as_axes(
+7	  r_obj* axes,
+8	  int dimensionality,
+9	  struct rray_arg* arg,
+10	  struct r_lazy error_call
+11	) {
+12	  if (r_typeof(axes) != R_TYPE_integer) {
+13	    axes = vec_cast(axes, r_globals.empty_int, arg, NULL);
+14	  }
+15	  KEEP(axes);
+16	
+17	  if (r_attrib_has_any(axes)) {
+18	    r_abort_lazy_call(
+19	      error_call,
+20	      &quot;%s can't have attributes.&quot;,
+21	      rray_arg_format(arg)
+22	    );
+23	  }
+24	
+25	  const r_ssize axes_size = r_length(axes);
+26	
+27	  const int* v_axes = r_int_cbegin(axes);
+28	
+29	  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+30	    const int axis = v_axes[i];
+31	
+32	    if (axis == r_globals.na_int) {
+33	      r_abort_lazy_call(
+34	        error_call,
+35	        &quot;%s must not contain missing values.&quot;,
+36	        rray_arg_format(arg)
+37	      );
+38	    }
+39	
+40	    if (axis &lt; 1) {
+41	      r_abort_lazy_call(
+42	        error_call,
+43	        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+44	        rray_arg_format(arg),
+45	        axis
+46	      );
+47	    }
+48	
+49	    if (axis &gt; dimensionality) {
+50	      r_abort_lazy_call(
+51	        error_call,
+52	        &quot;%s must contain values less than or equal to the &quot;
+53	        &quot;dimensionality of %d, not %d.&quot;,
+54	        rray_arg_format(arg),
+55	        dimensionality,
+56	        axis
+57	      );
+58	    }
+59	
+60	    if (i &gt; 0 &amp;&amp; axis &lt;= v_axes[i - 1]) {</pre></details>
+<details class="tool"><summary>Read src/cast.c</summary>
+<pre class="output">1	#include &quot;cast.h&quot;
+2	
+3	#include &quot;syms.h&quot;
+4	#include &quot;type.h&quot;
+5	#include &quot;utils.h&quot;
+6	
+7	#include &quot;decl/cast-decl.h&quot;
+8	
+9	r_obj* ffi_rray_cast(r_obj* ffi_x, r_obj* ffi_to, r_obj* ffi_frame) {
+10	  struct r_lazy error_call = {.x = rray_syms.call, .env = ffi_frame};
+11	
+12	  struct r_lazy x_arg_lazy = {.x = rray_syms.x_arg, .env = ffi_frame};
+13	  struct rray_arg x_arg = new_lazy_arg(&amp;x_arg_lazy);
+14	
+15	  struct r_lazy to_arg_lazy = {.x = rray_syms.to_arg, .env = ffi_frame};
+16	  struct rray_arg to_arg = new_lazy_arg(&amp;to_arg_lazy);
+17	
+18	  return rray_cast(ffi_x, ffi_to, &amp;x_arg, &amp;to_arg, error_call);
+19	}
+20	
+21	r_obj* rray_cast(
+22	  r_obj* x,
+23	  r_obj* to,
+24	  struct rray_arg* x_arg,
+25	  struct rray_arg* to_arg,
+26	  struct r_lazy error_call
+27	) {
+28	  check_unclassed(x, x_arg, error_call);
+29	  check_unclassed(to, to_arg, error_call);
+30	
+31	  const enum rray_type x_type = rray_typeof(x);
+32	  const enum rray_type to_type = rray_typeof(to);
+33	
+34	  switch (x_type) {
+35	  case RRAY_TYPE_logical:
+36	    switch (to_type) {
+37	    case RRAY_TYPE_logical:
+38	      return vec_as_array(x);
+39	    case RRAY_TYPE_integer:
+40	      return rray_cast_lgl_to_int(x, x_arg, error_call);
+41	    case RRAY_TYPE_double:
+42	      return rray_cast_lgl_to_dbl(x, x_arg, error_call);
+43	    case RRAY_TYPE_complex:
+44	      return rray_cast_lgl_to_cpl(x, x_arg, error_call);
+45	    case RRAY_TYPE_scalar:
+46	      stop_scalar_input(to, to_arg, error_call);
+47	    default:
+48	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+49	    }
+50	  case RRAY_TYPE_integer:
+51	    switch (to_type) {
+52	    case RRAY_TYPE_logical:
+53	      return rray_cast_int_to_lgl(x, x_arg, error_call);
+54	    case RRAY_TYPE_integer:
+55	      return vec_as_array(x);
+56	    case RRAY_TYPE_double:
+57	      return rray_cast_int_to_dbl(x, x_arg, error_call);
+58	    case RRAY_TYPE_complex:
+59	      return rray_cast_int_to_cpl(x, x_arg, error_call);
+60	    case RRAY_TYPE_scalar:
+61	      stop_scalar_input(to, to_arg, error_call);
+62	    default:
+63	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+64	    }
+65	  case RRAY_TYPE_double:
+66	    switch (to_type) {
+67	    case RRAY_TYPE_logical:
+68	      return rray_cast_dbl_to_lgl(x, x_arg, error_call);
+69	    case RRAY_TYPE_integer:
+70	      return rray_cast_dbl_to_int(x, x_arg, error_call);
+71	    case RRAY_TYPE_double:
+72	      return vec_as_array(x);
+73	    case RRAY_TYPE_complex:
+74	      return rray_cast_dbl_to_cpl(x, x_arg, error_call);
+75	    case RRAY_TYPE_scalar:
+76	      stop_scalar_input(to, to_arg, error_call);
+77	    default:
+78	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+79	    }
+80	  case RRAY_TYPE_complex:
+81	    switch (to_type) {
+82	    case RRAY_TYPE_complex:
+83	      return vec_as_array(x);
+84	    case RRAY_TYPE_scalar:
+85	      stop_scalar_input(to, to_arg, error_call);
+86	    default:
+87	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+88	    }
+89	  case RRAY_TYPE_character:
+90	    switch (to_type) {
+91	    case RRAY_TYPE_character:
+92	      return vec_as_array(x);
+93	    case RRAY_TYPE_scalar:
+94	      stop_scalar_input(to, to_arg, error_call);
+95	    default:
+96	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+97	    }
+98	  case RRAY_TYPE_raw:
+99	    switch (to_type) {
+100	    case RRAY_TYPE_raw:
+101	      return vec_as_array(x);
+102	    case RRAY_TYPE_scalar:
+103	      stop_scalar_input(to, to_arg, error_call);
+104	    default:
+105	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+106	    }
+107	  case RRAY_TYPE_list:
+108	    switch (to_type) {
+109	    case RRAY_TYPE_list:
+110	      return vec_as_array(x);
+111	    case RRAY_TYPE_scalar:
+112	      stop_scalar_input(to, to_arg, error_call);
+113	    default:
+114	      stop_incompatible_cast(x_type, to_type, x_arg, error_call);
+115	    }
+116	  case RRAY_TYPE_scalar:
+117	    stop_scalar_input(x, x_arg, error_call);
+118	  }
+119	
+120	  r_stop_unreachable();
+121	}
+122	
+123	#define RRAY_CAST(FROM_CTYPE, FROM_CBEGIN, TO_RTYPE, TO_CTYPE, TO_BEGIN, ONE)  \
+124	  x = KEEP(vec_as_array(x));                                                   \
+125	                                                                               \
+126	  const r_ssize size = r_length(x);                                            \
+127	  const FROM_CTYPE* v_x = FROM_CBEGIN(x);                                      \
+128	                                                                               \
+129	  r_obj* out = KEEP(r_alloc_vector(TO_RTYPE, size));                           \
+130	  TO_CTYPE* v_out = TO_BEGIN(out);                                             \
+131	                                                                               \
+132	  for (r_ssize i = 0; i &lt; size; ++i) {                                         \
+133	    v_out[i] = ONE(v_x[i]);                                                    \
+134	  }                                                                            \
+135	                                                                               \
+136	  r_attrib_poke_dim(out, r_dim(x));                                            \
+137	                                                                               \
+138	  r_obj* names = r_dim_names(x);                                               \
+139	                                                                               \
+140	  if (names != r_null) {                                                       \
+141	    r_attrib_poke_dim_names(out, names);                                       \
+142	  }                                                                            \
+143	                                                                               \
+144	  FREE(2);                                                                     \
+145	  return out;
+146	
+147	#define RRAY_CAST_LOSSY(                                                       \
+148	  FROM_CTYPE,                                                                  \
+149	  FROM_CBEGIN,                                                                 \
+150	  TO_RTYPE,                                                                    \
+151	  TO_CTYPE,                                                                    \
+152	  TO_BEGIN,                                                                    \
+153	  ONE                                                                          \
+154	)                                                                              \
+155	  x = KEEP(vec_as_array(x));                                                   \
+156	                                                                               \
+157	  const r_ssize size = r_length(x);                                            \
+158	  const FROM_CTYPE* v_x = FROM_CBEGIN(x);                                      \
+159	                                                                               \
+160	  r_obj* out = KEEP(r_alloc_vector(TO_RTYPE, size));                           \
+161	  TO_CTYPE* v_out = TO_BEGIN(out);                                             \
+162	                                                                               \
+163	  for (r_ssize i = 0; i &lt; size; ++i) {                                         \
+164	    v_out[i] = ONE(v_x[i], i, x_arg, error_call);                              \
+165	  }                                                                            \
+166	                                                                               \
+167	  r_attrib_poke_dim(out, r_dim(x));                                            \
+168	                                                                               \
+169	  r_obj* names = r_dim_names(x);                                               \
+170	                                                                               \
+171	  if (names != r_null) {                                                       \
+172	    r_attrib_poke_dim_names(out, names);                                       \
+173	  }                                                                            \
+174	                                                                               \
+175	  FREE(2);                                                                     \
+176	  return out;
+177	
+178	static r_obj* rray_cast_lgl_to_int(
+179	  r_obj* x,
+180	  struct rray_arg* x_arg,
+181	  struct r_lazy error_call
+182	) {
+183	  RRAY_CAST(
+184	    int,
+185	    r_lgl_cbegin,
+186	    R_TYPE_integer,
+187	    int,
+188	    r_int_begin,
+189	    rray_cast_lgl_to_int_one
+190	  );
+191	}
+192	
+193	static r_obj* rray_cast_lgl_to_dbl(
+194	  r_obj* x,
+195	  struct rray_arg* x_arg,
+196	  struct r_lazy error_call
+197	) {
+198	  RRAY_CAST(
+199	    int,
+200	    r_lgl_cbegin,</pre><p class="cut">146 more lines cut</p></details>
+<p>Now I'll make the changes.</p>
+
+<details class="tool"><summary>Edit src/combine.h</summary>
+<pre class="diff"><span class="del">-#include &quot;rlang.h&quot;</span>
+<span class="del">-</span>
+<span class="del">-r_obj* rray_combine(r_obj* xs, int axis, struct r_lazy error_call);</span>
+<span class="ins">+#include &quot;rlang.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &quot;arg.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* rray_combine(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  int axis,</span>
+<span class="ins">+  r_obj* ptype,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);</span>
+<span class="del">-  return rray_combine(ffi_xs, axis, error_call);</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-r_obj* rray_combine(r_obj* xs, int axis, struct r_lazy error_call) {</span>
+<span class="del">-  if (r_length(xs) == 0) {</span>
+<span class="del">-    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* ptype =</span>
+<span class="del">-    KEEP(rray_ptype_common(xs, r_null, NULL, rray_args.empty, error_call));</span>
+<span class="del">-</span>
+<span class="del">-  xs = KEEP(rray_cast_common(xs, ptype, NULL, rray_args.empty, error_call));</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize xs_size = r_length(xs);</span>
+<span class="del">-  r_obj* const* v_xs = r_list_cbegin(xs);</span>
+<span class="del">-</span>
+<span class="del">-  int dimensionality = 1;</span>
+<span class="del">-</span>
+<span class="del">-  for (r_ssize i = 0; i &lt; xs_size; ++i) {</span>
+<span class="del">-    const int x_dimensionality =</span>
+<span class="del">-      rray_dimensionality(v_xs[i], rray_args.empty, error_call);</span>
+<span class="del">-    if (x_dimensionality &gt; dimensionality) {</span>
+<span class="del">-      dimensionality = x_dimensionality;</span>
+<span class="del">-    }</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* xs_names = KEEP(r_names(xs));</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize x_i = 0;</span>
+<span class="del">-  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, xs_size, &amp;x_i);</span>
+<span class="del">-  KEEP(x_arg-&gt;shelter);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize out_i = 0;</span>
+<span class="del">-  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, xs_size, &amp;out_i);</span>
+<span class="del">-  KEEP(out_arg-&gt;shelter);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));</span>
+<span class="ins">+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);</span>
+<span class="ins">+  return rray_combine(ffi_xs, axis, r_null, rray_args.empty, error_call);</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* rray_combine(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  int axis,</span>
+<span class="ins">+  r_obj* ptype,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  if (r_length(xs) == 0) {</span>
+<span class="ins">+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  ptype =</span>
+<span class="ins">+    KEEP(rray_ptype_common(xs, ptype, arg, rray_args.empty, error_call));</span>
+<span class="ins">+</span>
+<span class="ins">+  xs = KEEP(rray_cast_common(xs, ptype, arg, rray_args.empty, error_call));</span>
+<span class="ins">+</span>
+<span class="ins">+  const r_ssize xs_size = r_length(xs);</span>
+<span class="ins">+  r_obj* const* v_xs = r_list_cbegin(xs);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* xs_names = KEEP(r_names(xs));</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize x_i = 0;</span>
+<span class="ins">+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);</span>
+<span class="ins">+  KEEP(x_arg-&gt;shelter);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize out_i = 0;</span>
+<span class="ins">+  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;out_i);</span>
+<span class="ins">+  KEEP(out_arg-&gt;shelter);</span>
+<span class="ins">+</span>
+<span class="ins">+  int dimensionality = 1;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (x_i = 0; x_i &lt; xs_size; ++x_i) {</span>
+<span class="ins">+    const int x_dimensionality =</span>
+<span class="ins">+      rray_dimensionality(v_xs[x_i], x_arg, error_call);</span>
+<span class="ins">+    if (x_dimensionality &gt; dimensionality) {</span>
+<span class="ins">+      dimensionality = x_dimensionality;</span>
+<span class="ins">+    }</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  for (; x_i &lt; xs_size; ++x_i) {</span>
+<span class="del">-    r_obj* x_dimensions = r_dim(v_xs[x_i]);</span>
+<span class="ins">+  for (x_i = 0; x_i &lt; xs_size; ++x_i) {</span>
+<span class="ins">+    r_obj* x_dimensions = r_dim(v_xs[x_i]);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output"> src/combine.c | 41 +++++++++++++++++++++++------------------
+ src/combine.h | 10 +++++++++-
+ 2 files changed, 32 insertions(+), 19 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; 2&gt;&amp;1 | tail -20</summary>
+<pre>Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; 2&gt;&amp;1 | tail -20</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -30</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1681 ]</pre></details>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</summary>
+<pre>git status --short &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</pre><pre class="output"> M src/combine.c
+ M src/combine.h
+origin/feature/combine</pre></details>
+<details class="tool"><summary>Bash: git add src/combine.c src/combine.h &amp;&amp; git commit -m &quot;Add ptype and arg arguments to the C le…</summary>
+<pre>git add src/combine.c src/combine.h &amp;&amp; git commit -m &quot;Add ptype and arg arguments to the C level combine&quot; &amp;&amp; git push</pre><pre class="output">[feature/combine 6fec289] Add ptype and arg arguments to the C level combine
+ 2 files changed, 32 insertions(+), 19 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   c7b5cbe..6fec289  feature/combine -&gt; feature/combine</pre></details>
+<p>Done. Committed as <code>6fec289</code> and pushed to <code>feature/combine</code>. All 1681 tests pass.</p>
+<p>New signature:</p>
+<pre><code class="language-c">r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+</code></pre>
+<p>What changed in <code>src/combine.c:24</code>:</p>
+<ul>
+<li>
+<p><code>ptype</code> is threaded into <code>rray_ptype_common()</code> and <code>rray_cast_common()</code>, so a caller can force the common type. The FFI wrapper passes <code>r_null</code>, which keeps the current behaviour.</p>
+</li>
+<li>
+<p><code>arg</code> becomes the parent of the two subscript args, so element errors read <code>x$a</code> instead of <code>a</code> when a caller names the list. It is also passed to <code>rray_ptype_common()</code> and <code>rray_cast_common()</code> so type errors get the same prefix. The FFI wrapper passes <code>rray_args.empty</code>.</p>
+</li>
+<li>
+<p>The subscript args now get built before the dimensionality loop, so that loop passes <code>x_arg</code> to <code>rray_dimensionality()</code> instead of <code>rray_args.empty</code>.</p>
+</li>
+</ul>
+<p>Two things I left alone, tell me if you want them changed:</p>
+<ul>
+<li>
+<p>The <code>ptype_arg</code> in the <code>rray_ptype_common()</code> / <code>rray_cast_common()</code> calls is still <code>rray_args.empty</code>. There is no <code>.ptype</code> argument on the R side to name yet, so there was nothing to point at.</p>
+</li>
+<li>
+<p><code>r_length(xs) == 0</code> still errors even when <code>ptype</code> is supplied. vctrs would return an empty result there. That is a behaviour question, not a plumbing one, so I did not decide it for you.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Add a ptype_arg too and use it for the ptype errors</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/combine.h</summary>
+<pre class="diff"><span class="del">-  r_obj* ptype,</span>
+<span class="del">-  struct rray_arg* arg,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-);</span>
+<span class="ins">+  r_obj* ptype,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct rray_arg* ptype_arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  return rray_combine(ffi_xs, axis, r_null, rray_args.empty, error_call);</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-r_obj* rray_combine(</span>
+<span class="del">-  r_obj* xs,</span>
+<span class="del">-  int axis,</span>
+<span class="del">-  r_obj* ptype,</span>
+<span class="del">-  struct rray_arg* arg,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-) {</span>
+<span class="del">-  if (r_length(xs) == 0) {</span>
+<span class="del">-    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  ptype = KEEP(rray_ptype_common(xs, ptype, arg, rray_args.empty, error_call));</span>
+<span class="del">-</span>
+<span class="del">-  xs = KEEP(rray_cast_common(xs, ptype, arg, rray_args.empty, error_call));</span>
+<span class="ins">+  return rray_combine(</span>
+<span class="ins">+    ffi_xs,</span>
+<span class="ins">+    axis,</span>
+<span class="ins">+    r_null,</span>
+<span class="ins">+    rray_args.empty,</span>
+<span class="ins">+    rray_args.empty,</span>
+<span class="ins">+    error_call</span>
+<span class="ins">+  );</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* rray_combine(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  int axis,</span>
+<span class="ins">+  r_obj* ptype,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct rray_arg* ptype_arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  if (r_length(xs) == 0) {</span>
+<span class="ins">+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));</span>
+<span class="ins">+</span>
+<span class="ins">+  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -10</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -10</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1681 ]</pre></details>
+<details class="tool"><summary>Bash: git diff &amp;&amp; git add src/combine.c src/combine.h &amp;&amp; git commit -m &quot;Add a ptype_arg argument to…</summary>
+<pre>git diff &amp;&amp; git add src/combine.c src/combine.h &amp;&amp; git commit -m &quot;Add a ptype_arg argument to the C level combine&quot; &amp;&amp; git push</pre><pre class="output">diff --git a/src/combine.c b/src/combine.c
+index 9ff242a..e79c201 100644
+--- a/src/combine.c
++++ b/src/combine.c
+@@ -18,7 +18,14 @@ r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+   struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+ 
+   const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+-  return rray_combine(ffi_xs, axis, r_null, rray_args.empty, error_call);
++  return rray_combine(
++    ffi_xs,
++    axis,
++    r_null,
++    rray_args.empty,
++    rray_args.empty,
++    error_call
++  );
+ }
+ 
+ r_obj* rray_combine(
+@@ -26,15 +33,16 @@ r_obj* rray_combine(
+   int axis,
+   r_obj* ptype,
+   struct rray_arg* arg,
++  struct rray_arg* ptype_arg,
+   struct r_lazy error_call
+ ) {
+   if (r_length(xs) == 0) {
+     r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+   }
+ 
+-  ptype = KEEP(rray_ptype_common(xs, ptype, arg, rray_args.empty, error_call));
++  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+ 
+-  xs = KEEP(rray_cast_common(xs, ptype, arg, rray_args.empty, error_call));
++  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+ 
+   const r_ssize xs_size = r_length(xs);
+   r_obj* const* v_xs = r_list_cbegin(xs);
+diff --git a/src/combine.h b/src/combine.h
+index e9eb480..78ed571 100644
+--- a/src/combine.h
++++ b/src/combine.h
+@@ -10,6 +10,7 @@ r_obj* rray_combine(
+   int axis,
+   r_obj* ptype,
+   struct rray_arg* arg,
++  struct rray_arg* ptype_arg,
+   struct r_lazy error_call
+ );
+ 
+[feature/combine 5ea1c00] Add a ptype_arg argument to the C level combine
+ 2 files changed, 12 insertions(+), 3 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   6fec289..5ea1c00  feature/combine -&gt; feature/combine</pre></details>
+<p>Done, <code>5ea1c00</code> pushed. 1681 tests pass.</p>
+<pre><code class="language-c">r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+);
+</code></pre>
+<p><code>ptype_arg</code> goes to <code>rray_ptype_common()</code> and <code>rray_cast_common()</code>, which is where the ptype errors come from: <code>rray_ptype()</code> validating the supplied ptype, and the <code>to</code> side of cast errors. The FFI wrapper passes <code>rray_args.empty</code> for both args, since neither has an R-level name yet.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Remove the blank line after the error_call definition</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};</span>
+<span class="del">-</span>
+<span class="del">-  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);</span>
+<span class="ins">+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};</span>
+<span class="ins">+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff</pre><pre class="output">diff --git a/src/combine.c b/src/combine.c
+index e79c201..5ba17f4 100644
+--- a/src/combine.c
++++ b/src/combine.c
+@@ -16,7 +16,6 @@
+ 
+ r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+   struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+-
+   const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+   return rray_combine(
+     ffi_xs,</pre></details>
+<p>Removed. <code>src/combine.c:17</code> now reads:</p>
+<pre><code class="language-c">r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+  return rray_combine(
+</code></pre>
+<p>Left uncommitted. Say the word and I'll commit and push it.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add src/combine.c &amp;&amp; git commit -m &quot;Tighten spacing in the combine FFI wrapper&quot; &amp;&amp; git pu…</summary>
+<pre>git add src/combine.c &amp;&amp; git commit -m &quot;Tighten spacing in the combine FFI wrapper&quot; &amp;&amp; git push</pre><pre class="output">[feature/combine a57b5f2] Tighten spacing in the combine FFI wrapper
+ 1 file changed, 1 deletion(-)
+To https://github.com/DavisVaughan/rray4.git
+   5ea1c00..a57b5f2  feature/combine -&gt; feature/combine</pre></details>
+<p>Pushed as <code>a57b5f2</code> on <code>feature/combine</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

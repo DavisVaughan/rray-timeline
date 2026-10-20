@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How rray_mean() accumulates integers in int64_t</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-124">rray timeline</a>
+<h1>How <code>rray_mean()</code> accumulates integers in <code>int64_t</code></h1>
+<p class="facts">Claude · Oct 4, 2026 · 1 prompt · 1 reply · <a href="https://github.com/r-lib/rray/pull/124">#124</a></p>
+</header>
+<main>
+<p class="divider">Oct 4, 2026, 18:34 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Help me understand rray mean int64</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git show 67fe5b1 --stat &amp;&amp; git show 67fe5b1 | head -300</summary>
+<pre>git show 67fe5b1 --stat &amp;&amp; git show 67fe5b1 | head -300</pre><pre class="output">commit 67fe5b1219b3bfda9fb296bf4dd89b6d6ceb1f86
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 4 08:27:24 2026 -0400
+
+    Accumulate logical means in int64_t
+
+ src/decl/reduce-mean-decl.h |   9 +++-
+ src/reduce-mean.c           | 120 ++++++++++++++++++++++++++++++--------------
+ 2 files changed, 91 insertions(+), 38 deletions(-)
+commit 67fe5b1219b3bfda9fb296bf4dd89b6d6ceb1f86
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Sun Oct 4 08:27:24 2026 -0400
+
+    Accumulate logical means in int64_t
+
+diff --git a/src/decl/reduce-mean-decl.h b/src/decl/reduce-mean-decl.h
+index e2a6e39..8221045 100644
+--- a/src/decl/reduce-mean-decl.h
++++ b/src/decl/reduce-mean-decl.h
+@@ -55,6 +55,14 @@ static r_obj* rray_mean_dbl_na_rm(
+ );
+ 
+ static inline r_ssize rray_mean_count(r_obj* x, r_ssize out_size);
++static inline double rray_mean_int64(int64_t sum, r_ssize count);
++static void rray_mean_lgl_propagate_na(
++  const int* v_x,
++  double* v_out,
++  const int* v_dimensions,
++  int dimensionality,
++  const r_ssize* v_out_broadcast_strides
++);
+ 
+ static r_obj* rray_mean_int_fallback(
+   r_obj* x,
+@@ -63,7 +71,6 @@ static r_obj* rray_mean_int_fallback(
+   int dimensionality,
+   const r_ssize* v_out_broadcast_strides
+ );
+-static inline double rray_mean_int64(int64_t sum, r_ssize count);
+ static void rray_mean_int_propagate_na(
+   const int* v_x,
+   double* v_out,
+diff --git a/src/reduce-mean.c b/src/reduce-mean.c
+index 0bc1d99..6d781bb 100644
+--- a/src/reduce-mean.c
++++ b/src/reduce-mean.c
+@@ -67,17 +67,14 @@ static r_obj* rray_mean_lgl(
+ ) {
+   const r_ssize count = rray_mean_count(x, out_size);
+   const int na_lgl = r_globals.na_lgl;
+-  const double na_dbl = r_globals.na_dbl;
+-
+-  r_obj* out = KEEP(r_alloc_double(out_size));
+-  double* v_out = r_dbl_begin(out);
+ 
+-  for (r_ssize i = 0; i &lt; out_size; ++i) {
+-    v_out[i] = 0.0;
+-  }
++  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
++  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+ 
+   const int* v_x = r_lgl_cbegin(x);
+ 
++  bool any_na = false;
++
+   struct rray_run_iterator it;
+   rray_run_iterator_init1(
+     &amp;it,
+@@ -94,29 +91,45 @@ static r_obj* rray_mean_lgl(
+     const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+ 
+     if (out_stride == 0) {
+-      double sum = v_out[out_loc];
++      int64_t sum = v_sums[out_loc];
+ 
+       for (r_ssize i = start; i &lt; end; ++i) {
+         const int x_elt = v_x[i];
+-        sum += x_elt == na_lgl ? na_dbl : x_elt;
++        const bool na = x_elt == na_lgl;
++        sum += na ? 0 : x_elt;
++        any_na |= na;
+       }
+ 
+-      v_out[out_loc] = sum;
++      v_sums[out_loc] = sum;
+     } else {
+       for (r_ssize i = start; i &lt; end; ++i) {
+         const int x_elt = v_x[i];
+-        v_out[out_loc] += x_elt == na_lgl ? na_dbl : x_elt;
++        const bool na = x_elt == na_lgl;
++        v_sums[out_loc] += na ? 0 : x_elt;
++        any_na |= na;
+         out_loc += out_stride;
+       }
+     }
+   }
+ 
++  r_obj* out = KEEP(r_alloc_double(out_size));
++  double* v_out = r_dbl_begin(out);
++
+   for (r_ssize i = 0; i &lt; out_size; ++i) {
+-    const double sum = v_out[i];
+-    v_out[i] = ISNAN(sum) ? na_dbl : sum / count;
++    v_out[i] = rray_mean_int64(v_sums[i], count);
+   }
+ 
+-  FREE(1);
++  if (any_na) {
++    rray_mean_lgl_propagate_na(
++      v_x,
++      v_out,
++      v_dimensions,
++      dimensionality,
++      v_out_broadcast_strides
++    );
++  }
++
++  FREE(2);
+   return out;
+ }
+ 
+@@ -130,12 +143,8 @@ static r_obj* rray_mean_lgl_na_rm(
+ ) {
+   const int na_lgl = r_globals.na_lgl;
+ 
+-  r_obj* out = KEEP(r_alloc_double(out_size));
+-  double* v_out = r_dbl_begin(out);
+-
+-  for (r_ssize i = 0; i &lt; out_size; ++i) {
+-    v_out[i] = 0.0;
+-  }
++  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
++  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+ 
+   r_obj* counts = KEEP(r_alloc_raw0(out_size * sizeof(r_ssize)));
+   r_ssize* v_counts = (r_ssize*) r_raw_begin(counts);
+@@ -158,7 +167,7 @@ static r_obj* rray_mean_lgl_na_rm(
+     const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+ 
+     if (out_stride == 0) {
+-      double sum = v_out[out_loc];
++      int64_t sum = v_sums[out_loc];
+       r_ssize count = 0;
+ 
+       for (r_ssize i = start; i &lt; end; ++i) {
+@@ -168,24 +177,27 @@ static r_obj* rray_mean_lgl_na_rm(
+         count += ok;
+       }
+ 
+-      v_out[out_loc] = sum;
++      v_sums[out_loc] = sum;
+       v_counts[out_loc] += count;
+     } else {
+       for (r_ssize i = start; i &lt; end; ++i) {
+         const int x_elt = v_x[i];
+         const bool ok = x_elt != na_lgl;
+-        v_out[out_loc] += ok ? x_elt : 0;
++        v_sums[out_loc] += ok ? x_elt : 0;
+         v_counts[out_loc] += ok;
+         out_loc += out_stride;
+       }
+     }
+   }
+ 
++  r_obj* out = KEEP(r_alloc_double(out_size));
++  double* v_out = r_dbl_begin(out);
++
+   for (r_ssize i = 0; i &lt; out_size; ++i) {
+-    v_out[i] /= v_counts[i];
++    v_out[i] = rray_mean_int64(v_sums[i], v_counts[i]);
+   }
+ 
+-  FREE(2);
++  FREE(3);
+   return out;
+ }
+ 
+@@ -606,6 +618,52 @@ static inline r_ssize rray_mean_count(r_obj* x, r_ssize out_size) {
+   return out_size == 0 ? 0 : r_length(x) / out_size;
+ }
+ 
++static inline double rray_mean_int64(int64_t sum, r_ssize count) {
++  if (count == 0) {
++    return R_NaN;
++  }
++
++  if (-RRAY_MEAN_INT64_MAX_EXACT &lt;= sum &amp;&amp; sum &lt;= RRAY_MEAN_INT64_MAX_EXACT) {
++    return (double) sum / count;
++  }
++
++  return (double) (sum / count) + (double) (sum % count) / count;
++}
++
++static void rray_mean_lgl_propagate_na(
++  const int* v_x,
++  double* v_out,
++  const int* v_dimensions,
++  int dimensionality,
++  const r_ssize* v_out_broadcast_strides
++) {</pre><p class="cut">49 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;INT64\|int64_t\|fallback\|^static\|^r_obj&quot; src/reduce-mean.c | head -80; grep -rn &quot;M…</summary>
+<pre>grep -n &quot;INT64\|int64_t\|fallback\|^static\|^r_obj&quot; src/reduce-mean.c | head -80; grep -rn &quot;MAX_EXACT&quot; src/*.h src/*.c | head</pre><pre class="output">9:#define RRAY_MEAN_INT64_MAX_COUNT ((r_ssize) 1 &lt;&lt; 32)
+10:#define RRAY_MEAN_INT64_MAX_EXACT ((int64_t) 1 &lt;&lt; 53)
+12:r_obj* ffi_rray_mean(
+23:r_obj* rray_mean(
+33:static rray_reduce_fn rray_mean_switch(
+60:static r_obj* rray_mean_lgl(
+71:  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
+72:  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+94:      int64_t sum = v_sums[out_loc];
+136:static r_obj* rray_mean_lgl_na_rm(
+146:  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
+147:  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+170:      int64_t sum = v_sums[out_loc];
+204:static r_obj* rray_mean_int(
+214:  if (count &gt; RRAY_MEAN_INT64_MAX_COUNT) {
+215:    return rray_mean_int_fallback(
+226:  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
+227:  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+249:      int64_t sum = v_sums[out_loc];
+291:static r_obj* rray_mean_int_na_rm(
+299:  if (rray_mean_count(x, out_size) &gt; RRAY_MEAN_INT64_MAX_COUNT) {
+300:    return rray_mean_int_na_rm_fallback(
+311:  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
+312:  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+335:      int64_t sum = v_sums[out_loc];
+369:static r_obj* rray_mean_dbl(
+494:static r_obj* rray_mean_dbl_na_rm(
+617:static inline r_ssize rray_mean_count(r_obj* x, r_ssize out_size) {
+621:static inline double rray_mean_int64(int64_t sum, r_ssize count) {
+626:  if (-RRAY_MEAN_INT64_MAX_EXACT &lt;= sum &amp;&amp; sum &lt;= RRAY_MEAN_INT64_MAX_EXACT) {
+633:static void rray_mean_lgl_propagate_na(
+667:static r_obj* rray_mean_int_fallback(
+729:static void rray_mean_int_propagate_na(
+763:static r_obj* rray_mean_int_na_rm_fallback(
+831:static void rray_mean_dbl_rescale(
+901:static void rray_mean_dbl_propagate_na(
+934:static void rray_mean_dbl_rescale_na_rm(
+src/reduce-mean.c:10:#define RRAY_MEAN_INT64_MAX_EXACT ((int64_t) 1 &lt;&lt; 53)
+src/reduce-mean.c:626:  if (-RRAY_MEAN_INT64_MAX_EXACT &lt;= sum &amp;&amp; sum &lt;= RRAY_MEAN_INT64_MAX_EXACT) {</pre></details>
+<details class="tool"><summary>Bash: sed -n 200,290p src/reduce-mean.c; sed -n 660,830p src/reduce-mean.c</summary>
+<pre>sed -n 200,290p src/reduce-mean.c; sed -n 660,830p src/reduce-mean.c</pre><pre class="output">  FREE(3);
+  return out;
+}
+
+static r_obj* rray_mean_int(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  const r_ssize count = rray_mean_count(x, out_size);
+
+  if (count &gt; RRAY_MEAN_INT64_MAX_COUNT) {
+    return rray_mean_int_fallback(
+      x,
+      out_size,
+      v_dimensions,
+      dimensionality,
+      v_out_broadcast_strides
+    );
+  }
+
+  const int na_int = r_globals.na_int;
+
+  r_obj* sums = KEEP(r_alloc_raw0(out_size * sizeof(int64_t)));
+  int64_t* v_sums = (int64_t*) r_raw_begin(sums);
+
+  const int* v_x = r_int_cbegin(x);
+
+  bool any_na = false;
+
+  struct rray_run_iterator it;
+  rray_run_iterator_init1(
+    &amp;it,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides
+  );
+
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+    const r_ssize start = rray_run_iterator_start(&amp;it);
+    const r_ssize end = rray_run_iterator_end(&amp;it);
+
+    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+
+    if (out_stride == 0) {
+      int64_t sum = v_sums[out_loc];
+
+      for (r_ssize i = start; i &lt; end; ++i) {
+        const int x_elt = v_x[i];
+        const bool na = x_elt == na_int;
+        sum += na ? 0 : x_elt;
+        any_na |= na;
+      }
+
+      v_sums[out_loc] = sum;
+    } else {
+      for (r_ssize i = start; i &lt; end; ++i) {
+        const int x_elt = v_x[i];
+        const bool na = x_elt == na_int;
+        v_sums[out_loc] += na ? 0 : x_elt;
+        any_na |= na;
+        out_loc += out_stride;
+      }
+    }
+  }
+
+  r_obj* out = KEEP(r_alloc_double(out_size));
+  double* v_out = r_dbl_begin(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    v_out[i] = rray_mean_int64(v_sums[i], count);
+  }
+
+  if (any_na) {
+    rray_mean_int_propagate_na(
+      v_x,
+      v_out,
+      v_dimensions,
+      dimensionality,
+      v_out_broadcast_strides
+    );
+  }
+
+  FREE(2);
+  return out;
+}
+
+        v_out[out_loc] = na_dbl;
+      }
+      out_loc += out_stride;
+    }
+  }
+}
+
+static r_obj* rray_mean_int_fallback(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides
+) {
+  const r_ssize count = rray_mean_count(x, out_size);
+  const int na_int = r_globals.na_int;
+  const double na_dbl = r_globals.na_dbl;
+
+  r_obj* out = KEEP(r_alloc_double(out_size));
+  double* v_out = r_dbl_begin(out);
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    v_out[i] = 0.0;
+  }
+
+  const int* v_x = r_int_cbegin(x);
+
+  struct rray_run_iterator it;
+  rray_run_iterator_init1(
+    &amp;it,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides
+  );
+
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+    const r_ssize start = rray_run_iterator_start(&amp;it);
+    const r_ssize end = rray_run_iterator_end(&amp;it);
+
+    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+
+    if (out_stride == 0) {
+      double sum = v_out[out_loc];
+
+      for (r_ssize i = start; i &lt; end; ++i) {
+        const int x_elt = v_x[i];
+        sum += x_elt == na_int ? na_dbl : x_elt;
+      }
+
+      v_out[out_loc] = sum;
+    } else {
+      for (r_ssize i = start; i &lt; end; ++i) {
+        const int x_elt = v_x[i];
+        v_out[out_loc] += x_elt == na_int ? na_dbl : x_elt;
+        out_loc += out_stride;
+      }
+    }
+  }
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    const double sum = v_out[i];
+    v_out[i] = ISNAN(sum) ? na_dbl : sum / count;
+  }
+
+  FREE(1);
+  return out;
+}
+
+static void rray_mean_int_propagate_na(
+  const int* v_x,
+  double* v_out,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides
+) {
+  const int na_int = r_globals.na_int;
+  const double na_dbl = r_globals.na_dbl;
+
+  struct rray_run_iterator it;
+  rray_run_iterator_init1(
+    &amp;it,
+    v_dimensions,
+    dimensionality,
+    v_out_broadcast_strides
+  );
+
+  for (; !rray_run_iterator_done(&amp;it); rray_run_iterator_next1(&amp;it)) {
+    const r_ssize start = rray_run_iterator_start(&amp;it);
+    const r_ssize end = rray_run_iterator_end(&amp;it);
+
+    r_ssize out_loc = rray_run_iterator_loc(&amp;it, 0);
+    const r_ssize out_stride = rray_run_iterator_stride(&amp;it, 0);
+
+    for (r_ssize i = start; i &lt; end; ++i) {
+      if (v_x[i] == na_int) {
+        v_out[out_loc] = na_dbl;
+      }
+      out_loc += out_stride;
+    }
+  }
+}
+
+static r_obj* rray_mean_int_na_rm_fallback(
+  r_obj* x,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides</pre><p class="cut">61 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn &amp;&amp; grep -n &quot;case INTSXP&quot; -A 25 src/main/summary.c | grep -n &quot;re…</summary>
+<pre>cd ~/files/r/r-svn &amp;&amp; grep -n &quot;case INTSXP&quot; -A 25 src/main/summary.c | grep -n &quot;real_mean\|LDOUBLE\|int64\|irsum\|isum&quot; | head; grep -n &quot;^static SEXP real_mean\|^attribute_hidden SEXP do_summary\|static Rboolean isum\|R_INT_MIN\|LONG_INT\|ISUM_OVERFLOW&quot; src/main/summary.c | head -20</pre><pre class="output">2:552-	case REALSXP: return real_mean(x);
+48:661-            ans_type = INTSXP; iLcum = (isum_INT)0;
+84:796-		    updated = (use_isum ?
+85:797-			       isum(a, &amp;iLtmp, narm, call) :
+86:798-			       risum(a,  &amp;tmp, narm));
+90:802-		    else if(use_isum &amp;&amp; updated == 42) {
+91:803-			// impending integer overflow --&gt; switch to irsum()
+92:804-			use_isum = false;
+95:807-			risum(a, &amp;tmp, narm);
+36:#define R_INT_MIN	(1+INT_MIN)
+50:#ifdef LONG_INT // defined in Defn.h
+51:# define isum_INT LONG_INT
+54:    LONG_INT s = 0;  // at least 64-bit
+57:    int ii = R_INT_MIN; // need &gt; 2^32 entries to overflow; checking earlier is a waste
+61: * Assume LONG_INT_MAX &gt;= 2^63-1 &gt;=~ 9.223e18 &gt;  (1000 * 9000..0L = 9 * 10^18)
+63:# define ISUM_OVERFLOW_CHECK do {					\
+74:# define ISUM_OVERFLOW_CHECK do { } while(0)
+83:		    ISUM_OVERFLOW_CHECK;
+92:#undef ISUM_OVERFLOW_CHECK
+94:#else // no LONG_INT  : should never be used with a C99/C11 compiler
+115:    if(s &gt; INT_MAX || s &lt; R_INT_MIN){
+544:attribute_hidden SEXP do_summary(SEXP call, SEXP op, SEXP args, SEXP env)
+679:	icum = R_INT_MIN;
+795:#ifdef LONG_INT
+813:			// iLtmp is LONG_INT i.e. at least 64bit
+816:			    if(s &gt; INT_MAX || s &lt; R_INT_MIN ||
+817:			       iLtmp &lt; -LONG_INT_MAX || LONG_INT_MAX &lt; iLtmp) {
+821:			    } else if(s &lt; -(double)LONG_INT_MAX || (double)LONG_INT_MAX &lt; s) {
+844:			    if(s &gt; INT_MAX || s &lt; R_INT_MIN){
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,11p src/reduce-mean.c; git log --oneline main..HEAD | head -30</summary>
+<pre>sed -n 1,11p src/reduce-mean.c; git log --oneline main..HEAD | head -30</pre><pre class="output">#include &quot;reduce-mean.h&quot;
+
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-mean-decl.h&quot;
+
+#define RRAY_MEAN_INT64_MAX_COUNT ((r_ssize) 1 &lt;&lt; 32)
+#define RRAY_MEAN_INT64_MAX_EXACT ((int64_t) 1 &lt;&lt; 53)
+
+3220049 Rename the scaled sum buffers in rray_mean() to sums
+6803002 Rename the correction buffers in rray_mean() to corrections
+e5e9aec Rename the correction accumulator in rray_mean_dbl() kernels
+a1dcda3 Use na instead of ok for the missing value flag in rray_mean() kernels
+67fe5b1 Accumulate logical means in int64_t
+cd9aac3 Accumulate integer means in int64_t with a double fallback past 2^32 elements
+a44f0a0 Move rray_mean() to the flat walk with sum, correction, and count buffers</pre></details>
+<p><code>rray_mean()</code> adds up integers and logicals in an <code>int64_t</code> instead of a <code>double</code>, so the sum is exact. Floating point only comes in at the last step, when the sum is divided by the count. The code is all in <code>src/reduce-mean.c</code>.</p>
+<h2>Why not sum in a double</h2>
+<p>A double stores every integer exactly only up to 2^53. Above that, each <code>+=</code> can round. An <code>int64_t</code> sum never rounds, and integer adds in a tight loop are also cheaper than double adds.</p>
+<h2>The two limits</h2>
+<pre><code class="language-c">#define RRAY_MEAN_INT64_MAX_COUNT ((r_ssize) 1 &lt;&lt; 32)
+#define RRAY_MEAN_INT64_MAX_EXACT ((int64_t) 1 &lt;&lt; 53)
+</code></pre>
+<p><strong><code>MAX_COUNT</code> (2^32)</strong> keeps the sum from overflowing. Each integer is at most about 2^31 in size, so 2^32 of them add up to at most 2^63, which still fits in <code>int64_t</code>. If a single output cell has more than 2^32 inputs, <code>rray_mean_int()</code> switches to <code>rray_mean_int_fallback()</code>, which sums in a double the old way. Base R's <code>sum()</code> uses the same idea: a 64-bit sum (<code>isum()</code> in <code>summary.c</code>) that moves to <code>irsum()</code> before it can overflow.</p>
+<p>Logicals don't need this check. Each value is 0 or 1, so the sum can never be larger than the count.</p>
+<p><strong><code>MAX_EXACT</code> (2^53)</strong> controls how <code>rray_mean_int64()</code> (<code>src/reduce-mean.c:621</code>) does the division:</p>
+<pre><code class="language-c">if (-MAX_EXACT &lt;= sum &amp;&amp; sum &lt;= MAX_EXACT) {
+  return (double) sum / count;
+}
+return (double) (sum / count) + (double) (sum % count) / count;
+</code></pre>
+<ul>
+<li>
+<p><strong>Small sums (<code>|sum| &lt;= 2^53</code>):</strong> the cast to double is exact, so <code>sum / count</code> rounds only once.</p>
+</li>
+<li>
+<p><strong>Large sums:</strong> casting <code>sum</code> to double would already round, and then the division rounds again. So the code splits the sum into a whole part and a remainder first, both in integer math:</p>
+<ul>
+<li>The whole part <code>sum / count</code> is no bigger than about 2^31, so it fits in a double exactly.</li>
+<li>The remainder is smaller than <code>count</code>, which is at most 2^32, so it also fits exactly.</li>
+</ul>
+<p>Only <code>rem / count</code> and the final add can round. That isn't guaranteed to be perfectly rounded, but it is much closer than the direct way.</p>
+</li>
+</ul>
+<p>Here is a case where it matters: <code>sum = 2^53 + 1</code>, <code>count = 3</code>, and the true mean is the whole number <code>3002399751580331</code>.</p>
+<ul>
+<li>
+<p><strong>Direct:</strong> the cast rounds <code>sum</code> to <code>2^53</code>. Dividing by 3 gives <code>...330.5</code>, which is wrong.</p>
+</li>
+<li>
+<p><strong>Split:</strong> the whole part is <code>...331</code> and the remainder is <code>0</code>, so the result is exact.</p>
+</li>
+</ul>
+<p>A sum this large only needs about 4 million integers near <code>INT_MAX</code> in one cell, so the large-sum path can really be reached for integer input. For logicals, the sum is at most the count, so it would need more than 2^53 elements. In practice logicals always take the small-sum path.</p>
+<p>Negative sums work too. In C, <code>/</code> rounds toward zero and <code>%</code> keeps the sign of <code>sum</code>, so the two parts add back up correctly. For example, <code>-7 / 2 = -3</code> and <code>-7 % 2 = -1</code>, which gives <code>-3 + -0.5 = -3.5</code>.</p>
+<h2>Handling NA</h2>
+<p>An <code>int64_t</code> can't hold <code>NA</code>, so the main loop adds <code>0</code> for an <code>NA</code> and sets a flag:</p>
+<pre><code class="language-c">const bool na = x_elt == na_lgl;
+sum += na ? 0 : x_elt;
+any_na |= na;
+</code></pre>
+<p>After dividing, if <code>any_na</code> is set, a second pass (<code>rray_mean_lgl_propagate_na()</code> or <code>rray_mean_int_propagate_na()</code>) goes over the input again and writes <code>NA_real_</code> into every output cell that had an <code>NA</code>. When there are no <code>NA</code>s, which is the common case, this costs one OR per element and no second pass.</p>
+<p>Logicals get their own propagate helper, separate from the integer one, because logical and integer <code>NA</code> are different types even though they hold the same value.</p>
+<h2><code>na_rm = TRUE</code></h2>
+<p>This version doesn't need the <code>NA</code> pass. It keeps a count for each output cell in the <code>counts</code> buffer, skips <code>NA</code>s while summing, and then calls <code>rray_mean_int64(v_sums[i], v_counts[i])</code>. A cell whose inputs are all <code>NA</code> has a count of 0, so the result is <code>NaN</code>, the same as <code>mean(numeric(0))</code>.</p>
+<h2>What commit <code>67fe5b1</code> changed</h2>
+<p>Before this commit, the logical kernels summed in a double and relied on <code>NA</code> turning into <code>NaN</code> as it flowed through the sum. The commit made them work like the integer kernels from the commit before it (<code>cd9aac3</code>): an <code>int64_t</code> sum, a separate <code>NA</code> pass, and the shared <code>rray_mean_int64()</code>, which moved up next to <code>rray_mean_count()</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

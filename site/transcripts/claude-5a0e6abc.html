@@ -1,0 +1,3058 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reusing common dimensions with ignored axes in rray_combine()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-71">rray timeline</a>
+<h1>Reusing common dimensions with ignored axes in <code>rray_combine()</code></h1>
+<p class="facts">Claude · Sep 17, 2026 · 1 prompt · 10 replies · <a href="https://github.com/r-lib/rray/pull/71">#71</a></p>
+</header>
+<main>
+<p class="divider">Sep 17, 2026, 20:03 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Implement plans/combine.md and commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll start by reading the plan.</p>
+
+<details class="tool"><summary>Bash: cat ~/files/r/packages/rray4/plans/combine.md 2&gt;/dev/null || ls ~/files…</summary>
+<pre>cat ~/files/r/packages/rray4/plans/combine.md 2&gt;/dev/null || ls ~/files/r/packages/rray4/plans/ 2&gt;/dev/null || echo &quot;NOT FOUND&quot;</pre><pre class="output"># Reuse common dimensions in `rray_combine()`
+
+## Status
+
+This document is an implementation plan. The implementation should be completed
+in full, tested, committed, and pushed to the current `feature/combine` branch.
+
+Do not change the R API. This is an internal C refactor that removes the common
+dimension loop duplicated in `src/combine.c`.
+
+## Goal
+
+`rray_combine()` finds its output dimensions in two parts:
+
+1. Find common broadcast dimensions on every axis except `.axis`.
+2. Sum the input dimensions on `.axis`.
+
+The first part is the same operation as `rray_dimensions_common()` if the
+combine axis is ignored and returned with dimension `1`. Reuse the dimensions
+common implementation for that part, then keep the checked sum in
+`rray_combine()`.
+
+For example, combining `[2, 1, 3]` and `[4, 5]` on axis 1 should work as if the
+dimensions common calculation saw `[1, 1, 3]` and `[1, 5, 1]`:
+
+```text
+common dimensions with axis 1 ignored: [1, 5, 3]
+sum on axis 1:                       2 + 4 = 6
+output dimensions:                    [6, 5, 3]
+```
+
+Returning `1` on ignored axes is intentional. One is the identity dimension
+for broadcasting. The ignored axes remain present and still contribute to the
+dimensionality of the result.
+
+## C API changes
+
+Add `arg` to the internal `rray_dimensions_common()` signature:
+
+```c
+r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+```
+
+Use `arg` as the parent passed to both `new_subscript_arg()` calls inside the
+common dimension calculation. This preserves the argument context when the
+calculation is reused by `rray_combine()`.
+
+The FFI wrapper should pass `rray_args.empty` for `arg`. Update every other
+caller of `rray_dimensions_common()` to pass the correct argument. In
+particular, the existing broadcast common path should pass `rray_args.empty`.
+
+Do not add an R argument to `rray_dimensions_common()`. Its R signature and
+`.Call` registration stay unchanged.
+
+## Internal helper with ignored axes
+
+Move the calculated common dimension path into an internal helper. A suitable
+shape is:
+
+```c
+r_obj* rray_dimensions_common_opts(
+  r_obj* xs,
+  const int* v_ignore,
+  r_ssize ignore_size,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+```
+
+The exact helper name may change if another name reads better, but it should be
+declared in `src/dimensions.h` because `src/combine.c` calls it.
+
+The contracts are:
+
+- `v_ignore` points to an array of one-based axes.
+- `ignore_size` is the number of axes in `v_ignore`.
+- This is an internal interface. Its callers must pass validated axes.
+- `NULL` with `ignore_size = 0` means no axes are ignored.
+- Every ignored axis has dimension `1` in the result.
+- Ignoring an axis does not remove it and does not lower the result
+  dimensionality.
+- Non-ignored axes use the existing broadcast common rules and existing error
+  messages.
+- The input list must still be nonempty.
+
+The ordinary `rray_dimensions_common()` entry point should keep its current
+`.dimensions` behavior:
+
+- If `dimensions` is not `r_null`, validate and return that override.
+- Otherwise call the internal helper with `v_ignore = NULL` and
+  `ignore_size = 0`.
+
+This keeps ignored axes out of the `.dimensions` override path. There is no
+useful meaning for combining an explicit dimensions override with ignored axes
+in the current API.
+
+Within the helper, initialize output dimensions to `1` as today. Convert
+`v_ignore` into a small stack allocated lookup, or use another simple approach
+that makes the merge loop clear. When an axis is ignored, skip its
+`rray_dimension2()` call so its output dimension remains `1`. Still update the
+common dimensionality from every input before processing its axes.
+
+Do not validate `v_ignore` through an R-facing axis parser. The normal entry
+point always passes `NULL, 0`, and `rray_combine()` has already validated its
+axis with `check_axis()`.
+
+## Refactor `rray_combine()`
+
+Keep the existing order through type calculation, casting, maximum
+dimensionality, and `check_axis()`. In particular, validate `.axis` before the
+common dimension calculation. This preserves the current error precedence for
+an invalid axis.
+
+After `check_axis()`:
+
+1. Call the internal common dimension helper with the cast `xs`, `&amp;axis`, an
+   `ignore_size` of `1`, the existing `arg`, and `error_call`.
+2. Protect the returned dimensions.
+3. Make a small pass over `xs` to sum the dimension on `axis`.
+4. Treat a missing trailing axis as an implicit dimension of `1`, matching the
+   current combine behavior.
+5. Retain the current `INT_MAX` overflow check and its exact error message.
+6. Store the checked sum into the ignored axis of the returned dimensions.
+
+The extra pass over the input list is acceptable. It only reads dimensions,
+and the array filling work dominates it. Do not complicate the dimensions
+common helper with a sum output or a callback to avoid this pass.
+
+Remove the duplicated common dimension state and merge code from
+`src/combine.c`, including its local output argument tracking. The dimensions
+helper now owns incompatible dimension errors and uses the parent `arg` from
+combine, so named dots and nested arguments must continue to format correctly.
+
+Do not change the name handling, stride plans, fill kernels, output type, or
+the layout of combined values.
+
+## Important cases
+
+The refactor must preserve all of these behaviors:
+
+- Different dimensions on the combine axis are accepted and summed.
+- Incompatible dimensions on any other axis are rejected.
+- A dimension of `1` broadcasts on non-combine axes.
+- A lower-dimensional input has implicit trailing dimensions of `1`.
+- A zero dimension on the combine axis contributes zero to the sum.
+- A zero dimension on another axis follows the existing broadcasting rule.
+- One input returns the same dimensions and values after normalization and
+  casting.
+- The combined axis sum errors before exceeding `INT_MAX`.
+- Names on the combine axis are concatenated as before.
+- Names on other axes continue to follow broadcast name rules.
+
+## Files
+
+At minimum, inspect and update:
+
+- `src/dimensions.c`
+- `src/dimensions.h`
+- `src/combine.c`
+- `src/broadcast.c`
+- `src/decl/dimensions-decl.h` if the helper declarations change
+- `tests/testthat/test-dimensions.R`
+- `tests/testthat/test-combine.R`
+- snapshot files changed by intentional error output changes
+
+`src/init.c` should not need a registration change because no FFI signature is
+changing. Confirm that this remains true.
+
+## Tests
+
+Keep all existing tests passing. Add focused coverage where the current tests
+do not make the new contract obvious:
+
+- Public `rray_dimensions_common()` behavior is unchanged with positional and
+  named inputs.
+- Combine accepts conflicting dimensions on the ignored combine axis.
+- The same dimensions fail when that axis is not the combine axis.
+- Combine still broadcasts singleton dimensions on the other axes.
+- Combine on an implicit trailing axis still treats the missing dimension as
+  `1`.
+- Zero dimensions on and off the combine axis still work.
+- Named inputs still appear correctly in incompatible dimension errors.
+
+There is no R-facing test for `v_ignore` and `ignore_size` because they are
+intentionally not exposed. Exercise them through `rray_combine()`.
+
+Run at least:
+
+```sh
+Rscript -e &quot;devtools::test(filter = '^(dimensions|combine|broadcast)')&quot;
+Rscript -e &quot;devtools::test()&quot;
+```
+
+No documentation should change because there is no R API change. If any
+roxygen text is changed for an independent reason, run `devtools::document()`</pre><p class="cut">44 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/dimensions.h &amp;&amp; echo &quot;=====DECL=====&quot; &amp;&amp; cat src/decl/dimensions-decl.h</summary>
+<pre>cat src/dimensions.h &amp;&amp; echo &quot;=====DECL=====&quot; &amp;&amp; cat src/decl/dimensions-decl.h</pre><pre class="output">#ifndef RRAY_DIMENSIONS_H
+#define RRAY_DIMENSIONS_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_dimensions(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+int rray_dimension(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_set_dimensions(
+  r_obj* x,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_set_axes_dimension(
+  const int* v_dimensions,
+  int dimensionality,
+  const int* v_axes,
+  r_ssize axes_size,
+  int dimension
+);
+
+bool rray_dimensions_are_equal(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality
+);
+
+r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct r_lazy error_call
+);
+
+r_obj* rray_dimensions2(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+r_obj* arg_as_dimensions(
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+=====DECL=====
+static inline void rray_dimensions_merge(
+  int* v_out_dimensions,
+  r_ssize* v_out_args,
+  int* p_out_dimensionality,
+  r_ssize* p_out_i,
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  r_ssize x_i,
+  struct rray_arg* out_arg,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+);
+
+static inline int rray_dimension2(
+  int x,
+  int y,
+  int axis,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+static r_no_return void stop_incompatible_dimensions(
+  int x,
+  int y,
+  int axis,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);</pre></details>
+<details class="tool"><summary>Bash: cat src/dimensions.c</summary>
+<pre>cat src/dimensions.c</pre><pre class="output">#include &quot;dimensions.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/dimensions-decl.h&quot;
+
+r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_dimensions(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim(x);
+  FREE(1);
+  return out;
+}
+
+int rray_dimension(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return r_int_get(dimensions, axis - 1);
+}
+
+bool rray_dimensions_are_equal(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality
+) {
+  if (x_dimensionality != y_dimensionality) {
+    return false;
+  }
+
+  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    if (v_x_dimensions[i] != v_y_dimensions[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+r_obj* ffi_rray_set_dimensions(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_dimensions(ffi_x, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_set_dimensions(
+  r_obj* x,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  dimensions =
+    KEEP(arg_as_dimensions(dimensions, rray_args.dimensions, error_call));
+
+  const r_ssize x_size = rray_size(x, arg, error_call);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+
+  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  if (x_size != size) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Can't set these dimensions. &quot;
+      &quot;Can't change from a size of %&quot; R_PRIdXLEN_T
+      &quot; to a size of %&quot; R_PRIdXLEN_T &quot;.&quot;,
+      x_size,
+      size
+    );
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+
+  r_attrib_poke_dim_names(out, r_null);
+  r_attrib_poke_dim(out, dimensions);
+
+  FREE(3);
+  return out;
+}
+
+r_obj* rray_set_axes_dimension(
+  const int* v_dimensions,
+  int dimensionality,
+  const int* v_axes,
+  r_ssize axes_size,
+  int dimension
+) {
+  r_obj* out = KEEP(r_alloc_integer(dimensionality));
+  int* v_out = r_int_begin(out);
+
+  // Start with `v_dimensions`
+  r_memcpy(v_out, v_dimensions, sizeof(int) * dimensionality);
+
+  // Set `axes` to `dimension`
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    v_out[v_axes[i] - 1] = dimension;
+  }
+
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_dimensions_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);
+}
+
+r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct r_lazy error_call
+) {
+  if (dimensions != r_null) {
+    return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);
+  }
+
+  const r_ssize n = r_length(xs);
+
+  if (n == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  r_obj* const* v_xs = r_list_cbegin(xs);
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  r_ssize out_i = 0;
+  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, n, &amp;out_i);
+  KEEP(out_arg-&gt;shelter);
+
+  int out_dimensionality = 1;
+
+  // Stack allocated array of known max size that we accumulate the common
+  // dimensions in. Initialized to 1, which works very nicely with broadcasting.
+  int v_out_dimensions[RRAY_MAX_DIMENSIONALITY];
+
+  // Index of the input that set each axis of `v_out_dimensions`, always
+  // populated by the time that axis can conflict
+  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+    v_out_dimensions[i] = 1;
+    v_out_args[i] = 0;
+  }
+
+  for (; x_i &lt; n; ++x_i) {
+    r_obj* x = v_xs[x_i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, x_arg, error_call));
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    check_max_dimensionality(x_dimensionality);
+
+    // Update `v_out_dimensions` and `out_dimensionality` in place
+    // with common dimensions
+    rray_dimensions_merge(
+      v_out_dimensions,
+      v_out_args,
+      &amp;out_dimensionality,
+      &amp;out_i,
+      v_x_dimensions,
+      x_dimensionality,
+      x_i,
+      out_arg,
+      x_arg,
+      error_call
+    );
+
+    FREE(1);
+  }</pre><p class="cut">183 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/combine.c</summary>
+<pre>cat src/combine.c</pre><pre class="output">#include &quot;combine.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;axes.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast-common.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;ptype-common.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/combine-decl.h&quot;
+
+r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+  return rray_combine(
+    ffi_xs,
+    axis,
+    r_null,
+    rray_args.empty,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+) {
+  if (r_length(xs) == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+
+  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+
+  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+
+  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    v_out_dimensions[i] = 1;
+    v_out_args[i] = 0;
+  }
+
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  r_ssize out_i = 0;
+  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;out_i);
+  KEEP(out_arg-&gt;shelter);
+
+  r_ssize axis_dimension = 0;
+
+  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
+    r_obj* x_dimensions = r_dim(v_xs[x_i]);
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality = (int) r_length(x_dimensions);
+
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;
+
+      if (i == axis - 1) {
+        if (axis_dimension &gt; INT_MAX - x_dimension) {
+          r_abort_lazy_call(
+            error_call,
+            &quot;The combined dimension on `.axis` is too large.&quot;
+          );
+        }
+        axis_dimension += x_dimension;
+        continue;
+      }
+
+      const int out_dimension = v_out_dimensions[i];
+
+      if (out_dimension == x_dimension || x_dimension == 1) {
+        continue;
+      }
+
+      if (out_dimension == 1) {
+        v_out_dimensions[i] = x_dimension;
+        v_out_args[i] = x_i;
+        continue;
+      }
+
+      out_i = v_out_args[i];
+      r_abort_lazy_call(
+        error_call,
+        &quot;Can't find common dimensions at axis %d. &quot;
+        &quot;%s has dimension %d and %s has dimension %d.&quot;,
+        i + 1,
+        rray_arg_format(out_arg),
+        out_dimension,
+        rray_arg_format(x_arg),
+        x_dimension
+      );
+    }
+  }
+
+  v_out_dimensions[axis - 1] = (int) axis_dimension;
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    dimensionality,
+    v_out_strides
+  );
+
+  r_ssize axis_offset = 0;
+
+  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
+    r_obj* x = v_xs[x_i];
+    r_obj* x_dimensions = r_dim(x);
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality = (int) r_length(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+
+    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+    r_memcpy(
+      v_x_broadcast_dimensions,
+      v_out_dimensions,
+      sizeof(int) * dimensionality
+    );
+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+
+    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+    rray__fill_broadcast_strides(
+      v_x_dimensions,
+      x_dimensionality,
+      dimensionality,
+      v_x_strides
+    );
+
+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+      v_x_broadcast_dimensions,
+      dimensionality,
+      v_out_strides,
+      v_x_strides
+    );
+
+    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+    rray_combine_fill(x, out, out_start, &amp;plan);
+    axis_offset += x_axis_dimension;
+  }
+
+  r_obj* out_names = KEEP(rray_combine_names(xs, out_dimensions, axis));
+
+  r_attrib_poke_dim(out, out_dimensions);
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(8);
+  return out;
+}
+
+static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {
+  r_obj* out = rray_broadcast_names_common(xs, dimensions);
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  if (out != r_null) {
+    r_list_poke(out, axis - 1, r_null);
+  }
+
+  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis));
+
+  if (axis_names != r_null) {
+    if (out == r_null) {
+      out = r_alloc_list(r_length(dimensions));
+      KEEP_AT(out, out_loc);
+    }</pre><p class="cut">227 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_dimensions_common&quot; src/ R/ --include=*.c --include=*.h --include=*.R</summary>
+<pre>grep -rn &quot;rray_dimensions_common&quot; src/ R/ --include=*.c --include=*.h --include=*.R</pre><pre class="output">(eval):1: no matches found: --include=*.c</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_dimensions_common&quot; src R tests | grep -v &quot;^src/rlang/&quot;</summary>
+<pre>grep -rn &quot;rray_dimensions_common&quot; src R tests | grep -v &quot;^src/rlang/&quot;</pre><pre class="output">src/dimensions.c:125:r_obj* ffi_rray_dimensions_common(
+src/dimensions.c:131:  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);
+src/dimensions.c:134:r_obj* rray_dimensions_common(
+src/init.c:60:extern r_obj* ffi_rray_dimensions_common(
+src/init.c:194:  {&quot;ffi_rray_dimensions_common&quot;, (DL_FUNC) &amp;ffi_rray_dimensions_common, 3},
+src/dimensions.h:43:r_obj* rray_dimensions_common(
+src/broadcast.c:255:  dimensions = KEEP(rray_dimensions_common(xs, dimensions, error_call));
+R/broadcast.R:37:#' found by [rray_dimensions_common()].
+R/dimensions.R:27:#' `rray_dimensions_common()` finds the common dimensions among multiple
+R/dimensions.R:41:#' rray_dimensions_common(array(1, c(2, 3)), array(1, c(1, 3)))
+R/dimensions.R:42:#' rray_dimensions_common(1:5, array(1, c(1, 3)))
+R/dimensions.R:43:#' rray_dimensions_common(1:5, .dimensions = c(5L, 3L))
+R/dimensions.R:44:rray_dimensions_common &lt;- function(..., .dimensions = NULL) {
+R/dimensions.R:45:  .Call(ffi_rray_dimensions_common, list2(...), .dimensions, environment())
+tests/testthat/test-dimensions.R:42:# rray_dimensions_common()
+tests/testthat/test-dimensions.R:46:    rray_dimensions_common(1:5, 1:5),
+tests/testthat/test-dimensions.R:50:    rray_dimensions_common(array(1, c(2, 3)), array(1, c(2, 3))),
+tests/testthat/test-dimensions.R:57:    rray_dimensions_common(array(1, c(1, 3)), array(1, c(2, 1))),
+tests/testthat/test-dimensions.R:61:    rray_dimensions_common(array(1, c(1, 3)), array(1, c(2, 3))),
+tests/testthat/test-dimensions.R:68:    rray_dimensions_common(1:5, array(1, c(5, 3))),
+tests/testthat/test-dimensions.R:72:    rray_dimensions_common(array(1, c(2, 3)), array(1, c(2, 3, 4))),
+tests/testthat/test-dimensions.R:79:    rray_dimensions_common(NULL, 1:5)
+tests/testthat/test-dimensions.R:80:    rray_dimensions_common(1:5, NULL)
+tests/testthat/test-dimensions.R:81:    rray_dimensions_common(x = 1:5, y = NULL)
+tests/testthat/test-dimensions.R:82:    rray_dimensions_common(NULL, NULL)
+tests/testthat/test-dimensions.R:87:  expect_identical(rray_dimensions_common(NULL, .dimensions = 2L), 2L)
+tests/testthat/test-dimensions.R:91:  expect_identical(rray_dimensions_common(1:3), 3L)
+tests/testthat/test-dimensions.R:93:    rray_dimensions_common(array(1, c(2, 3))),
+tests/testthat/test-dimensions.R:100:    rray_dimensions_common(
+tests/testthat/test-dimensions.R:111:    rray_dimensions_common(1:5, .dimensions = c(5L, 3L)),
+tests/testthat/test-dimensions.R:117:    rray_dimensions_common(1:6, .dimensions = c(5L, 3L)),
+tests/testthat/test-dimensions.R:124:    rray_dimensions_common(array(1, c(2, 3)), array(1, c(4, 3))),
+tests/testthat/test-dimensions.R:131:    rray_dimensions_common(x = array(1, c(2, 3)), y = array(1, c(4, 3))),
+tests/testthat/test-dimensions.R:138:    rray_dimensions_common(
+tests/testthat/test-dimensions.R:151:    do.call(rray_dimensions_common, args)
+tests/testthat/test-dimensions.R:157:    rray_dimensions_common(`a b` = NULL)
+tests/testthat/test-dimensions.R:162:  expect_snapshot(rray_dimensions_common(), error = TRUE)
+tests/testthat/test-dimensions.R:167:  expect_snapshot(rray_dimensions_common(x), error = TRUE)
+tests/testthat/test-dimensions.R:171:  expect_snapshot(rray_dimensions_common(1, .dimensions = &quot;a&quot;), error = TRUE)
+tests/testthat/test-dimensions.R:173:    rray_dimensions_common(1, .dimensions = integer()),
+tests/testthat/_snaps/dimensions.md:44:      rray_dimensions_common(x)
+tests/testthat/_snaps/dimensions.md:46:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:60:      rray_dimensions_common(NULL, 1:5)
+tests/testthat/_snaps/dimensions.md:62:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:65:      rray_dimensions_common(1:5, NULL)
+tests/testthat/_snaps/dimensions.md:67:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:70:      rray_dimensions_common(x = 1:5, y = NULL)
+tests/testthat/_snaps/dimensions.md:72:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:75:      rray_dimensions_common(NULL, NULL)
+tests/testthat/_snaps/dimensions.md:77:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:83:      rray_dimensions_common(array(1, c(2, 3)), array(1, c(4, 3)))
+tests/testthat/_snaps/dimensions.md:85:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:91:      rray_dimensions_common(x = array(1, c(2, 3)), y = array(1, c(4, 3)))
+tests/testthat/_snaps/dimensions.md:93:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:99:      rray_dimensions_common(a = array(1, c(2, 1)), b = array(1, c(1, 3)), c = array(
+tests/testthat/_snaps/dimensions.md:102:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:108:      do.call(rray_dimensions_common, args)
+tests/testthat/_snaps/dimensions.md:116:      rray_dimensions_common(`a b` = NULL)
+tests/testthat/_snaps/dimensions.md:118:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:124:      rray_dimensions_common()
+tests/testthat/_snaps/dimensions.md:126:      Error in `rray_dimensions_common()`:
+tests/testthat/_snaps/dimensions.md:132:      rray_dimensions_common(1, .dimensions = &quot;a&quot;)
+tests/testthat/_snaps/dimensions.md:140:      rray_dimensions_common(1, .dimensions = integer())
+tests/testthat/_snaps/dimensions.md:142:      Error in `rray_dimensions_common()`:</pre></details>
+<details class="tool tool-error"><summary>Bash: cat src/arg.h &amp;&amp; echo ==== &amp;&amp; sed -n 1,200p src/arg.c</summary>
+<pre>cat src/arg.h &amp;&amp; echo ==== &amp;&amp; sed -n 1,200p src/arg.c</pre><pre class="output">Exit code 1
+#ifndef RRAY_ARG_H
+#define RRAY_ARG_H
+
+#include &quot;rlang.h&quot;
+
+struct rray_arg {
+  r_obj* shelter;
+  struct rray_arg* parent;
+  r_ssize (*fill)(void* data, char* buf, r_ssize remaining);
+  void* data;
+};
+
+struct rray_args {
+  struct rray_arg* empty;
+  struct rray_arg* x;
+  struct rray_arg* y;
+  struct rray_arg* names;
+  struct rray_arg* axis;
+  struct rray_arg* dot_axis;
+  struct rray_arg* axes;
+  struct rray_arg* from;
+  struct rray_arg* to;
+  struct rray_arg* dimensions;
+  struct rray_arg* dot_dimensions;
+};
+
+extern struct rray_args rray_args;
+
+r_obj* rray_arg(struct rray_arg* arg);
+
+const char* rray_arg_format(struct rray_arg* arg);
+
+const char* rray_arg_format_input(struct rray_arg* arg);
+
+bool rray_arg_is_empty(struct rray_arg* arg);
+
+struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+
+struct rray_arg new_lazy_arg(struct r_lazy* arg);
+
+struct rray_arg* new_subscript_arg(
+  struct rray_arg* parent,
+  r_obj* names,
+  r_ssize n,
+  r_ssize* p_i
+);
+
+#endif
+(eval):1: === not found</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -n 230,275p src/broadcast.c; echo ====; cat src/dimensionality.c; echo ====; cat src/dime…</summary>
+<pre>sed -n 230,275p src/broadcast.c; echo ====; cat src/dimensionality.c; echo ====; cat src/dimensionality.h</pre><pre class="output">Exit code 1
+
+static r_obj* rray_broadcast_list(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* plan
+) {
+  RRAY_BROADCAST_BARRIER(R_TYPE_list, r_list_cbegin, r_list_poke);
+}
+
+#undef RRAY_BROADCAST_ATOMIC
+#undef RRAY_BROADCAST_BARRIER
+
+r_obj* ffi_rray_broadcast_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_broadcast_common(ffi_xs, ffi_dimensions, error_call);
+}
+
+r_obj* rray_broadcast_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct r_lazy error_call
+) {
+  dimensions = KEEP(rray_dimensions_common(xs, dimensions, error_call));
+
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_obj* out = KEEP(r_alloc_list(n));
+  r_attrib_poke_names(out, xs_names);
+
+  r_ssize i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;i);
+  KEEP(x_arg-&gt;shelter);
+
+  for (; i &lt; n; ++i) {
+    r_list_poke(out, i, rray_broadcast(v_xs[i], dimensions, x_arg, error_call));
+  }
+
+  FREE(4);
+  return out;
+}
+
+(eval):1: === not found</pre></details>
+<details class="tool tool-error"><summary>Bash: cat src/decl/combine-decl.h; echo ====; cat src/axes.h | head -60</summary>
+<pre>cat src/decl/combine-decl.h; echo ====; cat src/axes.h | head -60</pre><pre class="output">Exit code 1
+static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis);
+static r_obj* rray_combine_axis_names(r_obj* xs, int axis);
+static void rray_combine_fill(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_lgl(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_int(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_dbl(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_cpl(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_raw(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_chr(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_list(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+(eval):1: === not found</pre></details>
+<details class="tool"><summary>Bash: cat src/dimensionality.c; echo '-----'; cat src/dimensionality.h; echo '-----'; cat src/axes.h</summary>
+<pre>cat src/dimensionality.c; echo '-----'; cat src/dimensionality.h; echo '-----'; cat src/axes.h</pre><pre class="output">#include &quot;dimensionality.h&quot;
+
+#include &quot;dimensions.h&quot;
+
+r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+}
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return rray_dimensionality_from_dimensions(dimensions);
+}
+
+int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+  return (int) r_length(dimensions);
+}
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  int out = 1;
+
+  for (; x_i &lt; xs_size; ++x_i) {
+    const int x_dimensionality =
+      rray_dimensionality(v_xs[x_i], x_arg, error_call);
+
+    if (x_dimensionality &gt; out) {
+      out = x_dimensionality;
+    }
+  }
+
+  FREE(2);
+  return out;
+}
+
+void check_max_dimensionality(int dimensionality) {
+  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+    r_abort(
+      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+      &quot;A dimensionality of %d was requested.&quot;,
+      RRAY_MAX_DIMENSIONALITY,
+      dimensionality
+    );
+  }
+}
+-----
+#ifndef RRAY_DIMENSIONALITY_H
+#define RRAY_DIMENSIONALITY_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+#define RRAY_MAX_DIMENSIONALITY 64
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+int rray_dimensionality_from_dimensions(r_obj* dimensions);
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_max_dimensionality(int dimensionality);
+
+#endif
+-----
+#ifndef RRAY_AXES_H
+#define RRAY_AXES_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* arg_as_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* arg_as_axes_unsorted(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* arg_as_axes_permutation(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+void check_axis(
+  int axis,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_axes_complement(
+  const int* v_axes,
+  r_ssize axes_size,
+  int dimensionality
+);
+
+#endif</pre></details>
+<details class="tool"><summary>Bash: cat src/arg.c</summary>
+<pre>cat src/arg.c</pre><pre class="output">#include &quot;arg.h&quot;
+
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+#include &quot;utils.h&quot;
+
+#include &quot;decl/arg-decl.h&quot;
+
+#define RRAY_ARG_BUFFER_SIZE 100
+
+r_obj* rray_arg(struct rray_arg* arg) {
+  if (arg == NULL) {
+    return r_chrs.empty_string;
+  }
+
+  r_ssize size = RRAY_ARG_BUFFER_SIZE;
+
+  while (true) {
+    r_obj* shelter = KEEP(r_alloc_raw(size));
+    char* buf = (char*) r_raw_begin(shelter);
+
+    if (fill_arg_buffer(arg, buf, 0, size) &gt;= 0) {
+      r_obj* out = r_chr(buf);
+      FREE(1);
+      return out;
+    }
+
+    FREE(1);
+    size += size / 2;
+  }
+}
+
+const char* rray_arg_format(struct rray_arg* arg) {
+  r_obj* chr = KEEP(rray_arg(arg));
+  const char* out = r_format_error_arg(chr);
+  FREE(1);
+  return out;
+}
+
+const char* rray_arg_format_input(struct rray_arg* arg) {
+  if (rray_arg_is_empty(arg)) {
+    return &quot;Input&quot;;
+  }
+
+  return rray_arg_format(arg);
+}
+
+static r_ssize fill_arg_buffer(
+  struct rray_arg* arg,
+  char* buf,
+  r_ssize cur_size,
+  r_ssize tot_size
+) {
+  if (arg-&gt;parent != NULL) {
+    cur_size = fill_arg_buffer(arg-&gt;parent, buf, cur_size, tot_size);
+
+    if (cur_size &lt; 0) {
+      return cur_size;
+    }
+  }
+
+  const r_ssize written =
+    arg-&gt;fill(arg-&gt;data, buf + cur_size, tot_size - cur_size);
+
+  if (written &lt; 0) {
+    return written;
+  }
+
+  return cur_size + written;
+}
+
+static r_ssize str_arg_fill(const char* data, char* buf, r_ssize remaining) {
+  const r_ssize len = (r_ssize) strlen(data);
+
+  if (len &gt;= remaining) {
+    return -1;
+  }
+
+  r_memcpy(buf, data, len);
+  buf[len] = '\0';
+
+  return len;
+}
+
+struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg) {
+  struct rray_arg out =
+    {.parent = parent, .fill = &amp;wrapper_arg_fill, .data = (void*) arg};
+  return out;
+}
+
+static r_ssize wrapper_arg_fill(void* data, char* buf, r_ssize remaining) {
+  return str_arg_fill((const char*) data, buf, remaining);
+}
+
+struct rray_arg new_lazy_arg(struct r_lazy* arg) {
+  return (struct rray_arg){.fill = &amp;lazy_arg_fill, .data = arg};
+}
+
+static r_ssize lazy_arg_fill(void* data, char* buf, r_ssize remaining) {
+  r_obj* arg = KEEP(r_lazy_eval(*(struct r_lazy*) data));
+
+  const char* string = &quot;&quot;;
+
+  if (r_is_string(arg)) {
+    string = r_chr_get_c_string(arg, 0);
+  } else if (arg != r_null) {
+    r_abort(
+      &quot;`arg` must be a string or `NULL`, not %s.&quot;,
+      r_obj_type_friendly(arg)
+    );
+  }
+
+  const r_ssize out = str_arg_fill(string, buf, remaining);
+
+  FREE(1);
+  return out;
+}
+
+struct subscript_arg_data {
+  struct rray_arg self;
+  r_obj* names;
+  r_ssize n;
+  r_ssize* p_i;
+};
+
+struct rray_arg* new_subscript_arg(
+  struct rray_arg* parent,
+  r_obj* names,
+  r_ssize n,
+  r_ssize* p_i
+) {
+  r_obj* shelter = KEEP(r_alloc_list(2));
+  r_list_poke(shelter, 0, r_alloc_raw(sizeof(struct subscript_arg_data)));
+  r_list_poke(shelter, 1, names);
+
+  struct subscript_arg_data* p_data = r_raw_begin(r_list_get(shelter, 0));
+
+  p_data-&gt;self = (struct rray_arg){
+    .shelter = shelter,
+    .parent = parent,
+    .fill = &amp;subscript_arg_fill,
+    .data = p_data
+  };
+  p_data-&gt;names = names;
+  p_data-&gt;n = n;
+  p_data-&gt;p_i = p_i;
+
+  FREE(1);
+  return (struct rray_arg*) p_data;
+}
+
+static r_ssize subscript_arg_fill(void* data, char* buf, r_ssize remaining) {
+  struct subscript_arg_data* p_data = (struct subscript_arg_data*) data;
+
+  const r_ssize i = *p_data-&gt;p_i;
+  const r_ssize n = p_data-&gt;n;
+  r_obj* names = p_data-&gt;names;
+
+  if (i &gt;= n) {
+    r_stop_internal(
+      &quot;`i` of %&quot; R_PRI_SSIZE &quot; can't be past the end of %&quot; R_PRI_SSIZE &quot;.&quot;,
+      i,
+      n
+    );
+  }
+
+  const size_t space = (size_t) remaining;
+  const bool named = r_has_name_at(names, i);
+  const bool child = !rray_arg_is_empty(p_data-&gt;self.parent);
+
+  int len;
+
+  if (child) {
+    if (named) {
+      len = snprintf(buf, space, &quot;$%s&quot;, r_chr_get_c_string(names, i));
+    } else {
+      len = snprintf(buf, space, &quot;[[%&quot; R_PRI_SSIZE &quot;]]&quot;, i + 1);
+    }
+  } else {
+    if (named) {
+      len = snprintf(buf, space, &quot;%s&quot;, r_chr_get_c_string(names, i));
+    } else {
+      len = snprintf(buf, space, &quot;..%&quot; R_PRI_SSIZE, i + 1);
+    }
+  }
+
+  if (len &gt;= remaining) {
+    return -1;
+  }
+
+  return len;
+}
+
+bool rray_arg_is_empty(struct rray_arg* arg) {
+  if (arg == NULL) {
+    return true;
+  }
+
+  char buf[1];</pre><p class="cut">28 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 1,400p src/axes.c | grep -n &quot;check_axis&quot; -A 30 | head -60</summary>
+<pre>sed -n 1,400p src/axes.c | grep -n &quot;check_axis&quot; -A 30 | head -60</pre><pre class="output">230:void check_axis(
+231-  int axis,
+232-  int dimensionality,
+233-  struct rray_arg* arg,
+234-  struct r_lazy error_call
+235-) {
+236-  if (axis == r_globals.na_int) {
+237-    r_abort_lazy_call(
+238-      error_call,
+239-      &quot;%s must not be missing.&quot;,
+240-      rray_arg_format(arg)
+241-    );
+242-  }
+243-
+244-  if (axis &lt; 1) {
+245-    r_abort_lazy_call(
+246-      error_call,
+247-      &quot;%s must be greater than or equal to 1, not %d.&quot;,
+248-      rray_arg_format(arg),
+249-      axis
+250-    );
+251-  }
+252-
+253-  if (axis &gt; dimensionality) {
+254-    r_abort_lazy_call(
+255-      error_call,
+256-      &quot;%s must be less than or equal to the dimensionality of %d, &quot;
+257-      &quot;not %d.&quot;,
+258-      rray_arg_format(arg),
+259-      dimensionality,
+260-      axis</pre></details>
+<p>Now implementing. First <code>src/dimensions.h</code>:</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+p = 'src/dimensions.h'
+s = open(p).read()
+old = &quot;&quot;&quot;r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct r_lazy error_call
+);
+&quot;&quot;&quot;
+new = &quot;&quot;&quot;r_obj* rray_dimensions_common(
+  r_obj* xs,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_dimensions_common_opts(
+  r_obj* xs,
+  const int* v_ignore,
+  r_ssize ignore_size,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+&quot;&quot;&quot;
+assert old in s
+open(p,'w').write(s.replace(old, new))
+EOF
+echo ok</pre><pre class="output">Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/dimensions.h</summary>
+<pre class="output">1	#ifndef RRAY_DIMENSIONS_H
+2	#define RRAY_DIMENSIONS_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	
+8	r_obj* rray_dimensions(
+9	  r_obj* x,
+10	  struct rray_arg* arg,
+11	  struct r_lazy error_call
+12	);
+13	
+14	int rray_dimension(
+15	  r_obj* x,
+16	  int axis,
+17	  struct rray_arg* arg,
+18	  struct r_lazy error_call
+19	);
+20	
+21	r_obj* rray_set_dimensions(
+22	  r_obj* x,
+23	  r_obj* dimensions,
+24	  struct rray_arg* arg,
+25	  struct r_lazy error_call
+26	);
+27	
+28	r_obj* rray_set_axes_dimension(
+29	  const int* v_dimensions,
+30	  int dimensionality,
+31	  const int* v_axes,
+32	  r_ssize axes_size,
+33	  int dimension
+34	);
+35	
+36	bool rray_dimensions_are_equal(
+37	  const int* v_x_dimensions,
+38	  int x_dimensionality,
+39	  const int* v_y_dimensions,
+40	  int y_dimensionality
+41	);
+42	
+43	r_obj* rray_dimensions_common(
+44	  r_obj* xs,
+45	  r_obj* dimensions,
+46	  struct r_lazy error_call
+47	);
+48	
+49	r_obj* rray_dimensions2(
+50	  const int* v_x_dimensions,
+51	  int x_dimensionality,
+52	  const int* v_y_dimensions,
+53	  int y_dimensionality,
+54	  struct rray_arg* x_arg,
+55	  struct rray_arg* y_arg,
+56	  struct r_lazy error_call
+57	);
+58	
+59	r_obj* arg_as_dimensions(
+60	  r_obj* dimensions,
+61	  struct rray_arg* arg,
+62	  struct r_lazy error_call
+63	);
+64	
+65	#endif
+66	</pre></details>
+<details class="tool"><summary>Read src/dimensions.c</summary>
+<pre class="output">1	#include &quot;dimensions.h&quot;
+2	
+3	#include &quot;dimensionality.h&quot;
+4	#include &quot;size.h&quot;
+5	#include &quot;utils.h&quot;
+6	#include &quot;wrapper.h&quot;
+7	
+8	#include &quot;decl/dimensions-decl.h&quot;
+9	
+10	r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+11	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+12	  return rray_dimensions(ffi_x, rray_args.x, error_call);
+13	}
+14	
+15	r_obj* rray_dimensions(
+16	  r_obj* x,
+17	  struct rray_arg* arg,
+18	  struct r_lazy error_call
+19	) {
+20	  check_unclassed(x, arg, error_call);
+21	  x = KEEP(arg_as_array(x, arg, error_call));
+22	  r_obj* out = r_dim(x);
+23	  FREE(1);
+24	  return out;
+25	}
+26	
+27	int rray_dimension(
+28	  r_obj* x,
+29	  int axis,
+30	  struct rray_arg* arg,
+31	  struct r_lazy error_call
+32	) {
+33	  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+34	  return r_int_get(dimensions, axis - 1);
+35	}
+36	
+37	bool rray_dimensions_are_equal(
+38	  const int* v_x_dimensions,
+39	  int x_dimensionality,
+40	  const int* v_y_dimensions,
+41	  int y_dimensionality
+42	) {
+43	  if (x_dimensionality != y_dimensionality) {
+44	    return false;
+45	  }
+46	
+47	  for (int i = 0; i &lt; x_dimensionality; ++i) {
+48	    if (v_x_dimensions[i] != v_y_dimensions[i]) {
+49	      return false;
+50	    }
+51	  }
+52	
+53	  return true;
+54	}
+55	
+56	r_obj* ffi_rray_set_dimensions(
+57	  r_obj* ffi_x,
+58	  r_obj* ffi_dimensions,
+59	  r_obj* ffi_frame
+60	) {
+61	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+62	  return rray_set_dimensions(ffi_x, ffi_dimensions, rray_args.x, error_call);
+63	}
+64	
+65	r_obj* rray_set_dimensions(
+66	  r_obj* x,
+67	  r_obj* dimensions,
+68	  struct rray_arg* arg,
+69	  struct r_lazy error_call
+70	) {
+71	  check_unclassed(x, arg, error_call);
+72	  x = KEEP(arg_as_array(x, arg, error_call));
+73	  dimensions =
+74	    KEEP(arg_as_dimensions(dimensions, rray_args.dimensions, error_call));
+75	
+76	  const r_ssize x_size = rray_size(x, arg, error_call);
+77	
+78	  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+79	  const int* v_dimensions = r_int_cbegin(dimensions);
+80	
+81	  const r_ssize size = rray_size_from_dimensions(v_dimensions, dimensionality);
+82	
+83	  if (x_size != size) {
+84	    r_abort_lazy_call(
+85	      error_call,
+86	      &quot;Can't set these dimensions. &quot;
+87	      &quot;Can't change from a size of %&quot; R_PRIdXLEN_T
+88	      &quot; to a size of %&quot; R_PRIdXLEN_T &quot;.&quot;,
+89	      x_size,
+90	      size
+91	    );
+92	  }
+93	
+94	  r_obj* out = KEEP(r_wrap(x));
+95	
+96	  r_attrib_poke_dim_names(out, r_null);
+97	  r_attrib_poke_dim(out, dimensions);
+98	
+99	  FREE(3);
+100	  return out;
+101	}
+102	
+103	r_obj* rray_set_axes_dimension(
+104	  const int* v_dimensions,
+105	  int dimensionality,
+106	  const int* v_axes,
+107	  r_ssize axes_size,
+108	  int dimension
+109	) {
+110	  r_obj* out = KEEP(r_alloc_integer(dimensionality));
+111	  int* v_out = r_int_begin(out);
+112	
+113	  // Start with `v_dimensions`
+114	  r_memcpy(v_out, v_dimensions, sizeof(int) * dimensionality);
+115	
+116	  // Set `axes` to `dimension`
+117	  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+118	    v_out[v_axes[i] - 1] = dimension;
+119	  }
+120	
+121	  FREE(1);
+122	  return out;
+123	}
+124	
+125	r_obj* ffi_rray_dimensions_common(
+126	  r_obj* ffi_xs,
+127	  r_obj* ffi_dimensions,
+128	  r_obj* ffi_frame
+129	) {
+130	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+131	  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);
+132	}
+133	
+134	r_obj* rray_dimensions_common(
+135	  r_obj* xs,
+136	  r_obj* dimensions,
+137	  struct r_lazy error_call
+138	) {
+139	  if (dimensions != r_null) {
+140	    return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);
+141	  }
+142	
+143	  const r_ssize n = r_length(xs);
+144	
+145	  if (n == 0) {
+146	    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+147	  }
+148	
+149	  r_obj* const* v_xs = r_list_cbegin(xs);
+150	  r_obj* xs_names = KEEP(r_names(xs));
+151	
+152	  r_ssize x_i = 0;
+153	  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;x_i);
+154	  KEEP(x_arg-&gt;shelter);
+155	
+156	  r_ssize out_i = 0;
+157	  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, n, &amp;out_i);
+158	  KEEP(out_arg-&gt;shelter);
+159	
+160	  int out_dimensionality = 1;
+161	
+162	  // Stack allocated array of known max size that we accumulate the common
+163	  // dimensions in. Initialized to 1, which works very nicely with broadcasting.
+164	  int v_out_dimensions[RRAY_MAX_DIMENSIONALITY];
+165	
+166	  // Index of the input that set each axis of `v_out_dimensions`, always
+167	  // populated by the time that axis can conflict
+168	  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+169	
+170	  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+171	    v_out_dimensions[i] = 1;
+172	    v_out_args[i] = 0;
+173	  }
+174	
+175	  for (; x_i &lt; n; ++x_i) {
+176	    r_obj* x = v_xs[x_i];
+177	
+178	    r_obj* x_dimensions = KEEP(rray_dimensions(x, x_arg, error_call));
+179	    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+180	    const int x_dimensionality =
+181	      rray_dimensionality_from_dimensions(x_dimensions);
+182	    check_max_dimensionality(x_dimensionality);
+183	
+184	    // Update `v_out_dimensions` and `out_dimensionality` in place
+185	    // with common dimensions
+186	    rray_dimensions_merge(
+187	      v_out_dimensions,
+188	      v_out_args,
+189	      &amp;out_dimensionality,
+190	      &amp;out_i,
+191	      v_x_dimensions,
+192	      x_dimensionality,
+193	      x_i,
+194	      out_arg,
+195	      x_arg,
+196	      error_call
+197	    );
+198	
+199	    FREE(1);
+200	  }</pre><p class="cut">184 more lines cut</p></details>
+<details class="tool"><summary>Edit src/dimensions.h</summary>
+<pre class="diff"><span class="del">-r_obj* rray_dimensions_common(</span>
+<span class="del">-  r_obj* xs,</span>
+<span class="del">-  r_obj* dimensions,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-);</span>
+<span class="ins">+r_obj* rray_dimensions_common(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  r_obj* dimensions,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* rray_dimensions_common_opts(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  const int* v_ignore,</span>
+<span class="ins">+  r_ssize ignore_size,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now <code>src/dimensions.c</code>:</p>
+
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};</span>
+<span class="del">-  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-r_obj* rray_dimensions_common(</span>
+<span class="del">-  r_obj* xs,</span>
+<span class="del">-  r_obj* dimensions,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-) {</span>
+<span class="del">-  if (dimensions != r_null) {</span>
+<span class="del">-    return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  const r_ssize n = r_length(xs);</span>
+<span class="ins">+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};</span>
+<span class="ins">+  return rray_dimensions_common(</span>
+<span class="ins">+    ffi_xs,</span>
+<span class="ins">+    ffi_dimensions,</span>
+<span class="ins">+    rray_args.empty,</span>
+<span class="ins">+    error_call</span>
+<span class="ins">+  );</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* rray_dimensions_common(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  r_obj* dimensions,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  if (dimensions != r_null) {</span>
+<span class="ins">+    return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return rray_dimensions_common_opts(xs, NULL, 0, arg, error_call);</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* rray_dimensions_common_opts(</span>
+<span class="ins">+  r_obj* xs,</span>
+<span class="ins">+  const int* v_ignore,</span>
+<span class="ins">+  r_ssize ignore_size,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  const r_ssize n = r_length(xs);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-  r_ssize x_i = 0;</span>
+<span class="del">-  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;x_i);</span>
+<span class="del">-  KEEP(x_arg-&gt;shelter);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize out_i = 0;</span>
+<span class="del">-  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, n, &amp;out_i);</span>
+<span class="del">-  KEEP(out_arg-&gt;shelter);</span>
+<span class="ins">+  r_ssize x_i = 0;</span>
+<span class="ins">+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;x_i);</span>
+<span class="ins">+  KEEP(x_arg-&gt;shelter);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize out_i = 0;</span>
+<span class="ins">+  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, n, &amp;out_i);</span>
+<span class="ins">+  KEEP(out_arg-&gt;shelter);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-</span>
+<span class="del">-  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {</span>
+<span class="del">-    v_out_dimensions[i] = 1;</span>
+<span class="del">-    v_out_args[i] = 0;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  for (; x_i &lt; n; ++x_i) {</span>
+<span class="ins">+  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+</span>
+<span class="ins">+  bool v_ignored[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {</span>
+<span class="ins">+    v_out_dimensions[i] = 1;</span>
+<span class="ins">+    v_out_args[i] = 0;</span>
+<span class="ins">+    v_ignored[i] = false;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; ignore_size; ++i) {</span>
+<span class="ins">+    v_ignored[v_ignore[i] - 1] = true;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  for (; x_i &lt; n; ++x_i) {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-      v_out_args,</span>
+<span class="del">-      &amp;out_dimensionality,</span>
+<span class="del">-      &amp;out_i,</span>
+<span class="del">-      v_x_dimensions,</span>
+<span class="ins">+      v_out_args,</span>
+<span class="ins">+      v_ignored,</span>
+<span class="ins">+      &amp;out_dimensionality,</span>
+<span class="ins">+      &amp;out_i,</span>
+<span class="ins">+      v_x_dimensions,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-static inline void rray_dimensions_merge(</span>
+<span class="del">-  int* v_out_dimensions,</span>
+<span class="del">-  r_ssize* v_out_args,</span>
+<span class="del">-  int* p_out_dimensionality,</span>
+<span class="ins">+static inline void rray_dimensions_merge(</span>
+<span class="ins">+  int* v_out_dimensions,</span>
+<span class="ins">+  r_ssize* v_out_args,</span>
+<span class="ins">+  const bool* v_ignored,</span>
+<span class="ins">+  int* p_out_dimensionality,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-  for (int i = 0; i &lt; common_dimensionality; ++i) {</span>
+<span class="del">-    const int out_dimension =</span>
+<span class="del">-      (i &lt; out_dimensionality) ? v_out_dimensions[i] : 1;</span>
+<span class="del">-    const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;</span>
+<span class="ins">+  for (int i = 0; i &lt; common_dimensionality; ++i) {</span>
+<span class="ins">+    if (v_ignored[i]) {</span>
+<span class="ins">+      continue;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    const int out_dimension =</span>
+<span class="ins">+      (i &lt; out_dimensionality) ? v_out_dimensions[i] : 1;</span>
+<span class="ins">+    const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/dimensions.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now the decl header:</p>
+
+<details class="tool"><summary>Read src/decl/dimensions-decl.h</summary>
+<pre class="output">1	static inline void rray_dimensions_merge(
+2	  int* v_out_dimensions,
+3	  r_ssize* v_out_args,
+4	  int* p_out_dimensionality,
+5	  r_ssize* p_out_i,
+6	  const int* v_x_dimensions,
+7	  int x_dimensionality,
+8	  r_ssize x_i,
+9	  struct rray_arg* out_arg,
+10	  struct rray_arg* x_arg,
+11	  struct r_lazy error_call
+12	);
+13	
+14	static inline int rray_dimension2(
+15	  int x,
+16	  int y,
+17	  int axis,
+18	  struct rray_arg* x_arg,
+19	  struct rray_arg* y_arg,
+20	  struct r_lazy error_call
+21	);
+22	
+23	static r_no_return void stop_incompatible_dimensions(
+24	  int x,
+25	  int y,
+26	  int axis,
+27	  struct rray_arg* x_arg,
+28	  struct rray_arg* y_arg,
+29	  struct r_lazy error_call
+30	);
+31	</pre></details>
+<details class="tool"><summary>Edit src/decl/dimensions-decl.h</summary>
+<pre class="diff"><span class="del">-  r_ssize* v_out_args,</span>
+<span class="del">-  int* p_out_dimensionality,</span>
+<span class="ins">+  r_ssize* v_out_args,</span>
+<span class="ins">+  const bool* v_ignored,</span>
+<span class="ins">+  int* p_out_dimensionality,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/dimensions-decl.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now <code>src/broadcast.c</code>:</p>
+
+<details class="tool"><summary>Read src/broadcast.c</summary>
+<pre class="output">248	}
+249	
+250	r_obj* rray_broadcast_common(
+251	  r_obj* xs,
+252	  r_obj* dimensions,
+253	  struct r_lazy error_call
+254	) {
+255	  dimensions = KEEP(rray_dimensions_common(xs, dimensions, error_call));
+256	
+257	  const r_ssize n = r_length(xs);
+258	  r_obj* const* v_xs = r_list_cbegin(xs);
+259	  r_obj* xs_names = KEEP(r_names(xs));</pre></details>
+<details class="tool"><summary>Edit src/broadcast.c</summary>
+<pre class="diff"><span class="del">-  dimensions = KEEP(rray_dimensions_common(xs, dimensions, error_call));</span>
+<span class="ins">+  dimensions =</span>
+<span class="ins">+    KEEP(rray_dimensions_common(xs, dimensions, rray_args.empty, error_call));</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/broadcast.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now <code>src/combine.c</code>:</p>
+
+<details class="tool"><summary>Read src/combine.c</summary>
+<pre class="output">1	#include &quot;combine.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	
+5	#include &quot;axes.h&quot;
+6	#include &quot;broadcast-names.h&quot;
+7	#include &quot;cast-common.h&quot;
+8	#include &quot;dimensionality.h&quot;
+9	#include &quot;ptype-common.h&quot;
+10	#include &quot;size.h&quot;
+11	#include &quot;strided-iterator.h&quot;
+12	#include &quot;strides.h&quot;
+13	#include &quot;utils.h&quot;
+14	
+15	#include &quot;decl/combine-decl.h&quot;
+16	
+17	r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+18	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+19	  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+20	  return rray_combine(
+21	    ffi_xs,
+22	    axis,
+23	    r_null,
+24	    rray_args.empty,
+25	    rray_args.empty,
+26	    error_call
+27	  );
+28	}
+29	
+30	r_obj* rray_combine(
+31	  r_obj* xs,
+32	  int axis,
+33	  r_obj* ptype,
+34	  struct rray_arg* arg,
+35	  struct rray_arg* ptype_arg,
+36	  struct r_lazy error_call
+37	) {
+38	  if (r_length(xs) == 0) {
+39	    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+40	  }
+41	
+42	  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+43	
+44	  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+45	
+46	  const r_ssize xs_size = r_length(xs);
+47	  r_obj* const* v_xs = r_list_cbegin(xs);
+48	
+49	  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+50	
+51	  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+52	
+53	  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+54	  int* v_out_dimensions = r_int_begin(out_dimensions);
+55	
+56	  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+57	
+58	  for (int i = 0; i &lt; dimensionality; ++i) {
+59	    v_out_dimensions[i] = 1;
+60	    v_out_args[i] = 0;
+61	  }
+62	
+63	  r_obj* xs_names = KEEP(r_names(xs));
+64	
+65	  r_ssize x_i = 0;
+66	  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+67	  KEEP(x_arg-&gt;shelter);
+68	
+69	  r_ssize out_i = 0;
+70	  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;out_i);
+71	  KEEP(out_arg-&gt;shelter);
+72	
+73	  r_ssize axis_dimension = 0;
+74	
+75	  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
+76	    r_obj* x_dimensions = r_dim(v_xs[x_i]);
+77	    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+78	    const int x_dimensionality = (int) r_length(x_dimensions);
+79	
+80	    for (int i = 0; i &lt; dimensionality; ++i) {
+81	      const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;
+82	
+83	      if (i == axis - 1) {
+84	        if (axis_dimension &gt; INT_MAX - x_dimension) {
+85	          r_abort_lazy_call(
+86	            error_call,
+87	            &quot;The combined dimension on `.axis` is too large.&quot;
+88	          );
+89	        }
+90	        axis_dimension += x_dimension;
+91	        continue;
+92	      }
+93	
+94	      const int out_dimension = v_out_dimensions[i];
+95	
+96	      if (out_dimension == x_dimension || x_dimension == 1) {
+97	        continue;
+98	      }
+99	
+100	      if (out_dimension == 1) {
+101	        v_out_dimensions[i] = x_dimension;
+102	        v_out_args[i] = x_i;
+103	        continue;
+104	      }
+105	
+106	      out_i = v_out_args[i];
+107	      r_abort_lazy_call(
+108	        error_call,
+109	        &quot;Can't find common dimensions at axis %d. &quot;
+110	        &quot;%s has dimension %d and %s has dimension %d.&quot;,
+111	        i + 1,
+112	        rray_arg_format(out_arg),
+113	        out_dimension,
+114	        rray_arg_format(x_arg),
+115	        x_dimension
+116	      );
+117	    }
+118	  }
+119	
+120	  v_out_dimensions[axis - 1] = (int) axis_dimension;
+121	  const r_ssize out_size = rray_size_from_dimensions_checked(
+122	    v_out_dimensions,
+123	    dimensionality,
+124	    error_call
+125	  );</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));</span>
+<span class="del">-  int* v_out_dimensions = r_int_begin(out_dimensions);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-</span>
+<span class="del">-  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-    v_out_dimensions[i] = 1;</span>
+<span class="del">-    v_out_args[i] = 0;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* xs_names = KEEP(r_names(xs));</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize x_i = 0;</span>
+<span class="del">-  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);</span>
+<span class="del">-  KEEP(x_arg-&gt;shelter);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize out_i = 0;</span>
+<span class="del">-  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;out_i);</span>
+<span class="del">-  KEEP(out_arg-&gt;shelter);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize axis_dimension = 0;</span>
+<span class="del">-</span>
+<span class="del">-  for (x_i = 0; x_i &lt; xs_size; ++x_i) {</span>
+<span class="del">-    r_obj* x_dimensions = r_dim(v_xs[x_i]);</span>
+<span class="del">-    const int* v_x_dimensions = r_int_cbegin(x_dimensions);</span>
+<span class="del">-    const int x_dimensionality = (int) r_length(x_dimensions);</span>
+<span class="del">-</span>
+<span class="del">-    for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-      const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;</span>
+<span class="del">-</span>
+<span class="del">-      if (i == axis - 1) {</span>
+<span class="del">-        if (axis_dimension &gt; INT_MAX - x_dimension) {</span>
+<span class="del">-          r_abort_lazy_call(</span>
+<span class="del">-            error_call,</span>
+<span class="del">-            &quot;The combined dimension on `.axis` is too large.&quot;</span>
+<span class="del">-          );</span>
+<span class="del">-        }</span>
+<span class="del">-        axis_dimension += x_dimension;</span>
+<span class="del">-        continue;</span>
+<span class="del">-      }</span>
+<span class="del">-</span>
+<span class="del">-      const int out_dimension = v_out_dimensions[i];</span>
+<span class="del">-</span>
+<span class="del">-      if (out_dimension == x_dimension || x_dimension == 1) {</span>
+<span class="del">-        continue;</span>
+<span class="del">-      }</span>
+<span class="del">-</span>
+<span class="del">-      if (out_dimension == 1) {</span>
+<span class="del">-        v_out_dimensions[i] = x_dimension;</span>
+<span class="del">-        v_out_args[i] = x_i;</span>
+<span class="del">-        continue;</span>
+<span class="del">-      }</span>
+<span class="del">-</span>
+<span class="del">-      out_i = v_out_args[i];</span>
+<span class="del">-      r_abort_lazy_call(</span>
+<span class="del">-        error_call,</span>
+<span class="del">-        &quot;Can't find common dimensions at axis %d. &quot;</span>
+<span class="del">-        &quot;%s has dimension %d and %s has dimension %d.&quot;,</span>
+<span class="del">-        i + 1,</span>
+<span class="del">-        rray_arg_format(out_arg),</span>
+<span class="del">-        out_dimension,</span>
+<span class="del">-        rray_arg_format(x_arg),</span>
+<span class="del">-        x_dimension</span>
+<span class="del">-      );</span>
+<span class="del">-    }</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  v_out_dimensions[axis - 1] = (int) axis_dimension;</span>
+<span class="ins">+  r_obj* out_dimensions =</span>
+<span class="ins">+    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));</span>
+<span class="ins">+  int* v_out_dimensions = r_int_begin(out_dimensions);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize axis_dimension = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (r_ssize x_i = 0; x_i &lt; xs_size; ++x_i) {</span>
+<span class="ins">+    r_obj* x_dimensions = r_dim(v_xs[x_i]);</span>
+<span class="ins">+    const int x_dimensionality = (int) r_length(x_dimensions);</span>
+<span class="ins">+    const int x_axis_dimension =</span>
+<span class="ins">+      (axis &lt;= x_dimensionality) ? r_int_cbegin(x_dimensions)[axis - 1] : 1;</span>
+<span class="ins">+</span>
+<span class="ins">+    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {</span>
+<span class="ins">+      r_abort_lazy_call(</span>
+<span class="ins">+        error_call,</span>
+<span class="ins">+        &quot;The combined dimension on `.axis` is too large.&quot;</span>
+<span class="ins">+      );</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    axis_dimension += x_axis_dimension;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  v_out_dimensions[axis - 1] = (int) axis_dimension;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Read src/combine.c</summary>
+<pre class="output">46	  const r_ssize xs_size = r_length(xs);
+47	  r_obj* const* v_xs = r_list_cbegin(xs);
+48	
+49	  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+50	
+51	  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+52	
+53	  r_obj* out_dimensions =
+54	    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+55	  int* v_out_dimensions = r_int_begin(out_dimensions);
+56	
+57	  r_ssize axis_dimension = 0;
+58	
+59	  for (r_ssize x_i = 0; x_i &lt; xs_size; ++x_i) {
+60	    r_obj* x_dimensions = r_dim(v_xs[x_i]);
+61	    const int x_dimensionality = (int) r_length(x_dimensions);
+62	    const int x_axis_dimension =
+63	      (axis &lt;= x_dimensionality) ? r_int_cbegin(x_dimensions)[axis - 1] : 1;
+64	
+65	    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+66	      r_abort_lazy_call(
+67	        error_call,
+68	        &quot;The combined dimension on `.axis` is too large.&quot;
+69	      );
+70	    }
+71	
+72	    axis_dimension += x_axis_dimension;
+73	  }
+74	
+75	  v_out_dimensions[axis - 1] = (int) axis_dimension;
+76	  const r_ssize out_size = rray_size_from_dimensions_checked(
+77	    v_out_dimensions,
+78	    dimensionality,
+79	    error_call
+80	  );
+81	
+82	  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+83	
+84	  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+85	  rray_fill_strides_from_dimensions(
+86	    v_out_dimensions,
+87	    dimensionality,
+88	    v_out_strides
+89	  );
+90	
+91	  r_ssize axis_offset = 0;
+92	
+93	  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
+94	    r_obj* x = v_xs[x_i];
+95	    r_obj* x_dimensions = r_dim(x);
+96	    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+97	    const int x_dimensionality = (int) r_length(x_dimensions);
+98	    const int x_axis_dimension =
+99	      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+100	
+101	    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+102	    r_memcpy(
+103	      v_x_broadcast_dimensions,
+104	      v_out_dimensions,
+105	      sizeof(int) * dimensionality
+106	    );
+107	    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+108	
+109	    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+110	    rray__fill_broadcast_strides(
+111	      v_x_dimensions,
+112	      x_dimensionality,
+113	      dimensionality,
+114	      v_x_strides
+115	    );
+116	
+117	    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+118	      v_x_broadcast_dimensions,
+119	      dimensionality,
+120	      v_out_strides,
+121	      v_x_strides
+122	    );
+123	
+124	    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+125	    rray_combine_fill(x, out, out_start, &amp;plan);
+126	    axis_offset += x_axis_dimension;
+127	  }
+128	
+129	  r_obj* out_names = KEEP(rray_combine_names(xs, out_dimensions, axis));
+130	
+131	  r_attrib_poke_dim(out, out_dimensions);
+132	  if (out_names != r_null) {
+133	    r_attrib_poke_dim_names(out, out_names);
+134	  }
+135	</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  for (x_i = 0; x_i &lt; xs_size; ++x_i) {</span>
+<span class="del">-    r_obj* x = v_xs[x_i];</span>
+<span class="del">-    r_obj* x_dimensions = r_dim(x);</span>
+<span class="ins">+  for (r_ssize x_i = 0; x_i &lt; xs_size; ++x_i) {</span>
+<span class="ins">+    r_obj* x = v_xs[x_i];</span>
+<span class="ins">+    r_obj* x_dimensions = r_dim(x);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-#include &quot;dimensionality.h&quot;</span>
+<span class="del">-#include &quot;ptype-common.h&quot;</span>
+<span class="ins">+#include &quot;dimensionality.h&quot;</span>
+<span class="ins">+#include &quot;dimensions.h&quot;</span>
+<span class="ins">+#include &quot;ptype-common.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Read src/combine.c</summary>
+<pre class="output">128	  }
+129	
+130	  r_obj* out_names = KEEP(rray_combine_names(xs, out_dimensions, axis));
+131	
+132	  r_attrib_poke_dim(out, out_dimensions);
+133	  if (out_names != r_null) {
+134	    r_attrib_poke_dim_names(out, out_names);
+135	  }
+136	
+137	  FREE(8);
+138	  return out;
+139	}
+140	
+141	static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  FREE(8);</span>
+<span class="del">-  return out;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {</span>
+<span class="ins">+  FREE(5);</span>
+<span class="ins">+  return out;</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; R CMD SHLIB --help &gt;/dev/null 2&gt;&amp;1; Rscript -e &quot;pkgbuild::…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; R CMD SHLIB --help &gt;/dev/null 2&gt;&amp;1; Rscript -e &quot;pkgbuild::compile_dll()&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">[1mequal.c:589:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  589 |   [0;34mconst[0m bool missing = rray_cpl_is_missing(x) | rray_cpl_is_missing(y);[0m
+      | [0;1;32m                       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[0m      | [0;32m                                              ||
+[0m[1mequal.c:589:24: [0m[0;1;36mnote: [0mcast one or both operands to int to silence this warning[0m
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c ptype-common.c -o ptype-common.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c ptype.c -o ptype.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-logical.c -o reduce-logical.o
+1 warning generated.
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-mean.c -o reduce-mean.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-names.c -o reduce-names.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-product.c -o reduce-product.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-sum.c -o reduce-sum.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce.c -o reduce.o
+7 warnings generated.
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c remove-axes.c -o remove-axes.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c rlang.c -o rlang.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c size.c -o size.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c split-names.c -o split-names.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c split.c -o split.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c strides.c -o strides.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c syms.c -o syms.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c type.c -o type.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c typeof2.c -o typeof2.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c utils.c -o utils.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c wrapper.c -o wrapper.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray4.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o combine.o compare.o dimensionality.o dimensions.o equal.o extremum.o init.o insert-axes.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-logical.o reduce-mean.o reduce-names.o reduce-product.o reduce-sum.o reduce.o remove-axes.o rlang.o size.o split-names.o split.o strides.o syms.o type.o typeof2.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/Rtmpail9mi/devtools_install_1285b44aee325/00LOCK-rray4/00new/rray4/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray4)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^(dimensions|combine|broadcast)')&quot; 2&gt;&amp;1 | tail -40</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^(dimensions|combine|broadcast)')&quot; 2&gt;&amp;1 | tail -40</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 228 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -30</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1710 ]</pre></details>
+<details class="tool"><summary>Bash: git status --short; echo '---'; sed -n 1,200p tests/testthat/test-combine.R</summary>
+<pre>git status --short; echo '---'; sed -n 1,200p tests/testthat/test-combine.R</pre><pre class="output"> M src/broadcast.c
+ M src/combine.c
+ M src/decl/dimensions-decl.h
+ M src/dimensions.c
+ M src/dimensions.h
+---
+test_that(&quot;combines arrays along every axis&quot;, {
+  expect_identical(
+    rray_combine(1:2, 3:5, .axis = 1L),
+    array(1:5, 5L)
+  )
+
+  x &lt;- array(1:6, c(2L, 3L))
+  y &lt;- array(7:12, c(2L, 3L))
+
+  out &lt;- rray_combine(x, y, .axis = 1L)
+  expect_identical(dim(out), c(4L, 3L))
+  expect_identical(out[1:2, ], x)
+  expect_identical(out[3:4, ], y)
+
+  out &lt;- rray_combine(x, y, .axis = 2L)
+  expect_identical(dim(out), c(2L, 6L))
+  expect_identical(out[, 1:3], x)
+  expect_identical(out[, 4:6], y)
+
+  z &lt;- array(1:24, c(2L, 3L, 4L))
+  for (axis in seq_along(dim(z))) {
+    out &lt;- rray_combine(z, z + 24L, .axis = axis)
+    index &lt;- lapply(dim(out), seq_len)
+    index[[axis]] &lt;- seq_len(dim(z)[[axis]])
+    expect_identical(do.call(`[`, c(list(out), index, list(drop = FALSE))), z)
+    index[[axis]] &lt;- dim(z)[[axis]] + seq_len(dim(z)[[axis]])
+    expect_identical(
+      do.call(`[`, c(list(out), index, list(drop = FALSE))),
+      z + 24L
+    )
+  }
+})
+
+test_that(&quot;combines one or more than two inputs&quot;, {
+  x &lt;- array(1:4, c(2L, 2L))
+  expect_identical(rray_combine(x, .axis = 1L), x)
+
+  out &lt;- rray_combine(x, x + 4L, x + 8L, .axis = 2L)
+  expect_identical(dim(out), c(2L, 6L))
+  expect_identical(out[, 1:2], x)
+  expect_identical(out[, 3:4], x + 4L)
+  expect_identical(out[, 5:6], x + 8L)
+
+  xs &lt;- list(x, x + 4L, x + 8L)
+  expect_identical(
+    rlang::inject(rray_combine(!!!xs, .axis = 2L)),
+    out
+  )
+})
+
+test_that(&quot;uses the common type&quot;, {
+  expect_type(rray_combine(TRUE, 2L, .axis = 1L), &quot;integer&quot;)
+  expect_type(rray_combine(TRUE, 2, .axis = 1L), &quot;double&quot;)
+  expect_type(rray_combine(1L, 2i, .axis = 1L), &quot;complex&quot;)
+
+  expect_identical(
+    rray_combine(&quot;a&quot;, &quot;b&quot;, .axis = 1L),
+    array(c(&quot;a&quot;, &quot;b&quot;), 2L)
+  )
+  expect_identical(
+    rray_combine(as.raw(1), as.raw(2), .axis = 1L),
+    array(as.raw(1:2), 2L)
+  )
+  expect_identical(
+    rray_combine(list(1L), list(&quot;x&quot;), .axis = 1L),
+    array(list(1L, &quot;x&quot;), 2L)
+  )
+})
+
+test_that(&quot;broadcasts every non-combine axis&quot;, {
+  x &lt;- array(1:2, c(2L, 1L, 1L))
+  y &lt;- array(3:8, c(3L, 2L))
+  out &lt;- rray_combine(x, y, .axis = 1L)
+
+  expect_identical(dim(out), c(5L, 2L, 1L))
+  expect_identical(out[1:2, , 1L], x[, rep(1L, 2L), 1L])
+  expect_identical(out[3:5, , 1L], y)
+
+  x &lt;- array(1:6, c(2L, 1L, 3L))
+  y &lt;- array(7:12, c(3L, 2L))
+  out &lt;- rray_combine(x, y, .axis = 1L)
+
+  expect_identical(dim(out), c(5L, 2L, 3L))
+  for (i in 1:3) {
+    expect_identical(out[1:2, , i], x[, rep(1L, 2L), i])
+    expect_identical(out[3:5, , i], y)
+  }
+
+  x &lt;- array(1:2, c(1L, 2L, 1L))
+  y &lt;- array(3:26, c(3L, 4L, 2L))
+  out &lt;- rray_combine(x, y, .axis = 2L)
+  expect_identical(dim(out), c(3L, 6L, 2L))
+  expect_identical(out[, 1:2, ], rray_broadcast(x, c(3L, 2L, 2L)))
+  expect_identical(out[, 3:6, ], y)
+})
+
+test_that(&quot;combines on an implicit trailing axis&quot;, {
+  x &lt;- 1:2
+  y &lt;- array(3:8, c(2L, 3L))
+  out &lt;- rray_combine(x, y, .axis = 2L)
+
+  expect_identical(dim(out), c(2L, 4L))
+  expect_identical(out[, 1L], x)
+  expect_identical(out[, 2:4], y)
+})
+
+test_that(&quot;handles zero dimensions&quot;, {
+  x &lt;- array(integer(), c(0L, 2L))
+  y &lt;- array(1:6, c(3L, 2L))
+  expect_identical(rray_combine(x, y, .axis = 1L), y)
+
+  x &lt;- array(integer(), c(2L, 0L))
+  y &lt;- array(1:2, c(2L, 1L))
+  expect_identical(
+    rray_combine(x, y, .axis = 1L),
+    array(integer(), c(4L, 0L))
+  )
+})
+
+test_that(&quot;combines axis names and broadcasts other names&quot;, {
+  x &lt;- array(
+    1:4,
+    c(2L, 2L),
+    dimnames = list(c(&quot;x1&quot;, &quot;x2&quot;), c(&quot;a&quot;, &quot;b&quot;))
+  )
+  y &lt;- array(
+    5:6,
+    c(1L, 2L),
+    dimnames = list(NULL, c(&quot;c&quot;, &quot;d&quot;))
+  )
+
+  out &lt;- rray_combine(first = x, second = y, .axis = 1L)
+  expect_identical(
+    dimnames(out),
+    list(c(&quot;x1&quot;, &quot;x2&quot;, &quot;&quot;), c(&quot;a&quot;, &quot;b&quot;))
+  )
+
+  x &lt;- array(1:2, c(2L, 1L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), &quot;x&quot;))
+  y &lt;- array(3:8, c(2L, 3L), dimnames = list(NULL, letters[1:3]))
+  out &lt;- rray_combine(x, y, .axis = 1L)
+  expect_identical(dimnames(out), list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;&quot;, &quot;&quot;), letters[1:3]))
+
+  x &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, NA_character_)))
+  out &lt;- rray_combine(named = x, unnamed = 3L, .axis = 1L)
+  expect_identical(dimnames(out), list(c(&quot;a&quot;, NA_character_, &quot;&quot;)))
+})
+
+test_that(&quot;does not modify inputs&quot;, {
+  x &lt;- array(1:2, c(2L, 1L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), &quot;x&quot;))
+  y &lt;- array(3:8, c(2L, 3L))
+  expected_x &lt;- x
+  expected_y &lt;- y
+
+  rray_combine(x, y, .axis = 1L)
+
+  expect_identical(x, expected_x)
+  expect_identical(y, expected_y)
+})
+
+test_that(&quot;validates inputs and axis&quot;, {
+  x &lt;- array(1:4, c(2L, 2L))
+
+  expect_snapshot(error = TRUE, {
+    rray_combine(.axis = 1L)
+    rray_combine(x)
+    rray_combine(x, .axis = integer())
+    rray_combine(x, .axis = c(1L, 2L))
+    rray_combine(x, .axis = NA_integer_)
+    rray_combine(x, .axis = structure(1L, foo = &quot;bar&quot;))
+    rray_combine(x, .axis = 1.5)
+    rray_combine(x, .axis = 0L)
+    rray_combine(x, .axis = 3L)
+  })
+})
+
+test_that(&quot;rejects incompatible inputs&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_combine(array(1:4, c(2L, 2L)), array(1:6, c(3L, 2L)), .axis = 2L)
+    rray_combine(x = 1L, y = &quot;x&quot;, .axis = 1L)
+    rray_combine(x = NULL, y = 1L, .axis = 1L)
+    rray_combine(x = mean, y = 1L, .axis = 1L)
+    rray_combine(
+      x = structure(array(1L), class = &quot;foo&quot;),
+      y = 1L,
+      .axis = 1L
+    )
+  })
+})</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-dimensions.R</summary>
+<pre class="output">40	
+41	# ------------------------------------------------------------------------------
+42	# rray_dimensions_common()
+43	
+44	test_that(&quot;common dimensions of identical inputs&quot;, {
+45	  expect_identical(
+46	    rray_dimensions_common(1:5, 1:5),
+47	    5L
+48	  )
+49	  expect_identical(
+50	    rray_dimensions_common(array(1, c(2, 3)), array(1, c(2, 3))),
+51	    c(2L, 3L)
+52	  )
+53	})
+54	
+55	test_that(&quot;dimension of 1 is broadcast to the other&quot;, {
+56	  expect_identical(
+57	    rray_dimensions_common(array(1, c(1, 3)), array(1, c(2, 1))),
+58	    c(2L, 3L)
+59	  )
+60	  expect_identical(
+61	    rray_dimensions_common(array(1, c(1, 3)), array(1, c(2, 3))),
+62	    c(2L, 3L)
+63	  )
+64	})
+65	
+66	test_that(&quot;dimensionality is extended&quot;, {
+67	  expect_identical(
+68	    rray_dimensions_common(1:5, array(1, c(5, 3))),
+69	    c(5L, 3L)
+70	  )
+71	  expect_identical(
+72	    rray_dimensions_common(array(1, c(2, 3)), array(1, c(2, 3, 4))),
+73	    c(2L, 3L, 4L)
+74	  )
+75	})
+76	
+77	test_that(&quot;errors on NULL inputs&quot;, {
+78	  expect_snapshot(error = TRUE, {
+79	    rray_dimensions_common(NULL, 1:5)
+80	    rray_dimensions_common(1:5, NULL)
+81	    rray_dimensions_common(x = 1:5, y = NULL)
+82	    rray_dimensions_common(NULL, NULL)
+83	  })
+84	})
+85	
+86	test_that(&quot;`.dimensions` returns before `...` is looked at&quot;, {
+87	  expect_identical(rray_dimensions_common(NULL, .dimensions = 2L), 2L)
+88	})
+89	
+90	test_that(&quot;single input works&quot;, {
+91	  expect_identical(rray_dimensions_common(1:3), 3L)
+92	  expect_identical(
+93	    rray_dimensions_common(array(1, c(2, 3))),
+94	    c(2L, 3L)
+95	  )
+96	})
+97	
+98	test_that(&quot;more than two inputs work&quot;, {
+99	  expect_identical(
+100	    rray_dimensions_common(
+101	      array(1, c(1, 3)),
+102	      array(1, c(2, 1)),
+103	      array(1, c(1, 1, 4))
+104	    ),
+105	    c(2L, 3L, 4L)
+106	  )
+107	})
+108	
+109	test_that(&quot;`.dimensions` overrides&quot;, {
+110	  expect_identical(
+111	    rray_dimensions_common(1:5, .dimensions = c(5L, 3L)),
+112	    c(5L, 3L)
+113	  )
+114	
+115	  # Even if incompatible! Broadcasting handles it.
+116	  expect_identical(
+117	    rray_dimensions_common(1:6, .dimensions = c(5L, 3L)),
+118	    c(5L, 3L)
+119	  )
+120	})
+121	
+122	test_that(&quot;errors on incompatible dimensions&quot;, {
+123	  expect_snapshot(
+124	    rray_dimensions_common(array(1, c(2, 3)), array(1, c(4, 3))),
+125	    error = TRUE
+126	  )
+127	})
+128	
+129	test_that(&quot;errors name the problematic input&quot;, {
+130	  expect_snapshot(
+131	    rray_dimensions_common(x = array(1, c(2, 3)), y = array(1, c(4, 3))),
+132	    error = TRUE
+133	  )
+134	})
+135	
+136	test_that(&quot;errors name the input that set the conflicting axis&quot;, {
+137	  expect_snapshot(error = TRUE, {
+138	    rray_dimensions_common(
+139	      a = array(1, c(2, 1)),
+140	      b = array(1, c(1, 3)),
+141	      c = array(1, c(2, 4))
+142	    )
+143	  })
+144	})
+145	
+146	test_that(&quot;errors handle a name longer than the argument tag buffer&quot;, {
+147	  args &lt;- list(NULL)
+148	  names(args) &lt;- strrep(&quot;a&quot;, 150)
+149	
+150	  expect_snapshot(error = TRUE, {
+151	    do.call(rray_dimensions_common, args)
+152	  })
+153	})
+154	
+155	test_that(&quot;errors handle a non-syntactic name&quot;, {
+156	  expect_snapshot(error = TRUE, {
+157	    rray_dimensions_common(`a b` = NULL)
+158	  })
+159	})
+160	
+161	test_that(&quot;errors on zero inputs&quot;, {
+162	  expect_snapshot(rray_dimensions_common(), error = TRUE)
+163	})
+164	
+165	test_that(&quot;errors on classed input&quot;, {
+166	  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+167	  expect_snapshot(rray_dimensions_common(x), error = TRUE)
+168	})
+169	
+170	test_that(&quot;`.dimensions` errors use its own argument name&quot;, {
+171	  expect_snapshot(rray_dimensions_common(1, .dimensions = &quot;a&quot;), error = TRUE)
+172	  expect_snapshot(
+173	    rray_dimensions_common(1, .dimensions = integer()),
+174	    error = TRUE
+175	  )
+176	})
+177	
+178	# ------------------------------------------------------------------------------
+179	# rray_set_dimensions()</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_combine(&quot; src --include=* | grep -v &quot;^src/rlang/&quot; | grep -v &quot;static\|ffi_rray_…</summary>
+<pre>grep -rn &quot;rray_combine(&quot; src --include=* | grep -v &quot;^src/rlang/&quot; | grep -v &quot;static\|ffi_rray_combine\|^src/combine.c:.*rray_combine_&quot;</pre><pre class="output">(eval):1: no matches found: --include=*</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_combine&quot; src R | grep -v &quot;^src/rlang/&quot;</summary>
+<pre>grep -rn &quot;rray_combine&quot; src R | grep -v &quot;^src/rlang/&quot;</pre><pre class="output">src/combine.h:8:r_obj* rray_combine(
+src/init.c:70:extern r_obj* ffi_rray_combine(
+src/init.c:212:  {&quot;ffi_rray_combine&quot;, (DL_FUNC) &amp;ffi_rray_combine, 3},
+src/combine.c:18:r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+src/combine.c:21:  return rray_combine(
+src/combine.c:31:r_obj* rray_combine(
+src/combine.c:126:    rray_combine_fill(x, out, out_start, &amp;plan);
+src/combine.c:130:  r_obj* out_names = KEEP(rray_combine_names(xs, out_dimensions, axis));
+src/combine.c:141:static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis) {
+src/combine.c:150:  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis));
+src/combine.c:164:static r_obj* rray_combine_axis_names(r_obj* xs, int axis) {
+src/combine.c:221:static void rray_combine_fill(
+src/combine.c:229:    rray_combine_fill_lgl(x, out, out_start, plan);
+src/combine.c:232:    rray_combine_fill_int(x, out, out_start, plan);
+src/combine.c:235:    rray_combine_fill_dbl(x, out, out_start, plan);
+src/combine.c:238:    rray_combine_fill_cpl(x, out, out_start, plan);
+src/combine.c:241:    rray_combine_fill_raw(x, out, out_start, plan);
+src/combine.c:244:    rray_combine_fill_chr(x, out, out_start, plan);
+src/combine.c:247:    rray_combine_fill_list(x, out, out_start, plan);
+src/combine.c:319:static void rray_combine_fill_lgl(
+src/combine.c:328:static void rray_combine_fill_int(
+src/combine.c:337:static void rray_combine_fill_dbl(
+src/combine.c:346:static void rray_combine_fill_cpl(
+src/combine.c:355:static void rray_combine_fill_raw(
+src/combine.c:364:static void rray_combine_fill_chr(
+src/combine.c:373:static void rray_combine_fill_list(
+src/decl/combine-decl.h:1:static r_obj* rray_combine_names(r_obj* xs, r_obj* dimensions, int axis);
+src/decl/combine-decl.h:2:static r_obj* rray_combine_axis_names(r_obj* xs, int axis);
+src/decl/combine-decl.h:3:static void rray_combine_fill(
+src/decl/combine-decl.h:9:static void rray_combine_fill_lgl(
+src/decl/combine-decl.h:15:static void rray_combine_fill_int(
+src/decl/combine-decl.h:21:static void rray_combine_fill_dbl(
+src/decl/combine-decl.h:27:static void rray_combine_fill_cpl(
+src/decl/combine-decl.h:33:static void rray_combine_fill_raw(
+src/decl/combine-decl.h:39:static void rray_combine_fill_chr(
+src/decl/combine-decl.h:45:static void rray_combine_fill_list(
+R/combine.R:3:#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+R/combine.R:21:#' rray_combine(x, y, .axis = 1)
+R/combine.R:22:#' rray_combine(x, y, .axis = 2)
+R/combine.R:25:#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+R/combine.R:26:rray_combine &lt;- function(..., .axis) {
+R/combine.R:27:  .Call(ffi_rray_combine, list2(...), .axis, environment())</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-combine.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;combines on an implicit trailing axis&quot;, {</span>
+<span class="ins">+test_that(&quot;conflicting dimensions are allowed on the combine axis&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L))</span>
+<span class="ins">+  y &lt;- array(1:6, c(3L, 2L))</span>
+<span class="ins">+</span>
+<span class="ins">+  out &lt;- rray_combine(x, y, .axis = 1L)</span>
+<span class="ins">+  expect_identical(dim(out), c(5L, 2L))</span>
+<span class="ins">+  expect_identical(out[1:2, ], x)</span>
+<span class="ins">+  expect_identical(out[3:5, ], y)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;combines on an implicit trailing axis&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-combine.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;rejects incompatible inputs&quot;, {</span>
+<span class="ins">+test_that(&quot;incompatible dimension errors name the inputs&quot;, {</span>
+<span class="ins">+  expect_snapshot(error = TRUE, {</span>
+<span class="ins">+    rray_combine(</span>
+<span class="ins">+      x = array(1, c(2L, 2L)),</span>
+<span class="ins">+      y = array(1, c(3L, 2L)),</span>
+<span class="ins">+      .axis = 2L</span>
+<span class="ins">+    )</span>
+<span class="ins">+    rray_combine(</span>
+<span class="ins">+      a = array(1, c(2L, 1L, 1L)),</span>
+<span class="ins">+      b = array(1, c(2L, 3L, 1L)),</span>
+<span class="ins">+      c = array(1, c(2L, 4L, 1L)),</span>
+<span class="ins">+      .axis = 1L</span>
+<span class="ins">+    )</span>
+<span class="ins">+  })</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rejects incompatible inputs&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^combine')&quot; 2&gt;&amp;1 | tail -40</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^combine')&quot; 2&gt;&amp;1 | tail -40</pre><pre class="output">ℹ Testing rray4
+WARNING: 'test-combine.R:187:3' -------------------
+Adding new snapshot:
+Code
+  rray_combine(x = array(1, c(2L, 2L)), y = array(1, c(3L, 2L)), .axis = 2L)
+Condition
+  Error in `rray_combine()`:
+  ! Can't find common dimensions at axis 1. `x` has dimension 2 and `y` has dimension 3.
+Code
+  rray_combine(a = array(1, c(2L, 1L, 1L)), b = array(1, c(2L, 3L, 1L)), c = array(
+    1, c(2L, 4L, 1L)), .axis = 1L)
+Condition
+  Error in `rray_combine()`:
+  ! Can't find common dimensions at axis 2. `b` has dimension 3 and `c` has dimension 4.
+
+[ FAIL 0 | WARN 1 | SKIP 0 | PASS 54 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -20; echo '---'; git status --short</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -20; echo '---'; git status --short</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1714 ]
+---
+ M src/broadcast.c
+ M src/combine.c
+ M src/decl/dimensions-decl.h
+ M src/dimensions.c
+ M src/dimensions.h
+ M tests/testthat/_snaps/combine.md
+ M tests/testthat/test-combine.R</pre></details>
+<details class="tool"><summary>Bash: git diff src/</summary>
+<pre>git diff src/</pre><pre class="output">diff --git a/src/broadcast.c b/src/broadcast.c
+index 2976161..8119773 100644
+--- a/src/broadcast.c
++++ b/src/broadcast.c
+@@ -252,7 +252,8 @@ r_obj* rray_broadcast_common(
+   r_obj* dimensions,
+   struct r_lazy error_call
+ ) {
+-  dimensions = KEEP(rray_dimensions_common(xs, dimensions, error_call));
++  dimensions =
++    KEEP(rray_dimensions_common(xs, dimensions, rray_args.empty, error_call));
+ 
+   const r_ssize n = r_length(xs);
+   r_obj* const* v_xs = r_list_cbegin(xs);
+diff --git a/src/combine.c b/src/combine.c
+index 8545a7d..de802c7 100644
+--- a/src/combine.c
++++ b/src/combine.c
+@@ -6,6 +6,7 @@
+ #include &quot;broadcast-names.h&quot;
+ #include &quot;cast-common.h&quot;
+ #include &quot;dimensionality.h&quot;
++#include &quot;dimensions.h&quot;
+ #include &quot;ptype-common.h&quot;
+ #include &quot;size.h&quot;
+ #include &quot;strided-iterator.h&quot;
+@@ -50,71 +51,26 @@ r_obj* rray_combine(
+ 
+   check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+ 
+-  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
++  r_obj* out_dimensions =
++    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+   int* v_out_dimensions = r_int_begin(out_dimensions);
+ 
+-  r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+-
+-  for (int i = 0; i &lt; dimensionality; ++i) {
+-    v_out_dimensions[i] = 1;
+-    v_out_args[i] = 0;
+-  }
+-
+-  r_obj* xs_names = KEEP(r_names(xs));
+-
+-  r_ssize x_i = 0;
+-  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+-  KEEP(x_arg-&gt;shelter);
+-
+-  r_ssize out_i = 0;
+-  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;out_i);
+-  KEEP(out_arg-&gt;shelter);
+-
+   r_ssize axis_dimension = 0;
+ 
+-  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
++  for (r_ssize x_i = 0; x_i &lt; xs_size; ++x_i) {
+     r_obj* x_dimensions = r_dim(v_xs[x_i]);
+-    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+     const int x_dimensionality = (int) r_length(x_dimensions);
++    const int x_axis_dimension =
++      (axis &lt;= x_dimensionality) ? r_int_cbegin(x_dimensions)[axis - 1] : 1;
+ 
+-    for (int i = 0; i &lt; dimensionality; ++i) {
+-      const int x_dimension = (i &lt; x_dimensionality) ? v_x_dimensions[i] : 1;
+-
+-      if (i == axis - 1) {
+-        if (axis_dimension &gt; INT_MAX - x_dimension) {
+-          r_abort_lazy_call(
+-            error_call,
+-            &quot;The combined dimension on `.axis` is too large.&quot;
+-          );
+-        }
+-        axis_dimension += x_dimension;
+-        continue;
+-      }
+-
+-      const int out_dimension = v_out_dimensions[i];
+-
+-      if (out_dimension == x_dimension || x_dimension == 1) {
+-        continue;
+-      }
+-
+-      if (out_dimension == 1) {
+-        v_out_dimensions[i] = x_dimension;
+-        v_out_args[i] = x_i;
+-        continue;
+-      }
+-
+-      out_i = v_out_args[i];
++    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+       r_abort_lazy_call(
+         error_call,
+-        &quot;Can't find common dimensions at axis %d. &quot;
+-        &quot;%s has dimension %d and %s has dimension %d.&quot;,
+-        i + 1,
+-        rray_arg_format(out_arg),
+-        out_dimension,
+-        rray_arg_format(x_arg),
+-        x_dimension
++        &quot;The combined dimension on `.axis` is too large.&quot;
+       );
+     }
++
++    axis_dimension += x_axis_dimension;
+   }
+ 
+   v_out_dimensions[axis - 1] = (int) axis_dimension;
+@@ -135,7 +91,7 @@ r_obj* rray_combine(
+ 
+   r_ssize axis_offset = 0;
+ 
+-  for (x_i = 0; x_i &lt; xs_size; ++x_i) {
++  for (r_ssize x_i = 0; x_i &lt; xs_size; ++x_i) {
+     r_obj* x = v_xs[x_i];
+     r_obj* x_dimensions = r_dim(x);
+     const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+@@ -178,7 +134,7 @@ r_obj* rray_combine(
+     r_attrib_poke_dim_names(out, out_names);
+   }
+ 
+-  FREE(8);
++  FREE(5);
+   return out;
+ }
+ 
+diff --git a/src/decl/dimensions-decl.h b/src/decl/dimensions-decl.h
+index 3d48246..b86b374 100644
+--- a/src/decl/dimensions-decl.h
++++ b/src/decl/dimensions-decl.h
+@@ -1,6 +1,7 @@
+ static inline void rray_dimensions_merge(
+   int* v_out_dimensions,
+   r_ssize* v_out_args,
++  const bool* v_ignored,
+   int* p_out_dimensionality,
+   r_ssize* p_out_i,
+   const int* v_x_dimensions,
+diff --git a/src/dimensions.c b/src/dimensions.c
+index d25fd41..856a6b9 100644
+--- a/src/dimensions.c
++++ b/src/dimensions.c
+@@ -128,18 +128,34 @@ r_obj* ffi_rray_dimensions_common(
+   r_obj* ffi_frame
+ ) {
+   struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+-  return rray_dimensions_common(ffi_xs, ffi_dimensions, error_call);
++  return rray_dimensions_common(
++    ffi_xs,
++    ffi_dimensions,
++    rray_args.empty,
++    error_call
++  );
+ }
+ 
+ r_obj* rray_dimensions_common(
+   r_obj* xs,
+   r_obj* dimensions,
++  struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+   if (dimensions != r_null) {
+     return arg_as_dimensions(dimensions, rray_args.dot_dimensions, error_call);
+   }
+ 
++  return rray_dimensions_common_opts(xs, NULL, 0, arg, error_call);
++}
++
++r_obj* rray_dimensions_common_opts(
++  r_obj* xs,
++  const int* v_ignore,
++  r_ssize ignore_size,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++) {
+   const r_ssize n = r_length(xs);
+ 
+   if (n == 0) {
+@@ -150,11 +166,11 @@ r_obj* rray_dimensions_common(
+   r_obj* xs_names = KEEP(r_names(xs));
+ 
+   r_ssize x_i = 0;
+-  struct rray_arg* x_arg = new_subscript_arg(NULL, xs_names, n, &amp;x_i);
++  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, n, &amp;x_i);
+   KEEP(x_arg-&gt;shelter);
+ 
+   r_ssize out_i = 0;
+-  struct rray_arg* out_arg = new_subscript_arg(NULL, xs_names, n, &amp;out_i);
++  struct rray_arg* out_arg = new_subscript_arg(arg, xs_names, n, &amp;out_i);
+   KEEP(out_arg-&gt;shelter);
+ 
+   int out_dimensionality = 1;
+@@ -167,9 +183,16 @@ r_obj* rray_dimensions_common(
+   // populated by the time that axis can conflict
+   r_ssize v_out_args[RRAY_MAX_DIMENSIONALITY];
+ 
++  bool v_ignored[RRAY_MAX_DIMENSIONALITY];
++
+   for (int i = 0; i &lt; RRAY_MAX_DIMENSIONALITY; ++i) {
+     v_out_dimensions[i] = 1;
+     v_out_args[i] = 0;</pre><p class="cut">54 more lines cut</p></details>
+<p>Let me check a pre-existing edge: inputs with dimensionality above the max.</p>
+
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; git -C ~/files/r/packages/rray4 stash list &gt;/dev/null; Rscript -e '</summary>
+<pre>cd /tmp &amp;&amp; git -C ~/files/r/packages/rray4 stash list &gt;/dev/null; Rscript -e '
+setwd(&quot;~/files/r/packages/rray4&quot;)
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1, rep(1, 100))
+print(tryCatch(dim(rray_combine(x, x, .axis = 100L)), error = function(e) conditionMessage(e)))
+print(tryCatch(rray_dimensions_common(x, x), error = function(e) conditionMessage(e)))
+' 2&gt;&amp;1 | tail -20</pre><pre class="output">[1] &quot;rray can't support arrays with a dimensionality greater than 64. A dimensionality of 100 was requested.&quot;
+[1] &quot;rray can't support arrays with a dimensionality greater than 64. A dimensionality of 100 was requested.&quot;
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>There's a real out-of-bounds risk I need to close first. Checking it:</p>
+
+<details class="tool"><summary>Bash: git stash &amp;&amp; Rscript -e '</summary>
+<pre>git stash &amp;&amp; Rscript -e '
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1, rep(1, 100))
+print(tryCatch(dim(rray_combine(x, x, .axis = 100L)), error = function(e) conditionMessage(e)))
+' 2&gt;&amp;1 | tail -10; git stash pop</pre><pre class="output">Saved working directory and index state WIP on feature/combine: 6a139a4 Use C axes for ignored dimensions
+On branch feature/combine
+Your branch is up to date with 'origin/feature/combine'.
+
+Changes not staged for commit:
+  (use &quot;git add &lt;file&gt;...&quot; to update what will be committed)
+  (use &quot;git restore &lt;file&gt;...&quot; to discard changes in working directory)
+	modified:   src/broadcast.c
+	modified:   src/combine.c
+	modified:   src/decl/dimensions-decl.h
+	modified:   src/dimensions.c
+	modified:   src/dimensions.h
+	modified:   tests/testthat/_snaps/combine.md
+	modified:   tests/testthat/test-combine.R
+
+no changes added to commit (use &quot;git add&quot; and/or &quot;git commit -a&quot;)
+Dropped refs/stash@{0} (4456b377a8f4943e6c3a3e82b5f2ed54b5810cdf)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  const int dimensionality = list_max_dimensionality(xs, arg, error_call);</span>
+<span class="del">-</span>
+<span class="del">-  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);</span>
+<span class="ins">+  const int dimensionality = list_max_dimensionality(xs, arg, error_call);</span>
+<span class="ins">+  check_max_dimensionality(dimensionality);</span>
+<span class="ins">+</span>
+<span class="ins">+  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-combine.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;incompatible dimension errors name the inputs&quot;, {</span>
+<span class="ins">+test_that(&quot;rejects a dimensionality above the maximum&quot;, {</span>
+<span class="ins">+  x &lt;- array(1, rep(1L, 100L))</span>
+<span class="ins">+  expect_snapshot(rray_combine(x, x, .axis = 100L), error = TRUE)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;incompatible dimension errors name the inputs&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-combine.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">ℹ Testing rray4
+WARNING: 'test-combine.R:188:3' -------------------
+Adding new snapshot:
+Code
+  rray_combine(x, x, .axis = 100L)
+Condition
+  Error in `rray_combine()`:
+  ! rray can't support arrays with a dimensionality greater than 64. A dimensionality of 100 was requested.
+
+[ FAIL 0 | WARN 1 | SKIP 0 | PASS 1715 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -10; echo '---'; git diff --stat</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -10; echo '---'; git diff --stat</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1715 ]
+---
+ src/broadcast.c                  |  3 +-
+ src/combine.c                    | 69 ++++++++--------------------------------
+ src/decl/dimensions-decl.h       |  1 +
+ src/dimensions.c                 | 35 ++++++++++++++++++--
+ src/dimensions.h                 |  9 ++++++
+ tests/testthat/_snaps/combine.md | 22 +++++++++++++
+ tests/testthat/test-combine.R    | 31 ++++++++++++++++++
+ 7 files changed, 110 insertions(+), 60 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git diff tests/testthat/_snaps/combine.md</summary>
+<pre>git diff tests/testthat/_snaps/combine.md</pre><pre class="output">diff --git a/tests/testthat/_snaps/combine.md b/tests/testthat/_snaps/combine.md
+index d43d0aa..2cbc65c 100644
+--- a/tests/testthat/_snaps/combine.md
++++ b/tests/testthat/_snaps/combine.md
+@@ -47,6 +47,28 @@
+       Error in `rray_combine()`:
+       ! `.axis` must be less than or equal to the dimensionality of 2, not 3.
+ 
++# rejects a dimensionality above the maximum
++
++    Code
++      rray_combine(x, x, .axis = 100L)
++    Condition
++      Error in `rray_combine()`:
++      ! rray can't support arrays with a dimensionality greater than 64. A dimensionality of 100 was requested.
++
++# incompatible dimension errors name the inputs
++
++    Code
++      rray_combine(x = array(1, c(2L, 2L)), y = array(1, c(3L, 2L)), .axis = 2L)
++    Condition
++      Error in `rray_combine()`:
++      ! Can't find common dimensions at axis 1. `x` has dimension 2 and `y` has dimension 3.
++    Code
++      rray_combine(a = array(1, c(2L, 1L, 1L)), b = array(1, c(2L, 3L, 1L)), c = array(
++        1, c(2L, 4L, 1L)), .axis = 1L)
++    Condition
++      Error in `rray_combine()`:
++      ! Can't find common dimensions at axis 2. `b` has dimension 3 and `c` has dimension 4.
++
+ # rejects incompatible inputs
+ 
+     Code</pre></details>
+<details class="tool"><summary>Read src/combine.c</summary>
+<pre class="output">31	r_obj* rray_combine(
+32	  r_obj* xs,
+33	  int axis,
+34	  r_obj* ptype,
+35	  struct rray_arg* arg,
+36	  struct rray_arg* ptype_arg,
+37	  struct r_lazy error_call
+38	) {
+39	  if (r_length(xs) == 0) {
+40	    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+41	  }
+42	
+43	  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+44	
+45	  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+46	
+47	  const r_ssize xs_size = r_length(xs);
+48	  r_obj* const* v_xs = r_list_cbegin(xs);
+49	
+50	  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+51	  check_max_dimensionality(dimensionality);
+52	
+53	  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+54	
+55	  r_obj* out_dimensions =
+56	    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+57	  int* v_out_dimensions = r_int_begin(out_dimensions);
+58	
+59	  r_ssize axis_dimension = 0;
+60	
+61	  for (r_ssize x_i = 0; x_i &lt; xs_size; ++x_i) {
+62	    r_obj* x_dimensions = r_dim(v_xs[x_i]);
+63	    const int x_dimensionality = (int) r_length(x_dimensions);
+64	    const int x_axis_dimension =
+65	      (axis &lt;= x_dimensionality) ? r_int_cbegin(x_dimensions)[axis - 1] : 1;
+66	
+67	    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+68	      r_abort_lazy_call(
+69	        error_call,
+70	        &quot;The combined dimension on `.axis` is too large.&quot;
+71	      );
+72	    }
+73	
+74	    axis_dimension += x_axis_dimension;
+75	  }
+76	
+77	  v_out_dimensions[axis - 1] = (int) axis_dimension;
+78	  const r_ssize out_size = rray_size_from_dimensions_checked(
+79	    v_out_dimensions,
+80	    dimensionality,</pre></details>
+<p>Protection pass done (summary below). Committing and pushing:</p>
+
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m &quot;Reuse common dimensions when combining arrays&quot; &amp;&amp; git log -1 …</summary>
+<pre>git add -A &amp;&amp; git commit -q -m &quot;Reuse common dimensions when combining arrays&quot; &amp;&amp; git log -1 --stat --format='%H%n%s'</pre><pre class="output">b4e2d0db86ffbc67fb70eb000e57f591a3674560
+Reuse common dimensions when combining arrays
+
+ src/broadcast.c                  |  3 +-
+ src/combine.c                    | 69 ++++++++--------------------------------
+ src/decl/dimensions-decl.h       |  1 +
+ src/dimensions.c                 | 35 ++++++++++++++++++--
+ src/dimensions.h                 |  9 ++++++
+ tests/testthat/_snaps/combine.md | 22 +++++++++++++
+ tests/testthat/test-combine.R    | 31 ++++++++++++++++++
+ 7 files changed, 110 insertions(+), 60 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/combine 2&gt;&amp;1 | tail -10</summary>
+<pre>git push origin feature/combine 2&gt;&amp;1 | tail -10</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   6a139a4..b4e2d0d  feature/combine -&gt; feature/combine</pre></details>
+<p>Done. Commit <code>b4e2d0d</code>, pushed to <code>feature/combine</code>.</p>
+<h2>What changed</h2>
+<p><code>rray_dimensions_common()</code> gained an <code>arg</code> parameter (parent for both <code>new_subscript_arg()</code> calls), and the calculated path moved into <code>rray_dimensions_common_opts(xs, v_ignore, ignore_size, arg, error_call)</code>. Ignored axes are tracked in a stack <code>bool v_ignored[RRAY_MAX_DIMENSIONALITY]</code>; <code>rray_dimensions_merge()</code> skips them, so they stay at <code>1</code> without lowering the dimensionality.</p>
+<p><code>rray_combine()</code> now calls that helper with <code>&amp;axis, 1</code>, then makes one read-only pass over <code>xs</code> to sum the axis dimension, keeping the <code>INT_MAX</code> check and its message. The duplicated merge loop, the local <code>v_out_args</code>, and the two subscript args are gone. <code>FREE(8)</code> became <code>FREE(5)</code>.</p>
+<p><code>rray_broadcast_common()</code> and the FFI wrapper pass <code>rray_args.empty</code>. No R API, roxygen, or <code>init.c</code> change.</p>
+<h2>One addition beyond the plan</h2>
+<p>The plan assumed <code>check_axis()</code> was enough to bound <code>v_ignore</code>. It isn't: <code>list_max_dimensionality()</code> never checked the maximum, so <code>rray_combine(array(1, rep(1, 100)), ..., .axis = 100)</code> produced <code>axis = 100</code> and the ignore loop would write <code>v_ignored[99]</code> past a 64-element stack array. The same input already overflowed <code>v_out_args[100]</code> in the old combine code, so this was a pre-existing stack write out of bounds. I added <code>check_max_dimensionality(dimensionality)</code> right after <code>list_max_dimensionality()</code>, with a snapshot test. It errors before <code>check_axis()</code>, so a &gt;64-dimensional input now reports the dimensionality limit rather than an axis message.</p>
+<h2>Protection pass</h2>
+<p>Every <code>r_obj*</code> in the diff, and what reads it next:</p>
+<ul>
+<li>
+<p><code>out_dimensions</code> (combine) — returned unprotected by the helper, <code>KEEP()</code>d at the call site with no allocation in between. Held across <code>r_alloc_vector()</code> for <code>out</code> and <code>rray_combine_names()</code>, which both allocate. Safe.</p>
+</li>
+<li>
+<p><code>v_out_dimensions</code> — raw <code>int*</code> into <code>out_dimensions</code>, which stays protected for its whole lifetime.</p>
+</li>
+<li>
+<p><code>x_dimensions</code> (sum loop) — <code>r_dim()</code> of an element of the protected <code>xs</code>. Nothing allocates; <code>r_int_cbegin()</code> is only called when <code>axis &lt;= x_dimensionality</code>, so it never touches <code>r_null</code>.</p>
+</li>
+<li>
+<p><code>xs_names</code>, <code>x_arg-&gt;shelter</code>, <code>out_arg-&gt;shelter</code>, <code>x_dimensions</code>, <code>out</code> inside the helper — unchanged code, each <code>KEEP()</code>d immediately at its allocation site. The new <code>arg</code> parent is a <code>struct rray_arg*</code>, not a SEXP, so it adds nothing to protect.</p>
+</li>
+<li>
+<p><code>v_ignore</code> points at combine's stack <code>axis</code>, live for the synchronous call.</p>
+</li>
+</ul>
+<p>No <code>gctorture()</code> used.</p>
+<h2>Tests</h2>
+<pre><code>devtools::test(filter = '^(dimensions|combine|broadcast)')  228 pass
+devtools::test()                                           1715 pass, 0 fail, 0 warn
+</code></pre>
+<p>New tests: conflicting dimensions accepted on the combine axis, incompatible dimension errors naming both positional-style and three-input named cases, and the dimensionality limit. Existing snapshots are unchanged; only additions in <code>_snaps/combine.md</code>. <code>clang-format</code> and <code>air format .</code> were run over everything.</p>
+
+</section>
+</main>
+</body>
+</html>

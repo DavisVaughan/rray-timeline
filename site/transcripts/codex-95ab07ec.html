@@ -1,0 +1,791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Documenting rray_reduce_nested() and naming flat reduction</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-66">rray timeline</a>
+<h1>Documenting <code>rray_reduce_nested()</code> and naming flat reduction</h1>
+<p class="facts">Codex · Sep 14, 2026 · 4 prompts · 9 replies · <a href="https://github.com/r-lib/rray/pull/66">#66</a></p>
+</header>
+<main>
+<p class="divider">Sep 14, 2026, 20:01 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>If you were going to add a brief comment of a few sentences in reduce.h about rray reduce nested, what would it say? I think it would at least include</p>
+<ul>
+<li>Why it’s required</li>
+<li>Something about being needed when <code>out</code> isn’t your only state</li>
+<li>What the inner and outer loops do</li>
+<li>Connection to rray_permute_axes() in that it’s like bringing the reduction axes to the front</li>
+</ul>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll check <code>reduce.h</code> and the related permutation code so the wording matches the implementation and local terms.</p>
+
+<details class="tool"><summary>Bash: sed -n '1,240p' src/reduce.h &amp;&amp; rg -n &quot;rray_reduce_nested|rray_permute_axes|reduce_nested&quot; sr…</summary>
+<pre>$ sed -n '1,240p' src/reduce.h &amp;&amp; rg -n &quot;rray_reduce_nested|rray_permute_axes|reduce_nested&quot; src R tests</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+// --------------------------------------------------------------------------
+// rray_reduce
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+
+typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize out_start = 0;                                                       \
+  const r_ssize out_run_stride = rray_strided_iterator_plan_run_stride(plan);  \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize out_loc = out_start;                                               \
+                                                                               \
+    if (out_run_stride == 0) {                                                 \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+        out_loc += out_run_stride;                                             \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(out_start, v_point, plan);                      \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+// --------------------------------------------------------------------------
+// rray_reduce_nested
+
+typedef r_obj* (*rray_reduce_nested_fn)(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+
+typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE_OUTER(                                                     \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  ONE                                                                          \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  r_ssize out_run_start = 0;                                                   \
+  const r_ssize out_run_size =                                                 \
+    rray_strided_iterator_plan_run_size(outer_plan);                           \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride =                                                 \
+    rray_strided_iterator_plan_run_stride(outer_plan);                         \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality); \
+                                                                               \
+  while (out_run_start != size) {                                              \
+    const r_ssize out_run_end = out_run_start + out_run_size;                  \
+    r_ssize x_loc = x_start;                                                   \
+                                                                               \
+    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \
+      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \
+      x_loc += x_run_stride;                                                   \
+    }                                                                          \
+                                                                               \
+    out_run_start = out_run_end;                                               \
+    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+#define RRAY_REDUCE_INNER(X_CTYPE, ACCUMULATE)                                 \
+  do {                                                                         \
+    const r_ssize size = rray_strided_iterator_plan_size(inner_plan);          \
+                                                                               \
+    r_ssize run_start = 0;                                                     \
+    const r_ssize run_size = rray_strided_iterator_plan_run_size(inner_plan);  \
+                                                                               \
+    const r_ssize x_run_stride =                                               \
+      rray_strided_iterator_plan_run_stride(inner_plan);                       \
+                                                                               \
+    r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                  \
+    r_memset(                                                                  \
+      v_point,                                                                 \
+      0,                                                                       \
+      sizeof(r_ssize) * (size_t) inner_plan-&gt;dimensionality                    \
+    );                                                                         \
+                                                                               \
+    while (run_start != size) {                                                \
+      const r_ssize run_end = run_start + run_size;                            \
+      r_ssize x_loc = x_start;                                                 \
+                                                                               \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        ACCUMULATE;                                                            \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+                                                                               \
+      run_start = run_end;                                                     \
+      RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, inner_plan);                \
+    }                                                                          \
+  } while (0)
+
+// --------------------------------------------------------------------------
+// stop_unsupported_reduce
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif
+src/reduce.h:86:// rray_reduce_nested
+src/reduce.h:88:typedef r_obj* (*rray_reduce_nested_fn)(</pre><p class="cut">97 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,180p' src/reduce.c &amp;&amp; sed -n '1,220p' src/reduce-mean.c &amp;&amp; sed -n '1,140p' src/perm…</summary>
+<pre>$ sed -n '1,180p' src/reduce.c &amp;&amp; sed -n '1,220p' src/reduce-mean.c &amp;&amp; sed -n '1,140p' src/permute-axes.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;reduce.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-decl.h&quot;
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+  const int* v_out_dimensions = r_int_cbegin(out_dimensions);
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+    v_out_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    dimensionality
+  );
+
+  const rray_reduce_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, out_size, &amp;plan));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_max_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+
+  r_obj* retained_axes =
+    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+  const int* v_retained_axes = r_int_cbegin(retained_axes);
+  const r_ssize retained_axes_size = r_length(retained_axes);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  const struct rray_strided_iterator_plan outer_plan = rray_reduce_axes_plan(
+    v_x_dimensions,
+    v_x_strides,
+    v_retained_axes,
+    retained_axes_size
+  );
+
+  const struct rray_strided_iterator_plan inner_plan =
+    rray_reduce_axes_plan(v_x_dimensions, v_x_strides, v_axes, axes_size);
+
+  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(7);
+  return out;
+}
+
+static struct rray_strided_iterator_plan rray_reduce_axes_plan(
+  const int* v_x_dimensions,
+  const r_ssize* v_x_strides,
+  const int* v_axes,
+  r_ssize axes_size
+) {
+  int v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+    v_dimensions[i] = v_x_dimensions[axis - 1];
+    v_strides[i] = v_x_strides[axis - 1];
+  }
+
+  return rray_strided_iterator_plan(v_dimensions, (int) axes_size, v_strides);
+}
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't compute the %s of %s.&quot;,
+    op,
+    rray_arg_type_format(arg, rray_typeof(x))
+  );
+}
+#include &quot;reduce-mean.h&quot;
+
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-mean-decl.h&quot;
+
+r_obj* ffi_rray_mean_along(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_mean_along(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_mean_along(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce_nested(
+    x,
+    axes,
+    na_rm,
+    rray_mean_along_switch,
+    arg,</pre><p class="cut">328 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Explaining rray_reduce accumulator usage</strong></p>
+<p><strong>Drafting nested reduction iteration comment</strong></p>
+</details>
+<pre><code class="language-c">// Nested reduction is needed when an output element cannot hold all reduction
+// state, such as the sum and count required by a mean. The outer plan walks the
+// retained axes to select each output element, and the inner plan walks the
+// reduction axes to compute it. Conceptually, this is like using
+// `rray_permute_axes()` to bring the reduction axes to the front, without
+// materializing the permuted array.
+</code></pre>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push that</p>
+<p>Then also provide me a similar paragraph to check for rray_reduce()</p>
+<ul>
+<li>it’s useful when out is your only state between elements</li>
+<li>it’s more performant than nested reduction</li>
+</ul>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll add the approved <code>rray_reduce_nested()</code> paragraph, format the C sources as required, check the diff, then commit and push it. After that I’ll draft the matching <code>rray_reduce()</code> paragraph without adding it.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git remote -v</summary>
+<pre>$ git status --short --branch &amp;&amp; git remote -v</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+origin	https://github.com/DavisVaughan/rray4.git (fetch)
+origin	https://github.com/DavisVaughan/rray4.git (push)</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/reduce.h</span>
+<span class="hunk">@@</span>
+ // --------------------------------------------------------------------------
+ // rray_reduce_nested
+<span class="ins">+</span>
+<span class="ins">+// Nested reduction is needed when an output element cannot hold all reduction</span>
+<span class="ins">+// state, such as the sum and count required by a mean. The outer plan walks the</span>
+<span class="ins">+// retained axes to select each output element, and the inner plan walks the</span>
+<span class="ins">+// reduction axes to compute it. Conceptually, this is like using</span>
+<span class="ins">+// `rray_permute_axes()` to bring the reduction axes to the front, without</span>
+<span class="ins">+// materializing the permuted array.</span>
+ 
+ typedef r_obj* (*rray_reduce_nested_fn)(
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h</summary>
+<pre>$ clang-format -i src/*.c src/*.h</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: air format .</summary>
+<pre>$ air format .</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: git diff --check &amp;&amp; git diff -- src/reduce.h &amp;&amp; git status --short</summary>
+<pre>$ git diff --check &amp;&amp; git diff -- src/reduce.h &amp;&amp; git status --short</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+diff --git a/src/reduce.h b/src/reduce.h
+index 3bb66f8..f69a97e 100644
+--- a/src/reduce.h
++++ b/src/reduce.h
+@@ -85,6 +85,13 @@ r_obj* rray_reduce(
+ // --------------------------------------------------------------------------
+ // rray_reduce_nested
+ 
++// Nested reduction is needed when an output element cannot hold all reduction
++// state, such as the sum and count required by a mean. The outer plan walks the
++// retained axes to select each output element, and the inner plan walks the
++// reduction axes to compute it. Conceptually, this is like using
++// `rray_permute_axes()` to bring the reduction axes to the front, without
++// materializing the permuted array.
++
+ typedef r_obj* (*rray_reduce_nested_fn)(
+   r_obj* x,
+   const struct rray_strided_iterator_plan* outer_plan,
+ M src/reduce.h</pre></details>
+<p>The formatter left only the intended comment change, and <code>git diff --check</code> passes. I’m committing that single-file diff now.</p>
+
+<details class="tool"><summary>Bash: git add src/reduce.h &amp;&amp; git commit -m &quot;Document nested reduction iteration&quot;</summary>
+<pre>$ git add src/reduce.h &amp;&amp; git commit -m &quot;Document nested reduction iteration&quot;</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+fatal: Unable to create '~/files/r/packages/rray4/.git/index.lock': Operation not permitted</pre></details>
+<details class="tool"><summary>Bash: git add src/reduce.h &amp;&amp; git commit -m &quot;Document nested reduction iteration&quot;</summary>
+<pre>$ git add src/reduce.h &amp;&amp; git commit -m &quot;Document nested reduction iteration&quot;</pre><pre class="output">Script completed
+Wall time 9.2 seconds
+Output:
+
+[feature/mean 5ecce7b] Document nested reduction iteration
+ 1 file changed, 7 insertions(+)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/mean</summary>
+<pre>$ git push origin feature/mean</pre><pre class="output">Script completed
+Wall time 13.2 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   ae34f7d..5ecce7b  feature/mean -&gt; feature/mean</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Verifying RRAY_REDUCE efficiency claim</strong></p>
+</details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+5ecce7b Document nested reduction iteration</pre></details>
+<p>Committed and pushed <code>5ecce7b</code> to <code>origin/feature/mean</code>.</p>
+<p>For <code>rray_reduce()</code>:</p>
+<pre><code class="language-c">// Reduction is useful when the output element is the only state carried between
+// input elements. It walks `x` once in storage order, updating the output
+// element that each input contributes to. This is faster than nested reduction
+// because it reads `x` linearly and avoids a separate inner traversal for each
+// output element.
+</code></pre>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>What would be a better name for this? rray_reduce_flat() maybe?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating rray_reduce naming options</strong></p>
+</details>
+<p><code>rray_reduce_flat()</code> is a better name. It pairs naturally with <code>rray_reduce_nested()</code> and describes the loop structure without tying the name to a specific optimization.</p>
+<p>I would use:</p>
+<ul>
+<li><code>rray_reduce_flat()</code>: one flat pass over <code>x</code>, with state stored in <code>out</code></li>
+<li><code>rray_reduce_nested()</code>: outer loop over outputs, inner loop over reduction axes</li>
+</ul>
+<p><code>rray_reduce_linear()</code> is another option, but “linear” could be confused with linear indexing or algebra. <code>flat</code> makes the contrast with <code>nested</code> clearer.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Ok commit and push the comment except say “Flat reduction” not “Reduction” assuming we will change the function names later too</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll add the approved paragraph above <code>rray_reduce()</code>, starting with “Flat reduction,” then format, verify, commit, and push it. I’ll leave the function names unchanged for now.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; sed -n '1,115p' src/reduce.h</summary>
+<pre>$ git status --short --branch &amp;&amp; sed -n '1,115p' src/reduce.h</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+// --------------------------------------------------------------------------
+// rray_reduce
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+
+typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#define RRAY_REDUCE(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  OUT_INIT,                                                                    \
+  ONE                                                                          \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, out_size));                      \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_out[i] = OUT_INIT;                                                       \
+  }                                                                            \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+                                                                               \
+  r_ssize out_start = 0;                                                       \
+  const r_ssize out_run_stride = rray_strided_iterator_plan_run_stride(plan);  \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize out_loc = out_start;                                               \
+                                                                               \
+    if (out_run_stride == 0) {                                                 \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_out[out_loc] = ONE(v_out[out_loc], v_x[i]);                          \
+        out_loc += out_run_stride;                                             \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT(out_start, v_point, plan);                      \
+  }                                                                            \
+                                                                               \
+  FREE(1);                                                                     \
+  return out;
+
+// --------------------------------------------------------------------------
+// rray_reduce_nested
+
+// Nested reduction is needed when an output element cannot hold all reduction
+// state, such as the sum and count required by a mean. The outer plan walks the
+// retained axes to select each output element, and the inner plan walks the
+// reduction axes to compute it. Conceptually, this is like using
+// `rray_permute_axes()` to bring the reduction axes to the front, without
+// materializing the permuted array.
+
+typedef r_obj* (*rray_reduce_nested_fn)(
+  r_obj* x,
+  const struct rray_strided_iterator_plan* outer_plan,
+  const struct rray_strided_iterator_plan* inner_plan
+);
+
+typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);</pre></details>
+<details class="tool"><summary>Edit src/reduce.h</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/reduce.h</span>
+<span class="hunk">@@</span>
+ // --------------------------------------------------------------------------
+ // rray_reduce
+<span class="ins">+</span>
+<span class="ins">+// Flat reduction is useful when the output element is the only state carried</span>
+<span class="ins">+// between input elements. It walks `x` once in storage order, updating the</span>
+<span class="ins">+// output element that each input contributes to. This is faster than nested</span>
+<span class="ins">+// reduction because it reads `x` linearly and avoids a separate inner traversal</span>
+<span class="ins">+// for each output element.</span>
+ 
+ typedef r_obj* (*rray_reduce_fn)(
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h</summary>
+<pre>$ clang-format -i src/*.c src/*.h</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: air format .</summary>
+<pre>$ air format .</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: git diff --check &amp;&amp; git diff -- src/reduce.h &amp;&amp; git status --short</summary>
+<pre>$ git diff --check &amp;&amp; git diff -- src/reduce.h &amp;&amp; git status --short</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+diff --git a/src/reduce.h b/src/reduce.h
+index f69a97e..f79a5e7 100644
+--- a/src/reduce.h
++++ b/src/reduce.h
+@@ -9,6 +9,12 @@
+ // --------------------------------------------------------------------------
+ // rray_reduce
+ 
++// Flat reduction is useful when the output element is the only state carried
++// between input elements. It walks `x` once in storage order, updating the
++// output element that each input contributes to. This is faster than nested
++// reduction because it reads `x` linearly and avoids a separate inner traversal
++// for each output element.
++
+ typedef r_obj* (*rray_reduce_fn)(
+   r_obj* x,
+   r_ssize out_size,
+ M src/reduce.h</pre></details>
+<p>Only the new flat-reduction paragraph changed, and the diff passes the whitespace check. I’m committing and pushing it now.</p>
+
+<details class="tool"><summary>Bash: git add src/reduce.h &amp;&amp; git commit -m &quot;Document flat reduction iteration&quot;</summary>
+<pre>$ git add src/reduce.h &amp;&amp; git commit -m &quot;Document flat reduction iteration&quot;</pre><pre class="output">Script completed
+Wall time 4.3 seconds
+Output:
+
+[feature/mean a98e1e5] Document flat reduction iteration
+ 1 file changed, 6 insertions(+)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/mean</summary>
+<pre>$ git push origin feature/mean</pre><pre class="output">Script completed
+Wall time 8.0 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   5ecce7b..a98e1e5  feature/mean -&gt; feature/mean</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+a98e1e5 Document flat reduction iteration</pre></details>
+<p>Committed and pushed <code>a98e1e5</code> to <code>origin/feature/mean</code>. The working tree is clean.</p>
+
+</section>
+</main>
+</body>
+</html>

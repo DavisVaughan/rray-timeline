@@ -1,0 +1,1312 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trimming finished work from plans/implementation.md</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../">rray timeline</a>
+<h1>Trimming finished work from <code>plans/implementation.md</code></h1>
+<p class="facts">Claude · Sep 29, 2026 · 3 prompts · 5 replies · didn't ship</p>
+</header>
+<main>
+<p class="divider">Sep 29, 2026, 19:06 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Look through implementation.md and remove anything that looks done already. Reorder numbers as needed</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; find . -name implementation.md -not -path &quot;./.git/*&quot;;…</summary>
+<pre>cd ~/files/r/packages/rray4; find . -name implementation.md -not -path &quot;./.git/*&quot;; cat plans/implementation.md 2&gt;/dev/null || cat implementation.md</pre><pre class="output">./plans/implementation.md
+# rray4 implementation plan
+
+## What this is
+
+rray4 is a reimagining of rray, written in pure C with no xtensor. It is a
+toolkit of `rray_*()` functions that broadcast, reshape, reduce and index base R
+arrays.
+
+It works on bare arrays only. There is no rray class, and classed input is an
+error. The extension system that would let other packages plug their own array
+classes in is deliberately deferred, and is written up separately in
+`plans/extensions.md`.
+
+This document is the guide for agents working on rray4 across many sessions.
+Part 4 is the ordered list of pull requests. Part 5 is the catalogue of
+functions to work through after the foundations land.
+
+## How to use this plan
+
+Read Part 1 and Part 2 before starting any pull request. They are short on
+purpose.
+
+Then find your pull request in Part 4, or your function in Part 5. Each entry
+says what to build, which files to touch, and what &quot;done&quot; means.
+
+One pull request per entry. Keep them small.
+
+---
+
+# Part 1: Conventions
+
+Terminology (size, axis, dimension, dimensions, dimensionality) is defined in
+`CLAUDE.md`. Use it exactly.
+
+## Files
+
+Each feature is a `src/{name}.c` and `src/{name}.h` pair, with an R file at
+`R/{name}.R` and tests at `tests/testthat/test-{name}.R`.
+
+Functions that need per type code split into a shell and a core, both living in
+`src/{name}.c`. Copy the shape of `src/broadcast.c`.
+
+The shell is ordinary C, written once. It holds everything that does not depend
+on the type: argument checks, dimension arithmetic, iterator setup and names. It
+ends in a `switch` on `r_typeof(x)` that hands off to the core.
+
+The core is one small function per type. It takes `x`, the output size and the
+iterator, allocates the output at its own type, fills it, and returns it.
+Allocation belongs to the core because the type is the one thing the shell does
+not know.
+
+Putting the core behind a function call costs nothing. It was benchmarked across
+five types and four shapes, and every case landed within 1%, which is the run to
+run noise, because the call happens once per array rather than once per element.
+Do not re-open this.
+
+Two families vary from this.
+
+`rray_split()` returns a list of arrays rather than one array, and `r_typeof(x)`
+is enough to allocate every element at the right type, so the shell builds the
+list and the core fills what it is handed.
+
+The binary arithmetic operators share one shell across many files, so the shell
+lives in `src/arithmetic.c` and each operator gets its own
+`src/arithmetic-{op}.c`. They switch on the type pair rather than on one type,
+and the switch returns the core instead of calling it. 2.4 covers why.
+
+The reducers that take `(x, axes, ..., na_rm = FALSE)` share the same shape of
+shell for the same reason. `rray_reduce()` and the `RRAY_REDUCE` macro live in
+`src/reduce.c`/`src/reduce.h`, and each reducer gets its own
+`src/reduce-{name}.c`, switching on `rray_typeof(x)` and returning the core.
+`rray_sum_along()` is the first of these, in `src/reduce-sum.c`.
+
+Each core's whole body is a call into a macro, following `SLICE` in vctrs'
+`src/slice.c`. There are usually two. `RRAY_{NAME}_ATOMIC` covers `lgl`, `int`,
+`dbl`, `cpl` and `raw`, which write straight to a data pointer.
+`RRAY_{NAME}_BARRIER` covers `chr` and `list`, which write through the barrier.
+Undefine both once the cores are written.
+
+The arithmetic family needs only one macro, since it has no `chr` or `list`
+cores, but several files share it. So `RRAY_ARITHMETIC` lives in
+`src/arithmetic.h` and nothing undefines it. Only undefine a macro the file
+defined itself.
+
+Write each core's parameter list out in full. Do not hide it behind a macro.
+
+A flag that swaps the scalar operation, like `na_rm`, is folded into the same
+switch that dispatches on type, returning the core instead of calling it:
+
+```c
+case RRAY_TYPE_double:
+  return na_rm ? rray_sum_along_dbl_na_rm : rray_sum_along_dbl;
+```
+
+So there is one core per type per variant, the flag stays off the core's
+parameter list, and the loop is written once. `rray_mean()`, `rray_max_along()`, and
+`rray_min_along()` want the same shape when they land, sharing `rray_reduce()`'s
+shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+`axes` and return positions rather than reduced values, so whether they fit this
+shell at all is still an open question for whoever picks them up.
+
+A `.c` file reads top down: the main entry point first, its helpers below, in
+the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+`rray_broadcast()`, the `rray_broadcast_lgl()` family, `rray_broadcast_names()`,
+then everything else. You should meet the shell before the cores it dispatches
+to.
+
+`src/decl/{name}-decl.h` is what makes that ordering work. Declare every helper
+there, so the `.c` file never needs a forward declaration of its own.
+
+A decl header has no includes and no include guard. It is included last, from
+exactly one `.c` file, so everything it names is already in scope and there is
+nothing to guard against. It could not reach a sibling header in `src/` anyway,
+since only `src/rlang` is on the include path.
+
+## Naming
+
+- Internal C: `rray_{name}()`, returns C types.
+
+- FFI wrappers: `ffi_rray_{name}()`, thin SEXP bridges, placed above the
+  internal functions in the `.c` file.
+
+- Typed cores are file static, and keep the prefix with a type suffix, e.g.
+  `rray_broadcast_dbl()`. A binary core carries both input types, `x` first, so
+  `rray_add_int_dbl()` reads integers from `x` and doubles from `y`.
+
+- Headers declare internal functions only, never FFI wrappers.
+
+- `src/init.c` uses `extern` declarations, it does not include feature headers.
+
+- An `arg` is a `struct rray_arg*`, the argument tag ported from vctrs. Tags
+  nest, and nothing is materialised until an error is actually raised, so
+  carrying one through a loop costs nothing. `src/arg.c` is the whole of it.
+
+  `rray_args` holds the fixed ones, so `check_unclassed(x, rray_args.x, ...)`.
+  A function taking `...` builds one tag with `new_subscript_arg()`, which reads
+  a pointer to the caller's loop index and gives an input's name when it has one
+  and `..2` otherwise. `rray_arg_format()` turns a tag into a string with the
+  backticks already on, so messages write `%s` and not `` `%s` ``.
+
+## C style
+
+Follow vctrs and rlang closely. Prefer an rlang wrapper over the raw R API every
+time (`r_globals.na_int`, `r_length()`, `r_attrib_get()`).
+
+Prefer `r_ssize` over `int`. Mark variables `const` where you can. Grab a data
+pointer before a loop rather than indexing the `r_obj*`.
+
+Protect anything that allocates with `KEEP()` and `FREE()`.
+
+**Ruthlessly avoid protection issues.** A value that allocates is unprotected
+the instant it exists, including one built inline as a function argument, e.g.
+`f(x, r_chr(arg))`. If the callee allocates anything before it uses that
+argument, a GC in that window can collect it out from under you. Trace every
+allocation forward to its last use and make sure something on the protection
+stack covers it the whole way, not just at the call site that looks risky. This
+class of bug compiles fine, passes tests that don't happen to trigger a GC, and
+only shows up as a rare crash or corrupted value. Check for it explicitly in
+every pull request that touches C code, don't wait for it to be caught in
+review.
+
+Allocate a names list only once an axis actually survives, so the common case
+where nothing survives allocates nothing:
+
+```c
+r_obj* out = r_null;
+r_keep_loc out_loc;
+KEEP_HERE(out, &amp;out_loc);
+```
+
+Allocate inside the loop, right before the first assignment, and reprotect with
+`KEEP_AT()`. `rray_broadcast_names()` is the example.
+
+`#include &quot;decl/{name}-decl.h&quot;` always goes last, after every other include,
+separated from them by one blank line.
+
+Never touch `src/rlang/`.
+
+Run `clang-format -i src/*.c src/*.h` over all files after any C change.
+
+## Comments
+
+**Do not write comments.** Not in C, not in R. The only exception is roxygen2 on
+exported R functions. This overrides the usual defaults.
+
+This is not &quot;write fewer comments&quot;, it is &quot;write none&quot;. Do not explain what the
+code does, do not justify a choice, do not label a section, do not flag a tricky
+line. Not even one short line. If you think your comment is the exception
+because it explains something genuinely non-obvious, it is not.
+
+Comments already in the code stay. Leave them exactly as they are, and do not
+add new ones next to them. Anything that needs explaining goes in the pull
+request, not the source.
+
+## R style
+
+Run `air format .` after any R change. Use `|&gt;`, not `%&gt;%`. Use `\() ...` for one
+line anonymous functions and `function() {...}` otherwise. The package must work
+on R 4.1, so no `_$x`.</pre><p class="cut">1,077 more lines cut</p></details>
+<details class="tool"><summary>Read plans/implementation.md</summary>
+<pre class="output">1	# rray4 implementation plan
+2	
+3	## What this is
+4	
+5	rray4 is a reimagining of rray, written in pure C with no xtensor. It is a
+6	toolkit of `rray_*()` functions that broadcast, reshape, reduce and index base R
+7	arrays.
+8	
+9	It works on bare arrays only. There is no rray class, and classed input is an
+10	error. The extension system that would let other packages plug their own array
+11	classes in is deliberately deferred, and is written up separately in
+12	`plans/extensions.md`.
+13	
+14	This document is the guide for agents working on rray4 across many sessions.
+15	Part 4 is the ordered list of pull requests. Part 5 is the catalogue of
+16	functions to work through after the foundations land.
+17	
+18	## How to use this plan
+19	
+20	Read Part 1 and Part 2 before starting any pull request. They are short on
+21	purpose.
+22	
+23	Then find your pull request in Part 4, or your function in Part 5. Each entry
+24	says what to build, which files to touch, and what &quot;done&quot; means.
+25	
+26	One pull request per entry. Keep them small.
+27	
+28	---
+29	
+30	# Part 1: Conventions
+31	
+32	Terminology (size, axis, dimension, dimensions, dimensionality) is defined in
+33	`CLAUDE.md`. Use it exactly.
+34	
+35	## Files
+36	
+37	Each feature is a `src/{name}.c` and `src/{name}.h` pair, with an R file at
+38	`R/{name}.R` and tests at `tests/testthat/test-{name}.R`.
+39	
+40	Functions that need per type code split into a shell and a core, both living in
+41	`src/{name}.c`. Copy the shape of `src/broadcast.c`.
+42	
+43	The shell is ordinary C, written once. It holds everything that does not depend
+44	on the type: argument checks, dimension arithmetic, iterator setup and names. It
+45	ends in a `switch` on `r_typeof(x)` that hands off to the core.
+46	
+47	The core is one small function per type. It takes `x`, the output size and the
+48	iterator, allocates the output at its own type, fills it, and returns it.
+49	Allocation belongs to the core because the type is the one thing the shell does
+50	not know.
+51	
+52	Putting the core behind a function call costs nothing. It was benchmarked across
+53	five types and four shapes, and every case landed within 1%, which is the run to
+54	run noise, because the call happens once per array rather than once per element.
+55	Do not re-open this.
+56	
+57	Two families vary from this.
+58	
+59	`rray_split()` returns a list of arrays rather than one array, and `r_typeof(x)`
+60	is enough to allocate every element at the right type, so the shell builds the
+61	list and the core fills what it is handed.
+62	
+63	The binary arithmetic operators share one shell across many files, so the shell
+64	lives in `src/arithmetic.c` and each operator gets its own
+65	`src/arithmetic-{op}.c`. They switch on the type pair rather than on one type,
+66	and the switch returns the core instead of calling it. 2.4 covers why.
+67	
+68	The reducers that take `(x, axes, ..., na_rm = FALSE)` share the same shape of
+69	shell for the same reason. `rray_reduce()` and the `RRAY_REDUCE` macro live in
+70	`src/reduce.c`/`src/reduce.h`, and each reducer gets its own
+71	`src/reduce-{name}.c`, switching on `rray_typeof(x)` and returning the core.
+72	`rray_sum_along()` is the first of these, in `src/reduce-sum.c`.
+73	
+74	Each core's whole body is a call into a macro, following `SLICE` in vctrs'
+75	`src/slice.c`. There are usually two. `RRAY_{NAME}_ATOMIC` covers `lgl`, `int`,
+76	`dbl`, `cpl` and `raw`, which write straight to a data pointer.
+77	`RRAY_{NAME}_BARRIER` covers `chr` and `list`, which write through the barrier.
+78	Undefine both once the cores are written.
+79	
+80	The arithmetic family needs only one macro, since it has no `chr` or `list`
+81	cores, but several files share it. So `RRAY_ARITHMETIC` lives in
+82	`src/arithmetic.h` and nothing undefines it. Only undefine a macro the file
+83	defined itself.
+84	
+85	Write each core's parameter list out in full. Do not hide it behind a macro.
+86	
+87	A flag that swaps the scalar operation, like `na_rm`, is folded into the same
+88	switch that dispatches on type, returning the core instead of calling it:
+89	
+90	```c
+91	case RRAY_TYPE_double:
+92	  return na_rm ? rray_sum_along_dbl_na_rm : rray_sum_along_dbl;
+93	```
+94	
+95	So there is one core per type per variant, the flag stays off the core's
+96	parameter list, and the loop is written once. `rray_mean()`, `rray_max_along()`, and
+97	`rray_min_along()` want the same shape when they land, sharing `rray_reduce()`'s
+98	shell. `rray_max_pos()` and `rray_min_pos()` take a single `axis` rather than
+99	`axes` and return positions rather than reduced values, so whether they fit this
+100	shell at all is still an open question for whoever picks them up.
+101	
+102	A `.c` file reads top down: the main entry point first, its helpers below, in
+103	the order they are used. For `src/broadcast.c` that is `ffi_rray_broadcast()`,
+104	`rray_broadcast()`, the `rray_broadcast_lgl()` family, `rray_broadcast_names()`,
+105	then everything else. You should meet the shell before the cores it dispatches
+106	to.
+107	
+108	`src/decl/{name}-decl.h` is what makes that ordering work. Declare every helper
+109	there, so the `.c` file never needs a forward declaration of its own.
+110	
+111	A decl header has no includes and no include guard. It is included last, from
+112	exactly one `.c` file, so everything it names is already in scope and there is
+113	nothing to guard against. It could not reach a sibling header in `src/` anyway,
+114	since only `src/rlang` is on the include path.
+115	
+116	## Naming
+117	
+118	- Internal C: `rray_{name}()`, returns C types.
+119	
+120	- FFI wrappers: `ffi_rray_{name}()`, thin SEXP bridges, placed above the
+121	  internal functions in the `.c` file.
+122	
+123	- Typed cores are file static, and keep the prefix with a type suffix, e.g.
+124	  `rray_broadcast_dbl()`. A binary core carries both input types, `x` first, so
+125	  `rray_add_int_dbl()` reads integers from `x` and doubles from `y`.
+126	
+127	- Headers declare internal functions only, never FFI wrappers.
+128	
+129	- `src/init.c` uses `extern` declarations, it does not include feature headers.
+130	
+131	- An `arg` is a `struct rray_arg*`, the argument tag ported from vctrs. Tags
+132	  nest, and nothing is materialised until an error is actually raised, so
+133	  carrying one through a loop costs nothing. `src/arg.c` is the whole of it.
+134	
+135	  `rray_args` holds the fixed ones, so `check_unclassed(x, rray_args.x, ...)`.
+136	  A function taking `...` builds one tag with `new_subscript_arg()`, which reads
+137	  a pointer to the caller's loop index and gives an input's name when it has one
+138	  and `..2` otherwise. `rray_arg_format()` turns a tag into a string with the
+139	  backticks already on, so messages write `%s` and not `` `%s` ``.
+140	
+141	## C style
+142	
+143	Follow vctrs and rlang closely. Prefer an rlang wrapper over the raw R API every
+144	time (`r_globals.na_int`, `r_length()`, `r_attrib_get()`).
+145	
+146	Prefer `r_ssize` over `int`. Mark variables `const` where you can. Grab a data
+147	pointer before a loop rather than indexing the `r_obj*`.
+148	
+149	Protect anything that allocates with `KEEP()` and `FREE()`.
+150	
+151	**Ruthlessly avoid protection issues.** A value that allocates is unprotected
+152	the instant it exists, including one built inline as a function argument, e.g.
+153	`f(x, r_chr(arg))`. If the callee allocates anything before it uses that
+154	argument, a GC in that window can collect it out from under you. Trace every
+155	allocation forward to its last use and make sure something on the protection
+156	stack covers it the whole way, not just at the call site that looks risky. This
+157	class of bug compiles fine, passes tests that don't happen to trigger a GC, and
+158	only shows up as a rare crash or corrupted value. Check for it explicitly in
+159	every pull request that touches C code, don't wait for it to be caught in
+160	review.
+161	
+162	Allocate a names list only once an axis actually survives, so the common case
+163	where nothing survives allocates nothing:
+164	
+165	```c
+166	r_obj* out = r_null;
+167	r_keep_loc out_loc;
+168	KEEP_HERE(out, &amp;out_loc);
+169	```
+170	
+171	Allocate inside the loop, right before the first assignment, and reprotect with
+172	`KEEP_AT()`. `rray_broadcast_names()` is the example.
+173	
+174	`#include &quot;decl/{name}-decl.h&quot;` always goes last, after every other include,
+175	separated from them by one blank line.
+176	
+177	Never touch `src/rlang/`.
+178	
+179	Run `clang-format -i src/*.c src/*.h` over all files after any C change.
+180	
+181	## Comments
+182	
+183	**Do not write comments.** Not in C, not in R. The only exception is roxygen2 on
+184	exported R functions. This overrides the usual defaults.
+185	
+186	This is not &quot;write fewer comments&quot;, it is &quot;write none&quot;. Do not explain what the
+187	code does, do not justify a choice, do not label a section, do not flag a tricky
+188	line. Not even one short line. If you think your comment is the exception
+189	because it explains something genuinely non-obvious, it is not.
+190	
+191	Comments already in the code stay. Leave them exactly as they are, and do not
+192	add new ones next to them. Anything that needs explaining goes in the pull
+193	request, not the source.
+194	
+195	## R style
+196	
+197	Run `air format .` after any R change. Use `|&gt;`, not `%&gt;%`. Use `\() ...` for one
+198	line anonymous functions and `function() {...}` otherwise. The package must work
+199	on R 4.1, so no `_$x`.
+200	</pre><p class="cut">1,077 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat NAMESPACE | grep export; ls R src tests/testthat;…</summary>
+<pre>cd ~/files/r/packages/rray4; cat NAMESPACE | grep export; ls R src tests/testthat; git log --oneline | head -100</pre><pre class="output">export(rray_add)
+export(rray_all_along)
+export(rray_and)
+export(rray_any_along)
+export(rray_axis_names)
+export(rray_broadcast)
+export(rray_broadcast_common)
+export(rray_column_names)
+export(rray_combine)
+export(rray_dimensionality)
+export(rray_dimensions)
+export(rray_dimensions_common)
+export(rray_divide)
+export(rray_equal)
+export(rray_exponentiate)
+export(rray_extract)
+export(rray_extract_assign)
+export(rray_greater_than)
+export(rray_greater_than_or_equal)
+export(rray_index)
+export(rray_insert_axes)
+export(rray_less_than)
+export(rray_less_than_or_equal)
+export(rray_max)
+export(rray_mean_along)
+export(rray_min)
+export(rray_move_axes)
+export(rray_multiply)
+export(rray_names)
+export(rray_not_equal)
+export(rray_or)
+export(rray_permute_axes)
+export(rray_product_along)
+export(rray_remove_axes)
+export(rray_rep)
+export(rray_rep_each)
+export(rray_roll)
+export(rray_roll_each)
+export(rray_row_names)
+export(rray_set_axis_names)
+export(rray_set_column_names)
+export(rray_set_dimensions)
+export(rray_set_names)
+export(rray_set_row_names)
+export(rray_size)
+export(rray_slice)
+export(rray_slice_assign)
+export(rray_slice_assign_axis)
+export(rray_slice_assign_columns)
+export(rray_slice_assign_rows)
+export(rray_slice_axis)
+export(rray_slice_columns)
+export(rray_slice_rows)
+export(rray_split)
+export(rray_stack)
+export(rray_subtract)
+export(rray_sum_along)
+export(rray_unstack)
+export(rray_xor)
+R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extract-subscript.R
+extract.R
+extremum.R
+index.R
+insert-axes.R
+logical.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+roll.R
+rray4-package.R
+size.R
+slice-subscript.R
+slice.R
+split.R
+stack.R
+unstack.R
+zzz.R
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c</pre><p class="cut">229 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray4; ls plans; for f in R/index.R R/extract.R R/slice.R R/…</summary>
+<pre>cd ~/files/r/packages/rray4; ls plans; for f in R/index.R R/extract.R R/slice.R R/combine.R R/extremum.R; do echo &quot;== $f&quot;; grep -n &quot;^#' &quot; $f | head -30; done; grep -rn &quot;yank\|rray_subset\|rray_bind\|flatten\|flip\|clip\|if_else\|full_like\|max_along\|max_pos&quot; R plans --include=*.R --include=*.md | grep -v &quot;plans/implementation.md&quot; | head -40</pre><pre class="output">The server-side auto mode classifier gave no verdict (error), so auto mode cannot determine the safety of Bash. This is a transient failure of the check, not a judgment about the action: a later response may get a verdict. You may try the action again once, as-is. Repeated attempts are slowed by a growing delay, and after 10 responses in a row without a verdict the turn stops. If it keeps failing, continue with other tasks that don't require this action and come back to it later. Note: reading files, searching code, and other read-only operations do not require the classifier and can still be used.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; ls plans; for f in R/index.R R/extract.R R/slice.R R/…</summary>
+<pre>cd ~/files/r/packages/rray4; ls plans; for f in R/index.R R/extract.R R/slice.R R/combine.R R/extremum.R; do echo &quot;== $f&quot;; grep -n &quot;^#' &quot; $f | head -30; done; grep -rn &quot;yank\|rray_subset\|rray_bind\|flatten\|flip\|clip\|if_else\|full_like\|max_along\|max_pos&quot; R plans --include=*.R --include=*.md | grep -v &quot;plans/implementation.md&quot; | head -40</pre><pre class="output">extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+== R/index.R
+4:#' Index an array by coordinates
+6:#' `rray_index()` selects values from `x` with one coordinate array for each
+7:#' source axis. The coordinate arrays broadcast to common dimensions and are
+8:#' read pointwise. Their common dimensions become the dimensions of the result.
+10:#' @details
+11:#' Each argument in `...` identifies positions on one axis of `x`. The first
+12:#' argument identifies positions on the first axis, the second argument
+13:#' identifies positions on the second axis, and so on. You must supply exactly
+14:#' one unnamed coordinate array for every axis of `x`.
+16:#' A coordinate array must be a bare integer vector or array. Vectors are
+17:#' treated as one-dimensional arrays. Each coordinate must be a positive,
+18:#' one-based position within its source axis. Zero, negative, and out-of-bounds
+19:#' coordinates are errors.
+21:#' Coordinate arrays use left-aligned broadcasting. At each point in the common
+22:#' dimensions, `rray_index()` takes one coordinate from each broadcast array
+23:#' and uses the complete set of coordinates to select one value from `x`.
+24:#' Singleton dimensions can be placed on different axes to form a Cartesian
+25:#' product.
+27:#' A missing coordinate on any source axis produces a missing value at that
+28:#' result point. For raw arrays the missing value is `as.raw(0)`, and for list
+29:#' arrays it is `NULL`.
+31:#' The result has the same storage type as `x`. Its dimensions are the common
+32:#' dimensions of the coordinate arrays. All names are dropped because a result
+33:#' axis does not necessarily correspond to one source axis.
+35:#' @param x A bare array or vector.
+37:#' @param ... Exactly one unnamed integer coordinate array for each axis of
+38:#'   `x`.
+40:#' @returns
+41:#' An array with the common dimensions of `...` and the same storage type as
+42:#' `x`.
+== R/extract.R
+1:#' Extract values from an array
+3:#' @description
+4:#' `rray_extract()` selects values from `x` by 1D location or by coordinate
+5:#' point. The result is always a 1D array.
+7:#' `rray_extract_assign()` replaces the selected values with `value` and returns
+8:#' a modified copy of `x`.
+10:#' @details
+11:#' The type and shape of `i` decide how it is used:
+13:#' - An integer or double vector holds 1D locations. `x` is treated as its
+14:#'   equivalent flattened array, so location `4` in a 2 x 3 matrix is row 2,
+15:#'   column 2. Locations follow the usual R rules: negative values drop
+16:#'   elements, zero is ignored, duplicates repeat elements, and `NA` gives a
+17:#'   missing value.
+19:#' - A logical vector must be size 1 or the size of `x`. A logical array must
+20:#'   have the same dimensions as `x`, so `rray_extract(x, x &gt; 5)` works. When
+21:#'   `TRUE`, the corresponding value in `x` is returned.
+23:#' - An integer or double matrix holds coordinate points. Each row selects one
+24:#'   element, and there must be one column per axis of `x`. Coordinates must be
+25:#'   positive and within the dimension of their axis. `NA` at any position
+26:#'   within the row generates a missing value.
+28:#' For raw arrays the missing value is `as.raw(0)`, and for list arrays it is
+29:#' `NULL`.
+31:#' For assignment, a missing entry in `i` leaves `x` unchanged at that
+32:#' position but uses one element of `value`. This also applies to a point row
+33:#' with a missing coordinate. Zero locations use no element of `value`.
+34:#' Negative locations can't be combined with missing values.
+36:#' @param x An array.
+38:#' @param i A numeric vector of locations, a logical vector, a logical array
+39:#'   with the same dimensions as `x`, or a numeric matrix of coordinate points.
+41:#' @param value A 1D array to assign to the selected values. It is cast to the
+== R/slice.R
+1:#' Slice an array
+3:#' @description
+4:#' `rray_slice()` selects positions along each axis of `x`. The result always
+5:#' has the same dimensionality as `x`.
+7:#' `rray_slice_axis()` is `rray_slice()` restricted to a single axis, which can
+8:#' be more ergonomic to write. `rray_slice_rows()` and `rray_slice_columns()`
+9:#' are shortcuts for `axis = 1` and `axis = 2`.
+11:#' The `_assign` versions replace the selected positions with `value` and
+12:#' return a modified copy of `x`.
+14:#' @details
+15:#' `NA` in a subscript gives missing values in the result. For raw arrays the
+16:#' missing value is `as.raw(0)`, and for list arrays it is `NULL`. If the axis
+17:#' has names, the name of a missing value is `&quot;&quot;`. For assignment, `NA` in a
+18:#' subscript leaves `x` unchanged at that position but uses one element of
+19:#' `value`.
+21:#' Unlike `[`, an empty argument does not select a whole axis. Use `TRUE`
+22:#' instead, so that every axis is provided explicitly:
+24:#' ```r
+25:#' x &lt;- array(1:24, c(2L, 3L, 4L))
+27:#' # Base R
+28:#' x[1, , , drop = FALSE]
+30:#' # rray
+31:#' rray_slice(x, 1, TRUE, TRUE)
+33:#' # Or, more simply
+34:#' rray_slice_axis(x, 1, axis = 1)
+35:#' rray_slice_rows(x, 1)
+36:#' ```
+38:#' @param x An array.
+40:#' @param ... One unnamed subscript for each axis of `x`, in axis order. Each
+41:#'   subscript is one of:
+== R/combine.R
+1:#' Combine arrays along an existing axis
+3:#' `rray_combine()` joins one or more arrays along `.axis`. Dimensions on every
+4:#' other axis are broadcast to common dimensions.
+6:#' @param ... Arrays to combine.
+8:#' @param .axis A single integer between 1 and the greatest input
+9:#'   dimensionality.
+11:#' @returns
+12:#' An array with the following dimensions:
+13:#' - Along `.axis`, the input dimensions are added together.
+14:#' - Along all other axes, the common dimensions are taken via broadcasting.
+16:#' @export
+17:#' @examples
+18:#' x &lt;- array(1:6, c(2, 3))
+19:#' y &lt;- array(7:12, c(2, 3))
+21:#' rray_combine(x, y, .axis = 1)
+22:#' rray_combine(x, y, .axis = 2)
+24:#' # Missing trailing axes have an implicit dimension of 1
+25:#' rray_combine(1:2, array(3:8, c(2, 3)), .axis = 2)
+== R/extremum.R
+1:#' Elementwise maximum and minimum
+3:#' @description
+4:#' - `rray_max()` computes the elementwise maximum of two arrays.
+6:#' - `rray_min()` computes the elementwise minimum of two arrays.
+8:#' @details
+9:#' The arrays are broadcast to common dimensions first, so they do not have to
+10:#' be the same shape.
+12:#' @inheritParams rlang::args_dots_empty
+14:#' @param x An array.
+16:#' @param y An array.
+18:#' @param na_rm If `TRUE`, missing values are removed before taking the maximum
+19:#'   or minimum.
+21:#' @returns
+22:#' An array with the common dimensions and common type of `x` and `y`.
+24:#' @name extremum
+25:#' @examples
+26:#' x &lt;- array(1:6, c(3L, 2L))
+28:#' rray_max(x, 4L)
+29:#' rray_min(x, 4L)
+31:#' # Compare each column with a different value through broadcasting
+32:#' rray_max(x, array(c(2L, 5L), c(1L, 2L)))
+35:#' @rdname extremum
+36:#' @export
+42:#' @rdname extremum
+43:#' @export
+(eval):1: no matches found: --include=*.R</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -rn &quot;yank\|rray_subset\|rray_bind\|rbind\|cbind\…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -rn &quot;yank\|rray_subset\|rray_bind\|rbind\|cbind\|flatten\|flip\|clip\|if_else\|full_like\|max_along\|max_pos\|_assign&quot; plans R | grep -v &quot;plans/implementation.md&quot; | head -40</pre><pre class="output">plans/extensions.md:237:- `rray_max_pos()` and `rray_min_pos()` return a bare integer array.
+plans/index.md:10:rray_index_assign(x, ..., value)
+plans/index.md:13:rray_index_assign_axis(x, i, ..., axis, value)
+plans/index.md:33:| Orthogonal subscripts | `rray_slice()` | `rray_slice_assign()` |
+plans/index.md:34:| One-axis subscript | `rray_slice_axis()` | `rray_slice_assign_axis()` |
+plans/index.md:35:| First axis subscript | `rray_slice_rows()` | `rray_slice_assign_rows()` |
+plans/index.md:36:| Second axis subscript | `rray_slice_columns()` | `rray_slice_assign_columns()` |
+plans/index.md:37:| One-axis coordinate array | `rray_index_axis()` | `rray_index_assign_axis()` |
+plans/index.md:38:| Full coordinate arrays | `rray_index()` | `rray_index_assign()` |
+plans/index.md:39:| Flat subscript or point matrix | `rray_extract()` | `rray_extract_assign()` |
+plans/index.md:41:Do not add replacement functions. Every `_assign()` function returns a
+plans/index.md:124:rray_index_assign(x, ..., value)
+plans/index.md:146:`value` follows `...` in `rray_index_assign()`, so it must be supplied by
+plans/index.md:177:rray_index_assign_axis(x, i, ..., axis, value)
+plans/index.md:189:rray_index_assign_axis(x, i, axis = 2, value = 0L)
+plans/index.md:319:i &lt;- rbind(
+plans/index.md:552:rray_index_assign(x, ..., value)
+plans/index.md:553:rray_index_assign_axis(x, i, ..., axis, value)
+plans/index.md:591:out &lt;- rray_index_assign(
+plans/index.md:702:points &lt;- rbind(
+plans/index.md:780:rray_index_assign_axis(x, i, axis = 2L, value = 0)
+plans/index.md:785:`rray_extract_assign()` instead.
+plans/slice.md:9:rray_slice_assign(x, ..., value)
+plans/slice.md:12:rray_slice_assign_axis(x, i, ..., axis, value)
+plans/slice.md:15:rray_slice_assign_rows(x, i, value)
+plans/slice.md:18:rray_slice_assign_columns(x, i, value)
+plans/slice.md:21:rray_extract_assign(x, i, value)
+plans/slice.md:46:Do not add replacement functions. Every `_assign()` function returns a
+plans/slice.md:106:rray_slice_assign(x, ..., value)
+plans/slice.md:149:`value` follows `...` in `rray_slice_assign()`, so it must be supplied by
+plans/slice.md:156:rray_slice_assign_axis(x, i, ..., axis, value)
+plans/slice.md:165:rray_slice_assign_axis(x, c(3, 1), axis = 2, value = 0L)
+plans/slice.md:218:rray_slice_assign_rows(x, i, value)
+plans/slice.md:221:rray_slice_assign_columns(x, i, value)
+plans/slice.md:243:rray_extract_assign(x, i, value)
+plans/slice.md:304:points &lt;- rbind(
+plans/slice.md:325:points &lt;- rbind(
+plans/slice.md:447:out &lt;- rray_slice_assign(x, 1, TRUE, TRUE, value = 0L)
+plans/slice.md:448:out &lt;- rray_slice_assign_axis(x, 1, axis = 3, value = 0L)
+plans/slice.md:476:- `rray_subset()`: `rray_slice()` names the orthogonal operation directly.</pre></details>
+<p>Checking what's already exported against the plan, then trimming <code>plans/implementation.md</code>.</p>
+
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray4; python3 - &lt;&lt;'EOF'</summary>
+<pre>cd ~/files/r/packages/rray4; python3 - &lt;&lt;'EOF'
+p = &quot;plans/implementation.md&quot;
+s = open(p).read()
+
+def cut(start, end):
+    global s
+    i = s.index(start); j = s.index(end, i)
+    s = s[:i] + s[j:]
+
+def rep(a, b):
+    global s
+    assert s.count(a) == 1, a
+    s = s.replace(a, b)
+
+rep(&quot;&quot;&quot;This document is the guide for agents working on rray4 across many sessions.
+Part 4 is the ordered list of pull requests. Part 5 is the catalogue of
+functions to work through after the foundations land.&quot;&quot;&quot;,
+&quot;&quot;&quot;This document is the guide for agents working on rray4 across many sessions.
+Part 4 is the catalogue of functions still to build.&quot;&quot;&quot;)
+rep(&quot;&quot;&quot;Then find your pull request in Part 4, or your function in Part 5. Each entry
+says what to build, which files to touch, and what &quot;done&quot; means.&quot;&quot;&quot;,
+&quot;&quot;&quot;Then find your function in Part 4. Each entry says what to build, which files
+to touch, and what &quot;done&quot; means.&quot;&quot;&quot;)
+rep(&quot;&quot;&quot;parameter list, and the loop is written once. `rray_mean()`, `rray_max_along()`, and
+`rray_min_along()` want the same shape when they land, sharing `rray_reduce()`'s
+shell.&quot;&quot;&quot;, &quot;&quot;&quot;parameter list, and the loop is written once. `rray_max_along()` and
+`rray_min_along()` want the same shape when they land, sharing `rray_reduce()`'s
+shell.&quot;&quot;&quot;)
+rep(&quot;There are five rules. Every function in Part 5 declares&quot;, &quot;There are five rules. Every function in Part 4 declares&quot;)
+rep(&quot;`rray_bind(chr_array, NA)` to work. See Part 7.&quot;, &quot;`rray_bind(chr_array, NA)` to work. See Part 6.&quot;)
+
+cut(&quot;# Part 4: The pull requests&quot;, &quot;# Part 5: Function reference&quot;)
+rep(&quot;# Part 5: Function reference&quot;, &quot;# Part 4: Function reference&quot;)
+rep(&quot;## 5.1 Shape&quot;, &quot;## 4.1 Shape&quot;)
+cut(&quot;## 5.2 Elementwise arithmetic&quot;, &quot;## 5.3 Other elementwise numeric&quot;)
+rep(&quot;## 5.3 Other elementwise numeric&quot;, &quot;## 4.2 Other elementwise numeric&quot;)
+rep(&quot;## 5.4 Reductions&quot;, &quot;## 4.3 Reductions&quot;)
+
+rep(&quot;&quot;&quot;| function | op | type rule |
+|---|---|---|
+| `rray_sum_along(x, axes, ..., na_rm = FALSE)` | `sum` | promoted, exists |
+| `rray_product_along(x, axes, ..., na_rm = FALSE)` | `prod` | promoted, int to dbl |
+| `rray_mean_along(x, axes, ..., na_rm = FALSE)` | `mean` | promoted, lgl and int to dbl, exists |
+| `rray_max_along(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |
+| `rray_min_along(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |
+| `rray_all_along(x, axes, ..., na_rm = FALSE)` | `all` | fixed, logical in, logical out, exists |
+| `rray_any_along(x, axes, ..., na_rm = FALSE)` | `any` | fixed, logical in, logical out, exists |
+&quot;&quot;&quot;, &quot;&quot;&quot;| function | op | type rule |
+|---|---|---|
+| `rray_max_along(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |
+| `rray_min_along(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |
+&quot;&quot;&quot;)
+cut(&quot;`rray_sum_along()` already exists, documented under&quot;, &quot;`rray_max_pos()` and `rray_min_pos()` take `axis`&quot;)
+s = s.replace(&quot;`rray_max_pos()` and `rray_min_pos()` take `axis`&quot;, &quot;&quot;&quot;`rray_max_along()` and `rray_min_along()` share `rray_sum_along()`'s
+`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to
+`R/reduce.R` and their own `src/reduce-{name}.c` beside it, on top of the
+`rray_reduce()` shell in `src/reduce.c`/`src/reduce.h`.
+
+`rray_max_pos()` and `rray_min_pos()` take `axis`&quot;&quot;&quot;, 1)
+cut(&quot;## 5.5 Indexing&quot;, &quot;# Part 6: Out of scope&quot;)
+rep(&quot;# Part 6: Out of scope&quot;, &quot;# Part 5: Out of scope&quot;)
+rep(&quot;&quot;&quot;Deferred rather than dropped:
+&quot;&quot;&quot;, &quot;&quot;&quot;Deferred rather than dropped:
+
+- **`rray_modulo()` and `rray_integer_divide()`** (`%%` and `%/%`). See
+  `plans/mod-and-idiv.md`.
+&quot;&quot;&quot;)
+rep(&quot;# Part 7: Possible improvements for later&quot;, &quot;# Part 6: Possible improvements for later&quot;)
+open(p, &quot;w&quot;).write(s)
+EOF
+git diff --stat; grep -n &quot;Part [0-9]\|^## [0-9]\|^# \|5\.[0-9]\|7\b&quot; plans/implementation.md | head -60</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-Part 4 is the ordered list of pull requests. Part 5 is the catalogue of</span>
+<span class="del">-functions to work through after the foundations land.</span>
+<span class="ins">+Part 4 is the catalogue of functions still to build.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-Then find your pull request in Part 4, or your function in Part 5. Each entry</span>
+<span class="del">-says what to build, which files to touch, and what &quot;done&quot; means.</span>
+<span class="ins">+Then find your function in Part 4. Each entry says what to build, which files</span>
+<span class="ins">+to touch, and what &quot;done&quot; means.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-parameter list, and the loop is written once. `rray_mean()`, `rray_max_along()`, and</span>
+<span class="del">-`rray_min_along()` want</span>
+<span class="ins">+parameter list, and the loop is written once. `rray_max_along()` and</span>
+<span class="ins">+`rray_min_along()` want</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-Every function in Part 5 declares</span>
+<span class="ins">+Every function in Part 4 declares</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-`rray_bind(chr_array, NA)` to work. See Part 7.</span>
+<span class="ins">+`rray_bind(chr_array, NA)` to work. See Part 6.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-# Part 4: The pull requests</span>
+<span class="del">-</span>
+<span class="del">-What exists today: the argument tags, the argument checking helpers, the names</span>
+<span class="del">-API, the coalesce rule as the `rray_broadcast_names()` family, the dimension and</span>
+<span class="del">-shape helpers, the type rules as the `rray_ptype2()` and `rray_cast()` families,</span>
+<span class="del">-the scalar casts as `static inline` functions in `src/cast.h`, and</span>
+<span class="del">-`rray_broadcast()`, `rray_broadcast_common()`, `rray_split()`,</span>
+<span class="del">-`rray_sum_along()`,</span>
+<span class="del">-`rray_add()`, `rray_multiply()`, `rray_subtract()`, `rray_divide()` and</span>
+<span class="del">-`rray_exponentiate()`. The array functions all follow the shell and core</span>
+<span class="del">-pattern in Part 1, and no templates are left in `src/`.</span>
+<span class="del">-</span>
+<span class="del">-`rray_modulo()` and `rray_integer_divide()` (`%%` and `%/%`) are deferred. See</span>
+<span class="del">-`plans/mod-and-idiv.md`.</span>
+<span class="del">-</span>
+<span class="del">-Every pull request that was tracked here has landed. Work through Part 5 next,</span>
+<span class="del">-in any order that respects the dependencies noted there.</span>
+<span class="del">-</span>
+----
+<span class="del">-</span>
+<span class="del">-# Part 5: Function reference</span>
+<span class="ins">+# Part 4: Function reference</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-## 5.1 Shape</span>
+<span class="ins">+## 4.1 Shape</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-## 5.2 Elementwise arithmetic</span>
+<span class="del">-</span>
+<span class="del">-Names: coalesce. Type: promoted.</span>
+<span class="del">-</span>
+<span class="del">-All binary, all sharing the loop and the pipeline from 2.4: pick a core from the</span>
+<span class="del">-type pair, find common dimensions, loop with an `rray_iterator2` converting as</span>
+<span class="del">-you go.</span>
+<span class="del">-</span>
+<span class="del">-| function | op |</span>
+<span class="del">-|---|---|</span>
+<span class="del">-| `rray_add(x, y)` | `+` |</span>
+<span class="del">-| `rray_subtract(x, y)` | `-` |</span>
+<span class="del">-| `rray_multiply(x, y)` | `*` |</span>
+<span class="del">-| `rray_divide(x, y)` | `/` |</span>
+<span class="del">-| `rray_exponentiate(x, y)` | `^` |</span>
+<span class="del">-</span>
+<span class="del">-There is no unary negation. `-x` already works on a bare array, so a function</span>
+<span class="del">-for it would add nothing.</span>
+<span class="del">-</span>
+<span class="del">-Match R's own semantics for missing values, `NaN`, and division by zero. Check</span>
+<span class="del">-`~/files/r/r-svn` when a case is unclear rather than guessing.</span>
+<span class="del">-</span>
+<span class="del">-Files: one `src/arithmetic-{op}.c` per operator, over the shared</span>
+<span class="del">-`src/arithmetic.c` and `src/arithmetic.h`. All the R bindings share</span>
+<span class="del">-`R/arithmetic.R` and one documentation page.</span>
+<span class="del">-</span>
+<span class="del">-## 5.3 Other elementwise numeric</span>
+<span class="ins">+## 4.2 Other elementwise numeric</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-## 5.4 Reductions</span>
+<span class="ins">+## 4.3 Reductions</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-|---|---|---|</span>
+<span class="del">-| `rray_sum_along(x, axes, ..., na_rm = FALSE)` | `sum` | promoted, exists |</span>
+<span class="del">-| `rray_product_along(x, axes, ..., na_rm = FALSE)` | `prod` | promoted, int to dbl |</span>
+<span class="del">-| `rray_mean_along(x, axes, ..., na_rm = FALSE)` | `mean` | promoted, lgl and int to dbl, exists |</span>
+<span class="del">-| `rray_max_along(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |</span>
+<span class="del">-| `rray_min_along(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |</span>
+<span class="del">-| `rray_all_along(x, axes, ..., na_rm = FALSE)` | `all` | fixed, logical in, logical out, exists |</span>
+<span class="del">-| `rray_any_along(x, axes, ..., na_rm = FALSE)` | `any` | fixed, logical in, logical out, exists |</span>
+<span class="ins">+|---|---|---|</span>
+<span class="ins">+| `rray_max_along(x, axes, ..., na_rm = FALSE)` | `max` | preserved, errors on cpl |</span>
+<span class="ins">+| `rray_min_along(x, axes, ..., na_rm = FALSE)` | `min` | preserved, errors on cpl |</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-`rray_sum_along()` already exists, documented under the shared `reduce` topic in</span>
+<span class="del">-`R/reduce.R`, with its C in `src/reduce-sum.c` on top of the `rray_reduce()`</span>
+<span class="del">-shell in `src/reduce.c`/`src/reduce.h` (see 2.1).</span>
+<span class="del">-</span>
+<span class="del">-`rray_product_along()`, `rray_mean_along()`, `rray_max_along()`, and</span>
+<span class="del">-`rray_min_along()` share</span>
+<span class="del">-`rray_sum_along()`'s</span>
+<span class="del">-`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to</span>
+<span class="del">-`R/reduce.R` and their own `src/reduce-{name}.c` beside it.</span>
+<span class="del">-</span>
+<span class="del">-`rray_mean_along()` needs numerical state per output element, so it uses the</span>
+<span class="del">-`rray_reduce_nested()` shell rather than `rray_reduce()`. That shell walks the</span>
+<span class="del">-retained axes and the reduced axes with two immutable plans, which lets the</span>
+<span class="del">-mean core make several passes over one reduced slice before moving on.</span>
+<span class="del">-</span>
+<span class="del">-`rray_all_along()` and `rray_any_along()` share that shape too, so they are</span>
+<span class="del">-`@rdname reduce` entries as well. They are the one place two reducers share a C</span>
+<span class="del">-pair, `src/reduce-logical.c` and `src/reduce-logical.h`, because each supports</span>
+<span class="del">-only logical input and so is small. Their `na_rm = FALSE` behaviour follows</span>
+<span class="del">-`all()` and `any()`: a missing value only reaches the result when it could</span>
+<span class="del">-change the answer, so `all(c(FALSE, NA))` is `FALSE` and not `NA`.</span>
+<span class="del">-</span>
+<span class="ins">+`rray_max_along()` and `rray_min_along()` share `rray_sum_along()`'s</span>
+<span class="ins">+`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to</span>
+<span class="ins">+`R/reduce.R` and their own `src/reduce-{name}.c` beside it, on top of the</span>
+<span class="ins">+`rray_reduce()` shell in `src/reduce.c`/`src/reduce.h`.</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now the indexing and binding sections, and renumbering the last two parts.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;^## 5.5 Indexing\|^# Part 6: Out of scope\|^…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;^## 5.5 Indexing\|^# Part 6: Out of scope\|^# Part 7\|^Deferred rather&quot; plans/implementation.md</pre><pre class="output">992:## 5.5 Indexing
+1114:# Part 6: Out of scope
+1147:Deferred rather than dropped:
+1162:# Part 7: Possible improvements for later</pre></details>
+<details class="tool"><summary>Read plans/implementation.md</summary>
+<pre class="output">985	
+986	`rray_max_pos()` and `rray_min_pos()` take `axis` rather than `axes` and return
+987	positions rather than reduced values, so they do not match `rray_reduce()`'s
+988	shape. They need their own file and topic, `R/max-pos.R`, with its own C pair.
+989	Whether any part of `rray_reduce()` can be shared with them is a design question
+990	for whoever picks them up.
+991	
+992	## 5.5 Indexing
+993	
+994	**A human should design review this whole section before any of it is</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-## 5.5 Indexing</span>
+<span class="del">-</span>
+<span class="del">-**A human should design review this whole section before any of it is</span>
+<span class="del">-implemented.** It was the most confusing part of the original rray, and it</span>
+<span class="del">-deserves a fresh look rather than a port. What follows documents what rray did,</span>
+<span class="del">-so the review has something concrete to react to.</span>
+<span class="del">-</span>
+<span class="del">-Three ways to pull data out, distinguished by what happens to dimensionality.</span>
+<span class="del">-</span>
+<span class="del">-Type: preserved throughout.</span>
+<span class="del">-</span>
+<span class="del">-### `rray_subset()`, by index, keeps dimensionality</span>
+<span class="del">-</span>
+<span class="del">-Never drops dimensions. Ignores trailing commas, so `x[1]` and `x[1, ]` agree.</span>
+<span class="del">-Missing arguments select a whole axis.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-x &lt;- array(1:8, c(2, 2, 2))</span>
+<span class="del">-</span>
+<span class="del">-rray_subset(x, 1)        # first row, still (1, 2, 2)</span>
+<span class="del">-rray_subset(x, , 1)      # all rows, first column, still (2, 1, 2)</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Base R cannot do the second one without fully specifying every axis and passing</span>
+<span class="del">-`drop = FALSE`.</span>
+<span class="del">-</span>
+<span class="del">-Index types: integer-ish selects elements, logical must be length 1 or the</span>
+<span class="del">-dimension, character requires names on that axis, `NULL` means 0.</span>
+<span class="del">-</span>
+<span class="del">-Names: subset.</span>
+<span class="del">-</span>
+<span class="del">-### `rray_extract()`, by index, always drops</span>
+<span class="del">-</span>
+<span class="del">-Always returns a one dimensional result, and never keeps names.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-x &lt;- array(1:16, c(2, 4, 2), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL, NULL))</span>
+<span class="del">-</span>
+<span class="del">-rray_extract(x, 1)          # first row, flattened</span>
+<span class="del">-rray_extract(x, 1, 1:2)     # first row, first two columns, flattened</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Like `x[[i, j, ...]]` but each subscript may have length greater than 1.</span>
+<span class="del">-</span>
+<span class="del">-Names: dropped.</span>
+<span class="del">-</span>
+<span class="del">-### `rray_yank()`, by position, always flattens</span>
+<span class="del">-</span>
+<span class="del">-Pulls elements out by their position in the flat array, ignoring dimensions</span>
+<span class="del">-entirely. Always one dimensional.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-x &lt;- array(10:17, c(2, 2, 2))</span>
+<span class="del">-</span>
+<span class="del">-rray_yank(x, 1:3)</span>
+<span class="del">-rray_yank(x, FALSE)</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-`i` is an integer vector of positions, a logical of length 1 or `rray_size(x)`,</span>
+<span class="del">-or a logical with exactly `x`'s dimensions.</span>
+<span class="del">-</span>
+<span class="del">-Names: dropped.</span>
+<span class="del">-</span>
+<span class="del">-### `rray_slice()`</span>
+<span class="del">-</span>
+<span class="del">-Subset a single axis by index, keeping dimensionality.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-rray_slice(x, i, axis)</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Names: subset.</span>
+<span class="del">-</span>
+<span class="del">-### The assignment forms</span>
+<span class="del">-</span>
+<span class="del">-`rray_subset_assign()`, `rray_extract_assign()`, `rray_yank_assign()`,</span>
+<span class="del">-`rray_slice_assign()`.</span>
+<span class="del">-</span>
+<span class="del">-The original cast `value` to `x` rather than the other way round, and broadcast</span>
+<span class="del">-`value` to the shape of the selection. Both decisions are worth re-examining in</span>
+<span class="del">-the design review.</span>
+<span class="del">-</span>
+<span class="del">-No `&lt;-` replacement forms, consistent with the names API.</span>
+<span class="del">-</span>
+<span class="del">-Files: one pair per function, plus shared `src/subscript.c` and</span>
+<span class="del">-`src/subscript.h` for turning user supplied subscripts into locations.</span>
+<span class="del">-</span>
+<span class="del">-## 5.6 Binding</span>
+<span class="del">-</span>
+<span class="del">-**A human should design review this before implementation.** The axis semantics</span>
+<span class="del">-in the original were subtle, particularly how binding &quot;up&quot; into a new axis</span>
+<span class="del">-interacts with broadcasting and with names.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-a &lt;- matrix(1:4, ncol = 2)</span>
+<span class="del">-b &lt;- matrix(5:6, ncol = 1)</span>
+<span class="del">-</span>
+<span class="del">-rray_bind(a, b, .axis = 2)    # bind along columns</span>
+<span class="del">-rray_bind(a, b, .axis = 1)    # bind along rows, broadcasting automatically</span>
+<span class="del">-rray_bind(a, b, .axis = 3)    # bind up into a new third axis</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-The second one is not possible with `rbind()`, because `a` and `b` have</span>
+<span class="del">-different column counts and `b` has to broadcast.</span>
+<span class="del">-</span>
+<span class="del">-Names: coalesce on the axes that are not bound. The bound axis concatenates its</span>
+<span class="del">-names, which needs its own rule worked out in the design review.</span>
+<span class="del">-</span>
+<span class="del">-`rray_broadcast_names_common()` handles the unbound axes as is: on the bound</span>
+<span class="del">-axis every input's dimension differs from the output's, so it is skipped for</span>
+<span class="del">-every input and bind pokes the concatenation in afterwards.</span>
+<span class="del">-</span>
+<span class="del">-Type: common. This is the main consumer of `rray_ptype_common()`, so it takes a</span>
+<span class="del">-`.ptype` argument for an override, matching `.dimensions` elsewhere.</span>
+<span class="del">-</span>
+<span class="del">-Signatures: `rray_bind(..., .axis, .ptype = NULL)`, `rray_rbind(..., .ptype =</span>
+<span class="del">-NULL)`, `rray_cbind(..., .ptype = NULL)`.</span>
+<span class="del">-</span>
+<span class="del">-Files: `R/bind.R`, `src/bind.c`, `src/bind.h`.</span>
+<span class="del">-</span>
+----
+<span class="del">-</span>
+<span class="del">-# Part 6: Out of scope</span>
+<span class="ins">+---</span>
+<span class="ins">+</span>
+<span class="ins">+# Part 5: Out of scope</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-Deferred rather than dropped:</span>
+<span class="ins">+Deferred rather than dropped:</span>
+<span class="ins">+</span>
+<span class="ins">+- **`rray_modulo()` and `rray_integer_divide()`** (`%%` and `%/%`). See</span>
+<span class="ins">+  `plans/mod-and-idiv.md`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-# Part 7: Possible improvements for later</span>
+<span class="ins">+# Part 6: Possible improvements for later</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;Part [0-9]\|^## [0-9]\|^# \| 5\.[0-9]\|see 2…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;Part [0-9]\|^## [0-9]\|^# \| 5\.[0-9]\|see 2\.1&quot; plans/implementation.md; git diff --stat</pre><pre class="output">1:# rray4 implementation plan
+15:Part 4 is the catalogue of functions still to build.
+19:Read Part 1 and Part 2 before starting any pull request. They are short on
+22:Then find your function in Part 4. Each entry says what to build, which files
+29:# Part 1: Conventions
+209:# Part 2: The core ideas
+211:## 2.1 Arrays in, arrays out
+238:## 2.2 Broadcasting
+288:## 2.3 Names
+290:There are five rules. Every function in Part 4 declares which one it follows.
+365:## 2.4 Types
+608:`rray_bind(chr_array, NA)` to work. See Part 6.
+706:## 2.5 Iterators
+745:# Part 3: Testing
+797:# Part 4: Function reference
+818:## 4.1 Shape
+864:## 4.2 Other elementwise numeric
+957:## 4.3 Reductions
+994:# Part 5: Out of scope
+1045:# Part 6: Possible improvements for later
+ plans/implementation.md | 222 ++++--------------------------------------------
+ 1 file changed, 18 insertions(+), 204 deletions(-)</pre></details>
+<p>I trimmed <code>plans/implementation.md</code> by about 200 lines and renumbered it. Nothing is committed.</p>
+<p><strong>Removed as done:</strong></p>
+<ul>
+<li>
+<p><strong>Old Part 4 (the pull request list):</strong> it only said that every tracked PR had landed. Its one live note, that <code>rray_modulo()</code> and <code>rray_integer_divide()</code> are deferred, now sits in the &quot;Deferred rather than dropped&quot; list.</p>
+</li>
+<li>
+<p><strong>5.2 Elementwise arithmetic:</strong> all five operators exist.</p>
+</li>
+<li>
+<p><strong>Reductions:</strong> I took <code>sum</code>, <code>product</code>, <code>mean</code>, <code>all</code> and <code>any</code> out of the table, along with their paragraphs. Only <code>rray_max_along()</code>, <code>rray_min_along()</code>, <code>rray_max_pos()</code> and <code>rray_min_pos()</code> are left.</p>
+</li>
+<li>
+<p><strong>5.5 Indexing:</strong> <code>rray_slice()</code>, <code>rray_extract()</code> and their <code>_assign</code> forms have landed. <code>rray_subset()</code> and <code>rray_yank()</code> were replaced in the redesign (<code>plans/slice.md</code> says <code>rray_slice()</code> replaces <code>rray_subset()</code>). What's left, like <code>rray_index_axis()</code> and <code>rray_index_assign()</code>, is tracked in <code>plans/index.md</code>.</p>
+</li>
+<li>
+<p><strong>5.6 Binding:</strong> <code>rray_combine()</code> and <code>rray_stack()</code> took its place.</p>
+</li>
+<li>
+<p><strong>Part 1:</strong> one stale mention of <code>rray_mean()</code> in the list of reducers still to come.</p>
+</li>
+</ul>
+<p><strong>Renumbered:</strong> Part 5 became Part 4 (sections 4.1 Shape, 4.2 Other elementwise numeric, 4.3 Reductions). Parts 6 and 7 became Parts 5 and 6. I updated the cross-references to match.</p>
+<p><strong>Still in the plan:</strong> <code>rray_flatten()</code>, <code>rray_flip()</code>, <code>rray_clip()</code>, <code>rray_if_else()</code>, the <code>rray_full_like()</code> family, the max and min reducers, and Parts 5 and 6.</p>
+<p>Two sentences still name <code>rray_bind()</code>, even though <code>rray_combine()</code> replaced it: the unspecified-type note in 2.4 and its entry in Part 6. I left them because they describe a design question, not a function to build. Tell me if you want them to say <code>rray_combine()</code> instead.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Use combine then commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;bind&quot; plans/implementation.md</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;bind&quot; plans/implementation.md</pre><pre class="output">407:- `rray_bind()` needs a common type across many inputs.
+607:type for this. We do not, at least until `rray_bind()` wants
+608:`rray_bind(chr_array, NA)` to work. See Part 6.
+780:- The R side does not split. Every operator's binding lives in `R/arithmetic.R`,
+1082:special handling for arithmetic. But `rray_bind(chr_array, NA)` fails, because
+1086:`rray_bind()` can live without it first.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-- `rray_bind()` needs a common type</span>
+<span class="ins">+- `rray_combine()` needs a common type</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-at least until `rray_bind()` wants</span>
+<span class="del">-`rray_bind(chr_array, NA)` to work.</span>
+<span class="ins">+at least until `rray_combine()` wants</span>
+<span class="ins">+`rray_combine(chr_array, NA)` to work.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-But `rray_bind(chr_array, NA)` fails</span>
+<span class="ins">+But `rray_combine(chr_array, NA)` fails</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-`rray_bind()` can live without it first.</span>
+<span class="ins">+`rray_combine()` can live without it first.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git add plans/implementation.md &amp;&amp; git commit -q -m &quot;…</summary>
+<pre>cd ~/files/r/packages/rray4; git add plans/implementation.md &amp;&amp; git commit -q -m &quot;Remove finished work from the implementation plan&quot; &amp;&amp; git push -u origin main 2&gt;&amp;1 | tail -3; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   aa61f5d..ed62853  main -&gt; main
+branch 'main' set up to track 'origin/main'.
+ed62853 Remove finished work from the implementation plan</pre></details>
+<p>I changed the four <code>rray_bind()</code> mentions to <code>rray_combine()</code>, then committed and pushed to <code>main</code> as <code>ed62853</code> (&quot;Remove finished work from the implementation plan&quot;). The mentions were in the list of type-rule users in 2.4, the unspecified-type note in 2.4, and the unspecified-type entry in Part 6.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Remove flatten and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;flatten\|^## 4.1\|^### &quot; plans/implementatio…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;flatten\|^## 4.1\|^### &quot; plans/implementation.md</pre><pre class="output">354:### The names API
+459:### Argument tags and the error call
+591:### The common type rules
+610:### Operator promotion
+680:### Operators that promote nothing
+690:### Operators with a fixed output type
+818:## 4.1 Shape
+820:### `rray_flatten()`
+825:rray_flatten(array(1:10, c(5, 2)))     # (5, 2) -&gt; (10)
+833:rray_flatten(y)                                   # (2) -&gt; (2), names kept
+834:rray_flatten(array(1:2, c(2, 1), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL)))
+836:rray_flatten(array(1:2, c(1, 2), dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;))))
+840:Signature: `rray_flatten(x)`. Attributes only.
+842:Files: `R/flatten.R`, `src/flatten.c`, `src/flatten.h`.
+844:### `rray_flip()`
+866:### `rray_clip()`
+894:### `rray_if_else()`
+937:### `rray_full_like()`, `rray_ones_like()`, `rray_zeros_like()`</pre></details>
+<details class="tool"><summary>Edit plans/implementation.md</summary>
+<pre class="diff"><span class="del">-### `rray_flatten()`</span>
+<span class="del">-</span>
+<span class="del">-Collapse to one dimension.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-rray_flatten(array(1:10, c(5, 2)))     # (5, 2) -&gt; (10)</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Names: follow the axis. Type: preserved. So names survive only when the first</span>
+<span class="del">-axis' dimension is unchanged.</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-y &lt;- array(1:2, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))</span>
+<span class="del">-rray_flatten(y)                                   # (2) -&gt; (2), names kept</span>
+<span class="del">-rray_flatten(array(1:2, c(2, 1), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL)))</span>
+<span class="del">-                                                  # (2, 1) -&gt; (2), names kept</span>
+<span class="del">-rray_flatten(array(1:2, c(1, 2), dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;))))</span>
+<span class="del">-                                                  # (1, 2) -&gt; (2), names dropped</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Signature: `rray_flatten(x)`. Attributes only.</span>
+<span class="del">-</span>
+<span class="del">-Files: `R/flatten.R`, `src/flatten.c`, `src/flatten.h`.</span>
+<span class="del">-</span>
+<span class="del">-### `rray_flip()`</span>
+<span class="ins">+### `rray_flip()`</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/implementation.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git add plans/implementation.md &amp;&amp; git commit -q -m &quot;…</summary>
+<pre>cd ~/files/r/packages/rray4; git add plans/implementation.md &amp;&amp; git commit -q -m &quot;Remove \`rray_flatten()\` from the implementation plan&quot; &amp;&amp; git push -u origin main 2&gt;&amp;1 | tail -2; git log --oneline -1</pre><pre class="output">   ed62853..0dcff00  main -&gt; main
+branch 'main' set up to track 'origin/main'.
+0dcff00 Remove `rray_flatten()` from the implementation plan</pre></details>
+<p>I removed the <code>rray_flatten()</code> entry, and pushed the change to <code>main</code> as <code>0dcff00</code> (&quot;Remove <code>rray_flatten()</code> from the implementation plan&quot;). Section 4.1 Shape now lists only <code>rray_flip()</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

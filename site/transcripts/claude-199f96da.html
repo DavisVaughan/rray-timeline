@@ -1,0 +1,2641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Implementing rray_move_axes() on top of rray_permute_axes()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-69">rray timeline</a>
+<h1>Implementing <code>rray_move_axes()</code> on top of <code>rray_permute_axes()</code></h1>
+<p class="facts">Claude · Sep 15, 2026 · 10 prompts · 18 replies · <a href="https://github.com/r-lib/rray/pull/69">#69</a></p>
+</header>
+<main>
+<p class="divider">Sep 15, 2026, 14:11 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create branch feature/move-axes</p>
+<p>Let’s create rray_move_axes(x, axes, to) which works like numpy’s version with different argument names</p>
+<p>It should validate axes and to (individually and against each other) and construct a call to rray permute axes (still all in C)</p>
+<p>Expecting move-axes.R and C files</p>
+<p>Expecting docs to connect to rray permute axes.</p>
+<p>You can provide more than one axis to move at once, and to is the location they end up in. Can’t provide duplicate axes or locations.</p>
+<p>Ask any questions before beginning this work</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll look at the existing code first so my questions are specific.</p>
+
+<details class="tool"><summary>Bash: ls ~/files/r/packages/rray4/R ~/files/r/packages/rray4/src ~…</summary>
+<pre>ls ~/files/r/packages/rray4/R ~/files/r/packages/rray4/src ~/files/r/packages/rray4/src/decl</pre><pre class="output">~/files/r/packages/rray4/R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+rray4-package.R
+size.R
+split-names.R
+split.R
+squeeze.R
+zzz.R
+
+~/files/r/packages/rray4/src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extremum.c
+extremum.h
+extremum.o
+init.c
+init.o
+Makevars
+missing.h
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+split-names.c
+split-names.h
+split-names.o
+split.c
+split.h
+split.o
+squeeze.c
+squeeze.h
+squeeze.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o
+
+~/files/r/packages/rray4/src/decl:
+arg-decl.h
+arithmetic-add-decl.h
+arithmetic-divide-decl.h
+arithmetic-exponentiate-decl.h
+arithmetic-multiply-decl.h
+arithmetic-subtract-decl.h
+broadcast-decl.h
+broadcast-names-decl.h
+cast-decl.h
+compare-decl.h
+dimensions-decl.h
+equal-decl.h
+extremum-decl.h
+names-decl.h
+permute-axes-decl.h
+ptype-decl.h
+reduce-decl.h
+reduce-logical-decl.h
+reduce-mean-decl.h
+reduce-names-decl.h
+reduce-product-decl.h
+reduce-sum-decl.h
+split-decl.h
+split-names-decl.h
+strided-iterator-decl.h
+utils-decl.h
+wrapper-decl.h</pre></details>
+<details class="tool"><summary>Read R/permute-axes.R</summary>
+<pre class="output">1	#' Permute the axes of an array
+2	#'
+3	#' `rray_permute_axes()` reorders the axes of an array.
+4	#'
+5	#' @details
+6	#' Names travel with their axis to its new position.
+7	#'
+8	#' `rray_permute_axes(x, c(2, 1))` transposes a matrix, like [t()].
+9	#'
+10	#' @param x An array.
+11	#'
+12	#' @param axes An integer vector. It must use each axis of `x` exactly once.
+13	#'
+14	#' @returns
+15	#' An array with the axes of `x` reordered by `axes`.
+16	#'
+17	#' @export
+18	#' @examples
+19	#' x &lt;- array(1:6, c(2, 3))
+20	#'
+21	#' # Transpose a matrix
+22	#' rray_permute_axes(x, c(2, 1))
+23	#'
+24	#' y &lt;- array(1:24, c(4, 3, 2))
+25	#'
+26	#' # Reverse every axis
+27	#' # (4, 3, 2) -&gt; (2, 3, 4)
+28	#' rray_dimensions(rray_permute_axes(y, c(3, 2, 1)))
+29	#'
+30	#' # Swap the first two axes, leaving the third alone
+31	#' # (4, 3, 2) -&gt; (3, 4, 2)
+32	#' rray_dimensions(rray_permute_axes(y, c(2, 1, 3)))
+33	rray_permute_axes &lt;- function(x, axes) {
+34	  .Call(ffi_rray_permute_axes, x, axes, environment())
+35	}
+36	</pre></details>
+<details class="tool"><summary>Read src/permute-axes.c</summary>
+<pre class="output">1	#include &quot;permute-axes.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;strided-iterator.h&quot;
+7	#include &quot;strides.h&quot;
+8	#include &quot;utils.h&quot;
+9	
+10	#include &quot;decl/permute-axes-decl.h&quot;
+11	
+12	r_obj* ffi_rray_permute_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+13	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+14	  return rray_permute_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+15	}
+16	
+17	r_obj* rray_permute_axes(
+18	  r_obj* x,
+19	  r_obj* axes,
+20	  struct rray_arg* arg,
+21	  struct r_lazy error_call
+22	) {
+23	  check_unclassed(x, arg, error_call);
+24	  x = KEEP(arg_as_array(x, arg, error_call));
+25	
+26	  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+27	  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+28	
+29	  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+30	  check_max_dimensionality(dimensionality);
+31	
+32	  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+33	  rray_fill_strides_from_dimensions(
+34	    v_x_dimensions,
+35	    dimensionality,
+36	    v_x_strides
+37	  );
+38	
+39	  axes = KEEP(
+40	    arg_as_axes_permutation(axes, dimensionality, rray_args.axes, error_call)
+41	  );
+42	  const int* v_axes = r_int_cbegin(axes);
+43	
+44	  r_obj* dimensions = KEEP(r_alloc_integer(dimensionality));
+45	  int* v_dimensions = r_int_begin(dimensions);
+46	
+47	  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+48	
+49	  for (int i = 0; i &lt; dimensionality; ++i) {
+50	    const int axis = v_axes[i] - 1;
+51	    v_dimensions[i] = v_x_dimensions[axis];
+52	    v_strides[i] = v_x_strides[axis];
+53	  }
+54	
+55	  struct rray_strided_iterator_plan plan =
+56	    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);
+57	
+58	  r_obj* out;
+59	
+60	  switch (r_typeof(x)) {
+61	  case R_TYPE_logical:
+62	    out = rray_permute_axes_lgl(x, &amp;plan);
+63	    break;
+64	  case R_TYPE_integer:
+65	    out = rray_permute_axes_int(x, &amp;plan);
+66	    break;
+67	  case R_TYPE_double:
+68	    out = rray_permute_axes_dbl(x, &amp;plan);
+69	    break;
+70	  case R_TYPE_complex:
+71	    out = rray_permute_axes_cpl(x, &amp;plan);
+72	    break;
+73	  case R_TYPE_raw:
+74	    out = rray_permute_axes_raw(x, &amp;plan);
+75	    break;
+76	  case R_TYPE_character:
+77	    out = rray_permute_axes_chr(x, &amp;plan);
+78	    break;
+79	  case R_TYPE_list:
+80	    out = rray_permute_axes_list(x, &amp;plan);
+81	    break;
+82	  default:
+83	    r_stop_unreachable();
+84	  }
+85	
+86	  KEEP(out);
+87	  r_attrib_poke_dim(out, dimensions);
+88	
+89	  r_obj* names = KEEP(rray_permute_axes_names(x, v_axes, dimensionality));
+90	
+91	  if (names != r_null) {
+92	    r_attrib_poke_dim_names(out, names);
+93	  }
+94	
+95	  FREE(6);
+96	  return out;
+97	}
+98	
+99	#define RRAY_PERMUTE_AXES_ATOMIC(RTYPE, CTYPE, CONST_DEREF, DEREF)             \
+100	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+101	                                                                               \
+102	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+103	  CTYPE* v_out = DEREF(out);                                                   \
+104	                                                                               \
+105	  const CTYPE* v_x = CONST_DEREF(x);                                           \
+106	                                                                               \
+107	  r_ssize run_start = 0;                                                       \
+108	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+109	                                                                               \
+110	  r_ssize x_start = 0;                                                         \
+111	  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+112	                                                                               \
+113	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+114	  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \
+115	                                                                               \
+116	  while (run_start != size) {                                                  \
+117	    const r_ssize run_end = run_start + run_size;                              \
+118	    r_ssize x_loc = x_start;                                                   \
+119	                                                                               \
+120	    if (x_run_stride == 0) {                                                   \
+121	      const CTYPE x_elt = v_x[x_loc];                                          \
+122	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+123	        v_out[i] = x_elt;                                                      \
+124	      }                                                                        \
+125	    } else {                                                                   \
+126	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+127	        v_out[i] = v_x[x_loc];                                                 \
+128	        x_loc += x_run_stride;                                                 \
+129	      }                                                                        \
+130	    }                                                                          \
+131	                                                                               \
+132	    run_start = run_end;                                                       \
+133	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+134	  }                                                                            \
+135	                                                                               \
+136	  FREE(1);                                                                     \
+137	  return out;
+138	
+139	#define RRAY_PERMUTE_AXES_BARRIER(RTYPE, CONST_DEREF, POKE)                    \
+140	  const r_ssize size = rray_strided_iterator_plan_size(plan);                  \
+141	                                                                               \
+142	  r_obj* out = KEEP(r_alloc_vector(RTYPE, size));                              \
+143	                                                                               \
+144	  r_obj* const* v_x = CONST_DEREF(x);                                          \
+145	                                                                               \
+146	  r_ssize run_start = 0;                                                       \
+147	  const r_ssize run_size = rray_strided_iterator_plan_run_size(plan);          \
+148	                                                                               \
+149	  r_ssize x_start = 0;                                                         \
+150	  const r_ssize x_run_stride = rray_strided_iterator_plan_run_stride(plan);    \
+151	                                                                               \
+152	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+153	  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \
+154	                                                                               \
+155	  while (run_start != size) {                                                  \
+156	    const r_ssize run_end = run_start + run_size;                              \
+157	    r_ssize x_loc = x_start;                                                   \
+158	                                                                               \
+159	    if (x_run_stride == 0) {                                                   \
+160	      r_obj* const x_elt = v_x[x_loc];                                         \
+161	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+162	        POKE(out, i, x_elt);                                                   \
+163	      }                                                                        \
+164	    } else {                                                                   \
+165	      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+166	        POKE(out, i, v_x[x_loc]);                                              \
+167	        x_loc += x_run_stride;                                                 \
+168	      }                                                                        \
+169	    }                                                                          \
+170	                                                                               \
+171	    run_start = run_end;                                                       \
+172	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, plan);                        \
+173	  }                                                                            \
+174	                                                                               \
+175	  FREE(1);                                                                     \
+176	  return out;
+177	
+178	static r_obj* rray_permute_axes_lgl(
+179	  r_obj* x,
+180	  const struct rray_strided_iterator_plan* plan
+181	) {
+182	  RRAY_PERMUTE_AXES_ATOMIC(R_TYPE_logical, int, r_lgl_cbegin, r_lgl_begin);
+183	}
+184	
+185	static r_obj* rray_permute_axes_int(
+186	  r_obj* x,
+187	  const struct rray_strided_iterator_plan* plan
+188	) {
+189	  RRAY_PERMUTE_AXES_ATOMIC(R_TYPE_integer, int, r_int_cbegin, r_int_begin);
+190	}
+191	
+192	static r_obj* rray_permute_axes_dbl(
+193	  r_obj* x,
+194	  const struct rray_strided_iterator_plan* plan
+195	) {
+196	  RRAY_PERMUTE_AXES_ATOMIC(R_TYPE_double, double, r_dbl_cbegin, r_dbl_begin);
+197	}
+198	
+199	static r_obj* rray_permute_axes_cpl(
+200	  r_obj* x,</pre><p class="cut">57 more lines cut</p></details>
+<details class="tool"><summary>Read src/axes.c</summary>
+<pre class="output">1	#include &quot;axes.h&quot;
+2	
+3	#include &quot;dimensionality.h&quot;
+4	#include &quot;utils.h&quot;
+5	
+6	r_obj* arg_as_axes(
+7	  r_obj* axes,
+8	  int dimensionality,
+9	  struct rray_arg* arg,
+10	  struct r_lazy error_call
+11	) {
+12	  if (r_typeof(axes) != R_TYPE_integer) {
+13	    axes = vec_cast(axes, r_globals.empty_int, arg, NULL);
+14	  }
+15	  KEEP(axes);
+16	
+17	  if (r_attrib_has_any(axes)) {
+18	    r_abort_lazy_call(
+19	      error_call,
+20	      &quot;%s can't have attributes.&quot;,
+21	      rray_arg_format(arg)
+22	    );
+23	  }
+24	
+25	  const r_ssize axes_size = r_length(axes);
+26	
+27	  const int* v_axes = r_int_cbegin(axes);
+28	
+29	  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+30	    const int axis = v_axes[i];
+31	
+32	    if (axis == r_globals.na_int) {
+33	      r_abort_lazy_call(
+34	        error_call,
+35	        &quot;%s must not contain missing values.&quot;,
+36	        rray_arg_format(arg)
+37	      );
+38	    }
+39	
+40	    if (axis &lt; 1) {
+41	      r_abort_lazy_call(
+42	        error_call,
+43	        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+44	        rray_arg_format(arg),
+45	        axis
+46	      );
+47	    }
+48	
+49	    if (axis &gt; dimensionality) {
+50	      r_abort_lazy_call(
+51	        error_call,
+52	        &quot;%s must contain values less than or equal to the &quot;
+53	        &quot;dimensionality of %d, not %d.&quot;,
+54	        rray_arg_format(arg),
+55	        dimensionality,
+56	        axis
+57	      );
+58	    }
+59	
+60	    if (i &gt; 0 &amp;&amp; axis &lt;= v_axes[i - 1]) {
+61	      r_abort_lazy_call(
+62	        error_call,
+63	        &quot;%s must be in strictly increasing order.&quot;,
+64	        rray_arg_format(arg)
+65	      );
+66	    }
+67	  }
+68	
+69	  FREE(1);
+70	  return axes;
+71	}
+72	
+73	r_obj* arg_as_axes_permutation(
+74	  r_obj* axes,
+75	  int dimensionality,
+76	  struct rray_arg* arg,
+77	  struct r_lazy error_call
+78	) {
+79	  check_max_dimensionality(dimensionality);
+80	
+81	  if (r_typeof(axes) != R_TYPE_integer) {
+82	    axes = vec_cast(axes, r_globals.empty_int, arg, NULL);
+83	  }
+84	  KEEP(axes);
+85	
+86	  if (r_attrib_has_any(axes)) {
+87	    r_abort_lazy_call(
+88	      error_call,
+89	      &quot;%s can't have attributes.&quot;,
+90	      rray_arg_format(arg)
+91	    );
+92	  }
+93	
+94	  const r_ssize axes_size = r_length(axes);
+95	
+96	  if (axes_size != dimensionality) {
+97	    r_abort_lazy_call(
+98	      error_call,
+99	      &quot;%s must have length %d to match the dimensionality of the array, &quot;
+100	      &quot;not length %&quot; R_PRIdXLEN_T &quot;.&quot;,
+101	      rray_arg_format(arg),
+102	      dimensionality,
+103	      axes_size
+104	    );
+105	  }
+106	
+107	  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+108	
+109	  const int* v_axes = r_int_cbegin(axes);
+110	
+111	  for (int i = 0; i &lt; dimensionality; ++i) {
+112	    const int axis = v_axes[i];
+113	
+114	    if (axis == r_globals.na_int) {
+115	      r_abort_lazy_call(
+116	        error_call,
+117	        &quot;%s must not contain missing values.&quot;,
+118	        rray_arg_format(arg)
+119	      );
+120	    }
+121	
+122	    if (axis &lt; 1) {
+123	      r_abort_lazy_call(
+124	        error_call,
+125	        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+126	        rray_arg_format(arg),
+127	        axis
+128	      );
+129	    }
+130	
+131	    if (axis &gt; dimensionality) {
+132	      r_abort_lazy_call(
+133	        error_call,
+134	        &quot;%s must contain values less than or equal to the &quot;
+135	        &quot;dimensionality of %d, not %d.&quot;,
+136	        rray_arg_format(arg),
+137	        dimensionality,
+138	        axis
+139	      );
+140	    }
+141	
+142	    if (v_seen[axis - 1]) {
+143	      r_abort_lazy_call(
+144	        error_call,
+145	        &quot;%s must not contain axis %d more than once.&quot;,
+146	        rray_arg_format(arg),
+147	        axis
+148	      );
+149	    }
+150	
+151	    v_seen[axis - 1] = true;
+152	  }
+153	
+154	  FREE(1);
+155	  return axes;
+156	}
+157	
+158	void check_axis(
+159	  int axis,
+160	  int dimensionality,
+161	  struct rray_arg* arg,
+162	  struct r_lazy error_call
+163	) {
+164	  if (axis == r_globals.na_int) {
+165	    r_abort_lazy_call(
+166	      error_call,
+167	      &quot;%s must not be missing.&quot;,
+168	      rray_arg_format(arg)
+169	    );
+170	  }
+171	
+172	  if (axis &lt; 1) {
+173	    r_abort_lazy_call(
+174	      error_call,
+175	      &quot;%s must be greater than or equal to 1, not %d.&quot;,
+176	      rray_arg_format(arg),
+177	      axis
+178	    );
+179	  }
+180	
+181	  if (axis &gt; dimensionality) {
+182	    r_abort_lazy_call(
+183	      error_call,
+184	      &quot;%s must be less than or equal to the dimensionality of %d, &quot;
+185	      &quot;not %d.&quot;,
+186	      rray_arg_format(arg),
+187	      dimensionality,
+188	      axis
+189	    );
+190	  }
+191	}
+192	
+193	r_obj* rray_axes_complement(
+194	  const int* v_axes,
+195	  r_ssize axes_size,
+196	  int dimensionality
+197	) {
+198	  r_obj* out = KEEP(r_alloc_integer(dimensionality - axes_size));
+199	  int* v_out = r_int_begin(out);
+200	</pre><p class="cut">16 more lines cut</p></details>
+<details class="tool"><summary>Read src/axes.h</summary>
+<pre class="output">1	#ifndef RRAY_AXES_H
+2	#define RRAY_AXES_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	
+8	r_obj* arg_as_axes(
+9	  r_obj* axes,
+10	  int dimensionality,
+11	  struct rray_arg* arg,
+12	  struct r_lazy error_call
+13	);
+14	
+15	r_obj* arg_as_axes_permutation(
+16	  r_obj* axes,
+17	  int dimensionality,
+18	  struct rray_arg* arg,
+19	  struct r_lazy error_call
+20	);
+21	
+22	void check_axis(
+23	  int axis,
+24	  int dimensionality,
+25	  struct rray_arg* arg,
+26	  struct r_lazy error_call
+27	);
+28	
+29	r_obj* rray_axes_complement(
+30	  const int* v_axes,
+31	  r_ssize axes_size,
+32	  int dimensionality
+33	);
+34	
+35	#endif
+36	</pre></details>
+<details class="tool"><summary>Read src/arg.h</summary>
+<pre class="output">1	#ifndef RRAY_ARG_H
+2	#define RRAY_ARG_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	struct rray_arg {
+7	  r_obj* shelter;
+8	  struct rray_arg* parent;
+9	  r_ssize (*fill)(void* data, char* buf, r_ssize remaining);
+10	  void* data;
+11	};
+12	
+13	struct rray_args {
+14	  struct rray_arg* empty;
+15	  struct rray_arg* x;
+16	  struct rray_arg* y;
+17	  struct rray_arg* names;
+18	  struct rray_arg* axis;
+19	  struct rray_arg* axes;
+20	  struct rray_arg* dimensions;
+21	  struct rray_arg* dot_dimensions;
+22	};
+23	
+24	extern struct rray_args rray_args;
+25	
+26	r_obj* rray_arg(struct rray_arg* arg);
+27	
+28	const char* rray_arg_format(struct rray_arg* arg);
+29	
+30	const char* rray_arg_format_input(struct rray_arg* arg);
+31	
+32	bool rray_arg_is_empty(struct rray_arg* arg);
+33	
+34	struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+35	
+36	struct rray_arg new_lazy_arg(struct r_lazy* arg);
+37	
+38	struct rray_arg* new_subscript_arg(
+39	  struct rray_arg* parent,
+40	  r_obj* names,
+41	  r_ssize n,
+42	  r_ssize* p_i
+43	);
+44	
+45	#endif
+46	</pre></details>
+<details class="tool"><summary>Read src/permute-axes.h</summary>
+<pre class="output">1	#ifndef RRAY_PERMUTE_AXES_H
+2	#define RRAY_PERMUTE_AXES_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	
+8	r_obj* rray_permute_axes(
+9	  r_obj* x,
+10	  r_obj* axes,
+11	  struct rray_arg* arg,
+12	  struct r_lazy error_call
+13	);
+14	
+15	#endif
+16	</pre></details>
+<details class="tool"><summary>Read src/decl/permute-axes-decl.h</summary>
+<pre class="output">1	static r_obj* rray_permute_axes_lgl(
+2	  r_obj* x,
+3	  const struct rray_strided_iterator_plan* plan
+4	);
+5	static r_obj* rray_permute_axes_int(
+6	  r_obj* x,
+7	  const struct rray_strided_iterator_plan* plan
+8	);
+9	static r_obj* rray_permute_axes_dbl(
+10	  r_obj* x,
+11	  const struct rray_strided_iterator_plan* plan
+12	);
+13	static r_obj* rray_permute_axes_cpl(
+14	  r_obj* x,
+15	  const struct rray_strided_iterator_plan* plan
+16	);
+17	static r_obj* rray_permute_axes_raw(
+18	  r_obj* x,
+19	  const struct rray_strided_iterator_plan* plan
+20	);
+21	static r_obj* rray_permute_axes_chr(
+22	  r_obj* x,
+23	  const struct rray_strided_iterator_plan* plan
+24	);
+25	static r_obj* rray_permute_axes_list(
+26	  r_obj* x,
+27	  const struct rray_strided_iterator_plan* plan
+28	);
+29	
+30	static r_obj* rray_permute_axes_names(
+31	  r_obj* x,
+32	  const int* v_axes,
+33	  int dimensionality
+34	);
+35	</pre></details>
+<details class="tool"><summary>Bash: ls tests/testthat &amp;&amp; cat src/arg.c | head -80 &amp;&amp; echo ---- &amp;&amp; cat src/init.c | head -60 &amp;&amp; ec…</summary>
+<pre>ls tests/testthat &amp;&amp; cat src/arg.c | head -80 &amp;&amp; echo ---- &amp;&amp; cat src/init.c | head -60 &amp;&amp; echo ---- &amp;&amp; cat R/squeeze.R</pre><pre class="output">_snaps
+helper-ptype.R
+helper-wrapper.R
+test-arithmetic-add.R
+test-arithmetic-divide.R
+test-arithmetic-exponentiate.R
+test-arithmetic-multiply.R
+test-arithmetic-subtract.R
+test-broadcast-names.R
+test-broadcast.R
+test-cast-common.R
+test-cast.R
+test-compare.R
+test-dimensionality.R
+test-dimensions.R
+test-equal.R
+test-extremum.R
+test-names.R
+test-permute-axes.R
+test-ptype-common.R
+test-ptype.R
+test-reduce-logical.R
+test-reduce-mean.R
+test-reduce-names.R
+test-reduce-product.R
+test-reduce-sum.R
+test-size.R
+test-split-names.R
+test-split.R
+test-squeeze.R
+test-wrapper.R
+#include &quot;arg.h&quot;
+
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+#include &quot;utils.h&quot;
+
+#include &quot;decl/arg-decl.h&quot;
+
+#define RRAY_ARG_BUFFER_SIZE 100
+
+r_obj* rray_arg(struct rray_arg* arg) {
+  if (arg == NULL) {
+    return r_chrs.empty_string;
+  }
+
+  r_ssize size = RRAY_ARG_BUFFER_SIZE;
+
+  while (true) {
+    r_obj* shelter = KEEP(r_alloc_raw(size));
+    char* buf = (char*) r_raw_begin(shelter);
+
+    if (fill_arg_buffer(arg, buf, 0, size) &gt;= 0) {
+      r_obj* out = r_chr(buf);
+      FREE(1);
+      return out;
+    }
+
+    FREE(1);
+    size += size / 2;
+  }
+}
+
+const char* rray_arg_format(struct rray_arg* arg) {
+  r_obj* chr = KEEP(rray_arg(arg));
+  const char* out = r_format_error_arg(chr);
+  FREE(1);
+  return out;
+}
+
+const char* rray_arg_format_input(struct rray_arg* arg) {
+  if (rray_arg_is_empty(arg)) {
+    return &quot;Input&quot;;
+  }
+
+  return rray_arg_format(arg);
+}
+
+static r_ssize fill_arg_buffer(
+  struct rray_arg* arg,
+  char* buf,
+  r_ssize cur_size,
+  r_ssize tot_size
+) {
+  if (arg-&gt;parent != NULL) {
+    cur_size = fill_arg_buffer(arg-&gt;parent, buf, cur_size, tot_size);
+
+    if (cur_size &lt; 0) {
+      return cur_size;
+    }
+  }
+
+  const r_ssize written =
+    arg-&gt;fill(arg-&gt;data, buf + cur_size, tot_size - cur_size);
+
+  if (written &lt; 0) {
+    return written;
+  }
+
+  return cur_size + written;
+}
+
+static r_ssize str_arg_fill(const char* data, char* buf, r_ssize remaining) {
+  const r_ssize len = (r_ssize) strlen(data);
+
+  if (len &gt;= remaining) {
+    return -1;
+  }
+
+  r_memcpy(buf, data, len);
+----
+#include &lt;R_ext/Rdynload.h&gt;
+#include &lt;stdlib.h&gt;
+
+#include &quot;rlang.h&quot;
+
+extern r_obj* ffi_rray_broadcast(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_broadcast_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_size(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_names(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_axis_names(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_row_names(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_col_names(r_obj* ffi_x, r_obj* ffi_frame);
+extern r_obj* ffi_rray_set_names(
+  r_obj* ffi_x,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_set_axis_names(
+  r_obj* ffi_x,
+  r_obj* ffi_axis,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_set_row_names(
+  r_obj* ffi_x,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_set_col_names(
+  r_obj* ffi_x,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions);
+extern r_obj* ffi_rray_broadcast_names2(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_dimensions
+);
+extern r_obj* ffi_rray_broadcast_names_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions
+);
+extern r_obj* ffi_rray_reduce_names(r_obj* ffi_x, r_obj* ffi_axes);
+extern r_obj* ffi_rray_split_names(r_obj* ffi_x, r_obj* ffi_axes);
+extern r_obj* ffi_rray_dimensions_common(
+----
+#' Squeeze axes
+#'
+#' `rray_squeeze()` drops axes with a dimension of 1.
+#'
+#' @details
+#' Squeezed axes lose their names.
+#' Surviving axes keep their names and carry them to their new positions.
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to squeeze. Each selected axis must
+#'   have a dimension of 1. At least one axis must remain.
+#'
+#' @returns
+#' An array with the selected `axes` removed.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:10, c(10, 1, 1))
+#'
+#' rray_squeeze(x, 2)
+#' rray_squeeze(x, c(2, 3))
+rray_squeeze &lt;- function(x, axes) {
+  .Call(ffi_rray_squeeze, x, axes, environment())
+}</pre></details>
+<details class="tool"><summary>Read src/squeeze.c</summary>
+<pre class="output">1	#include &quot;squeeze.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;utils.h&quot;
+7	#include &quot;wrapper.h&quot;
+8	
+9	r_obj* ffi_rray_squeeze(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+10	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+11	  return rray_squeeze(ffi_x, ffi_axes, rray_args.x, error_call);
+12	}
+13	
+14	r_obj* rray_squeeze(
+15	  r_obj* x,
+16	  r_obj* axes,
+17	  struct rray_arg* arg,
+18	  struct r_lazy error_call
+19	) {
+20	  check_unclassed(x, arg, error_call);
+21	  x = KEEP(arg_as_array(x, arg, error_call));
+22	
+23	  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+24	  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+25	  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+26	
+27	  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+28	  const int* v_axes = r_int_cbegin(axes);
+29	  const r_ssize axes_size = r_length(axes);
+30	
+31	  if (axes_size == dimensionality) {
+32	    r_abort_lazy_call(error_call, &quot;`axes` can't squeeze every axis.&quot;);
+33	  }
+34	
+35	  const int out_dimensionality = dimensionality - (int) axes_size;
+36	
+37	  r_obj* out_dimensions = KEEP(r_alloc_integer(out_dimensionality));
+38	  int* v_out_dimensions = r_int_begin(out_dimensions);
+39	
+40	  r_obj* x_names = r_dim_names(x);
+41	  r_obj* const* v_x_names = x_names == r_null ? NULL : r_list_cbegin(x_names);
+42	
+43	  r_obj* out_names = r_null;
+44	  r_keep_loc out_names_loc;
+45	  KEEP_HERE(out_names, &amp;out_names_loc);
+46	
+47	  r_ssize axes_i = 0;
+48	  int out_i = 0;
+49	
+50	  for (int i = 0; i &lt; dimensionality; ++i) {
+51	    // Check if we are squeezing this axis
+52	    if (axes_i &lt; axes_size &amp;&amp; v_axes[axes_i] - 1 == i) {
+53	      if (v_x_dimensions[i] != 1) {
+54	        r_abort_lazy_call(
+55	          error_call,
+56	          &quot;Can't squeeze axis %d of %s because it has dimension %d, not 1.&quot;,
+57	          i + 1,
+58	          rray_arg_format(arg),
+59	          v_x_dimensions[i]
+60	        );
+61	      }
+62	
+63	      ++axes_i;
+64	      continue;
+65	    }
+66	
+67	    // Shift all unsqueezed axes left
+68	    v_out_dimensions[out_i] = v_x_dimensions[i];
+69	
+70	    if (v_x_names != NULL &amp;&amp; v_x_names[i] != r_null) {
+71	      if (out_names == r_null) {
+72	        out_names = r_alloc_list(out_dimensionality);
+73	        KEEP_AT(out_names, out_names_loc);
+74	      }
+75	
+76	      r_list_poke(out_names, out_i, v_x_names[i]);
+77	    }
+78	
+79	    ++out_i;
+80	  }
+81	
+82	  r_obj* out = KEEP(r_wrap(x));
+83	  r_attrib_poke_dim(out, out_dimensions);
+84	
+85	  if (out_names != r_null) {
+86	    r_attrib_poke_dim_names(out, out_names);
+87	  }
+88	
+89	  FREE(6);
+90	  return out;
+91	}
+92	</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-permute-axes.R</summary>
+<pre class="output">1	test_that(&quot;transposes a matrix&quot;, {
+2	  x &lt;- array(1:6, c(2L, 3L))
+3	  expected &lt;- array(c(1L, 3L, 5L, 2L, 4L, 6L), c(3L, 2L))
+4	
+5	  expect_identical(rray_permute_axes(x, c(2L, 1L)), expected)
+6	})
+7	
+8	test_that(&quot;axis `i` of the result comes from axis `axes[i]` of `x`&quot;, {
+9	  x &lt;- array(1:24, c(4L, 3L, 2L))
+10	  out &lt;- rray_permute_axes(x, c(2L, 3L, 1L))
+11	
+12	  expect_identical(rray_dimensions(out), c(3L, 2L, 4L))
+13	  expect_identical(out[2L, 1L, 3L], x[3L, 2L, 1L])
+14	})
+15	
+16	test_that(&quot;an identity permutation returns the input&quot;, {
+17	  x &lt;- array(1:24, c(4L, 3L, 2L))
+18	  expect_identical(rray_permute_axes(x, c(1L, 2L, 3L)), x)
+19	})
+20	
+21	test_that(&quot;matches `aperm()` for every permutation of a 3D array&quot;, {
+22	  x &lt;- array(1:24, c(4L, 3L, 2L))
+23	
+24	  permutations &lt;- list(
+25	    c(1L, 2L, 3L),
+26	    c(1L, 3L, 2L),
+27	    c(2L, 1L, 3L),
+28	    c(2L, 3L, 1L),
+29	    c(3L, 1L, 2L),
+30	    c(3L, 2L, 1L)
+31	  )
+32	
+33	  for (permutation in permutations) {
+34	    expect_identical(rray_permute_axes(x, permutation), aperm(x, permutation))
+35	  }
+36	})
+37	
+38	test_that(&quot;matches `aperm()` for a 4D array&quot;, {
+39	  x &lt;- array(seq_len(7L * 5L * 3L * 2L), c(7L, 5L, 3L, 2L))
+40	
+41	  expect_identical(
+42	    rray_permute_axes(x, c(4L, 3L, 2L, 1L)),
+43	    aperm(x, c(4L, 3L, 2L, 1L))
+44	  )
+45	  expect_identical(
+46	    rray_permute_axes(x, c(3L, 1L, 4L, 2L)),
+47	    aperm(x, c(3L, 1L, 4L, 2L))
+48	  )
+49	})
+50	
+51	test_that(&quot;names travel with their axis&quot;, {
+52	  x &lt;- array(
+53	    1:6,
+54	    c(1L, 2L, 3L),
+55	    dimnames = list(&quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;f&quot;))
+56	  )
+57	  out &lt;- rray_permute_axes(x, c(3L, 1L, 2L))
+58	
+59	  expect_identical(rray_names(out), list(c(&quot;d&quot;, &quot;e&quot;, &quot;f&quot;), &quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;)))
+60	})
+61	
+62	test_that(&quot;unnamed axes remain unnamed&quot;, {
+63	  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+64	  out &lt;- rray_permute_axes(x, c(2L, 1L))
+65	
+66	  expect_identical(rray_names(out), list(NULL, c(&quot;a&quot;, &quot;b&quot;)))
+67	})
+68	
+69	test_that(&quot;outer names of `dimnames()` are dropped&quot;, {
+70	  x &lt;- array(
+71	    1:6,
+72	    c(2L, 3L),
+73	    dimnames = list(rows = c(&quot;a&quot;, &quot;b&quot;), cols = c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
+74	  )
+75	
+76	  expect_named(dimnames(rray_permute_axes(x, c(2L, 1L))), NULL)
+77	})
+78	
+79	test_that(&quot;works with every native type&quot;, {
+80	  xs &lt;- list(
+81	    array(c(TRUE, FALSE), c(1L, 2L)),
+82	    array(1:2, c(1L, 2L)),
+83	    array(c(1, 2), c(1L, 2L)),
+84	    array(c(1i, 2i), c(1L, 2L)),
+85	    array(c(&quot;x&quot;, &quot;y&quot;), c(1L, 2L)),
+86	    array(as.raw(1:2), c(1L, 2L)),
+87	    array(list(&quot;x&quot;, &quot;y&quot;), c(1L, 2L))
+88	  )
+89	
+90	  for (x in xs) {
+91	    expect_identical(rray_permute_axes(x, c(2L, 1L)), aperm(x))
+92	  }
+93	})
+94	
+95	test_that(&quot;works with zero-size arrays&quot;, {
+96	  x &lt;- array(integer(), c(0L, 3L))
+97	  expect_identical(
+98	    rray_permute_axes(x, c(2L, 1L)),
+99	    array(integer(), c(3L, 0L))
+100	  )
+101	
+102	  x &lt;- array(integer(), c(0L, 0L, 2L))
+103	  expect_identical(
+104	    rray_permute_axes(x, c(3L, 2L, 1L)),
+105	    array(integer(), c(2L, 0L, 0L))
+106	  )
+107	})
+108	
+109	test_that(&quot;1D arrays come back unchanged&quot;, {
+110	  expect_identical(rray_permute_axes(array(1:3, 3L), 1L), array(1:3, 3L))
+111	
+112	  expected &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+113	  expect_identical(rray_permute_axes(c(a = 1L, b = 2L), 1L), expected)
+114	})
+115	
+116	test_that(&quot;errors on invalid `axes`&quot;, {
+117	  x &lt;- array(1:6, c(2L, 3L))
+118	
+119	  expect_snapshot(error = TRUE, {
+120	    rray_permute_axes(x, NULL)
+121	    rray_permute_axes(x, 1L)
+122	    rray_permute_axes(x, c(1L, 2L, 3L))
+123	    rray_permute_axes(x, c(1L, 1L))
+124	    rray_permute_axes(x, c(1L, 3L))
+125	    rray_permute_axes(x, c(1L, 0L))
+126	    rray_permute_axes(x, c(1L, NA_integer_))
+127	    rray_permute_axes(x, structure(c(1L, 2L), foo = &quot;bar&quot;))
+128	    rray_permute_axes(x, c(1.5, 2))
+129	    rray_permute_axes(x, &quot;x&quot;)
+130	  })
+131	})
+132	
+133	test_that(&quot;errors on non-array input&quot;, {
+134	  expect_snapshot(error = TRUE, {
+135	    rray_permute_axes(NULL, 1L)
+136	    rray_permute_axes(mean, 1L)
+137	  })
+138	})
+139	
+140	test_that(&quot;errors on classed input&quot;, {
+141	  x &lt;- structure(array(1L), class = &quot;foo&quot;)
+142	  expect_snapshot(rray_permute_axes(x, 1L), error = TRUE)
+143	})
+144	</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;rray_args&quot; src/arg.c | head -40; echo ----; sed -n '/struct rray_args rray_args/,/^}…</summary>
+<pre>grep -n &quot;rray_args&quot; src/arg.c | head -40; echo ----; sed -n '/struct rray_args rray_args/,/^}/p' src/arg.c; echo ----; cat _pkgdown.yml; echo ----; grep -n &quot;permute\|squeeze&quot; NAMESPACE src/init.c</pre><pre class="output">204:struct rray_args rray_args;
+209:  rray_args.ARG = &amp;ARG
+214:  rray_args.ARG = &amp;ARG
+----
+struct rray_args rray_args;
+
+#define INIT_ARG(ARG)                                                          \
+  static struct rray_arg ARG;                                                  \
+  ARG = new_wrapper_arg(NULL, #ARG);                                           \
+  rray_args.ARG = &amp;ARG
+
+#define INIT_ARG2(ARG, STR)                                                    \
+  static struct rray_arg ARG;                                                  \
+  ARG = new_wrapper_arg(NULL, STR);                                            \
+  rray_args.ARG = &amp;ARG
+
+void rray_init_args(r_obj* ns) {
+  INIT_ARG2(empty, &quot;&quot;);
+  INIT_ARG(x);
+  INIT_ARG(y);
+  INIT_ARG(names);
+  INIT_ARG(axis);
+  INIT_ARG(axes);
+  INIT_ARG(dimensions);
+  INIT_ARG2(dot_dimensions, &quot;.dimensions&quot;);
+}
+----
+url: https://github.com/DavisVaughan/rray4
+
+development:
+  mode: auto
+
+reference:
+- title: Dimensions
+  contents:
+  - rray_dimensions
+  - rray_dimensions_common
+  - rray_dimensionality
+  - rray_size
+  - rray_set_dimensions
+
+- title: Names
+  contents:
+  - rray_names
+  - rray_axis_names
+  - rray_row_names
+  - rray_col_names
+  - rray_set_names
+  - rray_set_axis_names
+  - rray_set_row_names
+  - rray_set_col_names
+
+- title: Manipulation
+  contents:
+  - rray_broadcast
+  - rray_broadcast_common
+  - rray_squeeze
+  - rray_split
+  - rray_permute_axes
+
+- title: Binary
+  contents:
+  - arithmetic
+  - extremum
+  - equal
+  - compare
+
+- title: Reducers
+  contents:
+  - reduce
+----
+src/init.c:71:extern r_obj* ffi_rray_squeeze(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame);
+src/init.c:72:extern r_obj* ffi_rray_permute_axes(
+src/init.c:193:  {&quot;ffi_rray_squeeze&quot;, (DL_FUNC) &amp;ffi_rray_squeeze, 3},
+src/init.c:194:  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+NAMESPACE:26:export(rray_permute_axes)
+NAMESPACE:36:export(rray_squeeze)</pre></details>
+<p>Read <code>permute-axes.c</code>, <code>axes.c</code>, <code>squeeze.c</code>, and the arg plumbing. The plan is clear: <code>move-axes.c</code> validates, builds the permutation, and hands it to <code>rray_permute_axes()</code>. Two things are your call.</p>
+
+<details class="tool"><summary>Question: Where should the `axes` / `to` validator live?</summary>
+<p>Where should the <code>axes</code> / <code>to</code> validator live?</p>
+<ul>
+<li>Shared in axes.c (Recommended)</li>
+<li>Static helper in move-axes.c</li>
+</ul>
+<p>How should the docs connect <code>rray_move_axes()</code> and <code>rray_permute_axes()</code>?</p>
+<ul>
+<li>@seealso both ways (Recommended)</li>
+<li>One shared help page</li>
+<li>@family axes</li>
+</ul>
+<pre class="output">The user answered: &quot;Where should the `axes` / `to` validator live?&quot;=&quot;Shared but call it arg_as_axes_unsorted()&quot;, &quot;How should the docs connect `rray_move_axes()` and `rray_permute_axes()`?&quot;=&quot;@seealso both ways (Recommended)&quot;. Read the answers carefully — they may request clarification, changes, or that you not proceed — and follow what they actually say.</pre></details>
+<details class="tool"><summary>Read src/utils.h</summary>
+<pre class="output">1	#ifndef RRAY_UTILS_H
+2	#define RRAY_UTILS_H
+3	
+4	#include &lt;complex.h&gt;
+5	#include &lt;string.h&gt;
+6	
+7	#include &quot;rlang.h&quot;
+8	
+9	#include &quot;arg.h&quot;
+10	#include &quot;type.h&quot;
+11	
+12	// Operations such as `*`, `/`, and `^` are either more efficient or more
+13	// correct (around infinities) if they go through the C99 `_Complex`. The C99
+14	// standard guarantees that `_Complex` has the same representation as a two
+15	// element array of its real type, so we can `memcpy()` it over. Analysis of
+16	// the assembly shows that this copy disappears entirely, so it's not a
+17	// performance hit.
+18	static inline double _Complex rray_cpl_to_c99(r_complex x) {
+19	  double _Complex out;
+20	  memcpy(&amp;out, &amp;x, sizeof(out));
+21	  return out;
+22	}
+23	
+24	static inline r_complex rray_c99_to_cpl(double _Complex x) {
+25	  r_complex out;
+26	  memcpy(&amp;out, &amp;x, sizeof(out));
+27	  return out;
+28	}
+29	
+30	void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+31	
+32	r_no_return void stop_scalar_input(
+33	  r_obj* x,
+34	  struct rray_arg* arg,
+35	  struct r_lazy error_call
+36	);
+37	
+38	r_obj* vec_as_array(r_obj* x);
+39	
+40	r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+41	
+42	int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+43	
+44	bool r_has_name_at(r_obj* names, r_ssize i);
+45	
+46	r_obj* vec_cast(
+47	  r_obj* x,
+48	  r_obj* to,
+49	  struct rray_arg* x_arg,
+50	  struct rray_arg* to_arg
+51	);
+52	
+53	#endif
+54	</pre></details>
+<details class="tool"><summary>Read src/dimensionality.h</summary>
+<pre class="output">1	#ifndef RRAY_DIMENSIONALITY_H
+2	#define RRAY_DIMENSIONALITY_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	#include &quot;arg.h&quot;
+7	
+8	#define RRAY_MAX_DIMENSIONALITY 64
+9	
+10	int rray_dimensionality(
+11	  r_obj* x,
+12	  struct rray_arg* arg,
+13	  struct r_lazy error_call
+14	);
+15	int rray_dimensionality_from_dimensions(r_obj* dimensions);
+16	
+17	void check_max_dimensionality(int dimensionality);
+18	
+19	#endif
+20	</pre></details>
+<details class="tool"><summary>Read src/dimensionality.c</summary>
+<pre class="output">1	#include &quot;dimensionality.h&quot;
+2	
+3	#include &quot;dimensions.h&quot;
+4	
+5	r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+6	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+7	  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+8	}
+9	
+10	int rray_dimensionality(
+11	  r_obj* x,
+12	  struct rray_arg* arg,
+13	  struct r_lazy error_call
+14	) {
+15	  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+16	  return rray_dimensionality_from_dimensions(dimensions);
+17	}
+18	
+19	int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+20	  return (int) r_length(dimensions);
+21	}
+22	
+23	void check_max_dimensionality(int dimensionality) {
+24	  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+25	    r_abort(
+26	      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+27	      &quot;A dimensionality of %d was requested.&quot;,
+28	      RRAY_MAX_DIMENSIONALITY,
+29	      dimensionality
+30	    );
+31	  }
+32	}
+33	</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/move-axes &amp;&amp; git status</summary>
+<pre>git checkout -b feature/move-axes &amp;&amp; git status</pre><pre class="output">Switched to a new branch 'feature/move-axes'
+On branch feature/move-axes
+nothing to commit, working tree clean</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,80p' src/dimensions.c</summary>
+<pre>sed -n '1,80p' src/dimensions.c</pre><pre class="output">#include &quot;dimensions.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/dimensions-decl.h&quot;
+
+r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_dimensions(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim(x);
+  FREE(1);
+  return out;
+}
+
+int rray_dimension(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return r_int_get(dimensions, axis - 1);
+}
+
+bool rray_dimensions_are_equal(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality
+) {
+  if (x_dimensionality != y_dimensionality) {
+    return false;
+  }
+
+  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    if (v_x_dimensions[i] != v_y_dimensions[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+r_obj* ffi_rray_set_dimensions(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_dimensions(ffi_x, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_set_dimensions(
+  r_obj* x,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  dimensions =
+    KEEP(arg_as_dimensions(dimensions, rray_args.dimensions, error_call));
+
+  const r_ssize x_size = rray_size(x, arg, error_call);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  const int* v_dimensions = r_int_cbegin(dimensions);</pre></details>
+<details class="tool"><summary>Bash: sed -n '60,90p' src/init.c; echo ----; sed -n '185,200p' src/init.c</summary>
+<pre>sed -n '60,90p' src/init.c; echo ----; sed -n '185,200p' src/init.c</pre><pre class="output">extern r_obj* ffi_rray_dimensions_common(
+  r_obj* ffi_xs,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_set_dimensions(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_split(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame);
+extern r_obj* ffi_rray_squeeze(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame);
+extern r_obj* ffi_rray_permute_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_sum_along(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_product_along(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+);
+extern r_obj* ffi_rray_mean_along(
+  r_obj* ffi_x,
+----
+  {&quot;ffi_rray_broadcast_names2&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names2, 3},
+  {&quot;ffi_rray_broadcast_names_common&quot;,
+   (DL_FUNC) &amp;ffi_rray_broadcast_names_common,
+   2},
+  {&quot;ffi_rray_reduce_names&quot;, (DL_FUNC) &amp;ffi_rray_reduce_names, 2},
+  {&quot;ffi_rray_split_names&quot;, (DL_FUNC) &amp;ffi_rray_split_names, 2},
+  {&quot;ffi_rray_set_dimensions&quot;, (DL_FUNC) &amp;ffi_rray_set_dimensions, 3},
+  {&quot;ffi_rray_split&quot;, (DL_FUNC) &amp;ffi_rray_split, 3},
+  {&quot;ffi_rray_squeeze&quot;, (DL_FUNC) &amp;ffi_rray_squeeze, 3},
+  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+  {&quot;ffi_rray_sum_along&quot;, (DL_FUNC) &amp;ffi_rray_sum_along, 4},
+  {&quot;ffi_rray_product_along&quot;, (DL_FUNC) &amp;ffi_rray_product_along, 4},
+  {&quot;ffi_rray_mean_along&quot;, (DL_FUNC) &amp;ffi_rray_mean_along, 4},
+  {&quot;ffi_rray_all_along&quot;, (DL_FUNC) &amp;ffi_rray_all_along, 4},
+  {&quot;ffi_rray_any_along&quot;, (DL_FUNC) &amp;ffi_rray_any_along, 4},
+  {&quot;ffi_rray_ptype&quot;, (DL_FUNC) &amp;ffi_rray_ptype, 2},</pre></details>
+<p>Now writing the C.</p>
+
+<details class="tool"><summary>Write src/move-axes.h</summary>
+<pre>#ifndef RRAY_MOVE_AXES_H
+#define RRAY_MOVE_AXES_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_move_axes(
+  r_obj* x,
+  r_obj* axes,
+  r_obj* to,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/move-axes.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/move-axes.c</summary>
+<pre>#include &quot;move-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;permute-axes.h&quot;
+
+r_obj* ffi_rray_move_axes(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_to,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_move_axes(ffi_x, ffi_axes, ffi_to, rray_args.x, error_call);
+}
+
+r_obj* rray_move_axes(
+  r_obj* x,
+  r_obj* axes,
+  r_obj* to,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_max_dimensionality(dimensionality);
+
+  axes = KEEP(
+    arg_as_axes_unsorted(axes, dimensionality, rray_args.axes, error_call)
+  );
+  to =
+    KEEP(arg_as_axes_unsorted(to, dimensionality, rray_args.to, error_call));
+
+  const r_ssize axes_size = r_length(axes);
+  const r_ssize to_size = r_length(to);
+
+  if (axes_size != to_size) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;`axes` and `to` must be the same length, not lengths %&quot; R_PRIdXLEN_T
+      &quot; and %&quot; R_PRIdXLEN_T &quot;.&quot;,
+      axes_size,
+      to_size
+    );
+  }
+
+  const int* v_axes = r_int_cbegin(axes);
+  const int* v_to = r_int_cbegin(to);
+
+  r_obj* permutation = KEEP(r_alloc_integer(dimensionality));
+  int* v_permutation = r_int_begin(permutation);
+
+  bool v_moved[RRAY_MAX_DIMENSIONALITY] = {false};
+  bool v_filled[RRAY_MAX_DIMENSIONALITY] = {false};
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+    const int location = v_to[i];
+
+    v_permutation[location - 1] = axis;
+    v_moved[axis - 1] = true;
+    v_filled[location - 1] = true;
+  }
+
+  int axis = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    if (v_filled[i]) {
+      continue;
+    }
+
+    while (v_moved[axis - 1]) {
+      ++axis;
+    }
+
+    v_permutation[i] = axis;
+    ++axis;
+  }
+
+  r_obj* out = KEEP(rray_permute_axes(x, permutation, arg, error_call));
+
+  FREE(4);
+  return out;
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/move-axes.c (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now the shared validator and arg plumbing.</p>
+
+<details class="tool"><summary>Edit src/axes.c</summary>
+<pre class="diff"><span class="del">-r_obj* arg_as_axes_permutation(</span>
+<span class="ins">+r_obj* arg_as_axes_unsorted(</span>
+<span class="ins">+  r_obj* axes,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+) {</span>
+<span class="ins">+  check_max_dimensionality(dimensionality);</span>
+<span class="ins">+</span>
+<span class="ins">+  if (r_typeof(axes) != R_TYPE_integer) {</span>
+<span class="ins">+    axes = vec_cast(axes, r_globals.empty_int, arg, NULL);</span>
+<span class="ins">+  }</span>
+<span class="ins">+  KEEP(axes);</span>
+<span class="ins">+</span>
+<span class="ins">+  if (r_attrib_has_any(axes)) {</span>
+<span class="ins">+    r_abort_lazy_call(</span>
+<span class="ins">+      error_call,</span>
+<span class="ins">+      &quot;%s can't have attributes.&quot;,</span>
+<span class="ins">+      rray_arg_format(arg)</span>
+<span class="ins">+    );</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  const r_ssize axes_size = r_length(axes);</span>
+<span class="ins">+</span>
+<span class="ins">+  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};</span>
+<span class="ins">+</span>
+<span class="ins">+  const int* v_axes = r_int_cbegin(axes);</span>
+<span class="ins">+</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; axes_size; ++i) {</span>
+<span class="ins">+    const int axis = v_axes[i];</span>
+<span class="ins">+</span>
+<span class="ins">+    if (axis == r_globals.na_int) {</span>
+<span class="ins">+      r_abort_lazy_call(</span>
+<span class="ins">+        error_call,</span>
+<span class="ins">+        &quot;%s must not contain missing values.&quot;,</span>
+<span class="ins">+        rray_arg_format(arg)</span>
+<span class="ins">+      );</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    if (axis &lt; 1) {</span>
+<span class="ins">+      r_abort_lazy_call(</span>
+<span class="ins">+        error_call,</span>
+<span class="ins">+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,</span>
+<span class="ins">+        rray_arg_format(arg),</span>
+<span class="ins">+        axis</span>
+<span class="ins">+      );</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    if (axis &gt; dimensionality) {</span>
+<span class="ins">+      r_abort_lazy_call(</span>
+<span class="ins">+        error_call,</span>
+<span class="ins">+        &quot;%s must contain values less than or equal to the &quot;</span>
+<span class="ins">+        &quot;dimensionality of %d, not %d.&quot;,</span>
+<span class="ins">+        rray_arg_format(arg),</span>
+<span class="ins">+        dimensionality,</span>
+<span class="ins">+        axis</span>
+<span class="ins">+      );</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    if (v_seen[axis - 1]) {</span>
+<span class="ins">+      r_abort_lazy_call(</span>
+<span class="ins">+        error_call,</span>
+<span class="ins">+        &quot;%s must not contain %d more than once.&quot;,</span>
+<span class="ins">+        rray_arg_format(arg),</span>
+<span class="ins">+        axis</span>
+<span class="ins">+      );</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    v_seen[axis - 1] = true;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(1);</span>
+<span class="ins">+  return axes;</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* arg_as_axes_permutation(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/axes.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/axes.h</summary>
+<pre class="diff"><span class="del">-r_obj* arg_as_axes_permutation(</span>
+<span class="ins">+r_obj* arg_as_axes_unsorted(</span>
+<span class="ins">+  r_obj* axes,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  struct rray_arg* arg,</span>
+<span class="ins">+  struct r_lazy error_call</span>
+<span class="ins">+);</span>
+<span class="ins">+</span>
+<span class="ins">+r_obj* arg_as_axes_permutation(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/axes.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/arg.h</summary>
+<pre class="diff"><span class="del">-  struct rray_arg* axes;</span>
+<span class="ins">+  struct rray_arg* axes;</span>
+<span class="ins">+  struct rray_arg* to;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/arg.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/arg.c</summary>
+<pre class="diff"><span class="del">-  INIT_ARG(axes);</span>
+<span class="del">-  INIT_ARG(dimensions);</span>
+<span class="ins">+  INIT_ARG(axes);</span>
+<span class="ins">+  INIT_ARG(to);</span>
+<span class="ins">+  INIT_ARG(dimensions);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/arg.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now register the FFI function.</p>
+
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-extern r_obj* ffi_rray_sum_along(</span>
+<span class="ins">+extern r_obj* ffi_rray_move_axes(</span>
+<span class="ins">+  r_obj* ffi_x,</span>
+<span class="ins">+  r_obj* ffi_axes,</span>
+<span class="ins">+  r_obj* ffi_to,</span>
+<span class="ins">+  r_obj* ffi_frame</span>
+<span class="ins">+);</span>
+<span class="ins">+extern r_obj* ffi_rray_sum_along(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/init.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-  {&quot;ffi_rray_sum_along&quot;, (DL_FUNC) &amp;ffi_rray_sum_along, 4},</span>
+<span class="ins">+  {&quot;ffi_rray_move_axes&quot;, (DL_FUNC) &amp;ffi_rray_move_axes, 4},</span>
+<span class="ins">+  {&quot;ffi_rray_sum_along&quot;, (DL_FUNC) &amp;ffi_rray_sum_along, 4},</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/init.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write R/move-axes.R</summary>
+<pre>#' Move the axes of an array
+#'
+#' `rray_move_axes()` moves `axes` to new positions. The axes that don't move
+#' keep their relative order, and fill in the positions that are left over.
+#'
+#' @details
+#' Names travel with their axis to its new position.
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to move. It must not use an axis of
+#'   `x` more than once.
+#'
+#' @param to An integer vector of positions to move `axes` to. `axes[[i]]` ends
+#'   up at position `to[[i]]`. It must be the same length as `axes`, and must
+#'   not use a position more than once.
+#'
+#' @returns
+#' An array with the `axes` of `x` moved to the positions in `to`.
+#'
+#' @seealso [rray_permute_axes()]
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:24, c(2, 3, 4))
+#'
+#' # Move the first axis to the end
+#' # (2, 3, 4) -&gt; (3, 4, 2)
+#' rray_dimensions(rray_move_axes(x, 1, 3))
+#'
+#' # Move the last axis to the front
+#' # (2, 3, 4) -&gt; (4, 2, 3)
+#' rray_dimensions(rray_move_axes(x, 3, 1))
+#'
+#' # Move two axes at once, the axis that stays fills in what is left
+#' # (2, 3, 4) -&gt; (4, 2, 3)
+#' rray_dimensions(rray_move_axes(x, c(1, 3), c(2, 1)))
+#'
+#' # Swap the first two axes
+#' # (2, 3, 4) -&gt; (3, 2, 4)
+#' rray_dimensions(rray_move_axes(x, c(1, 2), c(2, 1)))
+rray_move_axes &lt;- function(x, axes, to) {
+  .Call(ffi_rray_move_axes, x, axes, to, environment())
+}</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/R/move-axes.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit R/permute-axes.R</summary>
+<pre class="diff"><span class="del">-#' An array with the axes of `x` reordered by `axes`.</span>
+<span class="del">-#'</span>
+<span class="del">-#' @export</span>
+<span class="ins">+#' An array with the axes of `x` reordered by `axes`.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @seealso [rray_move_axes()]</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @export</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/permute-axes.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit _pkgdown.yml</summary>
+<pre class="diff"><span class="del">-  - rray_permute_axes</span>
+<span class="ins">+  - rray_permute_axes</span>
+<span class="ins">+  - rray_move_axes</span></pre><pre class="output">The file ~/files/r/packages/rray4/_pkgdown.yml has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat</pre><pre class="output"> R/permute-axes.R |  2 ++
+ _pkgdown.yml     |  1 +
+ src/arg.c        |  1 +
+ src/arg.h        |  1 +
+ src/axes.c       | 74 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/axes.h       |  7 ++++++
+ src/init.c       |  7 ++++++
+ 7 files changed, 93 insertions(+)</pre></details>
+<p>Now document, compile, and test.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -20</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -20</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c strides.c -o strides.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c syms.c -o syms.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c type.c -o type.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c typeof2.c -o typeof2.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c utils.c -o utils.o
+clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c wrapper.c -o wrapper.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray4.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o compare.o dimensionality.o dimensions.o equal.o extremum.o init.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-logical.o reduce-mean.o reduce-names.o reduce-product.o reduce-sum.o reduce.o rlang.o size.o split-names.o split.o squeeze.o strides.o syms.o type.o typeof2.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+installing to /private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpxqD94Z/devtools_install_129f467f901a7/00LOCK-rray4/00new/rray4/libs
+** checking absolute paths in shared objects and dynamic libraries
+* DONE (rray4)
+✖ permute-axes.R:17: @seealso Could not resolve link to topic &quot;rray_move_axes&quot;
+  in the dependencies or base packages.
+ℹ If you haven't documented &quot;rray_move_axes&quot; yet, or just changed its name,
+  this is normal. Once &quot;rray_move_axes&quot; is documented, this warning goes away.
+ℹ Make sure that the name of the topic is spelled correctly.
+ℹ Always list the linked package as a dependency.
+ℹ Alternatively, you can fully qualify the link with a package name.
+Writing 'NAMESPACE'
+Writing 'rray_move_axes.Rd'
+Writing 'rray_permute_axes.Rd'</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -6</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -6</pre><pre class="output">ℹ Updating rray4 documentation
+ℹ Loading rray4</pre></details>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1:24, c(2, 3, 4))
+print(rray_dimensions(rray_move_axes(x, 1, 3)))
+print(rray_dimensions(rray_move_axes(x, 3, 1)))
+print(rray_dimensions(rray_move_axes(x, c(1, 3), c(2, 1))))
+print(rray_dimensions(rray_move_axes(x, c(1, 2), c(2, 1))))
+print(identical(rray_move_axes(x, 1, 3), aperm(x, c(2, 3, 1))))
+print(identical(rray_move_axes(x, integer(), integer()), x))
+try(rray_move_axes(x, c(1, 2), 1))
+try(rray_move_axes(x, c(1, 1), c(1, 2)))
+try(rray_move_axes(x, c(1, 2), c(3, 3)))
+try(rray_move_axes(x, 4, 1))
+'</pre><pre class="output">[1] 3 4 2
+[1] 4 2 3
+[1] 4 2 3
+[1] 3 2 4
+[1] TRUE
+[1] TRUE
+Error in rray_move_axes(x, c(1, 2), 1) : 
+  `axes` and `to` must be the same length, not lengths 2 and 1.
+Error in rray_move_axes(x, c(1, 1), c(1, 2)) : 
+  `axes` must not contain 1 more than once.
+Error in rray_move_axes(x, c(1, 2), c(3, 3)) : 
+  `to` must not contain 3 more than once.
+Error in rray_move_axes(x, 4, 1) : 
+  `axes` must contain values less than or equal to the dimensionality of 3, not 4.</pre></details>
+<p>Now tests.</p>
+
+<details class="tool"><summary>Write tests/testthat/test-move-axes.R</summary>
+<pre>test_that(&quot;moves a single axis&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_identical(rray_move_axes(x, 1L, 3L), aperm(x, c(2L, 3L, 1L)))
+  expect_identical(rray_move_axes(x, 3L, 1L), aperm(x, c(3L, 1L, 2L)))
+})
+
+test_that(&quot;`axes[[i]]` ends up at position `to[[i]]`&quot;, {
+  x &lt;- array(seq_len(7L * 5L * 3L * 2L), c(7L, 5L, 3L, 2L))
+  out &lt;- rray_move_axes(x, c(1L, 2L), c(4L, 3L))
+
+  expect_identical(rray_dimensions(out), c(3L, 2L, 5L, 7L))
+  expect_identical(out, aperm(x, c(3L, 4L, 2L, 1L)))
+})
+
+test_that(&quot;axes that don't move keep their relative order&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_identical(rray_dimensions(rray_move_axes(x, 2L, 1L)), c(3L, 2L, 4L))
+  expect_identical(
+    rray_dimensions(rray_move_axes(x, c(1L, 3L), c(2L, 1L))),
+    c(4L, 2L, 3L)
+  )
+})
+
+test_that(&quot;an identity move returns the input&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_identical(rray_move_axes(x, 2L, 2L), x)
+  expect_identical(rray_move_axes(x, c(1L, 2L, 3L), c(1L, 2L, 3L)), x)
+})
+
+test_that(&quot;moving no axes returns the input&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+  expect_identical(rray_move_axes(x, integer(), integer()), x)
+})
+
+test_that(&quot;names travel with their axis&quot;, {
+  x &lt;- array(
+    1:6,
+    c(1L, 2L, 3L),
+    dimnames = list(&quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;), c(&quot;d&quot;, &quot;e&quot;, &quot;f&quot;))
+  )
+  out &lt;- rray_move_axes(x, 3L, 1L)
+
+  expect_identical(rray_names(out), list(c(&quot;d&quot;, &quot;e&quot;, &quot;f&quot;), &quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;)))
+})
+
+test_that(&quot;works with zero-size arrays&quot;, {
+  x &lt;- array(integer(), c(0L, 3L, 2L))
+
+  expect_identical(
+    rray_move_axes(x, 1L, 3L),
+    array(integer(), c(3L, 2L, 0L))
+  )
+})
+
+test_that(&quot;1D arrays come back unchanged&quot;, {
+  expect_identical(rray_move_axes(array(1:3, 3L), 1L, 1L), array(1:3, 3L))
+
+  expected &lt;- array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+  expect_identical(rray_move_axes(c(a = 1L, b = 2L), 1L, 1L), expected)
+})
+
+test_that(&quot;works with every native type&quot;, {
+  xs &lt;- list(
+    array(c(TRUE, FALSE), c(1L, 2L)),
+    array(1:2, c(1L, 2L)),
+    array(c(1, 2), c(1L, 2L)),
+    array(c(1i, 2i), c(1L, 2L)),
+    array(c(&quot;x&quot;, &quot;y&quot;), c(1L, 2L)),
+    array(as.raw(1:2), c(1L, 2L)),
+    array(list(&quot;x&quot;, &quot;y&quot;), c(1L, 2L))
+  )
+
+  for (x in xs) {
+    expect_identical(rray_move_axes(x, 1L, 2L), aperm(x))
+  }
+})
+
+test_that(&quot;errors on invalid `axes`&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_snapshot(error = TRUE, {
+    rray_move_axes(x, c(1L, 1L), c(1L, 2L))
+    rray_move_axes(x, 4L, 1L)
+    rray_move_axes(x, 0L, 1L)
+    rray_move_axes(x, NA_integer_, 1L)
+    rray_move_axes(x, structure(1L, foo = &quot;bar&quot;), 1L)
+    rray_move_axes(x, 1.5, 1L)
+    rray_move_axes(x, &quot;x&quot;, 1L)
+  })
+})
+
+test_that(&quot;errors on invalid `to`&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_snapshot(error = TRUE, {
+    rray_move_axes(x, c(1L, 2L), c(3L, 3L))
+    rray_move_axes(x, 1L, 4L)
+    rray_move_axes(x, 1L, 0L)
+    rray_move_axes(x, 1L, NA_integer_)
+    rray_move_axes(x, 1L, structure(1L, foo = &quot;bar&quot;))
+    rray_move_axes(x, 1L, 1.5)
+    rray_move_axes(x, 1L, &quot;x&quot;)
+  })
+})
+
+test_that(&quot;`axes` and `to` must be the same length&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+
+  expect_snapshot(error = TRUE, {
+    rray_move_axes(x, c(1L, 2L), 1L)
+    rray_move_axes(x, 1L, c(1L, 2L))
+    rray_move_axes(x, 1L, integer())
+  })
+})
+
+test_that(&quot;errors on non-array input&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_move_axes(NULL, 1L, 1L)
+    rray_move_axes(mean, 1L, 1L)
+  })
+})
+
+test_that(&quot;errors on classed input&quot;, {
+  x &lt;- structure(array(1L), class = &quot;foo&quot;)
+  expect_snapshot(rray_move_axes(x, 1L, 1L), error = TRUE)
+})</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/tests/testthat/test-move-axes.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^move-axes')&quot; 2&gt;&amp;1 | tail -30</summary>
+<pre>air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^move-axes')&quot; 2&gt;&amp;1 | tail -30</pre><pre class="output">  Error in `rray_move_axes()`:
+  ! `axes` and `to` must be the same length, not lengths 1 and 2.
+Code
+  rray_move_axes(x, 1L, integer())
+Condition
+  Error in `rray_move_axes()`:
+  ! `axes` and `to` must be the same length, not lengths 1 and 0.
+
+WARNING: 'test-move-axes.R:120:3' -----------------
+Adding new snapshot:
+Code
+  rray_move_axes(NULL, 1L, 1L)
+Condition
+  Error in `rray_move_axes()`:
+  ! `x` must be an array, not `NULL`.
+Code
+  rray_move_axes(mean, 1L, 1L)
+Condition
+  Error in `rray_move_axes()`:
+  ! `x` must be an array, not a function.
+
+WARNING: 'test-move-axes.R:128:3' -----------------
+Adding new snapshot:
+Code
+  rray_move_axes(x, 1L, 1L)
+Condition
+  Error in `rray_move_axes()`:
+  ! `x` must be a bare array, not a &lt;foo&gt; object.
+
+[ FAIL 0 | WARN 5 | SKIP 0 | PASS 25 ]</pre></details>
+<details class="tool"><summary>Read tests/testthat/_snaps/move-axes.md</summary>
+<pre class="output">1	# errors on invalid `axes`
+2	
+3	    Code
+4	      rray_move_axes(x, c(1L, 1L), c(1L, 2L))
+5	    Condition
+6	      Error in `rray_move_axes()`:
+7	      ! `axes` must not contain 1 more than once.
+8	    Code
+9	      rray_move_axes(x, 4L, 1L)
+10	    Condition
+11	      Error in `rray_move_axes()`:
+12	      ! `axes` must contain values less than or equal to the dimensionality of 3, not 4.
+13	    Code
+14	      rray_move_axes(x, 0L, 1L)
+15	    Condition
+16	      Error in `rray_move_axes()`:
+17	      ! `axes` must contain values greater than or equal to 1, not 0.
+18	    Code
+19	      rray_move_axes(x, NA_integer_, 1L)
+20	    Condition
+21	      Error in `rray_move_axes()`:
+22	      ! `axes` must not contain missing values.
+23	    Code
+24	      rray_move_axes(x, structure(1L, foo = &quot;bar&quot;), 1L)
+25	    Condition
+26	      Error in `rray_move_axes()`:
+27	      ! `axes` can't have attributes.
+28	    Code
+29	      rray_move_axes(x, 1.5, 1L)
+30	    Condition
+31	      Error:
+32	      ! Can't convert from `axes` &lt;double&gt; to &lt;integer&gt; due to loss of precision.
+33	      * Locations: 1
+34	    Code
+35	      rray_move_axes(x, &quot;x&quot;, 1L)
+36	    Condition
+37	      Error:
+38	      ! Can't convert `axes` &lt;character&gt; to &lt;integer&gt;.
+39	
+40	# errors on invalid `to`
+41	
+42	    Code
+43	      rray_move_axes(x, c(1L, 2L), c(3L, 3L))
+44	    Condition
+45	      Error in `rray_move_axes()`:
+46	      ! `to` must not contain 3 more than once.
+47	    Code
+48	      rray_move_axes(x, 1L, 4L)
+49	    Condition
+50	      Error in `rray_move_axes()`:
+51	      ! `to` must contain values less than or equal to the dimensionality of 3, not 4.
+52	    Code
+53	      rray_move_axes(x, 1L, 0L)
+54	    Condition
+55	      Error in `rray_move_axes()`:
+56	      ! `to` must contain values greater than or equal to 1, not 0.
+57	    Code
+58	      rray_move_axes(x, 1L, NA_integer_)
+59	    Condition
+60	      Error in `rray_move_axes()`:
+61	      ! `to` must not contain missing values.
+62	    Code
+63	      rray_move_axes(x, 1L, structure(1L, foo = &quot;bar&quot;))
+64	    Condition
+65	      Error in `rray_move_axes()`:
+66	      ! `to` can't have attributes.
+67	    Code
+68	      rray_move_axes(x, 1L, 1.5)
+69	    Condition
+70	      Error:
+71	      ! Can't convert from `to` &lt;double&gt; to &lt;integer&gt; due to loss of precision.
+72	      * Locations: 1
+73	    Code
+74	      rray_move_axes(x, 1L, &quot;x&quot;)
+75	    Condition
+76	      Error:
+77	      ! Can't convert `to` &lt;character&gt; to &lt;integer&gt;.
+78	
+79	# `axes` and `to` must be the same length
+80	
+81	    Code
+82	      rray_move_axes(x, c(1L, 2L), 1L)
+83	    Condition
+84	      Error in `rray_move_axes()`:
+85	      ! `axes` and `to` must be the same length, not lengths 2 and 1.
+86	    Code
+87	      rray_move_axes(x, 1L, c(1L, 2L))
+88	    Condition
+89	      Error in `rray_move_axes()`:
+90	      ! `axes` and `to` must be the same length, not lengths 1 and 2.
+91	    Code
+92	      rray_move_axes(x, 1L, integer())
+93	    Condition
+94	      Error in `rray_move_axes()`:
+95	      ! `axes` and `to` must be the same length, not lengths 1 and 0.
+96	
+97	# errors on non-array input
+98	
+99	    Code
+100	      rray_move_axes(NULL, 1L, 1L)
+101	    Condition
+102	      Error in `rray_move_axes()`:
+103	      ! `x` must be an array, not `NULL`.
+104	    Code
+105	      rray_move_axes(mean, 1L, 1L)
+106	    Condition
+107	      Error in `rray_move_axes()`:
+108	      ! `x` must be an array, not a function.
+109	
+110	# errors on classed input
+111	
+112	    Code
+113	      rray_move_axes(x, 1L, 1L)
+114	    Condition
+115	      Error in `rray_move_axes()`:
+116	      ! `x` must be a bare array, not a &lt;foo&gt; object.
+117	
+118	</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | ta…</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8; Rscript -e &quot;pkgdown::check_pkgdown()&quot; 2&gt;&amp;1 | tail -5</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1631 ]
+✔ No problems found.</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::check(document = FALSE, args = '--no-manual')&quot; 2&gt;&amp;1 | tail -15</summary>
+<pre>Rscript -e &quot;devtools::check(document = FALSE, args = '--no-manual')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">  ‘/private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpdKZzsl/file12deb536a0ce0/rray4.Rcheck/00check.log’
+for details.
+── R CMD check results ─────────────────────────────────── rray4 0.0.0.9000 ────
+Duration: 42.4s
+
+❯ checking whether package ‘rray4’ can be installed ... [8s/12s] WARNING
+  See below...
+
+❯ checking top-level files ... NOTE
+  Non-standard file/directory found at top level:
+    ‘AGENTS.md’
+
+0 errors ✔ | 1 warning ✖ | 1 note ✖
+Error: R CMD check found WARNINGs
+Execution halted</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::check(document = FALSE, args = '--no-manual')&quot; 2&gt;&amp;1 | grep -A 25 &quot;can b…</summary>
+<pre>Rscript -e &quot;devtools::check(document = FALSE, args = '--no-manual')&quot; 2&gt;&amp;1 | grep -A 25 &quot;can be installed ... \[&quot; | head -40</pre><pre class="output">* checking whether package ‘rray4’ can be installed ... [8s/12s] WARNING
+Found the following significant warnings:
+  [1m./missing.h:16:10: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  [0m[1mequal.c:558:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  [1mequal.c:564:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  [1mequal.c:570:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  [1mequal.c:576:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  [1mequal.c:583:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+  [1mequal.c:589:24: [0m[0;1;35mwarning: [0m[1muse of bitwise '|' with boolean operands [-Wbitwise-instead-of-logical][0m
+See ‘/private/var/folders/by/4wf2qrmn4_j93s5k5k5fzrx00000gp/T/RtmpBVJafV/file131a02520aecd/rray4.Rcheck/00install.out’ for details.
+* used C compiler: ‘Apple clang version 17.0.0 (clang-1700.0.13.3)’
+* used SDK: ‘MacOSX15.4.sdk’
+* checking installed package size ... OK
+* checking package directory ... OK
+* checking for future file timestamps ... OK
+* checking DESCRIPTION meta-information ... OK
+* checking top-level files ... NOTE
+Non-standard file/directory found at top level:
+  ‘AGENTS.md’
+* checking for left-over files ... OK
+* checking index information ... OK
+* checking package subdirectories ... OK
+* checking code files for non-ASCII characters ... OK
+* checking R files for syntax errors ... OK
+* checking whether the package can be loaded ... OK
+* checking whether the package can be loaded with stated dependencies ... OK
+--
+❯ checking whether package ‘rray4’ can be installed ... [8s/12s] WARNING
+  See below...
+
+❯ checking top-level files ... NOTE
+  Non-standard file/directory found at top level:
+    ‘AGENTS.md’
+
+0 errors ✔ | 1 warning ✖ | 1 note ✖
+Error: R CMD check found WARNINGs
+Execution halted</pre></details>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git diff --stat</summary>
+<pre>git status --short &amp;&amp; git diff --stat</pre><pre class="output"> M NAMESPACE
+ M R/permute-axes.R
+ M _pkgdown.yml
+ M man/rray_permute_axes.Rd
+ M src/arg.c
+ M src/arg.h
+ M src/axes.c
+ M src/axes.h
+ M src/init.c
+?? R/move-axes.R
+?? man/rray_move_axes.Rd
+?? src/move-axes.c
+?? src/move-axes.h
+?? tests/testthat/_snaps/move-axes.md
+?? tests/testthat/test-move-axes.R
+ NAMESPACE                |  1 +
+ R/permute-axes.R         |  2 ++
+ _pkgdown.yml             |  1 +
+ man/rray_permute_axes.Rd |  3 ++
+ src/arg.c                |  1 +
+ src/arg.h                |  1 +
+ src/axes.c               | 74 ++++++++++++++++++++++++++++++++++++++++++++++++
+ src/axes.h               |  7 +++++
+ src/init.c               |  7 +++++
+ 9 files changed, 97 insertions(+)</pre></details>
+<p><code>rray_move_axes(x, axes, to)</code> is on branch <code>feature/move-axes</code>. All 1631 tests pass, <code>pkgdown::check_pkgdown()</code> is clean, and <code>R CMD check</code> shows only the two pre-existing issues (<code>equal.c</code> bitwise-or warnings, <code>AGENTS.md</code> note).</p>
+<p><strong>How it works</strong></p>
+<p><code>rray_move_axes()</code> validates, builds a permutation, and calls <code>rray_permute_axes()</code> in C. The permutation is built directly: put <code>axes[[i]]</code> at position <code>to[[i]]</code>, then fill the leftover positions with the leftover axes in ascending order. That matches numpy's <code>moveaxis()</code> on every case I checked, including multi-axis moves like <code>rray_move_axes(x, c(1, 2), c(4, 3))</code> on a 4D array.</p>
+<p><strong>Files</strong></p>
+<ul>
+<li>
+<p><code>src/move-axes.c</code> / <code>src/move-axes.h</code> / <code>R/move-axes.R</code>, plus registration in <code>src/init.c</code>.</p>
+</li>
+<li>
+<p><code>arg_as_axes_unsorted()</code> in <code>src/axes.c</code>: casts to integer, rejects attributes, <code>NA</code>, values outside <code>1..dimensionality</code>, and duplicates, but allows any order. Both <code>axes</code> and <code>to</code> go through it with their own arg, so errors say <code>`axes`</code> or <code>`to`</code>.</p>
+</li>
+<li>
+<p><code>src/arg.c</code> / <code>arg.h</code> gained a <code>to</code> arg.</p>
+</li>
+<li>
+<p>Docs cross-link both ways with <code>@seealso</code>, and <code>rray_move_axes</code> is under &quot;Manipulation&quot; in <code>_pkgdown.yml</code>.</p>
+</li>
+</ul>
+<p><strong>Decisions I made without asking</strong></p>
+<ul>
+<li>
+<p><code>length(axes) != length(to)</code> is an error, no recycling: &quot;<code>axes</code> and <code>to</code> must be the same length, not lengths 2 and 1.&quot;</p>
+</li>
+<li>
+<p><code>rray_move_axes(x, integer(), integer())</code> returns <code>x</code> unchanged.</p>
+</li>
+<li>
+<p>No negative &quot;from the end&quot; axes, matching the rest of the package.</p>
+</li>
+<li>
+<p>The duplicate message is value-neutral (&quot;<code>to</code> must not contain 3 more than once&quot;) since the validator is shared and <code>to</code> holds positions, not axes. <code>arg_as_axes_permutation()</code> still says &quot;axis %d&quot;; say the word and I'll align them.</p>
+</li>
+</ul>
+<p>One thing to look at: <code>rray_move_axes()</code> calls <code>rray_dimensionality()</code> for validation and then <code>rray_permute_axes()</code> re-checks and re-converts <code>x</code>. That is one extra <code>arg_as_array()</code> pass on a bare vector input. It keeps the code small and the error messages identical, but it is duplicated work if you'd rather split a lower-level entry point out of <code>rray_permute_axes()</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Length error should be</p>
+<p>axes (2) and to (1) must be the same length,</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read src/move-axes.c</summary>
+<pre class="output">32	  const r_ssize axes_size = r_length(axes);
+33	  const r_ssize to_size = r_length(to);
+34	
+35	  if (axes_size != to_size) {
+36	    r_abort_lazy_call(
+37	      error_call,
+38	      &quot;`axes` and `to` must be the same length, not lengths %&quot; R_PRIdXLEN_T
+39	      &quot; and %&quot; R_PRIdXLEN_T &quot;.&quot;,
+40	      axes_size,
+41	      to_size
+42	    );
+43	  }
+44	
+45	  const int* v_axes = r_int_cbegin(axes);</pre></details>
+<details class="tool"><summary>Edit src/move-axes.c</summary>
+<pre class="diff"><span class="del">-      &quot;`axes` and `to` must be the same length, not lengths %&quot; R_PRIdXLEN_T</span>
+<span class="del">-      &quot; and %&quot; R_PRIdXLEN_T &quot;.&quot;,</span>
+<span class="ins">+      &quot;`axes` (%&quot; R_PRIdXLEN_T &quot;) and `to` (%&quot; R_PRIdXLEN_T</span>
+<span class="ins">+      &quot;) must be the same length.&quot;,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/move-axes.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;testthat::snapshot_accept('move-axes'); devtoo…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;testthat::snapshot_accept('move-axes'); devtools::test(filter = '^move-axes')&quot; 2&gt;&amp;1 | tail -6</pre><pre class="output">  Code
+and 4 more ...
+* Run `testthat::snapshot_accept(&quot;move-axes&quot;)` to accept the change.
+* Run `testthat::snapshot_review(&quot;move-axes&quot;)` to review the change.
+
+[ FAIL 1 | WARN 0 | SKIP 0 | PASS 24 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;testthat::snapshot_accept('move-axes'); devtools::test(filter = '^move-axes')&quot; 2&gt;…</summary>
+<pre>Rscript -e &quot;testthat::snapshot_accept('move-axes'); devtools::test(filter = '^move-axes')&quot; 2&gt;&amp;1 | tail -4</pre><pre class="output">Updating snapshots: 'move-axes.md'.
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 25 ]</pre></details>
+<details class="tool"><summary>Bash: sed -n '79,96p' tests/testthat/_snaps/move-axes.md</summary>
+<pre>sed -n '79,96p' tests/testthat/_snaps/move-axes.md</pre><pre class="output"># `axes` and `to` must be the same length
+
+    Code
+      rray_move_axes(x, c(1L, 2L), 1L)
+    Condition
+      Error in `rray_move_axes()`:
+      ! `axes` (2) and `to` (1) must be the same length.
+    Code
+      rray_move_axes(x, 1L, c(1L, 2L))
+    Condition
+      Error in `rray_move_axes()`:
+      ! `axes` (1) and `to` (2) must be the same length.
+    Code
+      rray_move_axes(x, 1L, integer())
+    Condition
+      Error in `rray_move_axes()`:
+      ! `axes` (1) and `to` (0) must be the same length.</pre></details>
+<p>Message updated to <code>`axes` (2) and `to` (1) must be the same length.</code> Snapshot regenerated, tests pass.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git status --short</summary>
+<pre>git add -A &amp;&amp; git status --short</pre><pre class="output">M  NAMESPACE
+A  R/move-axes.R
+M  R/permute-axes.R
+M  _pkgdown.yml
+A  man/rray_move_axes.Rd
+M  man/rray_permute_axes.Rd
+M  src/arg.c
+M  src/arg.h
+M  src/axes.c
+M  src/axes.h
+M  src/init.c
+A  src/move-axes.c
+A  src/move-axes.h
+A  tests/testthat/_snaps/move-axes.md
+A  tests/testthat/test-move-axes.R</pre></details>
+<details class="tool"><summary>Bash: git commit -m &quot;Add \`rray_move_axes()\`&quot; &amp;&amp; git push -u origin feature/move-axes 2&gt;&amp;1 | tail …</summary>
+<pre>git commit -m &quot;Add \`rray_move_axes()\`&quot; &amp;&amp; git push -u origin feature/move-axes 2&gt;&amp;1 | tail -5</pre><pre class="output">[feature/move-axes f58d984] Add `rray_move_axes()`
+ 15 files changed, 535 insertions(+)
+ create mode 100644 R/move-axes.R
+ create mode 100644 man/rray_move_axes.Rd
+ create mode 100644 src/move-axes.c
+ create mode 100644 src/move-axes.h
+ create mode 100644 tests/testthat/_snaps/move-axes.md
+ create mode 100644 tests/testthat/test-move-axes.R
+remote:      https://github.com/DavisVaughan/rray4/pull/new/feature/move-axes        
+remote: 
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/move-axes -&gt; feature/move-axes
+branch 'feature/move-axes' set up to track 'origin/feature/move-axes'.</pre></details>
+<p>Committed as <code>f58d984</code> (&quot;Add <code>rray_move_axes()</code>&quot;) and pushed to <code>origin/feature/move-axes</code>, tracking set. 15 files, 535 insertions.</p>
+<p>GitHub's PR link, if you want it: <a href="https://github.com/DavisVaughan/rray4/pull/new/feature/move-axes">https://github.com/DavisVaughan/rray4/pull/new/feature/move-axes</a></p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Describe to me how the leftover axes fill in</p>
+<p>Is it to the left or right of specified axes?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: Rscript -e '</summary>
+<pre>Rscript -e '
+devtools::load_all(quiet = TRUE)
+x &lt;- array(1, c(1, 2, 3, 4))
+p &lt;- function(axes, to) cat(sprintf(&quot;move(%s -&gt; %s): %s\n&quot;, paste(axes, collapse = &quot;,&quot;), paste(to, collapse = &quot;,&quot;), paste(rray_dimensions(rray_move_axes(x, axes, to)), collapse = &quot; &quot;)))
+p(2, 4)
+p(2, 1)
+p(c(4, 1), c(2, 3))
+p(c(1, 3), c(2, 1))
+'</pre><pre class="output">move(2 -&gt; 4): 1 3 4 2
+move(2 -&gt; 1): 2 1 3 4
+move(4,1 -&gt; 2,3): 2 4 1 3
+move(1,3 -&gt; 2,1): 3 1 2 4</pre></details>
+<p>Neither. The leftovers don't go as a block to one side of the moved axes: the moved axes claim exact positions, and the leftovers pour into the holes that remain, left to right, keeping their relative order.</p>
+<p>Two steps:</p>
+<ol>
+<li>
+<p>For each <code>i</code>, put <code>axes[[i]]</code> at position <code>to[[i]]</code>. These are absolute positions in the output, not offsets from anything.</p>
+</li>
+<li>
+<p>Walk the output positions from 1 upward. Every position not claimed in step 1 takes the next unmoved axis, in ascending axis order.</p>
+</li>
+</ol>
+<p>Here is <code>x</code> with dims <code>(1, 2, 3, 4)</code>, so each dimension value tells you which source axis it came from:</p>
+<pre><code class="language-r">rray_move_axes(x, 2, 4)           # 1 3 4 2
+rray_move_axes(x, 2, 1)           # 2 1 3 4
+rray_move_axes(x, c(4, 1), c(2, 3))  # 2 4 1 3
+</code></pre>
+<p>Take the first one. Axis 2 is pinned to position 4. Holes at 1, 2, 3, and the unmoved axes 1, 3, 4 drop in that order, giving <code>1 3 4 2</code>.</p>
+<p>The third shows why &quot;left or right&quot; doesn't describe it. Axis 4 goes to position 2 and axis 1 to position 3, leaving holes at 1 and 4. Unmoved axes 2 and 3 fill them in order, so axis 2 lands to the left of both moved axes and axis 3 to the right. They were split up, not pushed to one side.</p>
+<p>This is the same rule as numpy's <code>moveaxis()</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Test against rray permute axes not aperm</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Read tests/testthat/test-move-axes.R</summary>
+<pre class="output">1	test_that(&quot;moves a single axis&quot;, {
+2	  x &lt;- array(1:24, c(2L, 3L, 4L))
+3	
+4	  expect_identical(rray_move_axes(x, 1L, 3L), aperm(x, c(2L, 3L, 1L)))
+5	  expect_identical(rray_move_axes(x, 3L, 1L), aperm(x, c(3L, 1L, 2L)))
+6	})
+7	
+8	test_that(&quot;`axes[[i]]` ends up at position `to[[i]]`&quot;, {
+9	  x &lt;- array(seq_len(7L * 5L * 3L * 2L), c(7L, 5L, 3L, 2L))
+10	  out &lt;- rray_move_axes(x, c(1L, 2L), c(4L, 3L))
+11	
+12	  expect_identical(rray_dimensions(out), c(3L, 2L, 5L, 7L))
+13	  expect_identical(out, aperm(x, c(3L, 4L, 2L, 1L)))
+14	})
+15	
+16	test_that(&quot;axes that don't move keep their relative order&quot;, {</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-move-axes.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(rray_move_axes(x, 1L, 3L), aperm(x, c(2L, 3L, 1L)))</span>
+<span class="del">-  expect_identical(rray_move_axes(x, 3L, 1L), aperm(x, c(3L, 1L, 2L)))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_move_axes(x, 1L, 3L),</span>
+<span class="ins">+    rray_permute_axes(x, c(2L, 3L, 1L))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_move_axes(x, 3L, 1L),</span>
+<span class="ins">+    rray_permute_axes(x, c(3L, 1L, 2L))</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-move-axes.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-move-axes.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(out, aperm(x, c(3L, 4L, 2L, 1L)))</span>
+<span class="ins">+  expect_identical(out, rray_permute_axes(x, c(3L, 4L, 2L, 1L)))</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-move-axes.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-move-axes.R</summary>
+<pre class="diff"><span class="del">-    expect_identical(rray_move_axes(x, 1L, 2L), aperm(x))</span>
+<span class="ins">+    expect_identical(</span>
+<span class="ins">+      rray_move_axes(x, 1L, 2L),</span>
+<span class="ins">+      rray_permute_axes(x, c(2L, 1L))</span>
+<span class="ins">+    )</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-move-axes.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;aperm&quot; tests/testthat/test-move-axes.R; air format . &amp;&amp; Rscript -e &quot;devtools::test(f…</summary>
+<pre>grep -n &quot;aperm&quot; tests/testthat/test-move-axes.R; air format . &amp;&amp; Rscript -e &quot;devtools::test(filter = '^move-axes')&quot; 2&gt;&amp;1 | tail -4</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 25 ]</pre></details>
+<p>All three <code>aperm()</code> comparisons now go through <code>rray_permute_axes()</code>; no <code>aperm()</code> left in the file. 25 tests pass.</p>
+<p>The swaps:</p>
+<ul>
+<li>
+<p><code>aperm(x, c(2L, 3L, 1L))</code> → <code>rray_permute_axes(x, c(2L, 3L, 1L))</code>, same for <code>c(3L, 1L, 2L)</code> and <code>c(3L, 4L, 2L, 1L)</code>.</p>
+</li>
+<li>
+<p>In the native types loop, <code>aperm(x)</code> → <code>rray_permute_axes(x, c(2L, 1L))</code>.</p>
+</li>
+</ul>
+<p>Left uncommitted, since the branch is already pushed. Say the word and I'll commit and push it.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -m &quot;Test \`rray_move_axes()\` against \`rray_permute_axes()\` instea…</summary>
+<pre>git add -A &amp;&amp; git commit -m &quot;Test \`rray_move_axes()\` against \`rray_permute_axes()\` instead of \`aperm()\`&quot; &amp;&amp; git push 2&gt;&amp;1 | tail -3</pre><pre class="output">[feature/move-axes f094608] Test `rray_move_axes()` against `rray_permute_axes()` instead of `aperm()`
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   f58d984..f094608  feature/move-axes -&gt; feature/move-axes</pre></details>
+<p>Pushed <code>f094608</code> to <code>origin/feature/move-axes</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Address my GitHub pr comment</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: gh pr list --head feature/move-axes --state all 2&gt;&amp;1 | head</summary>
+<pre>gh pr list --head feature/move-axes --state all 2&gt;&amp;1 | head</pre><pre class="output">69	Add `rray_move_axes()`	feature/move-axes	OPEN	2026-09-15T14:33:03Z</pre></details>
+<details class="tool"><summary>Bash: gh pr view 69 --json title,body,comments,reviews | head -c 4000; echo; echo &quot;---- REVIEW COMM…</summary>
+<pre>gh pr view 69 --json title,body,comments,reviews | head -c 4000; echo; echo &quot;---- REVIEW COMMENTS ----&quot;; gh api repos/DavisVaughan/rray4/pulls/69/comments --jq '.[] | {id, path, line, body, user: .user.login}' 2&gt;&amp;1 | head -c 4000</pre><pre class="output">{&quot;body&quot;:&quot;&quot;,&quot;comments&quot;:[],&quot;reviews&quot;:[{&quot;id&quot;:&quot;PRR_kwDOUHAoJs8AAAABNqBMSg&quot;,&quot;author&quot;:{&quot;login&quot;:&quot;DavisVaughan&quot;},&quot;authorAssociation&quot;:&quot;OWNER&quot;,&quot;body&quot;:&quot;&quot;,&quot;submittedAt&quot;:&quot;2026-09-15T14:49:41Z&quot;,&quot;includesCreatedEdit&quot;:false,&quot;reactionGroups&quot;:[],&quot;state&quot;:&quot;COMMENTED&quot;,&quot;commit&quot;:{&quot;oid&quot;:&quot;f58d984a328bc8055612390beb0e38da6386f86f&quot;}}],&quot;title&quot;:&quot;Add `rray_move_axes()`&quot;}
+
+---- REVIEW COMMENTS ----
+{&quot;body&quot;:&quot;```suggestion\n#' Move array axes\n```\n&quot;,&quot;id&quot;:4016776186,&quot;line&quot;:1,&quot;path&quot;:&quot;R/move-axes.R&quot;,&quot;user&quot;:&quot;DavisVaughan&quot;}</pre></details>
+<p>One review comment from you on <code>R/move-axes.R:1</code>, a suggestion to change the title.</p>
+
+<details class="tool"><summary>Edit R/move-axes.R</summary>
+<pre class="diff"><span class="del">-#' Move the axes of an array</span>
+<span class="ins">+#' Move array axes</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/move-axes.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -3 &amp;&amp; git diff --stat</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -3 &amp;&amp; git diff --stat</pre><pre class="output">ℹ Updating rray4 documentation
+ℹ Loading rray4
+Writing 'rray_move_axes.Rd'
+ R/move-axes.R         | 2 +-
+ man/rray_move_axes.Rd | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)</pre></details>
+<p>Title is now <code>Move array axes</code>, and <code>man/rray_move_axes.Rd</code> is regenerated.</p>
+<p>Worth noting: <code>rray_permute_axes()</code> still reads &quot;Permute the axes of an array&quot;, so the two topics no longer match in style. Tell me if you want that one shortened to &quot;Permute array axes&quot; too.</p>
+<p>Left uncommitted. Want me to commit and push?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Update permute too and commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit R/permute-axes.R</summary>
+<pre class="diff"><span class="del">-#' Permute the axes of an array</span>
+<span class="ins">+#' Permute array axes</span></pre><pre class="output">The file ~/files/r/packages/rray4/R/permute-axes.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -3 &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail…</summary>
+<pre>Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -3 &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -3</pre><pre class="output">ℹ Updating rray4 documentation
+ℹ Loading rray4
+Writing 'rray_permute_axes.Rd'
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1631 ]</pre></details>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -m &quot;Shorten the axis topic titles to \`Move array axes\` and \`Permu…</summary>
+<pre>git add -A &amp;&amp; git commit -m &quot;Shorten the axis topic titles to \`Move array axes\` and \`Permute array axes\`&quot; &amp;&amp; git push 2&gt;&amp;1 | tail -3</pre><pre class="output">[feature/move-axes 529d210] Shorten the axis topic titles to `Move array axes` and `Permute array axes`
+ 4 files changed, 4 insertions(+), 4 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   f094608..529d210  feature/move-axes -&gt; feature/move-axes</pre></details>
+<p>Both titles shortened, docs regenerated, all 1631 tests pass. Pushed <code>529d210</code> to <code>origin/feature/move-axes</code>.</p>
+<p>Your review comment on <code>R/move-axes.R:1</code> is addressed; I didn't reply to it on GitHub, so resolve it whenever you're ready.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Resolve it</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: gh api graphql -f query='</summary>
+<pre>gh api graphql -f query='
+{
+  repository(owner: &quot;DavisVaughan&quot;, name: &quot;rray4&quot;) {
+    pullRequest(number: 69) {
+      reviewThreads(first: 20) {
+        nodes { id isResolved comments(first: 1) { nodes { path body } } }
+      }
+    }
+  }
+}'</pre><pre class="output">{&quot;data&quot;:{&quot;repository&quot;:{&quot;pullRequest&quot;:{&quot;reviewThreads&quot;:{&quot;nodes&quot;:[{&quot;id&quot;:&quot;PRRT_kwDOUHAoJs6ikE52&quot;,&quot;isResolved&quot;:false,&quot;comments&quot;:{&quot;nodes&quot;:[{&quot;path&quot;:&quot;R/move-axes.R&quot;,&quot;body&quot;:&quot;```suggestion\n#' Move array axes\n```\n&quot;}]}}]}}}}}</pre></details>
+<details class="tool"><summary>Bash: gh api graphql -f query='</summary>
+<pre>gh api graphql -f query='
+mutation {
+  resolveReviewThread(input: {threadId: &quot;PRRT_kwDOUHAoJs6ikE52&quot;}) {
+    thread { id isResolved }
+  }
+}'</pre><pre class="output">{&quot;data&quot;:{&quot;resolveReviewThread&quot;:{&quot;thread&quot;:{&quot;id&quot;:&quot;PRRT_kwDOUHAoJs6ikE52&quot;,&quot;isResolved&quot;:true}}}}</pre></details>
+<p>Resolved. The thread on <code>R/move-axes.R</code> now shows <code>isResolved: true</code>, and it was the only open one on PR #69.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Merged clean up locally</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: gh pr view 69 --json state,mergedAt,mergeCommit --jq '{state, mergedAt, mergeCommit: .mergeCo…</summary>
+<pre>gh pr view 69 --json state,mergedAt,mergeCommit --jq '{state, mergedAt, mergeCommit: .mergeCommit.oid}'; git status --short</pre><pre class="output">{&quot;mergeCommit&quot;:&quot;50510ef37bb704ff40ddf0a526558f55a06135a4&quot;,&quot;mergedAt&quot;:&quot;2026-09-15T14:52:54Z&quot;,&quot;state&quot;:&quot;MERGED&quot;}</pre></details>
+<details class="tool"><summary>Bash: git checkout main &amp;&amp; git pull --prune 2&gt;&amp;1 | tail -5 &amp;&amp; git log --oneline -3</summary>
+<pre>git checkout main &amp;&amp; git pull --prune 2&gt;&amp;1 | tail -5 &amp;&amp; git log --oneline -3</pre><pre class="output">Switched to branch 'main'
+Your branch is up to date with 'origin/main'.
+ create mode 100644 man/rray_move_axes.Rd
+ create mode 100644 src/move-axes.c
+ create mode 100644 src/move-axes.h
+ create mode 100644 tests/testthat/_snaps/move-axes.md
+ create mode 100644 tests/testthat/test-move-axes.R
+50510ef Add `rray_move_axes()` (#69)
+71f5588 Add plan for rewriting `rray_split()` as a two stage traversal (#67)
+481bb30 Add`rray_mean_along()` and stateful reducing infra (#66)</pre></details>
+<details class="tool"><summary>Bash: git branch -d feature/move-axes 2&gt;&amp;1; git branch -a | head</summary>
+<pre>git branch -d feature/move-axes 2&gt;&amp;1; git branch -a | head</pre><pre class="output">error: The branch 'feature/move-axes' is not fully merged.
+If you are sure you want to delete it, run 'git branch -D feature/move-axes'.
+  feature/move-axes
+* main
+  remotes/origin/gh-pages
+  remotes/origin/main</pre></details>
+<details class="tool"><summary>Bash: git diff --stat feature/move-axes main</summary>
+<pre>git diff --stat feature/move-axes main</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: git branch -D feature/move-axes &amp;&amp; git branch -a &amp;&amp; git status --short</summary>
+<pre>git branch -D feature/move-axes &amp;&amp; git branch -a &amp;&amp; git status --short</pre><pre class="output">Deleted branch feature/move-axes (was 529d210).
+* main
+  remotes/origin/gh-pages
+  remotes/origin/main</pre></details>
+<p>Cleaned up. On <code>main</code> at <code>50510ef</code> (&quot;Add <code>rray_move_axes()</code> (#69)&quot;), working tree clean.</p>
+<p>Note on the delete: <code>git branch -d</code> refused because the PR was squash-merged, so git couldn't see the branch as merged. Before forcing it, I checked <code>git diff feature/move-axes main</code> and got zero output, meaning the branch tip and main were identical, so nothing was lost. The remote branch was already gone, pruned by the pull.</p>
+
+</section>
+</main>
+</body>
+</html>

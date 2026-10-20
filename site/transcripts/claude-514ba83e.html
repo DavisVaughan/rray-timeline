@@ -1,0 +1,1604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dropping names and titles from comparison and equality functions</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-162">rray timeline</a>
+<h1>Dropping names and titles from comparison and equality functions</h1>
+<p class="facts">Claude · Oct 20, 2026 · 1 prompt · 9 replies · <a href="https://github.com/r-lib/rray/pull/162">#162</a></p>
+</header>
+<main>
+<p class="divider">Oct 20, 2026, 00:17 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/names-titles<br />
+Implement plans/names-and-titles.md part 2<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Check this section off in the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status &amp;&amp; git log --oneline -5 &amp;&amp; ls &amp;&amp; cat plans/names-and-titles.md</summary>
+<pre>git status &amp;&amp; git log --oneline -5 &amp;&amp; ls &amp;&amp; cat plans/names-and-titles.md</pre><pre class="output">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+5dcbd72 Keep titles when `rray_stack()` expands inputs (#161)
+346d7cd Names and titles multi input plan (#160)
+e24da88 Move `rray_if_else()` to the functions that drop titles on purpose
+653ac2a Add a list of the functions that still drop titles
+2c8de9c Finish out the titles plan by adding tests (#159)
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+codecov.yml
+compile_commands.json
+DESCRIPTION
+docs
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+panache.toml
+pkgdown
+plans
+R
+README.md
+README.Rmd
+rray.Rproj
+src
+tests
+vignettes
+# Names and titles across several inputs
+
+## Goal
+
+When a function builds one result from several inputs, the inputs must agree
+on names and titles. If they don't, the function errors instead of silently
+picking one input's names.
+
+```r
+jan &lt;- array(1:2, 2, dimnames = list(c(&quot;north&quot;, &quot;south&quot;)))
+feb &lt;- array(3:4, 2, dimnames = list(c(&quot;south&quot;, &quot;north&quot;)))
+
+rray_stack(jan = jan, feb = feb, .axis = 2)
+#&gt; Error in `rray_stack()`:
+#&gt; ! Can't find common names at axis 1. `jan` and `feb` have different names at position 1: &quot;north&quot; and &quot;south&quot;.
+```
+
+Today this succeeds, labels every row with the order of `jan`, and the `feb`
+column is silently wrong.
+
+There is no argument to choose another behavior. To resolve a conflict, remove
+the names from one input with `rray_set_names()`, which returns a view and
+does not copy the data.
+
+At the same time, titles stop being dropped by these functions.
+
+## Which functions keep names
+
+A function that takes values and returns the same kind of value keeps names.
+A function that returns a verdict about its inputs drops them.
+
+- `rray_add()` takes numbers and returns numbers. The result is a new value at
+  the same labeled position, so the names still describe it.
+
+- `rray_and()` takes logicals and returns logicals. Two masks over rows `a`
+  and `b` combine into a mask over rows `a` and `b`.
+
+- `rray_equal()` takes anything and returns logicals. The result answers a
+  question about how the inputs relate, so it is not labeled like either one.
+
+The rule also decides what a name conflict means. Two masks with different
+row names are misaligned, so `rray_and()` errors. Comparing two arrays whose
+names differ is an ordinary question, so `rray_equal()` answers it.
+
+`rray_if_else()` is left out of this rule and keeps dropping names.
+
+## Functions in scope
+
+| Function | Names | Titles |
+|---|---|---|
+| `rray_add()`, `rray_subtract()`, `rray_multiply()`, `rray_divide()`, `rray_exponentiate()` | Must agree | Must agree, kept |
+| `rray_and()`, `rray_or()`, `rray_xor()` | Must agree | Must agree, kept |
+| `rray_pmax()`, `rray_pmin()` | Must agree | Must agree, kept |
+| `rray_combine()` | Must agree, except on `.axis` | Must agree, kept |
+| `rray_stack()` | Must agree, new axis from the names of `...` | Must agree, kept, `&quot;&quot;` on the new axis |
+| `rray_broadcast()`, `rray_broadcast_common()` | One input at a time, never errors | Kept, including on broadcast axes |
+| `rray_equal()`, `rray_not_equal()`, `rray_greater_than()`, `rray_greater_than_or_equal()`, `rray_less_than()`, `rray_less_than_or_equal()` | Dropped | Dropped |
+| `rray_if_else()` | Already dropped, unchanged | Already dropped, unchanged |
+
+## Names rules
+
+For each axis of the result:
+
+- An input has a say only if it has names on that axis and its dimension
+  there is not broadcast. An axis of dimension 1 that stays 1 is not
+  broadcast.
+
+- An input that is missing the axis, because it has a lower dimensionality,
+  has no say.
+
+- Every input with a say must have exactly the same names. There are no
+  holes: `c(&quot;r1&quot;, &quot;&quot;)` and `c(&quot;r1&quot;, &quot;r2&quot;)` disagree. `NA` agrees only with
+  `NA`.
+
+- If they agree, the result has those names. If no input has a say, the axis
+  has no names.
+
+- The combine axis of `rray_combine()` is not checked. Its names are pasted
+  together from every input, with `&quot;&quot;` for unnamed inputs, as today.
+
+- The new axis of `rray_stack()` is not checked. Its names come from the names
+  of `...`, as today.
+
+## Titles rules
+
+Titles are the names on the dimnames list.
+
+- An empty title, or no titles at all, has no say.
+
+- Every other title on an axis must agree, including titles from inputs that
+  broadcast on that axis or have no names there. A title labels the axis, not
+  its positions, so it survives broadcasting.
+
+- Because all non-empty titles must agree, the title of an axis is that one
+  agreed title, or `&quot;&quot;` when nobody has one.
+
+- The result has a titles vector exactly when some input has one.
+
+- The combine axis of `rray_combine()` is checked like any other axis.
+
+- The new axis of `rray_stack()` gets the title `&quot;&quot;`.
+
+- `rray_broadcast()` keeps every title of `x`, so it no longer depends on
+  whether any broadcasting happened.
+
+## Errors
+
+Inputs are visited left to right, and the axes of each input left to right.
+Names are checked before titles on each axis. The first disagreement errors.
+
+The error names the first input that had a say on the axis and the first input
+that disagrees with it. For names, it reports the first position that differs.
+The wording mirrors the existing `Can't find common dimensions` error in
+`src/dimensions.c`.
+
+```text
+Can't find common names at axis {axis}. {x_arg} and {y_arg} have different names at position {position}: &quot;{x_name}&quot; and &quot;{y_name}&quot;.
+
+Can't find common titles at axis {axis}. {x_arg} has title &quot;{x_title}&quot; and {y_arg} has title &quot;{y_title}&quot;.
+```
+
+An `NA` name is written without quotes, as `NA`.
+
+Names are compared by `CHARSXP` pointer. The same text in two different
+encodings compares as different, which is accepted.
+
+## Examples
+
+The outputs below are the intended behavior.
+
+### 1. Identical names pass, different names error
+
+```r
+x &lt;- array(1:2, 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;)))
+y &lt;- array(1:2, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+
+rray_add(x, x)
+#&gt; r1 r2
+#&gt;  2  4
+
+rray_add(x, y)
+#&gt; Error in `rray_add()`:
+#&gt; ! Can't find common names at axis 1. `x` and `y` have different names at position 1: &quot;r1&quot; and &quot;a&quot;.
+
+rray_add(x, rray_set_names(y, NULL))
+#&gt; r1 r2
+#&gt;  2  4
+```
+
+### 2. An input without names has no say
+
+```r
+x &lt;- array(1:4, c(2, 2), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+y &lt;- array(5:8, c(2, 2), dimnames = list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+
+rray_add(x, y)
+#&gt;    c1 c2
+#&gt; r1  6 10
+#&gt; r2  8 12
+```
+
+Each input names a different axis, so nothing conflicts and both are kept.
+
+### 3. A broadcast axis has no say on names
+
+```r
+x &lt;- array(1:3, c(1, 3), dimnames = list(&quot;total&quot;, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+y &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+</pre><p class="cut">264 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/compare.c src/equal.c; ls src/decl; cat src/decl/compare-decl.h src/decl/equal-decl.h…</summary>
+<pre>cat src/compare.c src/equal.c; ls src/decl; cat src/decl/compare-decl.h src/decl/equal-decl.h 2&gt;/dev/null; cat R/compare.R R/equal.R</pre><pre class="output">#include &quot;compare.h&quot;
+
+#include &quot;binary.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;missing.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;typeof2.h&quot;
+#include &quot;utils.h&quot;
+
+enum rray_compare_op {
+  RRAY_COMPARE_greater_than,
+  RRAY_COMPARE_greater_than_or_equal,
+  RRAY_COMPARE_less_than,
+  RRAY_COMPARE_less_than_or_equal
+};
+
+typedef r_obj* (*rray_compare_fn)(
+  r_obj* x,
+  r_obj* y,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_x_broadcast_strides,
+  const r_ssize* v_y_broadcast_strides,
+  enum rray_compare_op op
+);
+
+#include &quot;decl/compare-decl.h&quot;
+
+r_obj* ffi_rray_greater_than(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_greater_than(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_greater_than(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_compare(
+    x,
+    y,
+    RRAY_COMPARE_greater_than,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+r_obj* ffi_rray_greater_than_or_equal(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_greater_than_or_equal(
+    ffi_x,
+    ffi_y,
+    rray_args.x,
+    rray_args.y,
+    error_call
+  );
+}
+
+r_obj* rray_greater_than_or_equal(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_compare(
+    x,
+    y,
+    RRAY_COMPARE_greater_than_or_equal,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+r_obj* ffi_rray_less_than(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_less_than(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_less_than(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_compare(x, y, RRAY_COMPARE_less_than, x_arg, y_arg, error_call);
+}
+
+r_obj* ffi_rray_less_than_or_equal(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_less_than_or_equal(
+    ffi_x,
+    ffi_y,
+    rray_args.x,
+    rray_args.y,
+    error_call
+  );
+}
+
+r_obj* rray_less_than_or_equal(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_compare(
+    x,
+    y,
+    RRAY_COMPARE_less_than_or_equal,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+static r_obj* rray_compare(
+  r_obj* x,
+  r_obj* y,
+  enum rray_compare_op op,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  check_unclassed(y, y_arg, error_call);
+
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+  y = KEEP(arg_as_array(y, y_arg, error_call));
+
+  const rray_compare_fn fn =
+    rray_compare_switch(x, y, op, x_arg, y_arg, error_call);
+
+  r_obj* x_dimensions = r_dim(x);
+  r_obj* y_dimensions = r_dim(y);
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int y_dimensionality =
+    rray_dimensionality_from_dimensions(y_dimensions);
+
+  r_obj* dimensions = KEEP(rray_dimensions2(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    x_arg,
+    y_arg,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  check_dimensionality(dimensionality);
+
+  r_ssize v_x_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_x_dimensions,
+    x_dimensionality,
+    dimensionality,
+    v_x_broadcast_strides
+  );
+
+  r_ssize v_y_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_y_dimensions,
+    y_dimensionality,
+    dimensionality,
+    v_y_broadcast_strides
+  );
+
+  r_obj* out = KEEP(fn(
+    x,
+    y,
+    v_dimensions,
+    dimensionality,
+    v_x_broadcast_strides,
+    v_y_broadcast_strides,
+    op
+  ));</pre><p class="cut">1,693 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat tests/testthat/test-compare.R tests/testthat/test-equal.R; ls tests/testthat/_snaps | gre…</summary>
+<pre>cat tests/testthat/test-compare.R tests/testthat/test-equal.R; ls tests/testthat/_snaps | grep -E 'compare|equal'</pre><pre class="output">test_that(&quot;compares elementwise&quot;, {
+  x &lt;- array(1:6, c(3L, 2L))
+  y &lt;- array(6:1, c(3L, 2L))
+
+  expect_identical(rray_greater_than(x, y), x &gt; y)
+  expect_identical(rray_greater_than_or_equal(x, y), x &gt;= y)
+  expect_identical(rray_less_than(x, y), x &lt; y)
+  expect_identical(rray_less_than_or_equal(x, y), x &lt;= y)
+})
+
+test_that(&quot;broadcasts both inputs to common dimensions&quot;, {
+  x &lt;- array(1:3, c(3L, 1L))
+  y &lt;- array(c(2L, 4L), c(1L, 2L))
+
+  expected_x &lt;- x[, rep(1L, 2L), drop = FALSE]
+  expected_y &lt;- y[rep(1L, 3L), , drop = FALSE]
+
+  expect_identical(rray_greater_than(x, y), expected_x &gt; expected_y)
+  expect_identical(
+    rray_greater_than_or_equal(x, y),
+    expected_x &gt;= expected_y
+  )
+  expect_identical(rray_less_than(x, y), expected_x &lt; expected_y)
+  expect_identical(
+    rray_less_than_or_equal(x, y),
+    expected_x &lt;= expected_y
+  )
+})
+
+test_that(&quot;works with 1D and 3D arrays&quot;, {
+  expect_identical(
+    rray_greater_than(1:3, 2L),
+    array(c(FALSE, FALSE, TRUE), 3L)
+  )
+
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+  y &lt;- array(c(1L, 2L), c(2L, 1L, 1L))
+  expected_y &lt;- y[, rep(1L, 3L), rep(1L, 4L), drop = FALSE]
+
+  expect_identical(rray_less_than_or_equal(x, y), x &lt;= expected_y)
+})
+
+test_that(&quot;returns logical output for every supported type pair&quot;, {
+  expect_snapshot(native_ptype_matrix(rray_greater_than, c(&quot;x&quot;, &quot;y&quot;)))
+})
+
+test_that(&quot;branchless missing-value loops match base R&quot;, {
+  operations &lt;- list(
+    greater_than = list(rray_greater_than, `&gt;`),
+    greater_than_or_equal = list(rray_greater_than_or_equal, `&gt;=`),
+    less_than = list(rray_less_than, `&lt;`),
+    less_than_or_equal = list(rray_less_than_or_equal, `&lt;=`)
+  )
+
+  integer_values &lt;- c(NA_integer_, -1L, 0L, 1L)
+  double_values &lt;- c(NA_real_, NaN, -Inf, -1, -0, 0, 1, Inf)
+
+  make_case &lt;- function(x_values, y_values = x_values) {
+    list(
+      x = rep(x_values, each = length(y_values)),
+      y = rep(y_values, times = length(x_values))
+    )
+  }
+
+  cases &lt;- list(
+    logical = make_case(c(NA, FALSE, TRUE)),
+    integer = make_case(integer_values),
+    double = make_case(double_values),
+    logical_integer = make_case(c(NA, FALSE, TRUE), integer_values),
+    integer_logical = make_case(integer_values, c(NA, FALSE, TRUE)),
+    logical_double = make_case(c(NA, FALSE, TRUE), double_values),
+    double_logical = make_case(double_values, c(NA, FALSE, TRUE)),
+    integer_double = make_case(integer_values, double_values),
+    double_integer = make_case(double_values, integer_values)
+  )
+
+  for (operation in operations) {
+    for (case in cases) {
+      expect_identical(
+        as.vector(operation[[1]](case$x, case$y)),
+        operation[[2]](case$x, case$y)
+      )
+    }
+  }
+})
+
+test_that(&quot;coalesces names across inputs&quot;, {
+  x &lt;- array(
+    1:3,
+    c(3L, 1L),
+    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), &quot;x&quot;)
+  )
+  y &lt;- array(
+    1:2,
+    c(1L, 2L),
+    dimnames = list(&quot;y&quot;, c(&quot;c1&quot;, &quot;c2&quot;))
+  )
+
+  expect_identical(
+    rray_names(rray_greater_than(x, y)),
+    list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), c(&quot;c1&quot;, &quot;c2&quot;))
+  )
+
+  x &lt;- array(1:3, 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+  y &lt;- array(1:3, 3L, dimnames = list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+  expect_identical(
+    rray_names(rray_less_than(x, y)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+  )
+})
+
+test_that(&quot;zero dimensions broadcast against dimensions of 1&quot;, {
+  x &lt;- array(1L, c(1L, 2L))
+  y &lt;- array(integer(), c(0L, 2L))
+  expect_identical(
+    rray_greater_than(x, y),
+    array(logical(), c(0L, 2L))
+  )
+
+  x &lt;- array(1L, c(1L, 1L))
+  y &lt;- array(integer(), c(0L, 0L))
+  expect_identical(rray_less_than(x, y), array(logical(), c(0L, 0L)))
+
+  expect_identical(rray_greater_than(integer(), 1L), array(logical(), 0L))
+})
+
+test_that(&quot;errors on incompatible dimensions&quot;, {
+  x &lt;- array(1:6, c(3L, 2L))
+  y &lt;- array(1L, c(2L, 2L))
+  expect_snapshot(rray_greater_than(x, y), error = TRUE)
+})
+
+test_that(&quot;errors on unsupported types&quot;, {
+  expect_snapshot(rray_greater_than(as.raw(1), as.raw(2)), error = TRUE)
+  expect_snapshot(rray_greater_than_or_equal(list(1), list(1)), error = TRUE)
+  expect_snapshot(rray_less_than(1i, 1i), error = TRUE)
+  expect_snapshot(rray_less_than_or_equal(&quot;a&quot;, &quot;b&quot;), error = TRUE)
+})
+
+test_that(&quot;a type error beats a dimension error&quot;, {
+  x &lt;- array(&quot;a&quot;, c(2L, 2L))
+  y &lt;- array(&quot;b&quot;, c(3L, 3L))
+  expect_snapshot(rray_greater_than(x, y), error = TRUE)
+})
+
+test_that(&quot;errors on scalar and classed input&quot;, {
+  expect_snapshot(rray_greater_than(NULL, 1L), error = TRUE)
+  expect_snapshot(rray_less_than(1L, NULL), error = TRUE)
+
+  x &lt;- structure(1L, class = &quot;foo&quot;)
+  expect_snapshot(rray_greater_than(x, 1L), error = TRUE)
+  expect_snapshot(rray_less_than(1L, x), error = TRUE)
+})
+test_that(&quot;tests equality elementwise&quot;, {
+  x &lt;- array(c(1 + 1i, 2 + 2i, 3 + 3i, 4 + 4i), c(2L, 2L))
+  y &lt;- array(c(4 + 4i, 2 + 2i, 3 + 3i, 1 + 1i), c(2L, 2L))
+
+  expect_identical(rray_equal(x, y), x == y)
+  expect_identical(rray_not_equal(x, y), x != y)
+})
+
+test_that(&quot;broadcasts both inputs to common dimensions&quot;, {
+  x &lt;- array(c(1 + 1i, 2 + 2i, 3 + 3i), c(3L, 1L))
+  y &lt;- array(c(2 + 2i, 4 + 4i), c(1L, 2L))
+
+  expected_x &lt;- x[, rep(1L, 2L), drop = FALSE]
+  expected_y &lt;- y[rep(1L, 3L), , drop = FALSE]
+
+  expect_identical(rray_equal(x, y), expected_x == expected_y)
+  expect_identical(rray_not_equal(x, y), expected_x != expected_y)
+})
+
+test_that(&quot;works with 1D and 3D arrays&quot;, {
+  expect_identical(rray_equal(1:3, 2L), array(c(FALSE, TRUE, FALSE), 3L))
+
+  x &lt;- array(1:24 + 1i, c(2L, 3L, 4L))
+  y &lt;- array(c(1 + 1i, 2 + 1i), c(2L, 1L, 1L))
+  expected_y &lt;- y[, rep(1L, 3L), rep(1L, 4L), drop = FALSE]
+
+  expect_identical(rray_not_equal(x, y), x != expected_y)
+})
+
+test_that(&quot;returns logical output for every supported type pair&quot;, {
+  expect_snapshot(native_ptype_matrix(rray_equal, c(&quot;x&quot;, &quot;y&quot;)))
+})
+
+test_that(&quot;missing values and complex edge cases match base R&quot;, {
+  values &lt;- list(
+    logical = c(NA, FALSE, TRUE),
+    integer = c(NA_integer_, -1L, 0L, 1L),
+    double = c(NA_real_, NaN, -Inf, -1, -0, 0, 1, Inf),
+    complex = c(
+      NA_complex_,
+      complex(real = NaN),
+      complex(imaginary = NaN),
+      complex(real = NA_real_, imaginary = 1),
+      complex(real = 1, imaginary = NA_real_),
+      complex(real = -Inf),
+      -1 - 1i,
+      complex(real = -0),</pre><p class="cut">100 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n -B3 -A12 'names' src/compare.c src/equal.c | head -150; wc -l src/compare.c src/equal…</summary>
+<pre>grep -n -B3 -A12 'names' src/compare.c src/equal.c | head -150; wc -l src/compare.c src/equal.c</pre><pre class="output">src/equal.c-1-#include &quot;equal.h&quot;
+src/equal.c-2-
+src/equal.c-3-#include &quot;binary.h&quot;
+src/equal.c:4:#include &quot;broadcast-names.h&quot;
+src/equal.c-5-#include &quot;cast.h&quot;
+src/equal.c-6-#include &quot;dimensionality.h&quot;
+src/equal.c-7-#include &quot;dimensions.h&quot;
+src/equal.c-8-#include &quot;missing.h&quot;
+src/equal.c-9-#include &quot;strides.h&quot;
+src/equal.c-10-#include &quot;type.h&quot;
+src/equal.c-11-#include &quot;typeof2.h&quot;
+src/equal.c-12-#include &quot;utils.h&quot;
+src/equal.c-13-
+src/equal.c-14-enum rray_equality_op {
+src/equal.c-15-  RRAY_EQUAL_equal,
+src/equal.c-16-  RRAY_EQUAL_not_equal
+--
+src/equal.c-127-  ));
+src/equal.c-128-  r_attrib_poke_dim(out, dimensions);
+src/equal.c-129-
+src/equal.c:130:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/equal.c-131-
+src/equal.c:132:  if (out_names != r_null) {
+src/equal.c:133:    r_attrib_poke_dim_names(out, out_names);
+src/equal.c-134-  }
+src/equal.c-135-
+src/equal.c-136-  FREE(5);
+src/equal.c-137-  return out;
+src/equal.c-138-}
+src/equal.c-139-
+src/equal.c-140-static rray_equality_fn rray_equality_switch(
+src/equal.c-141-  r_obj* x,
+src/equal.c-142-  r_obj* y,
+src/equal.c-143-  enum rray_equality_op op,
+src/equal.c-144-  struct rray_arg* x_arg,
+src/equal.c-145-  struct rray_arg* y_arg,
+src/compare.c-1-#include &quot;compare.h&quot;
+src/compare.c-2-
+src/compare.c-3-#include &quot;binary.h&quot;
+src/compare.c:4:#include &quot;broadcast-names.h&quot;
+src/compare.c-5-#include &quot;cast.h&quot;
+src/compare.c-6-#include &quot;dimensionality.h&quot;
+src/compare.c-7-#include &quot;dimensions.h&quot;
+src/compare.c-8-#include &quot;missing.h&quot;
+src/compare.c-9-#include &quot;strides.h&quot;
+src/compare.c-10-#include &quot;type.h&quot;
+src/compare.c-11-#include &quot;typeof2.h&quot;
+src/compare.c-12-#include &quot;utils.h&quot;
+src/compare.c-13-
+src/compare.c-14-enum rray_compare_op {
+src/compare.c-15-  RRAY_COMPARE_greater_than,
+src/compare.c-16-  RRAY_COMPARE_greater_than_or_equal,
+--
+src/compare.c-200-  ));
+src/compare.c-201-  r_attrib_poke_dim(out, dimensions);
+src/compare.c-202-
+src/compare.c:203:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/compare.c-204-
+src/compare.c:205:  if (out_names != r_null) {
+src/compare.c:206:    r_attrib_poke_dim_names(out, out_names);
+src/compare.c-207-  }
+src/compare.c-208-
+src/compare.c-209-  FREE(5);
+src/compare.c-210-  return out;
+src/compare.c-211-}
+src/compare.c-212-
+src/compare.c-213-static rray_compare_fn rray_compare_switch(
+src/compare.c-214-  r_obj* x,
+src/compare.c-215-  r_obj* y,
+src/compare.c-216-  enum rray_compare_op op,
+src/compare.c-217-  struct rray_arg* x_arg,
+src/compare.c-218-  struct rray_arg* y_arg,
+     732 src/compare.c
+     687 src/equal.c
+    1419 total</pre></details>
+<details class="tool"><summary>Bash: sed -n 150,212p src/compare.c; sed -n 85,140p src/equal.c; grep -n 'returns\|@details\|names\…</summary>
+<pre>sed -n 150,212p src/compare.c; sed -n 85,140p src/equal.c; grep -n 'returns\|@details\|names\|titles' R/compare.R R/equal.R</pre><pre class="output">  r_obj* x_dimensions = r_dim(x);
+  r_obj* y_dimensions = r_dim(y);
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int y_dimensionality =
+    rray_dimensionality_from_dimensions(y_dimensions);
+
+  r_obj* dimensions = KEEP(rray_dimensions2(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    x_arg,
+    y_arg,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  check_dimensionality(dimensionality);
+
+  r_ssize v_x_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_x_dimensions,
+    x_dimensionality,
+    dimensionality,
+    v_x_broadcast_strides
+  );
+
+  r_ssize v_y_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_y_dimensions,
+    y_dimensionality,
+    dimensionality,
+    v_y_broadcast_strides
+  );
+
+  r_obj* out = KEEP(fn(
+    x,
+    y,
+    v_dimensions,
+    dimensionality,
+    v_x_broadcast_strides,
+    v_y_broadcast_strides,
+    op
+  ));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+    rray_dimensionality_from_dimensions(x_dimensions);
+  const int y_dimensionality =
+    rray_dimensionality_from_dimensions(y_dimensions);
+
+  r_obj* dimensions = KEEP(rray_dimensions2(
+    v_x_dimensions,
+    x_dimensionality,
+    v_y_dimensions,
+    y_dimensionality,
+    x_arg,
+    y_arg,
+    error_call
+  ));
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  check_dimensionality(dimensionality);
+
+  r_ssize v_x_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_x_dimensions,
+    x_dimensionality,
+    dimensionality,
+    v_x_broadcast_strides
+  );
+
+  r_ssize v_y_broadcast_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_broadcast_strides_from_dimensions(
+    v_y_dimensions,
+    y_dimensionality,
+    dimensionality,
+    v_y_broadcast_strides
+  );
+
+  r_obj* out = KEEP(fn(
+    x,
+    y,
+    v_dimensions,
+    dimensionality,
+    v_x_broadcast_strides,
+    v_y_broadcast_strides,
+    op
+  ));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static rray_equality_fn rray_equality_switch(
+R/equal.R:8:#' @details
+R/equal.R:15:#' @returns
+R/compare.R:14:#' @details
+R/compare.R:21:#' @returns</pre></details>
+<details class="tool"><summary>Bash: sed -n 120,150p src/compare.c; sed -n 50,85p src/equal.c; sed -n 1,40p R/compare.R; sed -n 1,…</summary>
+<pre>sed -n 120,150p src/compare.c; sed -n 50,85p src/equal.c; sed -n 1,40p R/compare.R; sed -n 1,35p R/equal.R</pre><pre class="output">  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_compare(
+    x,
+    y,
+    RRAY_COMPARE_less_than_or_equal,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+static r_obj* rray_compare(
+  r_obj* x,
+  r_obj* y,
+  enum rray_compare_op op,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  check_unclassed(y, y_arg, error_call);
+
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+  y = KEEP(arg_as_array(y, y_arg, error_call));
+
+  const rray_compare_fn fn =
+    rray_compare_switch(x, y, op, x_arg, y_arg, error_call);
+
+
+r_obj* rray_not_equal(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_equality(x, y, RRAY_EQUAL_not_equal, x_arg, y_arg, error_call);
+}
+
+static r_obj* rray_equality(
+  r_obj* x,
+  r_obj* y,
+  enum rray_equality_op op,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  check_unclassed(y, y_arg, error_call);
+
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+  y = KEEP(arg_as_array(y, y_arg, error_call));
+
+  const rray_equality_fn fn =
+    rray_equality_switch(x, y, op, x_arg, y_arg, error_call);
+
+  r_obj* x_dimensions = r_dim(x);
+  r_obj* y_dimensions = r_dim(y);
+
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int* v_y_dimensions = r_int_cbegin(y_dimensions);
+
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+#' Compare arrays
+#'
+#' @description
+#' - `rray_greater_than()` tests whether `x` is greater than `y`.
+#'
+#' - `rray_greater_than_or_equal()` tests whether `x` is greater than or equal
+#'   to `y`.
+#'
+#' - `rray_less_than()` tests whether `x` is less than `y`.
+#'
+#' - `rray_less_than_or_equal()` tests whether `x` is less than or equal to
+#'   `y`.
+#'
+#' @details
+#' The arrays are broadcast to common dimensions before they are compared.
+#'
+#' @param x An array.
+#'
+#' @param y An array.
+#'
+#' @returns
+#' A logical array with the common dimensions of `x` and `y`.
+#'
+#' @name rray-compare
+#' @examples
+#' x &lt;- array(1:6, c(3L, 2L))
+#'
+#' rray_greater_than(x, 3L)
+#' rray_less_than_or_equal(x, array(c(2L, 5L), c(1L, 2L)))
+NULL
+
+#' @rdname rray-compare
+#' @export
+rray_greater_than &lt;- function(x, y) {
+  .Call(ffi_rray_greater_than, x, y, environment())
+}
+
+#' @rdname rray-compare
+#' @export
+rray_greater_than_or_equal &lt;- function(x, y) {
+#' Equality
+#'
+#' @description
+#' - `rray_equal()` tests whether `x` is equal to `y`.
+#'
+#' - `rray_not_equal()` tests whether `x` is not equal to `y`.
+#'
+#' @details
+#' The arrays are broadcast to common dimensions before they are compared.
+#'
+#' @param x An array.
+#'
+#' @param y An array.
+#'
+#' @returns
+#' A logical array with the common dimensions of `x` and `y`.
+#'
+#' @name rray-equal
+#' @examples
+#' x &lt;- array(1:2, c(2L, 1L))
+#'
+#' rray_equal(x, 1L)
+#' rray_not_equal(x, array(c(1L, 3L), c(1L, 2L)))
+NULL
+
+#' @rdname rray-equal
+#' @export
+rray_equal &lt;- function(x, y) {
+  .Call(ffi_rray_equal, x, y, environment())
+}
+
+#' @rdname rray-equal
+#' @export
+rray_not_equal &lt;- function(x, y) {
+  .Call(ffi_rray_not_equal, x, y, environment())</pre></details>
+<p>Part 2 is small: drop the names call in <code>src/compare.c</code> and <code>src/equal.c</code>, update docs and tests. Checking for other references before editing.</p>
+
+<details class="tool"><summary>Bash: grep -rn -i 'compar\|rray_equal\|greater' plans/titles.md README.Rmd | head -30; grep -n 'ret…</summary>
+<pre>grep -rn -i 'compar\|rray_equal\|greater' plans/titles.md README.Rmd | head -30; grep -n 'returns' -A4 R/logical.R R/arithmetic.R | head -30</pre><pre class="output">plans/titles.md:39:## Comparison
+plans/titles.md:41:Built on `rray_broadcast_names2()` in `src/compare.c`.
+plans/titles.md:43:- `rray_greater_than()`, `rray_greater_than_or_equal()`
+plans/titles.md:49:- `rray_equal()`, in `src/equal.c`
+R/logical.R:18:#' @returns
+R/logical.R-19-#' A logical array with the common dimensions of `x` and `y`.
+R/logical.R-20-#'
+R/logical.R-21-#' @name rray-logical
+R/logical.R-22-#' @examples
+R/arithmetic.R:38:#' @returns
+R/arithmetic.R-39-#' An array with the common dimensions of `x` and `y`.
+R/arithmetic.R-40-#'
+R/arithmetic.R-41-#' @name rray-arithmetic
+R/arithmetic.R-42-#' @examples</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,80p plans/titles.md</summary>
+<pre>sed -n 1,80p plans/titles.md</pre><pre class="output"># Titles still to handle
+
+The single-array functions keep titles as of #154 to #159. The functions below
+still drop them. They all combine names across several inputs, so they get
+titles when we finalize how dimension names combine (see `plans/n-ary.md`).
+
+Each one was checked against:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+```
+
+## Broadcasting
+
+- `rray_broadcast()`: drops titles whenever it actually broadcasts. It keeps
+  them only on a no-op, where `x` comes back untouched. The `&quot;dimension titles
+  are lost&quot;` test in `test-broadcast.R` pins this down today.
+
+- `rray_broadcast_common()`: the same, per input. An input that already has
+  the common dimensions keeps its titles, any other input loses them.
+
+Both go through `rray_broadcast_names()` in `src/broadcast-names.c`.
+
+## Arithmetic
+
+Built on `rray_broadcast_names2()` in `src/arithmetic.c`. Titles are dropped
+even for `rray_add(x, x)`, where nothing broadcasts.
+
+- `rray_add()`
+
+- `rray_subtract()`
+
+- `rray_multiply()`
+
+- `rray_divide()`
+
+- `rray_exponentiate()`
+
+## Comparison
+
+Built on `rray_broadcast_names2()` in `src/compare.c`.
+
+- `rray_greater_than()`, `rray_greater_than_or_equal()`
+
+- `rray_less_than()`, `rray_less_than_or_equal()`
+
+- `rray_not_equal()`
+
+- `rray_equal()`, in `src/equal.c`
+
+## Logical
+
+Built on `rray_broadcast_names2()` in `src/logical.c`.
+
+- `rray_and()`
+
+- `rray_or()`
+
+- `rray_xor()`
+
+## Parallel extremum
+
+Built on `rray_broadcast_names2()` in `src/extremum.c`.
+
+- `rray_pmax()`
+
+- `rray_pmin()`
+
+## Combining
+
+Built on `rray_broadcast_names_common_opts()` in `src/combine.c`. Titles are
+dropped even with a single input.
+
+- `rray_combine()`
+
+- `rray_stack()`, which also goes through the internal
+  `rray_expand_dimensionality()` in `src/dimensionality.c`. The new axis should
+  get the title `&quot;&quot;`.
+
+## Not on this list</pre></details>
+<details class="tool"><summary>Bash: sed -n 80,200p plans/titles.md; git log --stat -1 5dcbd72 | head -30</summary>
+<pre>sed -n 80,200p plans/titles.md; git log --stat -1 5dcbd72 | head -30</pre><pre class="output">## Not on this list
+
+These drop titles on purpose, because they drop all names. They are pinned by
+tests and need no further work:
+
+- `rray_extract()`
+
+- `rray_index()`
+
+- `rray_set_dimensions()`
+
+- `rray_if_else()`
+commit 5dcbd725b2429d9a5ba2e000a6babe07a3c24f0c
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Mon Oct 19 20:16:18 2026 -0400
+
+    Keep titles when `rray_stack()` expands inputs (#161)
+    
+    * Keep titles when `rray_stack()` expands inputs, using `rray_insert_axes()`
+    
+    * Protect the axes vector in `rray_stack_axes()`
+    
+    * Choose the axes in `rray_stack_prepare()` with a ternary
+    
+    * Go back to `rray_expand_dimensionality()` and keep titles in it
+
+ plans/names-and-titles.md |  5 ++---
+ src/dimensionality.c      | 13 +++++++++++++
+ 2 files changed, 15 insertions(+), 3 deletions(-)</pre></details>
+<details class="tool tool-error"><summary>Bash: git checkout -b feature/names-titles &amp;&amp; python3 - &lt;&lt;'EOF'</summary>
+<pre>git checkout -b feature/names-titles &amp;&amp; python3 - &lt;&lt;'EOF'
+import re
+for f in [&quot;src/compare.c&quot;,&quot;src/equal.c&quot;]:
+    s=open(f).read()
+    s=s.replace('#include &quot;broadcast-names.h&quot;\n','',1)
+    old='''  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);'''
+    assert s.count(old)==1
+    s=s.replace(old,'''  r_attrib_poke_dim(out, dimensions);
+
+  FREE(4);''')
+    open(f,&quot;w&quot;).write(s)
+EOF
+git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/names-titles</summary>
+<pre>git checkout -b feature/names-titles</pre><pre class="output">Switched to a new branch 'feature/names-titles'</pre></details>
+<details class="tool"><summary>Read src/compare.c</summary>
+<pre class="output">1	#include &quot;compare.h&quot;
+2	
+3	#include &quot;binary.h&quot;
+4	#include &quot;broadcast-names.h&quot;
+5	#include &quot;cast.h&quot;
+6	#include &quot;dimensionality.h&quot;
+7	#include &quot;dimensions.h&quot;
+8	#include &quot;missing.h&quot;
+9	#include &quot;strides.h&quot;
+10	#include &quot;type.h&quot;
+11	#include &quot;typeof2.h&quot;
+12	#include &quot;utils.h&quot;</pre></details>
+<details class="tool"><summary>Read src/equal.c</summary>
+<pre class="output">1	#include &quot;equal.h&quot;
+2	
+3	#include &quot;binary.h&quot;
+4	#include &quot;broadcast-names.h&quot;
+5	#include &quot;cast.h&quot;
+6	#include &quot;dimensionality.h&quot;
+7	#include &quot;dimensions.h&quot;
+8	#include &quot;missing.h&quot;
+9	#include &quot;strides.h&quot;
+10	#include &quot;type.h&quot;
+11	#include &quot;typeof2.h&quot;
+12	#include &quot;utils.h&quot;</pre></details>
+<details class="tool"><summary>Read src/compare.c</summary>
+<pre class="output">200	  ));
+201	  r_attrib_poke_dim(out, dimensions);
+202	
+203	  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+204	
+205	  if (out_names != r_null) {
+206	    r_attrib_poke_dim_names(out, out_names);
+207	  }
+208	
+209	  FREE(5);
+210	  return out;
+211	}</pre></details>
+<details class="tool"><summary>Read src/equal.c</summary>
+<pre class="output">127	  ));
+128	  r_attrib_poke_dim(out, dimensions);
+129	
+130	  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+131	
+132	  if (out_names != r_null) {
+133	    r_attrib_poke_dim_names(out, out_names);
+134	  }
+135	
+136	  FREE(5);
+137	  return out;
+138	}</pre></details>
+<details class="tool"><summary>Edit src/compare.c</summary>
+<pre class="diff"><span class="del">-  r_attrib_poke_dim(out, dimensions);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));</span>
+<span class="del">-</span>
+<span class="del">-  if (out_names != r_null) {</span>
+<span class="del">-    r_attrib_poke_dim_names(out, out_names);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  FREE(5);</span>
+<span class="ins">+  r_attrib_poke_dim(out, dimensions);</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(4);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/compare.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/equal.c</summary>
+<pre class="diff"><span class="del">-  r_attrib_poke_dim(out, dimensions);</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));</span>
+<span class="del">-</span>
+<span class="del">-  if (out_names != r_null) {</span>
+<span class="del">-    r_attrib_poke_dim_names(out, out_names);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  FREE(5);</span>
+<span class="ins">+  r_attrib_poke_dim(out, dimensions);</span>
+<span class="ins">+</span>
+<span class="ins">+  FREE(4);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/equal.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/compare.c</summary>
+<pre class="diff"><span class="del">-#include &quot;broadcast-names.h&quot;</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray/src/compare.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/equal.c</summary>
+<pre class="diff"><span class="del">-#include &quot;broadcast-names.h&quot;</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray/src/equal.c has been updated successfully.</pre></details>
+<p>C edits done. Now checking that the kernels always allocate a fresh result (so no names leak through), then docs and tests.</p>
+
+<details class="tool"><summary>Bash: grep -n 'return [xy];\|r_alloc_logical' src/compare.c src/equal.c | head</summary>
+<pre>grep -n 'return [xy];\|r_alloc_logical' src/compare.c src/equal.c | head</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: grep -n 'alloc\|return ' src/compare.c | sed -n 1,40p</summary>
+<pre>grep -n 'alloc\|return ' src/compare.c | sed -n 1,40p</pre><pre class="output">34:  return rray_greater_than(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+44:  return rray_compare(
+60:  return rray_greater_than_or_equal(
+76:  return rray_compare(
+88:  return rray_less_than(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+98:  return rray_compare(x, y, RRAY_COMPARE_less_than, x_arg, y_arg, error_call);
+107:  return rray_less_than_or_equal(
+123:  return rray_compare(
+203:  return out;
+221:    return rray_compare_lgl_lgl;
+223:    return side == RRAY_SIDE_right ? rray_compare_lgl_int
+226:    return side == RRAY_SIDE_right ? rray_compare_lgl_dbl
+229:    return rray_compare_int_int;
+231:    return side == RRAY_SIDE_right ? rray_compare_int_dbl
+234:    return rray_compare_dbl_dbl;
+288:    return &quot;&gt;&quot;;
+290:    return &quot;&gt;=&quot;;
+292:    return &quot;&lt;&quot;;
+294:    return &quot;&lt;=&quot;;
+300:static r_no_return void stop_unsupported_compare(
+606:  return missing ? r_globals.na_lgl : elt;</pre></details>
+<details class="tool"><summary>Bash: sed -n 300,360p src/compare.c | grep -n 'out\|r_alloc\|vector' | head</summary>
+<pre>sed -n 300,360p src/compare.c | grep -n 'out\|r_alloc\|vector' | head</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: grep -n 'out = ' src/compare.c src/equal.c src/binary.h | head</summary>
+<pre>grep -n 'out = ' src/compare.c src/equal.c src/binary.h | head</pre><pre class="output">src/equal.c:118:  r_obj* out = KEEP(fn(
+src/compare.c:191:  r_obj* out = KEEP(fn(
+src/binary.h:33:  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, rray_run_iterator_size(&amp;it)));   \
+src/binary.h:34:  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \</pre></details>
+<details class="tool"><summary>Edit R/compare.R</summary>
+<pre class="diff"><span class="del">-#' A logical array with the common dimensions of `x` and `y`.</span>
+<span class="ins">+#' A logical array with the common dimensions of `x` and `y`, and no names.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/compare.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/equal.R</summary>
+<pre class="diff"><span class="del">-#' A logical array with the common dimensions of `x` and `y`.</span>
+<span class="ins">+#' A logical array with the common dimensions of `x` and `y`, and no names.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/equal.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'x &lt;- array(1:4, c(2,2), dimnames = list(A = NULL, B = NULL)); str(attributes(x));…</summary>
+<pre>Rscript -e 'x &lt;- array(1:4, c(2,2), dimnames = list(A = NULL, B = NULL)); str(attributes(x)); devtools::load_all(quiet=TRUE); str(attributes(rray_equal(x, x))); str(attributes(rray_add(x, x)))'</pre><pre class="output">List of 2
+ $ dim     : int [1:2] 2 2
+ $ dimnames:List of 2
+  ..$ A: NULL
+  ..$ B: NULL
+List of 1
+ $ dim: int [1:2] 2 2
+List of 1
+ $ dim: int [1:2] 2 2</pre></details>
+<p>Rebuilt fine and titles are already gone. Now replacing the old &quot;coalesces names&quot; tests.</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-compare.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;coalesces names across inputs&quot;, {</span>
+<span class="del">-  x &lt;- array(</span>
+<span class="del">-    1:3,</span>
+<span class="del">-    c(3L, 1L),</span>
+<span class="del">-    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), &quot;x&quot;)</span>
+<span class="del">-  )</span>
+<span class="del">-  y &lt;- array(</span>
+<span class="del">-    1:2,</span>
+<span class="del">-    c(1L, 2L),</span>
+<span class="del">-    dimnames = list(&quot;y&quot;, c(&quot;c1&quot;, &quot;c2&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-</span>
+<span class="del">-  expect_identical(</span>
+<span class="del">-    rray_names(rray_greater_than(x, y)),</span>
+<span class="del">-    list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), c(&quot;c1&quot;, &quot;c2&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-</span>
+<span class="del">-  x &lt;- array(1:3, 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))</span>
+<span class="del">-  y &lt;- array(1:3, 3L, dimnames = list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))</span>
+<span class="del">-  expect_identical(</span>
+<span class="del">-    rray_names(rray_less_than(x, y)),</span>
+<span class="del">-    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;drops names and titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:3, c(3L, 1L), dimnames = list(R = c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), &quot;x&quot;))</span>
+<span class="ins">+  y &lt;- array(1:2, c(1L, 2L), dimnames = list(S = &quot;y&quot;, C = c(&quot;c1&quot;, &quot;c2&quot;)))</span>
+<span class="ins">+  z &lt;- array(1:4, c(2L, 2L), dimnames = list(A = NULL, B = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  fns &lt;- list(</span>
+<span class="ins">+    rray_greater_than,</span>
+<span class="ins">+    rray_greater_than_or_equal,</span>
+<span class="ins">+    rray_less_than,</span>
+<span class="ins">+    rray_less_than_or_equal</span>
+<span class="ins">+  )</span>
+<span class="ins">+</span>
+<span class="ins">+  for (fn in fns) {</span>
+<span class="ins">+    expect_null(dimnames(fn(x, x)))</span>
+<span class="ins">+    expect_null(dimnames(fn(x, y)))</span>
+<span class="ins">+    expect_null(dimnames(fn(z, z)))</span>
+<span class="ins">+  }</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-compare.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-equal.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;coalesces names across inputs&quot;, {</span>
+<span class="del">-  x &lt;- array(</span>
+<span class="del">-    1:3,</span>
+<span class="del">-    c(3L, 1L),</span>
+<span class="del">-    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), &quot;x&quot;)</span>
+<span class="del">-  )</span>
+<span class="del">-  y &lt;- array(</span>
+<span class="del">-    1:2,</span>
+<span class="del">-    c(1L, 2L),</span>
+<span class="del">-    dimnames = list(&quot;y&quot;, c(&quot;c1&quot;, &quot;c2&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-</span>
+<span class="del">-  expect_identical(</span>
+<span class="del">-    rray_names(rray_equal(x, y)),</span>
+<span class="del">-    list(c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), c(&quot;c1&quot;, &quot;c2&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-</span>
+<span class="del">-  x &lt;- array(1:3, 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))</span>
+<span class="del">-  y &lt;- array(1:3, 3L, dimnames = list(c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))</span>
+<span class="del">-  expect_identical(</span>
+<span class="del">-    rray_names(rray_not_equal(x, y)),</span>
+<span class="del">-    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;drops names and titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:3, c(3L, 1L), dimnames = list(R = c(&quot;r1&quot;, &quot;r2&quot;, &quot;r3&quot;), &quot;x&quot;))</span>
+<span class="ins">+  y &lt;- array(1:2, c(1L, 2L), dimnames = list(S = &quot;y&quot;, C = c(&quot;c1&quot;, &quot;c2&quot;)))</span>
+<span class="ins">+  z &lt;- array(1:4, c(2L, 2L), dimnames = list(A = NULL, B = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  for (fn in list(rray_equal, rray_not_equal)) {</span>
+<span class="ins">+    expect_null(dimnames(fn(x, x)))</span>
+<span class="ins">+    expect_null(dimnames(fn(x, y)))</span>
+<span class="ins">+    expect_null(dimnames(fn(z, z)))</span>
+<span class="ins">+  }</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-equal.R has been updated successfully.</pre></details>
+<p>Now updating the plans: check off item 2, drop the now-stale table row, and move comparisons to the &quot;drop on purpose&quot; list in <code>plans/titles.md</code>.</p>
+
+<details class="tool"><summary>Edit plans/names-and-titles.md</summary>
+<pre class="diff"><span class="del">-- [ ] 2. Comparison</span>
+<span class="ins">+- [x] 2. Comparison</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/names-and-titles.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/names-and-titles.md</summary>
+<pre class="diff"><span class="del">-| `src/compare.c`, `src/equal.c` | `rray_broadcast_names2()`, to be removed |</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/names-and-titles.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/titles.md</summary>
+<pre class="diff"><span class="del">-## Comparison</span>
+<span class="del">-</span>
+<span class="del">-Built on `rray_broadcast_names2()` in `src/compare.c`.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_greater_than()`, `rray_greater_than_or_equal()`</span>
+<span class="del">-</span>
+<span class="del">-- `rray_less_than()`, `rray_less_than_or_equal()`</span>
+<span class="del">-</span>
+<span class="del">-- `rray_not_equal()`</span>
+<span class="del">-</span>
+<span class="del">-- `rray_equal()`, in `src/equal.c`</span>
+<span class="del">-</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/titles.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/titles.md</summary>
+<pre class="diff"><span class="del">-- `rray_if_else()`</span>
+<span class="ins">+- `rray_if_else()`</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_equal()`, `rray_not_equal()`</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_greater_than()`, `rray_greater_than_or_equal()`</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_less_than()`, `rray_less_than_or_equal()`</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/titles.md has been updated successfully.</pre></details>
+<p>Running the checks: clang-format, air, document, then tests.</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e 'devtools::document()' 2&gt;&amp;1 | t…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e 'devtools::document()' 2&gt;&amp;1 | tail -5 &amp;&amp; Rscript -e 'devtools::test(filter = &quot;^(compare|equal)&quot;)' 2&gt;&amp;1 | tail -8 &amp;&amp; git status --short</pre><pre class="output">ℹ Updating rray documentation
+ℹ Loading rray
+Writing 'rray-compare.Rd'
+Writing 'rray-equal.Rd'
+ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 128 ]
+ M R/compare.R
+ M R/equal.R
+ M man/rray-compare.Rd
+ M man/rray-equal.Rd
+ M plans/names-and-titles.md
+ M plans/titles.md
+ M src/compare.c
+ M src/equal.c
+ M tests/testthat/test-compare.R
+ M tests/testthat/test-equal.R</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -6; git diff src/ plans/</summary>
+<pre>Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -6; git diff src/ plans/</pre><pre class="output">Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:518:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 7791 ]
+diff --git a/plans/names-and-titles.md b/plans/names-and-titles.md
+index ad5e7d8..6202dd4 100644
+--- a/plans/names-and-titles.md
++++ b/plans/names-and-titles.md
+@@ -300,7 +300,6 @@ it returns no names and no titles, like `vctrs::vec_equal()`.
+ |---|---|
+ | `rray_broadcast()` in `src/broadcast.c` | `rray_broadcast_names()` |
+ | `src/arithmetic.c`, `src/extremum.c`, `src/logical.c` | `rray_broadcast_names2()` |
+-| `src/compare.c`, `src/equal.c` | `rray_broadcast_names2()`, to be removed |
+ | `rray_combine_names()` in `src/combine.c` | `rray_broadcast_names_common_opts()` |
+ 
+ All of these live in `src/broadcast-names.c`. Today they implement first wins
+@@ -420,7 +419,7 @@ Each item is one pull request, merged before the next starts.
+ 
+ - [x] 1. `rray_expand_dimensionality()` keeps titles, with `&quot;&quot;` on new axes.
+ 
+-- [ ] 2. Comparison functions drop names and titles, with docs and tests.
++- [x] 2. Comparison functions drop names and titles, with docs and tests.
+ 
+ - [ ] 3. Names must agree. Rework `src/broadcast-names.c` around the merge
+   step, thread `rray_arg`s and `error_call` through every caller, compute
+diff --git a/plans/titles.md b/plans/titles.md
+index 83f9fc9..d3ba005 100644
+--- a/plans/titles.md
++++ b/plans/titles.md
+@@ -36,18 +36,6 @@ even for `rray_add(x, x)`, where nothing broadcasts.
+ 
+ - `rray_exponentiate()`
+ 
+-## Comparison
+-
+-Built on `rray_broadcast_names2()` in `src/compare.c`.
+-
+-- `rray_greater_than()`, `rray_greater_than_or_equal()`
+-
+-- `rray_less_than()`, `rray_less_than_or_equal()`
+-
+-- `rray_not_equal()`
+-
+-- `rray_equal()`, in `src/equal.c`
+-
+ ## Logical
+ 
+ Built on `rray_broadcast_names2()` in `src/logical.c`.
+@@ -89,3 +77,9 @@ tests and need no further work:
+ - `rray_set_dimensions()`
+ 
+ - `rray_if_else()`
++
++- `rray_equal()`, `rray_not_equal()`
++
++- `rray_greater_than()`, `rray_greater_than_or_equal()`
++
++- `rray_less_than()`, `rray_less_than_or_equal()`
+diff --git a/src/compare.c b/src/compare.c
+index 44bd307..8a178e9 100644
+--- a/src/compare.c
++++ b/src/compare.c
+@@ -1,7 +1,6 @@
+ #include &quot;compare.h&quot;
+ 
+ #include &quot;binary.h&quot;
+-#include &quot;broadcast-names.h&quot;
+ #include &quot;cast.h&quot;
+ #include &quot;dimensionality.h&quot;
+ #include &quot;dimensions.h&quot;
+@@ -200,13 +199,7 @@ static r_obj* rray_compare(
+   ));
+   r_attrib_poke_dim(out, dimensions);
+ 
+-  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+-
+-  if (out_names != r_null) {
+-    r_attrib_poke_dim_names(out, out_names);
+-  }
+-
+-  FREE(5);
++  FREE(4);
+   return out;
+ }
+ 
+diff --git a/src/equal.c b/src/equal.c
+index b7d8191..dd59a04 100644
+--- a/src/equal.c
++++ b/src/equal.c
+@@ -1,7 +1,6 @@
+ #include &quot;equal.h&quot;
+ 
+ #include &quot;binary.h&quot;
+-#include &quot;broadcast-names.h&quot;
+ #include &quot;cast.h&quot;
+ #include &quot;dimensionality.h&quot;
+ #include &quot;dimensions.h&quot;
+@@ -127,13 +126,7 @@ static r_obj* rray_equality(
+   ));
+   r_attrib_poke_dim(out, dimensions);
+ 
+-  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+-
+-  if (out_names != r_null) {
+-    r_attrib_poke_dim_names(out, out_names);
+-  }
+-
+-  FREE(5);
++  FREE(4);
+   return out;
+ }</pre></details>
+<p>All 7791 tests pass. Protection pass: the only <code>r_obj*</code> touched was the removed <code>out_names</code>. Each function now keeps <code>x</code>, <code>y</code>, <code>dimensions</code>, <code>out</code>, so <code>FREE(4)</code> is correct. Committing and pushing.</p>
+
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m 'Drop names and titles in comparison and equality functions' &amp;…</summary>
+<pre>git add -A &amp;&amp; git commit -q -m 'Drop names and titles in comparison and equality functions' &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/names-titles 2&gt;&amp;1 | tail -3</pre><pre class="output">ce3d6e4 Drop names and titles in comparison and equality functions
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/names-titles -&gt; feature/names-titles
+branch 'feature/names-titles' set up to track 'origin/feature/names-titles'.</pre></details>
+<p>I finished part 2 and pushed it as <code>ce3d6e4</code> on the new <code>feature/names-titles</code> branch. The six comparison and equality functions now return no names and no titles. All tests pass (7791 passed, 0 failed, 6 skipped).</p>
+<p>I used the branch name from your message. The session setup said to use <code>feature/titles</code>, so tell me if you wanted that one instead.</p>
+<p><strong>What changed</strong></p>
+<ul>
+<li>
+<p><strong>C code:</strong> in <code>src/compare.c</code> and <code>src/equal.c</code> I removed the <code>rray_broadcast_names2()</code> call and its include. Both now end with <code>FREE(4)</code>. The kernels always build a new result vector, so nothing from <code>x</code> or <code>y</code> can carry over.</p>
+</li>
+<li>
+<p><strong>Docs:</strong> <code>@returns</code> in <code>R/compare.R</code> and <code>R/equal.R</code> now says &quot;...and no names.&quot; I re-ran <code>devtools::document()</code>.</p>
+</li>
+<li>
+<p><strong>Tests:</strong> in <code>test-compare.R</code> and <code>test-equal.R</code>, <code>&quot;coalesces names across inputs&quot;</code> is now <code>&quot;drops names and titles&quot;</code>. It loops over every function and checks <code>dimnames()</code> is <code>NULL</code> for three cases:</p>
+<ul>
+<li>an input compared with itself;</li>
+<li>two inputs whose names conflict and that broadcast against each other;</li>
+<li>an input with only titles, like <code>list(A = NULL, B = NULL)</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Plans:</strong></p>
+<ul>
+<li>In <code>plans/names-and-titles.md</code>, item 2 is checked off and the &quot;to be removed&quot; row in the &quot;Where names are built today&quot; table is gone.</li>
+<li>In <code>plans/titles.md</code>, I moved the comparison functions from &quot;still to handle&quot; to the list of functions that drop titles on purpose. You didn't ask for this; I did it so that file stays accurate until it is deleted in part 4.</li>
+</ul>
+</li>
+</ul>
+<p><strong>Checks run:</strong> clang-format over all files, <code>air format .</code>, <code>devtools::document()</code>, the focused tests, the full suite, and the protection review. The only object the review had to look at was the removed <code>out_names</code>.</p>
+<p>I didn't open a PR.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p class="command"><code>/pr-finish</code></p>
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git branch --show-current &amp;&amp; git status --porcelain &amp;&amp; git rev-parse HEAD &amp;&amp; which gh</summary>
+<pre>git branch --show-current &amp;&amp; git status --porcelain &amp;&amp; git rev-parse HEAD &amp;&amp; which gh</pre><pre class="output">feature/names-titles
+ce3d6e4226bdd4899bbbdf3a37d3f1866ac6000d
+/opt/homebrew/bin/gh</pre></details>
+<details class="tool"><summary>Bash: gh pr view --json number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner</summary>
+<pre>gh pr view --json number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner</pre><pre class="output">{&quot;baseRefName&quot;:&quot;main&quot;,&quot;headRefName&quot;:&quot;feature/names-titles&quot;,&quot;headRefOid&quot;:&quot;ce3d6e4226bdd4899bbbdf3a37d3f1866ac6000d&quot;,&quot;headRepositoryOwner&quot;:{&quot;id&quot;:&quot;MDEyOk9yZ2FuaXphdGlvbjIyNjE4NzE2&quot;,&quot;login&quot;:&quot;r-lib&quot;},&quot;number&quot;:162,&quot;state&quot;:&quot;MERGED&quot;}</pre></details>
+<p>All checks pass. Cleaning up.</p>
+
+<details class="tool"><summary>Bash: git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/names-titles &amp;&amp; …</summary>
+<pre>git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/names-titles &amp;&amp; git fetch --prune origin &amp;&amp; git log --oneline -1</pre><pre class="output">Switched to branch 'main'
+Your branch is up to date with 'origin/main'.
+From https://github.com/r-lib/rray
+ * branch            main       -&gt; FETCH_HEAD
+   5dcbd72..bb1dfb2  main       -&gt; origin/main
+Updating 5dcbd72..bb1dfb2
+Fast-forward
+ R/compare.R                   |  2 +-
+ R/equal.R                     |  2 +-
+ man/rray-compare.Rd           |  2 +-
+ man/rray-equal.Rd             |  2 +-
+ plans/names-and-titles.md     |  3 +--
+ plans/titles.md               | 18 ++++++------------
+ src/compare.c                 |  9 +--------
+ src/equal.c                   |  9 +--------
+ tests/testthat/test-compare.R | 36 +++++++++++++++---------------------
+ tests/testthat/test-equal.R   | 33 ++++++++++-----------------------
+ 10 files changed, 38 insertions(+), 78 deletions(-)
+Deleted branch feature/names-titles (was ce3d6e4).
+From https://github.com/r-lib/rray
+ - [deleted]         (none)     -&gt; origin/feature/names-titles
+   a904544..d2fcc23  gh-pages   -&gt; origin/gh-pages
+bb1dfb2 Drop names and titles in comparison and equality functions (#162)</pre></details>
+<p>Cleanup is done. PR #162 was merged, and every step ran without errors.</p>
+<ul>
+<li>
+<p><strong>PR:</strong> #162, merged into <code>main</code>.</p>
+</li>
+<li>
+<p><strong>Checkout:</strong> switched to <code>main</code> and fast-forwarded it from <code>5dcbd72</code> to <code>bb1dfb2</code>.</p>
+</li>
+<li>
+<p><strong>Branch deleted:</strong> <code>feature/names-titles</code> (was <code>ce3d6e4</code>).</p>
+</li>
+<li>
+<p><strong>Prune:</strong> <code>origin/feature/names-titles</code> is gone.</p>
+</li>
+<li>
+<p><strong>Base branch:</strong> <code>main</code> is now on <code>bb1dfb2</code> &quot;Drop names and titles in comparison and equality functions (#162)&quot;.</p>
+</li>
+</ul>
+
+</section>
+</main>
+</body>
+</html>

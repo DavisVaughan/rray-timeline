@@ -1,0 +1,2136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparing nested reduction to rray_permute_axes() and renaming it</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-66">rray timeline</a>
+<h1>Comparing nested reduction to <code>rray_permute_axes()</code> and renaming it</h1>
+<p class="facts">Codex · Sep 14, 2026 · 6 prompts · 15 replies · <a href="https://github.com/r-lib/rray/pull/66">#66</a></p>
+</header>
+<main>
+<p class="divider">Sep 14, 2026, 18:40 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I feel like there’s an alternate version of this PR where we use rray_permute_axes() to bring the axes we are reducing over to the front (back?) making it so that we can directly iterate over x in order and assign directly into out</p>
+<p>Is that right? Am I crazy?</p>
+<p>Would that be possibly be even more performant at the cost of an allocation of x?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll trace the current reduction loop and <code>rray_permute_axes()</code> together, then compare their memory access, allocation, and likely performance.</p>
+
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git diff --stat &amp;&amp; git diff -- src R tests</summary>
+<pre>$ git status --short &amp;&amp; git diff --stat &amp;&amp; git diff -- src R tests</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log --oneline --decorate -12 &amp;&amp; rg -n &quot;permute_axes|reduce…</summary>
+<pre>$ git status --short --branch &amp;&amp; git log --oneline --decorate -12 &amp;&amp; rg -n &quot;permute_axes|reduce|reduc&quot; src R tests/testthat</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+5c41cf1 (HEAD -&gt; feature/mean, origin/feature/mean) Remove redundant grouped reduction output size
+c345e7e Use standard reduction location names
+8acb431 Name the outer output run start
+6c54b5a Inline missing double mean handling
+c9dc25e Section the reduction header
+5585e41 Move grouped reduction macros into reduce header
+5e4e004 Order inner reduction traversal locals
+475d5f8 Name inner reduction plans consistently
+da185c2 Rename the inner reduction macro
+8cd2d12 Rename the outer reduction macro
+abb332c Remove mean reduction details
+dc24ff9 Remove the now implemented `plans/no-macros.md`
+src/permute-axes.h:8:r_obj* rray_permute_axes(
+src/reduce.h:10:// rray_reduce
+src/reduce.h:12:typedef r_obj* (*rray_reduce_fn)(
+src/reduce.h:18:typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+src/reduce.h:25:r_obj* rray_reduce(
+src/reduce.h:29:  rray_reduce_fn_switch fn_switch,
+src/reduce.h:86:// rray_reduce_grouped
+src/reduce.h:88:typedef r_obj* (*rray_reduce_grouped_fn)(
+src/reduce.h:94:typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(
+src/reduce.h:101:r_obj* rray_reduce_grouped(
+src/reduce.h:105:  rray_reduce_grouped_fn_switch fn_switch,
+src/reduce.h:185:// stop_unsupported_reduce
+src/reduce.h:187:r_no_return void stop_unsupported_reduce(
+src/decl/reduce-product-decl.h:1:static rray_reduce_fn rray_product_along_switch(
+src/permute-axes.c:12:r_obj* ffi_rray_permute_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+src/permute-axes.c:14:  return rray_permute_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+src/permute-axes.c:17:r_obj* rray_permute_axes(
+src/permute-axes.c:62:    out = rray_permute_axes_lgl(x, &amp;plan);
+src/permute-axes.c:65:    out = rray_permute_axes_int(x, &amp;plan);
+src/permute-axes.c:68:    out = rray_permute_axes_dbl(x, &amp;plan);
+src/permute-axes.c:71:    out = rray_permute_axes_cpl(x, &amp;plan);
+src/permute-axes.c:74:    out = rray_permute_axes_raw(x, &amp;plan);
+src/permute-axes.c:77:    out = rray_permute_axes_chr(x, &amp;plan);
+src/permute-axes.c:80:    out = rray_permute_axes_list(x, &amp;plan);
+src/permute-axes.c:89:  r_obj* names = KEEP(rray_permute_axes_names(x, v_axes, dimensionality));
+src/permute-axes.c:178:static r_obj* rray_permute_axes_lgl(
+src/permute-axes.c:185:static r_obj* rray_permute_axes_int(
+src/permute-axes.c:192:static r_obj* rray_permute_axes_dbl(
+src/permute-axes.c:199:static r_obj* rray_permute_axes_cpl(
+src/permute-axes.c:211:static r_obj* rray_permute_axes_raw(
+src/permute-axes.c:218:static r_obj* rray_permute_axes_chr(
+src/permute-axes.c:225:static r_obj* rray_permute_axes_list(
+src/permute-axes.c:235:static r_obj* rray_permute_axes_names(
+R/reduce.R:17:#' The dimensionality of `x` is retained in the result, with the reduced axes
+R/reduce.R:31:#' @param axes An integer vector of axes to reduce over. `1` reduces
+R/reduce.R:32:#'   rows, `2` reduces columns, and so on.
+R/reduce.R:36:#' @param na_rm If `TRUE`, missing values are removed before reducing.
+R/reduce.R:40:#' `axes` reduced to 1.
+R/reduce.R:42:#' @name reduce
+R/reduce.R:67:#' @rdname reduce
+R/reduce.R:74:#' @rdname reduce
+R/reduce.R:81:#' @rdname reduce
+R/reduce.R:88:#' @rdname reduce
+R/reduce.R:95:#' @rdname reduce
+src/reduce-sum.c:1:#include &quot;reduce-sum.h&quot;
+src/reduce-sum.c:5:#include &quot;reduce.h&quot;
+src/reduce-sum.c:9:#include &quot;decl/reduce-sum-decl.h&quot;
+src/reduce-sum.c:29:  return rray_reduce(x, axes, na_rm, rray_sum_along_switch, arg, error_call);
+src/reduce-sum.c:32:static rray_reduce_fn rray_sum_along_switch(
+src/reduce-sum.c:51:    stop_unsupported_reduce(&quot;sum&quot;, x, arg, error_call);
+tests/testthat/test-reduce-logical.R:1:test_that(&quot;can reduce along axis 1&quot;, {
+tests/testthat/test-reduce-logical.R:7:test_that(&quot;can reduce along axis 2&quot;, {
+tests/testthat/test-reduce-logical.R:13:test_that(&quot;reduced axes become size 1&quot;, {
+tests/testthat/test-reduce-logical.R:19:test_that(&quot;can reduce over all axes&quot;, {
+tests/testthat/test-reduce-logical.R:31:test_that(&quot;reducing over no axes returns the input unchanged&quot;, {
+tests/testthat/test-reduce-logical.R:37:test_that(&quot;can reduce axis 3&quot;, {
+tests/testthat/test-reduce-logical.R:44:test_that(&quot;coalesces reduction axes&quot;, {
+tests/testthat/test-reduce-logical.R:69:test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+tests/testthat/test-reduce-logical.R:75:test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+tests/testthat/test-reduce-logical.R:143:test_that(&quot;reducing a zero-length axis gives the identity value&quot;, {
+tests/testthat/test-reduce-logical.R:155:test_that(&quot;reducing over a non-zero-length axis with a zero-length axis&quot;, {
+tests/testthat/test-reduce-logical.R:162:test_that(&quot;reducing all axes of a zero-length array&quot;, {
+R/permute-axes.R:3:#' `rray_permute_axes()` reorders the axes of an array.
+R/permute-axes.R:8:#' `rray_permute_axes(x, c(2, 1))` transposes a matrix, like [t()].
+R/permute-axes.R:22:#' rray_permute_axes(x, c(2, 1))
+R/permute-axes.R:28:#' rray_dimensions(rray_permute_axes(y, c(3, 2, 1)))
+R/permute-axes.R:32:#' rray_dimensions(rray_permute_axes(y, c(2, 1, 3)))
+R/permute-axes.R:33:rray_permute_axes &lt;- function(x, axes) {
+R/permute-axes.R:34:  .Call(ffi_rray_permute_axes, x, axes, environment())
+R/reduce-names.R:2:rray_reduce_names &lt;- function(x, axes) {
+R/reduce-names.R:3:  .Call(ffi_rray_reduce_names, x, axes)
+src/decl/reduce-sum-decl.h:1:static rray_reduce_fn rray_sum_along_switch(
+src/init.c:58:extern r_obj* ffi_rray_reduce_names(r_obj* ffi_x, r_obj* ffi_axes);
+src/init.c:72:extern r_obj* ffi_rray_permute_axes(
+src/init.c:189:  {&quot;ffi_rray_reduce_names&quot;, (DL_FUNC) &amp;ffi_rray_reduce_names, 2},
+src/init.c:194:  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+src/decl/reduce-decl.h:1:static struct rray_strided_iterator_plan rray_reduce_axes_plan(
+tests/testthat/test-ptype-common.R:23:test_that(&quot;`.ptype` is reduced to a bare empty vector&quot;, {
+src/reduce-mean.c:1:#include &quot;reduce-mean.h&quot;
+src/reduce-mean.c:3:#include &quot;reduce.h&quot;
+src/reduce-mean.c:7:#include &quot;decl/reduce-mean-decl.h&quot;
+src/reduce-mean.c:27:  return rray_reduce_grouped(
+src/reduce-mean.c:37:static rray_reduce_grouped_fn rray_mean_along_switch(
+src/reduce-mean.c:55:    stop_unsupported_reduce(&quot;mean&quot;, x, arg, error_call);
+src/decl/reduce-logical-decl.h:1:static rray_reduce_fn rray_all_along_switch(
+src/decl/reduce-logical-decl.h:7:static rray_reduce_fn rray_any_along_switch(
+src/decl/reduce-logical-decl.h:40:static r_no_return void stop_non_logical_reduce(
+src/reduce-names.h:6:r_obj* rray_reduce_names(r_obj* x, r_obj* axes);
+tests/testthat/test-reduce-names.R:2:# rray_reduce_names()
+tests/testthat/test-reduce-names.R:4:test_that(&quot;rray_reduce_names() keeps names of axes that aren't reduced&quot;, {
+tests/testthat/test-reduce-names.R:10:  expect_identical(rray_reduce_names(x, 1L), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-reduce-names.R:11:  expect_identical(rray_reduce_names(x, 2L), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-reduce-names.R:14:test_that(&quot;rray_reduce_names() drops names of every reduced axis&quot;, {
+tests/testthat/test-reduce-names.R:20:  expect_null(rray_reduce_names(x, c(1L, 2L)))
+tests/testthat/test-reduce-names.R:23:test_that(&quot;rray_reduce_names() keeps everything when nothing is reduced&quot;, {
+tests/testthat/test-reduce-names.R:30:    rray_reduce_names(x, integer()),
+tests/testthat/test-reduce-names.R:35:test_that(&quot;rray_reduce_names() drops names of a reduced axis of dimension 1&quot;, {
+tests/testthat/test-reduce-names.R:37:  expect_identical(rray_reduce_names(x, 1L), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-reduce-names.R:40:test_that(&quot;rray_reduce_names() returns NULL when `x` has no names&quot;, {
+tests/testthat/test-reduce-names.R:42:  expect_null(rray_reduce_names(x, 1L))
+tests/testthat/test-reduce-names.R:45:test_that(&quot;rray_reduce_names() leaves unnamed axes alone&quot;, {
+tests/testthat/test-reduce-names.R:47:  expect_identical(rray_reduce_names(x, 2L), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+tests/testthat/test-reduce-names.R:48:  expect_null(rray_reduce_names(x, 1L))
+tests/testthat/test-reduce-names.R:51:test_that(&quot;rray_reduce_names() works with 1 dimensional arrays&quot;, {
+tests/testthat/test-reduce-names.R:53:  expect_null(rray_reduce_names(x, 1L))
+tests/testthat/test-reduce-names.R:54:  expect_identical(rray_reduce_names(x, integer()), list(c(&quot;a&quot;, &quot;b&quot;)))
+tests/testthat/test-reduce-names.R:57:test_that(&quot;rray_reduce_names() works with 3+ dimensional arrays&quot;, {
+tests/testthat/test-reduce-names.R:64:    rray_reduce_names(x, 2L),
+tests/testthat/test-reduce-names.R:68:    rray_reduce_names(x, c(1L, 3L)),
+tests/testthat/test-reduce-names.R:73:test_that(&quot;rray_reduce_names() works with zero-size axes&quot;, {
+tests/testthat/test-reduce-names.R:75:  expect_identical(rray_reduce_names(x, 1L), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+tests/testthat/test-reduce-names.R:76:  expect_null(rray_reduce_names(x, 2L))
+src/decl/permute-axes-decl.h:1:static r_obj* rray_permute_axes_lgl(
+src/decl/permute-axes-decl.h:5:static r_obj* rray_permute_axes_int(
+src/decl/permute-axes-decl.h:9:static r_obj* rray_permute_axes_dbl(
+src/decl/permute-axes-decl.h:13:static r_obj* rray_permute_axes_cpl(
+src/decl/permute-axes-decl.h:17:static r_obj* rray_permute_axes_raw(
+src/decl/permute-axes-decl.h:21:static r_obj* rray_permute_axes_chr(
+src/decl/permute-axes-decl.h:25:static r_obj* rray_permute_axes_list(
+src/decl/permute-axes-decl.h:30:static r_obj* rray_permute_axes_names(
+src/reduce.c:1:#include &quot;reduce.h&quot;
+src/reduce.c:6:#include &quot;reduce-names.h&quot;
+src/reduce.c:12:#include &quot;decl/reduce-decl.h&quot;
+src/reduce.c:14:r_obj* rray_reduce(
+src/reduce.c:18:  rray_reduce_fn_switch fn_switch,
+src/reduce.c:53:  const rray_reduce_fn fn = fn_switch(x, na_rm, arg, error_call);
+src/reduce.c:58:  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+src/reduce.c:68:r_obj* rray_reduce_grouped(
+src/reduce.c:72:  rray_reduce_grouped_fn_switch fn_switch,
+src/reduce.c:109:  const struct rray_strided_iterator_plan outer_plan = rray_reduce_axes_plan(
+src/reduce.c:117:    rray_reduce_axes_plan(v_x_dimensions, v_x_strides, v_axes, axes_size);
+src/reduce.c:119:  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);
+src/reduce.c:124:  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+src/reduce.c:134:static struct rray_strided_iterator_plan rray_reduce_axes_plan(
+src/reduce.c:158:r_no_return void stop_unsupported_reduce(
+src/reduce-logical.c:1:#include &quot;reduce-logical.h&quot;
+src/reduce-logical.c:3:#include &quot;reduce.h&quot;
+src/reduce-logical.c:7:#include &quot;decl/reduce-logical-decl.h&quot;
+src/reduce-logical.c:38:  return rray_reduce(x, axes, na_rm, rray_all_along_switch, arg, error_call);
+src/reduce-logical.c:48:  return rray_reduce(x, axes, na_rm, rray_any_along_switch, arg, error_call);
+src/reduce-logical.c:51:static rray_reduce_fn rray_all_along_switch(
+src/reduce-logical.c:67:    stop_non_logical_reduce(x, arg, error_call);
+src/reduce-logical.c:76:static rray_reduce_fn rray_any_along_switch(
+src/reduce-logical.c:92:    stop_non_logical_reduce(x, arg, error_call);
+src/reduce-logical.c:185:static r_no_return void stop_non_logical_reduce(
+src/decl/reduce-mean-decl.h:1:static rray_reduce_grouped_fn rray_mean_along_switch(
+tests/testthat/test-reduce-product.R:13:test_that(&quot;reduced axes become size 1&quot;, {
+tests/testthat/test-reduce-product.R:19:test_that(&quot;can reduce over all axes&quot;, {
+tests/testthat/test-reduce-product.R:26:test_that(&quot;reducing over no axes returns the input values unchanged&quot;, {
+tests/testthat/test-reduce-product.R:33:test_that(&quot;can reduce over multiple axes of a 3D array&quot;, {
+tests/testthat/test-reduce-product.R:40:test_that(&quot;can reduce axis 3&quot;, {
+tests/testthat/test-reduce-product.R:50:test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+tests/testthat/test-reduce-product.R:62:test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+tests/testthat/test-reduce-product.R:260:test_that(&quot;scalar reduction works&quot;, {
+tests/testthat/test-reduce-product.R:274:test_that(&quot;reducing a zero-length axis gives identity value&quot;, {
+tests/testthat/test-reduce-product.R:281:test_that(&quot;reducing over a non-zero-length axis with a zero-length axis&quot;, {
+tests/testthat/test-reduce-product.R:288:test_that(&quot;reducing all axes of a zero-length array&quot;, {
+tests/testthat/test-reduce-product.R:295:test_that(&quot;the identity of an empty reduction has the output type&quot;, {
+src/decl/reduce-names-decl.h:1:static inline bool axis_is_reduced(
+tests/testthat/test-reduce-mean.R:13:test_that(&quot;reduced axes become size 1&quot;, {
+tests/testthat/test-reduce-mean.R:19:test_that(&quot;can reduce over all axes&quot;, {
+tests/testthat/test-reduce-mean.R:26:test_that(&quot;reducing over no axes returns the input as a double&quot;, {
+tests/testthat/test-reduce-mean.R:37:test_that(&quot;can reduce over multiple axes of a 3D array&quot;, {
+tests/testthat/test-reduce-mean.R:44:test_that(&quot;can reduce axis 3&quot;, {
+tests/testthat/test-reduce-mean.R:75:test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+tests/testthat/test-reduce-mean.R:81:test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+tests/testthat/test-reduce-mean.R:240:test_that(&quot;scalar reduction works&quot;, {
+tests/testthat/test-reduce-mean.R:261:test_that(&quot;reducing over a non-zero-length axis with a zero-length axis&quot;, {
+tests/testthat/test-reduce-mean.R:268:test_that(&quot;reducing all axes of a zero-length array&quot;, {
+tests/testthat/test-reduce-mean.R:275:test_that(&quot;the empty reduction of each input type is `NaN`&quot;, {
+tests/testthat/test-permute-axes.R:5:  expect_identical(rray_permute_axes(x, c(2L, 1L)), expected)
+tests/testthat/test-permute-axes.R:10:  out &lt;- rray_permute_axes(x, c(2L, 3L, 1L))
+tests/testthat/test-permute-axes.R:18:  expect_identical(rray_permute_axes(x, c(1L, 2L, 3L)), x)
+tests/testthat/test-permute-axes.R:34:    expect_identical(rray_permute_axes(x, permutation), aperm(x, permutation))
+tests/testthat/test-permute-axes.R:42:    rray_permute_axes(x, c(4L, 3L, 2L, 1L)),
+tests/testthat/test-permute-axes.R:46:    rray_permute_axes(x, c(3L, 1L, 4L, 2L)),
+tests/testthat/test-permute-axes.R:57:  out &lt;- rray_permute_axes(x, c(3L, 1L, 2L))
+tests/testthat/test-permute-axes.R:64:  out &lt;- rray_permute_axes(x, c(2L, 1L))
+tests/testthat/test-permute-axes.R:76:  expect_named(dimnames(rray_permute_axes(x, c(2L, 1L))), NULL)
+tests/testthat/test-permute-axes.R:91:    expect_identical(rray_permute_axes(x, c(2L, 1L)), aperm(x))
+tests/testthat/test-permute-axes.R:98:    rray_permute_axes(x, c(2L, 1L)),
+tests/testthat/test-permute-axes.R:104:    rray_permute_axes(x, c(3L, 2L, 1L)),
+tests/testthat/test-permute-axes.R:110:  expect_identical(rray_permute_axes(array(1:3, 3L), 1L), array(1:3, 3L))</pre><p class="cut">72 more lines cut</p></details>
+<details class="tool"><summary>Bash: git branch -a --no-color &amp;&amp; git diff --stat origin/main...HEAD &amp;&amp; git diff origin/main...HEAD…</summary>
+<pre>$ git branch -a --no-color &amp;&amp; git diff --stat origin/main...HEAD &amp;&amp; git diff origin/main...HEAD -- src/reduce.c src/reduce.h src/strided-iterator.c src/strided-iterator.h src/permute-axes.c src/permute-axes.h src/reduce-mean.c src/reduce-sum.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+* feature/mean
+  main
+  remotes/origin/feature/mean
+  remotes/origin/gh-pages
+  remotes/origin/main
+ NAMESPACE                            |   1 +
+ R/reduce.R                           |  14 +
+ bench/matrix-stats.R                 |   8 +-
+ bench/mean.R                         | 101 +++++++
+ man/reduce.Rd                        |   8 +
+ plans/implementation.md              |  14 +-
+ plans/no-macros.md                   | 555 -----------------------------------
+ src/decl/reduce-decl.h               |   6 +
+ src/decl/reduce-mean-decl.h          |  68 +++++
+ src/init.c                           |   7 +
+ src/reduce-mean.c                    | 307 +++++++++++++++++++
+ src/reduce-mean.h                    |  16 +
+ src/reduce.c                         |  93 ++++++
+ src/reduce.h                         | 119 +++++++-
+ tests/testthat/_snaps/reduce-mean.md | 112 +++++++
+ tests/testthat/test-reduce-mean.R    | 331 +++++++++++++++++++++
+ 16 files changed, 1193 insertions(+), 567 deletions(-)
+diff --git a/src/reduce-mean.c b/src/reduce-mean.c
+new file mode 100644
+index 0000000..71ff6c4
+--- /dev/null
++++ b/src/reduce-mean.c
+@@ -0,0 +1,307 @@
++#include &quot;reduce-mean.h&quot;
++
++#include &quot;reduce.h&quot;
++#include &quot;type.h&quot;
++#include &quot;utils.h&quot;
++
++#include &quot;decl/reduce-mean-decl.h&quot;
++
++r_obj* ffi_rray_mean_along(
++  r_obj* ffi_x,
++  r_obj* ffi_axes,
++  r_obj* ffi_na_rm,
++  r_obj* ffi_frame
++) {
++  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
++  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
++  return rray_mean_along(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
++}
++
++r_obj* rray_mean_along(
++  r_obj* x,
++  r_obj* axes,
++  bool na_rm,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++) {
++  return rray_reduce_grouped(
++    x,
++    axes,
++    na_rm,
++    rray_mean_along_switch,
++    arg,
++    error_call
++  );
++}
++
++static rray_reduce_grouped_fn rray_mean_along_switch(
++  r_obj* x,
++  bool na_rm,
++  struct rray_arg* arg,
++  struct r_lazy error_call
++) {
++  switch (rray_typeof(x)) {
++  case RRAY_TYPE_logical:
++    return na_rm ? rray_mean_along_lgl_na_rm : rray_mean_along_lgl;
++  case RRAY_TYPE_integer:
++    return na_rm ? rray_mean_along_int_na_rm : rray_mean_along_int;
++  case RRAY_TYPE_double:
++    return na_rm ? rray_mean_along_dbl_na_rm : rray_mean_along_dbl;
++
++  case RRAY_TYPE_complex:
++  case RRAY_TYPE_character:
++  case RRAY_TYPE_raw:
++  case RRAY_TYPE_list:
++    stop_unsupported_reduce(&quot;mean&quot;, x, arg, error_call);
++
++  case RRAY_TYPE_scalar:
++    stop_scalar_input(x, arg, error_call);
++  }
++
++  r_stop_unreachable();
++}
++
++static r_obj* rray_mean_along_lgl(
++  r_obj* x,
++  const struct rray_strided_iterator_plan* outer_plan,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  RRAY_REDUCE_OUTER(
++    int,
++    r_lgl_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    rray_mean_along_lgl_one
++  );
++}
++
++static r_obj* rray_mean_along_lgl_na_rm(
++  r_obj* x,
++  const struct rray_strided_iterator_plan* outer_plan,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  RRAY_REDUCE_OUTER(
++    int,
++    r_lgl_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    rray_mean_along_lgl_one_na_rm
++  );
++}
++
++static r_obj* rray_mean_along_int(
++  r_obj* x,
++  const struct rray_strided_iterator_plan* outer_plan,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  RRAY_REDUCE_OUTER(
++    int,
++    r_int_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    rray_mean_along_int_one
++  );
++}
++
++static r_obj* rray_mean_along_int_na_rm(
++  r_obj* x,
++  const struct rray_strided_iterator_plan* outer_plan,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  RRAY_REDUCE_OUTER(
++    int,
++    r_int_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    rray_mean_along_int_one_na_rm
++  );
++}
++
++static r_obj* rray_mean_along_dbl(
++  r_obj* x,
++  const struct rray_strided_iterator_plan* outer_plan,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  RRAY_REDUCE_OUTER(
++    double,
++    r_dbl_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    rray_mean_along_dbl_one
++  );
++}
++
++static r_obj* rray_mean_along_dbl_na_rm(
++  r_obj* x,
++  const struct rray_strided_iterator_plan* outer_plan,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  RRAY_REDUCE_OUTER(
++    double,
++    r_dbl_cbegin,
++    R_TYPE_double,
++    double,
++    r_dbl_begin,
++    rray_mean_along_dbl_one_na_rm
++  );
++}
++
++static inline double rray_mean_along_lgl_one(
++  const int* v_x,
++  r_ssize x_start,
++  const struct rray_strided_iterator_plan* inner_plan
++) {
++  const r_ssize n = rray_strided_iterator_plan_size(inner_plan);
++
++  long double s = 0.0;
++
++  RRAY_REDUCE_INNER(int, {
++    if (x_elt == r_globals.na_lgl) {
++      return r_globals.na_dbl;
++    }
++    s += x_elt;
++  });</pre><p class="cut">395 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,240p' src/reduce.c &amp;&amp; sed -n '1,260p' src/reduce.h &amp;&amp; sed -n '1,300p' src/permute-a…</summary>
+<pre>$ sed -n '1,240p' src/reduce.c &amp;&amp; sed -n '1,260p' src/reduce.h &amp;&amp; sed -n '1,300p' src/permute-axes.c &amp;&amp; sed -n '1,220p' src/strided-iterator.h &amp;&amp; sed -n '1,260p' src/strided-iterator.c &amp;&amp; sed -n '1,180p' bench/mean.R &amp;&amp; sed -n '1,140p' bench/matrix-stats.R</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;reduce.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-decl.h&quot;
+
+r_obj* rray_reduce(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+  const int* v_out_dimensions = r_int_cbegin(out_dimensions);
+
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  struct rray_strided_iterator_plan plan = rray_broadcast_iterator_plan(
+    v_out_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    dimensionality
+  );
+
+  const rray_reduce_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, out_size, &amp;plan));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_grouped(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_grouped_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_max_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+
+  r_obj* retained_axes =
+    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+  const int* v_retained_axes = r_int_cbegin(retained_axes);
+  const r_ssize retained_axes_size = r_length(retained_axes);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  const struct rray_strided_iterator_plan outer_plan = rray_reduce_axes_plan(
+    v_x_dimensions,
+    v_x_strides,
+    v_retained_axes,
+    retained_axes_size
+  );
+
+  const struct rray_strided_iterator_plan inner_plan =
+    rray_reduce_axes_plan(v_x_dimensions, v_x_strides, v_axes, axes_size);
+
+  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(7);
+  return out;
+}
+
+static struct rray_strided_iterator_plan rray_reduce_axes_plan(
+  const int* v_x_dimensions,
+  const r_ssize* v_x_strides,
+  const int* v_axes,
+  r_ssize axes_size
+) {
+  if (axes_size == 0) {
+    const int dimension = 1;
+    const r_ssize stride = 0;
+    return rray_strided_iterator_plan(&amp;dimension, 1, &amp;stride);
+  }
+
+  int v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+    v_dimensions[i] = v_x_dimensions[axis - 1];
+    v_strides[i] = v_x_strides[axis - 1];
+  }
+
+  return rray_strided_iterator_plan(v_dimensions, (int) axes_size, v_strides);
+}
+
+r_no_return void stop_unsupported_reduce(
+  const char* op,
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_abort_lazy_call(
+    error_call,
+    &quot;Can't compute the %s of %s.&quot;,
+    op,
+    rray_arg_type_format(arg, rray_typeof(x))
+  );
+}
+#ifndef RRAY_REDUCE_H
+#define RRAY_REDUCE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;strided-iterator.h&quot;
+
+// --------------------------------------------------------------------------
+// rray_reduce
+
+typedef r_obj* (*rray_reduce_fn)(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+
+typedef rray_reduce_fn (*rray_reduce_fn_switch)(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* rray_reduce(
+  r_obj* x,</pre><p class="cut">645 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing axis permutation for group reduction</strong></p>
+<p><strong>Weighing permutation versus direct reduction trade-offs</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing axis permutation for group reduction</strong></p>
+<p><strong>Weighing permutation versus direct reduction trade-offs</strong></p>
+</details>
+<p>The direction is “reduced axes first.” In R’s column-major layout, that makes each reduction group one contiguous block, while the retained axes determine the sequential output order. I’m checking whether the extra full-size copy pays for itself on the shapes this PR targets.</p>
+
+<details class="tool"><summary>Bash: sed -n '220,520p' src/strided-iterator.h; sed -n '1,240p' bench/mean.R; sed -n '1,200p' bench…</summary>
+<pre>$ sed -n '220,520p' src/strided-iterator.h; sed -n '1,240p' bench/mean.R; sed -n '1,200p' bench/matrix-stats.R; git show origin/main:src/reduce.c | sed -n '1,180p'; git show origin/main:src/reduce.h | sed -n '1,180p'; sed -n '1,180p' src/axes.c; sed -n '1,120p' src/axes.h</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+static inline r_ssize rray_strided_iterator_plan_size(
+  const struct rray_strided_iterator_plan* plan
+) {
+  return plan-&gt;size;
+}
+static inline r_ssize rray_strided_iterator_plan_run_size(
+  const struct rray_strided_iterator_plan* plan
+) {
+  return plan-&gt;v_dimensions[0];
+}
+static inline r_ssize rray_strided_iterator_plan_run_stride(
+  const struct rray_strided_iterator_plan* plan
+) {
+  return plan-&gt;v_strides[0];
+}
+
+#define RRAY_STRIDED_ITERATOR_NEXT(START, V_POINT, PLAN)                       \
+  for (int axis = 1; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+    ++V_POINT[axis];                                                           \
+    if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+      START += PLAN-&gt;v_strides[axis];                                          \
+      break;                                                                   \
+    }                                                                          \
+    V_POINT[axis] = 0;                                                         \
+    START -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides[axis];           \
+  }
+
+// --------------------------------------------------------------------------
+
+// Same as `rray_strided_iterator_plan`, but reports in two location spaces
+// while only walking the point space once
+struct rray_strided_iterator2_plan {
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize v_strides1[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_strides2[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator2_plan rray_strided_iterator2_plan(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides1,
+  const r_ssize* v_strides2
+) {
+  check_max_dimensionality(dimensionality);
+
+  struct rray_strided_iterator2_plan plan;
+
+  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    plan.v_strides1[i] = v_strides1[i];
+    plan.v_strides2[i] = v_strides2[i];
+  }
+
+  plan.dimensionality = rray__strided_iterator_axes_coalesce2(
+    plan.v_dimensions,
+    plan.v_strides1,
+    plan.v_strides2,
+    dimensionality
+  );
+
+  return plan;
+}
+
+// Same as `rray_broadcast_iterator_plan()`, but broadcasts two `from` spaces
+// into one shared `to` space
+static inline struct rray_strided_iterator2_plan rray_broadcast_iterator2_plan(
+  const int* v_from1_dimensions,
+  int from1_dimensionality,
+  const int* v_from2_dimensions,
+  int from2_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+) {
+  check_max_dimensionality(to_dimensionality);
+
+  rray__check_broadcast_dimensions(
+    v_from1_dimensions,
+    from1_dimensionality,
+    v_to_dimensions,
+    to_dimensionality
+  );
+
+  rray__check_broadcast_dimensions(
+    v_from2_dimensions,
+    from2_dimensionality,
+    v_to_dimensions,
+    to_dimensionality
+  );
+
+  r_ssize v_strides1[RRAY_MAX_DIMENSIONALITY];
+  r_ssize v_strides2[RRAY_MAX_DIMENSIONALITY];
+
+  rray__fill_broadcast_strides(
+    v_from1_dimensions,
+    from1_dimensionality,
+    to_dimensionality,
+    v_strides1
+  );
+
+  rray__fill_broadcast_strides(
+    v_from2_dimensions,
+    from2_dimensionality,
+    to_dimensionality,
+    v_strides2
+  );
+
+  return rray_strided_iterator2_plan(
+    v_to_dimensions,
+    to_dimensionality,
+    v_strides1,
+    v_strides2
+  );
+}
+
+static inline r_ssize rray_strided_iterator2_plan_size(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;size;
+}
+static inline r_ssize rray_strided_iterator2_plan_run_size(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;v_dimensions[0];
+}
+static inline r_ssize rray_strided_iterator2_plan_run_stride1(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;v_strides1[0];
+}
+static inline r_ssize rray_strided_iterator2_plan_run_stride2(
+  const struct rray_strided_iterator2_plan* plan
+) {
+  return plan-&gt;v_strides2[0];
+}
+
+#define RRAY_STRIDED_ITERATOR_NEXT2(START1, START2, V_POINT, PLAN)             \
+  for (int axis = 1; axis &lt; PLAN-&gt;dimensionality; ++axis) {                    \
+    ++V_POINT[axis];                                                           \
+    if (V_POINT[axis] &lt; PLAN-&gt;v_dimensions[axis]) {                            \
+      START1 += PLAN-&gt;v_strides1[axis];                                        \
+      START2 += PLAN-&gt;v_strides2[axis];                                        \
+      break;                                                                   \
+    }                                                                          \
+    V_POINT[axis] = 0;                                                         \
+    START1 -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides1[axis];         \
+    START2 -= (PLAN-&gt;v_dimensions[axis] - 1) * PLAN-&gt;v_strides2[axis];         \
+  }
+
+// --------------------------------------------------------------------------
+
+static inline int rray__strided_iterator_axes_coalesce(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides,
+  int dimensionality
+) {
+  int out_axis = 0;
+
+  for (int axis = 1; axis &lt; dimensionality; ++axis) {
+    const r_ssize left_dimension = v_dimensions[out_axis];
+    const r_ssize left_stride = v_strides[out_axis];
+    const r_ssize right_dimension = v_dimensions[axis];
+    const r_ssize right_stride = v_strides[axis];
+
+    const bool coalescible = rray__strided_iterator_axes_coalescible(
+      left_dimension,
+      left_stride,
+      right_dimension,
+      right_stride
+    );
+
+    if (coalescible) {
+      if (left_dimension == 1) {
+        v_strides[out_axis] = right_stride;
+      }
+      v_dimensions[out_axis] = left_dimension * right_dimension;
+    } else {
+      ++out_axis;
+      v_dimensions[out_axis] = right_dimension;
+      v_strides[out_axis] = right_stride;
+    }
+  }
+
+  return out_axis + 1;
+}
+
+static inline int rray__strided_iterator_axes_coalesce2(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides1,</pre><p class="cut">702 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning benchmarking for composite compile</strong></p>
+<p><strong>Analyzing axis reduction memory access patterns</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning benchmarking for composite compile</strong></p>
+<p><strong>Analyzing axis reduction memory access patterns</strong></p>
+</details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); perm_mean &lt;- function(x, axes, na_rm = FALSE) {…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); perm_mean &lt;- function(x, axes, na_rm = FALSE) { retained &lt;- setdiff(seq_along(dim(x)), axes); xp &lt;- rray_permute_axes(x, c(axes, retained)); rray_mean_along(xp, seq_along(axes), na_rm = na_rm) }; run &lt;- function(d, axes) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); z &lt;- bench::mark(current = rray_mean_along(x, axes), permuted = perm_mean(x, axes), iterations = 12, check = FALSE, filter_gc = FALSE); data.frame(dim = paste(d, collapse = &quot;x&quot;), axes = paste(axes, collapse = &quot;,&quot;), expression = as.character(z$expression), median_ms = as.numeric(z$median) * 1000, mem_mb = as.numeric(z$mem_alloc) / 1024^2) }; cases &lt;- list(list(c(1000L, 1000L), 1L), list(c(1000L, 1000L), 2L), list(c(1000L, 1000L), 1:2), list(c(100L, 100L, 100L), 1L), list(c(100L, 100L, 100L), 2L), list(c(100L, 100L, 100L), 3L), list(c(100L, 100L, 100L), c(1L, 3L))); print(do.call(rbind, lapply(cases, function(case) run(case[[1]], case[[2]]))), row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 3.7 seconds
+Output:
+
+         dim axes expression median_ms       mem_mb
+   1000x1000    1    current  1.692993 0.0076751709
+   1000x1000    1   permuted  2.489705 7.6371154785
+   1000x1000    2    current  1.818432 0.0076751709
+   1000x1000    2   permuted  2.558584 7.6371154785
+   1000x1000  1,2    current  1.775403 0.0000000000
+   1000x1000  1,2   permuted  3.094168 7.6294403076
+ 100x100x100    1    current  1.122867 0.0763397217
+ 100x100x100    1   permuted  2.931705 7.7057800293
+ 100x100x100    2    current  1.494163 0.0763397217
+ 100x100x100    2   permuted  3.251505 7.7057800293
+ 100x100x100    3    current  1.480059 0.0763397217
+ 100x100x100    3   permuted  1.959431 7.7057800293
+ 100x100x100  1,3    current  1.788194 0.0008087158
+ 100x100x100  1,3   permuted  2.552886 7.6302490234</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); perm_mean &lt;- function(x, axes) { retained &lt;- se…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); perm_mean &lt;- function(x, axes) { retained &lt;- setdiff(seq_along(dim(x)), axes); xp &lt;- rray_permute_axes(x, c(axes, retained)); rray_mean_along(xp, seq_along(axes)) }; run &lt;- function(d, axes) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); z &lt;- bench::mark(current = rray_mean_along(x, axes), permuted = perm_mean(x, axes), iterations = 5, check = FALSE, filter_gc = FALSE); data.frame(dim = paste(d, collapse = &quot;x&quot;), axes = paste(axes, collapse = &quot;,&quot;), expression = as.character(z$expression), median_ms = as.numeric(z$median) * 1000, mem_mb = as.numeric(z$mem_alloc) / 1024^2) }; cases &lt;- list(list(c(4000L, 4000L), 1L), list(c(4000L, 4000L), 2L), list(c(400L, 200L, 200L), 2L), list(c(400L, 200L, 200L), 3L), list(c(400L, 200L, 200L), c(1L, 3L))); print(do.call(rbind, lapply(cases, function(case) run(case[[1]], case[[2]]))), row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 6.2 seconds
+Output:
+
+         dim axes expression median_ms       mem_mb
+   4000x4000    1    current  28.78881 3.056335e-02
+   4000x4000    1   permuted  60.21645 1.221009e+02
+   4000x4000    2    current  67.17403 3.056335e-02
+   4000x4000    2   permuted  82.10615 1.221009e+02
+ 400x200x200    2    current  28.05749 6.103973e-01
+ 400x200x200    2   permuted  40.93690 1.226808e+02
+ 400x200x200    3    current  28.87072 6.103973e-01
+ 400x200x200    3   permuted  57.39205 1.226808e+02
+ 400x200x200  1,3    current  29.36682 1.571655e-03
+ 400x200x200  1,3   permuted  63.18600 1.220719e+02</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating axis reordering for direct iteration</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n &quot;permute|transpose|contigu|grouped|mean&quot; plans bench README.md src tests | head -300 &amp;&amp;…</summary>
+<pre>$ rg -n &quot;permute|transpose|contigu|grouped|mean&quot; plans bench README.md src tests | head -300 &amp;&amp; git log --oneline --all -- src/reduce-mean.c bench/mean.R</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+rg: README.md: No such file or directory (os error 2)
+bench/iterator.R:60:    contiguous_short_first = rray_add(short_first_x, short_first_y),
+bench/iterator.R:61:    contiguous_with_scalar = rray_add(short_first_x, 1),
+bench/iterator.R:135:  contiguous_prefix &lt;- array(seq_len(500000L), c(2L, 250000L, 1L))
+bench/iterator.R:147:    contiguous_prefix = rray_broadcast(contiguous_prefix, c(2L, 250000L, 2L)),
+plans/mod-and-idiv.md:24:does it. That means two scalar operations per operator, `_int_one` and
+plans/mod-and-idiv.md:53:in `Rmath.h`, so matching R here means porting the logic, not calling into R.
+plans/mod-and-idiv.md:194:  when the quotient is too large to trust. Porting that means a real R level
+bench/matrix-stats.R:19:  operation = c(&quot;sum&quot;, &quot;product&quot;, &quot;mean&quot;, &quot;all&quot;, &quot;any&quot;),
+bench/matrix-stats.R:31:    mean = as.double(seq_len(size) %% 1000L),
+bench/matrix-stats.R:55:  mean = list(
+bench/matrix-stats.R:56:    rray = rray_mean_along,
+tests/testthat/test-size.R:30:  expect_snapshot(rray_size(mean), error = TRUE)
+bench/mean.R:15:  implementation = c(&quot;mean&quot;, &quot;sum&quot;, &quot;base&quot;),
+bench/mean.R:42:    both = function(x, na.rm) mean(x, na.rm = na.rm)
+bench/mean.R:56:    mean = bench::mark(
+bench/mean.R:57:      rray_mean_along(x, axes, na_rm = case$na_rm),
+plans/null.md:159:pairs follow the same pattern as all the others: `null` on the left means the
+plans/null.md:160:right side wins, `null` on the right means the left side wins, and two nulls
+plans/null.md:161:mean both.
+plans/null.md:337:and in each existing outer block, null on the right means the left side wins:
+plans/null.md:414:mean &quot;not supplied&quot;, so there is no way to ask `rray_ptype_common()` for the null
+tests/testthat/test-names.R:34:  expect_snapshot(rray_names(mean), error = TRUE)
+bench/extremum.R:19:  traversal = c(&quot;contiguous&quot;, &quot;scalar&quot;, &quot;broadcast_axis0&quot;, &quot;broadcast_axis1&quot;),
+bench/extremum.R:65:    contiguous = size,
+bench/extremum.R:78:    contiguous = array(y, dimensions),
+tests/testthat/test-dimensions.R:31:  expect_snapshot(rray_dimensions(mean), error = TRUE)
+tests/testthat/test-dimensions.R:256:  # There is no meaningful way to keep them
+tests/testthat/test-dimensions.R:278:  expect_snapshot(rray_set_dimensions(mean, 1L), error = TRUE)
+plans/n-ary.md:243:addition. This means:
+tests/testthat/test-dimensionality.R:24:  expect_snapshot(rray_dimensionality(mean), error = TRUE)
+plans/extensions.md:152:For a class that is generic over storage, it means there is **no single ptype**
+plans/extensions.md:168:`rray_cast(x, to)` means &quot;cast `x` to the type of `to`&quot;. It changes type only,
+plans/extensions.md:172:means &quot;a double array&quot;.
+plans/extensions.md:194:| reduction | `rray_reduction_ptype(op, x)` | single | `sum`, `prod`, `mean`, `max`, `min` |
+plans/extensions.md:313:means restore is a shape check, not an operation check.
+src/permute-axes.h:8:r_obj* rray_permute_axes(
+plans/implementation.md:24:says what to build, which files to touch, and what &quot;done&quot; means.
+plans/implementation.md:96:parameter list, and the loop is written once. `rray_mean()`, `rray_max_along()`, and
+plans/implementation.md:373:plus `RRAY_TYPE_scalar`. Restricting it this way means a `switch` over a type
+plans/implementation.md:381:following vctrs' `VCTRS_TYPE_scalar`. It means `rray_typeof()` is total and
+plans/implementation.md:458:so it starts at the first input. That means `rray_ptype_common()` needs at least
+plans/implementation.md:497:`call = caller_env()` means the wrapper is blamed rather than the rray4
+plans/implementation.md:605:`.ptype = double()` means &quot;a double array&quot;, and we reduce it with
+plans/implementation.md:628:That means nothing is ever cast up front. `rray_add(int_array, 1)` allocates its
+plans/implementation.md:677:| `mean` | dbl | dbl | dbl | error |
+plans/implementation.md:681:immediately. `mean` does not support complex.
+plans/implementation.md:1052:| function | meaning |
+plans/implementation.md:1077:meaning &quot;all axes&quot;. We do not.
+plans/implementation.md:1085:| `rray_mean_along(x, axes, ..., na_rm = FALSE)` | `mean` | promoted, lgl and int to dbl, exists |
+plans/implementation.md:1104:`rray_product_along()`, `rray_mean_along()`, `rray_max_along()`, and
+plans/implementation.md:1110:`rray_mean_along()` needs numerical state per output element, so it uses the
+plans/implementation.md:1111:`rray_reduce_grouped()` shell rather than `rray_reduce()`. That shell walks the
+plans/implementation.md:1113:mean core make several passes over one reduced slice before moving on.
+plans/implementation.md:1155:dimension, character requires names on that axis, `NULL` means 0.
+plans/implementation.md:1265:- **`rray_rotate()`.** Expressible as a transpose plus a flip.
+src/reduce.h:86:// rray_reduce_grouped
+src/reduce.h:88:typedef r_obj* (*rray_reduce_grouped_fn)(
+src/reduce.h:94:typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(
+src/reduce.h:101:r_obj* rray_reduce_grouped(
+src/reduce.h:105:  rray_reduce_grouped_fn_switch fn_switch,
+src/decl/permute-axes-decl.h:1:static r_obj* rray_permute_axes_lgl(
+src/decl/permute-axes-decl.h:5:static r_obj* rray_permute_axes_int(
+src/decl/permute-axes-decl.h:9:static r_obj* rray_permute_axes_dbl(
+src/decl/permute-axes-decl.h:13:static r_obj* rray_permute_axes_cpl(
+src/decl/permute-axes-decl.h:17:static r_obj* rray_permute_axes_raw(
+src/decl/permute-axes-decl.h:21:static r_obj* rray_permute_axes_chr(
+src/decl/permute-axes-decl.h:25:static r_obj* rray_permute_axes_list(
+src/decl/permute-axes-decl.h:30:static r_obj* rray_permute_axes_names(
+src/reduce-mean.h:8:r_obj* rray_mean_along(
+tests/testthat/test-permute-axes.R:1:test_that(&quot;transposes a matrix&quot;, {
+tests/testthat/test-permute-axes.R:5:  expect_identical(rray_permute_axes(x, c(2L, 1L)), expected)
+tests/testthat/test-permute-axes.R:10:  out &lt;- rray_permute_axes(x, c(2L, 3L, 1L))
+tests/testthat/test-permute-axes.R:18:  expect_identical(rray_permute_axes(x, c(1L, 2L, 3L)), x)
+tests/testthat/test-permute-axes.R:34:    expect_identical(rray_permute_axes(x, permutation), aperm(x, permutation))
+tests/testthat/test-permute-axes.R:42:    rray_permute_axes(x, c(4L, 3L, 2L, 1L)),
+tests/testthat/test-permute-axes.R:46:    rray_permute_axes(x, c(3L, 1L, 4L, 2L)),
+tests/testthat/test-permute-axes.R:57:  out &lt;- rray_permute_axes(x, c(3L, 1L, 2L))
+tests/testthat/test-permute-axes.R:64:  out &lt;- rray_permute_axes(x, c(2L, 1L))
+tests/testthat/test-permute-axes.R:76:  expect_named(dimnames(rray_permute_axes(x, c(2L, 1L))), NULL)
+tests/testthat/test-permute-axes.R:91:    expect_identical(rray_permute_axes(x, c(2L, 1L)), aperm(x))
+tests/testthat/test-permute-axes.R:98:    rray_permute_axes(x, c(2L, 1L)),
+tests/testthat/test-permute-axes.R:104:    rray_permute_axes(x, c(3L, 2L, 1L)),
+tests/testthat/test-permute-axes.R:110:  expect_identical(rray_permute_axes(array(1:3, 3L), 1L), array(1:3, 3L))
+tests/testthat/test-permute-axes.R:113:  expect_identical(rray_permute_axes(c(a = 1L, b = 2L), 1L), expected)
+tests/testthat/test-permute-axes.R:120:    rray_permute_axes(x, NULL)
+tests/testthat/test-permute-axes.R:121:    rray_permute_axes(x, 1L)
+tests/testthat/test-permute-axes.R:122:    rray_permute_axes(x, c(1L, 2L, 3L))
+tests/testthat/test-permute-axes.R:123:    rray_permute_axes(x, c(1L, 1L))
+tests/testthat/test-permute-axes.R:124:    rray_permute_axes(x, c(1L, 3L))
+tests/testthat/test-permute-axes.R:125:    rray_permute_axes(x, c(1L, 0L))
+tests/testthat/test-permute-axes.R:126:    rray_permute_axes(x, c(1L, NA_integer_))
+tests/testthat/test-permute-axes.R:127:    rray_permute_axes(x, structure(c(1L, 2L), foo = &quot;bar&quot;))
+tests/testthat/test-permute-axes.R:128:    rray_permute_axes(x, c(1.5, 2))
+tests/testthat/test-permute-axes.R:129:    rray_permute_axes(x, &quot;x&quot;)
+tests/testthat/test-permute-axes.R:135:    rray_permute_axes(NULL, 1L)
+tests/testthat/test-permute-axes.R:136:    rray_permute_axes(mean, 1L)
+tests/testthat/test-permute-axes.R:142:  expect_snapshot(rray_permute_axes(x, 1L), error = TRUE)
+src/permute-axes.c:1:#include &quot;permute-axes.h&quot;
+src/permute-axes.c:10:#include &quot;decl/permute-axes-decl.h&quot;
+src/permute-axes.c:12:r_obj* ffi_rray_permute_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+src/permute-axes.c:14:  return rray_permute_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+src/permute-axes.c:17:r_obj* rray_permute_axes(
+src/permute-axes.c:62:    out = rray_permute_axes_lgl(x, &amp;plan);
+src/permute-axes.c:65:    out = rray_permute_axes_int(x, &amp;plan);
+src/permute-axes.c:68:    out = rray_permute_axes_dbl(x, &amp;plan);
+src/permute-axes.c:71:    out = rray_permute_axes_cpl(x, &amp;plan);
+src/permute-axes.c:74:    out = rray_permute_axes_raw(x, &amp;plan);
+src/permute-axes.c:77:    out = rray_permute_axes_chr(x, &amp;plan);
+src/permute-axes.c:80:    out = rray_permute_axes_list(x, &amp;plan);
+src/permute-axes.c:89:  r_obj* names = KEEP(rray_permute_axes_names(x, v_axes, dimensionality));
+src/permute-axes.c:178:static r_obj* rray_permute_axes_lgl(
+src/permute-axes.c:185:static r_obj* rray_permute_axes_int(
+src/permute-axes.c:192:static r_obj* rray_permute_axes_dbl(
+src/permute-axes.c:199:static r_obj* rray_permute_axes_cpl(
+src/permute-axes.c:211:static r_obj* rray_permute_axes_raw(
+src/permute-axes.c:218:static r_obj* rray_permute_axes_chr(
+src/permute-axes.c:225:static r_obj* rray_permute_axes_list(
+src/permute-axes.c:235:static r_obj* rray_permute_axes_names(
+tests/testthat/test-broadcast.R:229:  expect_snapshot(rray_broadcast(mean, 1L), error = TRUE)
+src/init.c:72:extern r_obj* ffi_rray_permute_axes(
+src/init.c:89:extern r_obj* ffi_rray_mean_along(
+src/init.c:194:  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+src/init.c:197:  {&quot;ffi_rray_mean_along&quot;, (DL_FUNC) &amp;ffi_rray_mean_along, 4},
+tests/testthat/test-reduce-mean.R:1:test_that(&quot;can take the mean along axis 1&quot;, {
+tests/testthat/test-reduce-mean.R:3:  out &lt;- rray_mean_along(x, 1L)
+tests/testthat/test-reduce-mean.R:7:test_that(&quot;can take the mean along axis 2&quot;, {
+tests/testthat/test-reduce-mean.R:9:  out &lt;- rray_mean_along(x, 2L)
+tests/testthat/test-reduce-mean.R:15:  expect_identical(rray_dimensions(rray_mean_along(x, 1L)), c(1L, 2L))
+tests/testthat/test-reduce-mean.R:16:  expect_identical(rray_dimensions(rray_mean_along(x, 2L)), c(5L, 1L))
+tests/testthat/test-reduce-mean.R:21:  out &lt;- rray_mean_along(x, c(1L, 2L))
+tests/testthat/test-reduce-mean.R:28:  expect_identical(rray_mean_along(x, integer()), x)
+tests/testthat/test-reduce-mean.R:32:    rray_mean_along(x, integer()),
+tests/testthat/test-reduce-mean.R:39:  out &lt;- rray_mean_along(x, c(1L, 2L))
+tests/testthat/test-reduce-mean.R:46:  out &lt;- rray_mean_along(x, 3L)
+tests/testthat/test-reduce-mean.R:51:test_that(&quot;matches `mean()` over every combination of axes&quot;, {
+tests/testthat/test-reduce-mean.R:60:      apply(x, kept_axes, mean)
+tests/testthat/test-reduce-mean.R:62:      mean(x)
+tests/testthat/test-reduce-mean.R:71:    expect_identical(rray_mean_along(x, axis), expected(axis))
+tests/testthat/test-reduce-mean.R:77:  expect_identical(dimnames(rray_mean_along(x, 1L)), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;)))
+tests/testthat/test-reduce-mean.R:78:  expect_identical(dimnames(rray_mean_along(x, 2L)), list(letters[1:5], NULL))
+tests/testthat/test-reduce-mean.R:83:  expect_null(dimnames(rray_mean_along(x, 1L)))
+tests/testthat/test-reduce-mean.R:87:  expect_identical(storage.mode(rray_mean_along(array(TRUE), 1L)), &quot;double&quot;)
+tests/testthat/test-reduce-mean.R:88:  expect_identical(storage.mode(rray_mean_along(array(1L), 1L)), &quot;double&quot;)
+tests/testthat/test-reduce-mean.R:89:  expect_identical(storage.mode(rray_mean_along(array(1), 1L)), &quot;double&quot;)
+tests/testthat/test-reduce-mean.R:94:  out &lt;- rray_mean_along(x, 1L)
+tests/testthat/test-reduce-mean.R:100:  expect_identical(as.vector(rray_mean_along(x, 1L)), mean(x))
+tests/testthat/test-reduce-mean.R:101:  expect_identical(as.vector(rray_mean_along(x, 1L)), 2500000000000001)
+tests/testthat/test-reduce-mean.R:106:  expect_identical(as.vector(rray_mean_along(x, 1L)), mean(x))
+tests/testthat/test-reduce-mean.R:107:  expect_identical(as.vector(rray_mean_along(x, 1L)), 1e308)
+tests/testthat/test-reduce-mean.R:112:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:115:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:120:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:123:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:128:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:131:  expect_identical(as.vector(rray_mean_along(x, 1L)), NaN)
+tests/testthat/test-reduce-mean.R:134:  expect_identical(as.vector(rray_mean_along(x, 1L)), NaN)
+tests/testthat/test-reduce-mean.R:137:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:140:  expect_identical(as.vector(rray_mean_along(x, 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:143:test_that(&quot;Inf matches base R mean&quot;, {
+tests/testthat/test-reduce-mean.R:144:  expect_identical(as.vector(rray_mean_along(c(Inf, 1), 1L)), mean(c(Inf, 1)))
+tests/testthat/test-reduce-mean.R:145:  expect_identical(as.vector(rray_mean_along(c(-Inf, 1), 1L)), mean(c(-Inf, 1)))
+tests/testthat/test-reduce-mean.R:147:    as.vector(rray_mean_along(c(Inf, -Inf), 1L)),
+tests/testthat/test-reduce-mean.R:148:    mean(c(Inf, -Inf))
+tests/testthat/test-reduce-mean.R:150:  expect_identical(as.vector(rray_mean_along(c(Inf, NaN), 1L)), NaN)
+tests/testthat/test-reduce-mean.R:151:  expect_identical(as.vector(rray_mean_along(c(Inf, NA), 1L)), NA_real_)
+tests/testthat/test-reduce-mean.R:156:  out &lt;- rray_mean_along(x, 1L, na_rm = TRUE)
+tests/testthat/test-reduce-mean.R:162:  out &lt;- rray_mean_along(x, 1L, na_rm = TRUE)
+tests/testthat/test-reduce-mean.R:168:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), 3)
+tests/testthat/test-reduce-mean.R:171:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), 3)
+tests/testthat/test-reduce-mean.R:176:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), NaN)
+tests/testthat/test-reduce-mean.R:179:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), NaN)
+tests/testthat/test-reduce-mean.R:182:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), NaN)
+tests/testthat/test-reduce-mean.R:185:test_that(&quot;na_rm does not change the sign of a zero mean&quot;, {
+tests/testthat/test-reduce-mean.R:187:  out &lt;- as.vector(rray_mean_along(x, 1L, na_rm = TRUE))
+tests/testthat/test-reduce-mean.R:188:  expect_identical(out, mean(x, na.rm = TRUE))
+tests/testthat/test-reduce-mean.R:194:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), Inf)
+tests/testthat/test-reduce-mean.R:197:  expect_identical(as.vector(rray_mean_along(x, 1L, na_rm = TRUE)), NaN)
+tests/testthat/test-reduce-mean.R:203:    rray_mean_along(x, 1L, na_rm = TRUE),
+tests/testthat/test-reduce-mean.R:204:    rray_mean_along(x, 1L)
+tests/testthat/test-reduce-mean.R:208:test_that(&quot;na_rm matches `mean()` over every combination of axes&quot;, {
+tests/testthat/test-reduce-mean.R:219:      apply(x, kept_axes, mean, na.rm = TRUE)
+tests/testthat/test-reduce-mean.R:221:      mean(x, na.rm = TRUE)
+tests/testthat/test-reduce-mean.R:230:    expect_identical(rray_mean_along(x, axis, na_rm = TRUE), expected(axis))
+tests/testthat/test-reduce-mean.R:235:  out &lt;- rray_mean_along(1:3, 1L)
+tests/testthat/test-reduce-mean.R:241:  out &lt;- rray_mean_along(5, 1L)
+tests/testthat/test-reduce-mean.R:249:    rray_mean_along(x, 1),
+tests/testthat/test-reduce-mean.R:250:    rray_mean_along(x, 1L)
+tests/testthat/test-reduce-mean.R:254:test_that(&quot;the mean of no values is `NaN`&quot;, {
+tests/testthat/test-reduce-mean.R:256:  out &lt;- rray_mean_along(x, 1L)
+tests/testthat/test-reduce-mean.R:263:  out &lt;- rray_mean_along(x, 2L)
+tests/testthat/test-reduce-mean.R:270:  out &lt;- rray_mean_along(x, c(1L, 2L))
+tests/testthat/test-reduce-mean.R:278:  expect_identical(as.vector(rray_mean_along(zero_size(logical()), 1L)), NaN)
+tests/testthat/test-reduce-mean.R:279:  expect_identical(as.vector(rray_mean_along(zero_size(integer()), 1L)), NaN)
+tests/testthat/test-reduce-mean.R:280:  expect_identical(as.vector(rray_mean_along(zero_size(double()), 1L)), NaN)
+tests/testthat/test-reduce-mean.R:285:  expect_snapshot(rray_mean_along(x, 3L), error = TRUE)</pre><p class="cut">115 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1090,1130p' plans/implementation.md; nl -ba src/reduce.c | sed -n '68,160p'; nl -ba s…</summary>
+<pre>$ sed -n '1090,1130p' plans/implementation.md; nl -ba src/reduce.c | sed -n '68,160p'; nl -ba src/reduce.h | sed -n '86,185p'; nl -ba src/permute-axes.c | sed -n '17,180p'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+
+`rray_max_pos(x, axis)` and `rray_min_pos(x, axis)` give the position of the
+maximum or minimum along a single axis. Type: fixed, integer output.
+
+```r
+x &lt;- array(c(1:10, 20:11), c(5, 2, 2))
+rray_max_pos(x, 1)     # position of the max along the rows
+rray_max_pos(x, 2)     # along the columns
+```
+
+`rray_sum_along()` already exists, documented under the shared `reduce` topic in
+`R/reduce.R`, with its C in `src/reduce-sum.c` on top of the `rray_reduce()`
+shell in `src/reduce.c`/`src/reduce.h` (see 2.1).
+
+`rray_product_along()`, `rray_mean_along()`, `rray_max_along()`, and
+`rray_min_along()` share
+`rray_sum_along()`'s
+`(x, axes, ..., na_rm = FALSE)` shape, so they add `@rdname reduce` entries to
+`R/reduce.R` and their own `src/reduce-{name}.c` beside it.
+
+`rray_mean_along()` needs numerical state per output element, so it uses the
+`rray_reduce_grouped()` shell rather than `rray_reduce()`. That shell walks the
+retained axes and the reduced axes with two immutable plans, which lets the
+mean core make several passes over one reduced slice before moving on.
+
+`rray_all_along()` and `rray_any_along()` share that shape too, so they are
+`@rdname reduce` entries as well. They are the one place two reducers share a C
+pair, `src/reduce-logical.c` and `src/reduce-logical.h`, because each supports
+only logical input and so is small. Their `na_rm = FALSE` behaviour follows
+`all()` and `any()`: a missing value only reaches the result when it could
+change the answer, so `all(c(FALSE, NA))` is `FALSE` and not `NA`.
+
+`rray_max_pos()` and `rray_min_pos()` take `axis` rather than `axes` and return
+positions rather than reduced values, so they do not match `rray_reduce()`'s
+shape. They need their own file and topic, `R/max-pos.R`, with its own C pair.
+Whether any part of `rray_reduce()` can be shared with them is a design question
+for whoever picks them up.
+
+## 5.6 Indexing
+
+**A human should design review this whole section before any of it is
+    68	r_obj* rray_reduce_grouped(
+    69	  r_obj* x,
+    70	  r_obj* axes,
+    71	  bool na_rm,
+    72	  rray_reduce_grouped_fn_switch fn_switch,
+    73	  struct rray_arg* arg,
+    74	  struct r_lazy error_call
+    75	) {
+    76	  check_unclassed(x, arg, error_call);
+    77	  x = KEEP(arg_as_array(x, arg, error_call));
+    78	
+    79	  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    80	  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    81	
+    82	  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+    83	  check_max_dimensionality(dimensionality);
+    84	
+    85	  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+    86	  const int* v_axes = r_int_cbegin(axes);
+    87	  const r_ssize axes_size = r_length(axes);
+    88	
+    89	  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    90	    v_x_dimensions,
+    91	    dimensionality,
+    92	    v_axes,
+    93	    axes_size,
+    94	    1
+    95	  ));
+    96	
+    97	  r_obj* retained_axes =
+    98	    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+    99	  const int* v_retained_axes = r_int_cbegin(retained_axes);
+   100	  const r_ssize retained_axes_size = r_length(retained_axes);
+   101	
+   102	  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+   103	  rray_fill_strides_from_dimensions(
+   104	    v_x_dimensions,
+   105	    dimensionality,
+   106	    v_x_strides
+   107	  );
+   108	
+   109	  const struct rray_strided_iterator_plan outer_plan = rray_reduce_axes_plan(
+   110	    v_x_dimensions,
+   111	    v_x_strides,
+   112	    v_retained_axes,
+   113	    retained_axes_size
+   114	  );
+   115	
+   116	  const struct rray_strided_iterator_plan inner_plan =
+   117	    rray_reduce_axes_plan(v_x_dimensions, v_x_strides, v_axes, axes_size);
+   118	
+   119	  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);
+   120	
+   121	  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+   122	  r_attrib_poke_dim(out, out_dimensions);
+   123	
+   124	  r_obj* out_names = KEEP(rray_reduce_names(x, axes));
+   125	
+   126	  if (out_names != r_null) {
+   127	    r_attrib_poke_dim_names(out, out_names);
+   128	  }
+   129	
+   130	  FREE(7);
+   131	  return out;
+   132	}
+   133	
+   134	static struct rray_strided_iterator_plan rray_reduce_axes_plan(
+   135	  const int* v_x_dimensions,
+   136	  const r_ssize* v_x_strides,
+   137	  const int* v_axes,
+   138	  r_ssize axes_size
+   139	) {
+   140	  if (axes_size == 0) {
+   141	    const int dimension = 1;
+   142	    const r_ssize stride = 0;
+   143	    return rray_strided_iterator_plan(&amp;dimension, 1, &amp;stride);
+   144	  }
+   145	
+   146	  int v_dimensions[RRAY_MAX_DIMENSIONALITY];
+   147	  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+   148	
+   149	  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+   150	    const int axis = v_axes[i];
+   151	    v_dimensions[i] = v_x_dimensions[axis - 1];
+   152	    v_strides[i] = v_x_strides[axis - 1];
+   153	  }
+   154	
+   155	  return rray_strided_iterator_plan(v_dimensions, (int) axes_size, v_strides);
+   156	}
+   157	
+   158	r_no_return void stop_unsupported_reduce(
+   159	  const char* op,
+   160	  r_obj* x,
+    86	// rray_reduce_grouped
+    87	
+    88	typedef r_obj* (*rray_reduce_grouped_fn)(
+    89	  r_obj* x,
+    90	  const struct rray_strided_iterator_plan* outer_plan,
+    91	  const struct rray_strided_iterator_plan* inner_plan
+    92	);
+    93	
+    94	typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(
+    95	  r_obj* x,
+    96	  bool na_rm,
+    97	  struct rray_arg* arg,
+    98	  struct r_lazy error_call
+    99	);
+   100	
+   101	r_obj* rray_reduce_grouped(
+   102	  r_obj* x,
+   103	  r_obj* axes,
+   104	  bool na_rm,
+   105	  rray_reduce_grouped_fn_switch fn_switch,
+   106	  struct rray_arg* arg,
+   107	  struct r_lazy error_call
+   108	);
+   109	
+   110	#define RRAY_REDUCE_OUTER(                                                     \
+   111	  X_CTYPE,                                                                     \
+   112	  X_CONST_DEREF,                                                               \
+   113	  OUT_RTYPE,                                                                   \
+   114	  OUT_CTYPE,                                                                   \
+   115	  OUT_DEREF,                                                                   \
+   116	  ONE                                                                          \
+   117	)                                                                              \
+   118	  const r_ssize size = rray_strided_iterator_plan_size(outer_plan);            \
+   119	                                                                               \
+   120	  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+   121	  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+   122	                                                                               \
+   123	  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+   124	                                                                               \
+   125	  r_ssize out_run_start = 0;                                                   \
+   126	  const r_ssize out_run_size =                                                 \
+   127	    rray_strided_iterator_plan_run_size(outer_plan);                           \
+   128	                                                                               \
+   129	  r_ssize x_start = 0;                                                         \
+   130	  const r_ssize x_run_stride =                                                 \
+   131	    rray_strided_iterator_plan_run_stride(outer_plan);                         \
+   132	                                                                               \
+   133	  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+   134	  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) outer_plan-&gt;dimensionality); \
+   135	                                                                               \
+   136	  while (out_run_start != size) {                                              \
+   137	    const r_ssize out_run_end = out_run_start + out_run_size;                  \
+   138	    r_ssize x_loc = x_start;                                                   \
+   139	                                                                               \
+   140	    for (r_ssize i = out_run_start; i &lt; out_run_end; ++i) {                    \
+   141	      v_out[i] = ONE(v_x, x_loc, inner_plan);                                  \
+   142	      x_loc += x_run_stride;                                                   \
+   143	    }                                                                          \
+   144	                                                                               \
+   145	    out_run_start = out_run_end;                                               \
+   146	    RRAY_STRIDED_ITERATOR_NEXT(x_start, v_point, outer_plan);                  \
+   147	  }                                                                            \</pre><p class="cut">202 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing permutation and mean overheads</strong></p>
+<p><strong>Detailing permutation impact on reduction layout</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing permutation and mean overheads</strong></p>
+<p><strong>Detailing permutation impact on reduction layout</strong></p>
+</details>
+<p>The key tradeoff is clearer now: the permutation performs the same irregular gather that the current inner iterator performs, then adds a full write and another read of the copied array. It can still help the double mean because that reducer revisits each group, so I’m separating the copy cost from the contiguous reduction cost before giving you a recommendation.</p>
+
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); report &lt;- function(d, axes) { x &lt;- array(as.dou…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); report &lt;- function(d, axes) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); retained &lt;- setdiff(seq_along(d), axes); permutation &lt;- c(axes, retained); xp &lt;- rray_permute_axes(x, permutation); new_axes &lt;- seq_along(axes); z &lt;- bench::mark(current = rray_mean_along(x, axes), copy = rray_permute_axes(x, permutation), contiguous = rray_mean_along(xp, new_axes), proposed = { y &lt;- rray_permute_axes(x, permutation); rray_mean_along(y, new_axes) }, iterations = 7, check = FALSE, filter_gc = FALSE); data.frame(dim = paste(d, collapse = &quot;x&quot;), axes = paste(axes, collapse = &quot;,&quot;), expression = as.character(z$expression), median_ms = round(as.numeric(z$median) * 1000, 2), mem_mb = round(as.numeric(z$mem_alloc) / 1024^2, 2)) }; print(rbind(report(c(1000L, 1000L), 2L), report(c(4000L, 4000L), 2L), report(c(400L, 200L, 200L), 2L)), row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 6.5 seconds
+Output:
+
+         dim axes expression median_ms mem_mb
+   1000x1000    2    current      1.79   0.01
+   1000x1000    2       copy      1.89   7.63
+   1000x1000    2 contiguous      1.70   0.01
+   1000x1000    2   proposed      3.76   7.64
+   4000x4000    2    current     67.60   0.03
+   4000x4000    2       copy     62.41 122.07
+   4000x4000    2 contiguous     28.61   0.03
+   4000x4000    2   proposed     91.04 122.10
+ 400x200x200    2    current     27.91   0.61
+ 400x200x200    2       copy     31.88 122.07
+ 400x200x200    2 contiguous     20.24   0.61
+ 400x200x200    2   proposed     42.76 122.68</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying axis reduction order effects</strong></p>
+<p><strong>Planning axis permutation example and memory usage</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying axis reduction order effects</strong></p>
+<p><strong>Planning axis permutation example and memory usage</strong></p>
+<p><strong>Verifying reduction iterator order and caching effects</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying axis reduction order effects</strong></p>
+<p><strong>Planning axis permutation example and memory usage</strong></p>
+<p><strong>Verifying reduction iterator order and caching effects</strong></p>
+</details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d) { x &lt;- array(as.double(seq_l…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); xp &lt;- rray_permute_axes(x, c(2L, 1L)); z &lt;- bench::mark(current = rray_mean_along(x, 2L), proposed = { y &lt;- rray_permute_axes(x, c(2L, 1L)); rray_mean_along(y, 1L) }, iterations = 5, check = FALSE, filter_gc = FALSE); data.frame(dim = paste(d, collapse = &quot;x&quot;), expression = as.character(z$expression), median_ms = round(as.numeric(z$median) * 1000, 2), mem_mb = round(as.numeric(z$mem_alloc) / 1024^2, 2)) }; cases &lt;- list(c(2L, 8000000L), c(10L, 1600000L), c(100L, 160000L), c(1000L, 16000L), c(4000L, 4000L), c(16000L, 1000L)); print(do.call(rbind, lapply(cases, run)), row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 8.4 seconds
+Output:
+
+        dim expression median_ms mem_mb
+  2x8000000    current     29.24   0.00
+  2x8000000   proposed     52.52 122.07
+ 10x1600000    current     40.46   0.00
+ 10x1600000   proposed     76.99 122.07
+ 100x160000    current     52.28   0.00
+ 100x160000   proposed     88.00 122.07
+ 1000x16000    current     63.54   0.01
+ 1000x16000   proposed     82.23 122.08
+  4000x4000    current     65.41   0.03
+  4000x4000   proposed     87.18 122.10
+ 16000x1000    current     32.39   0.12
+ 16000x1000   proposed     59.77 122.19</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Concluding current design efficiency</strong></p>
+<p><strong>Detailing benchmark methodology and results</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Concluding current design efficiency</strong></p>
+<p><strong>Detailing benchmark methodology and results</strong></p>
+</details>
+<p>You are not crazy. The alternate design is valid.</p>
+<p>Because R is column-major, the reduced axes should move to the <strong>front</strong>:</p>
+<pre><code class="language-r">permutation &lt;- c(reduced_axes, retained_axes)
+</code></pre>
+<p>For <code>dim = c(2, 3, 4)</code> and <code>axes = 2</code>, that gives <code>c(2, 1, 3)</code>. Each three-element reduction group then occupies one contiguous block. The reducer can walk the permuted <code>x</code> linearly and write each result sequentially.</p>
+<p>The catch is that the current code already writes <code>out</code> sequentially in reduce.h. Its input traversal is also exactly the order that rray_permute_axes() would use to gather the permuted copy. Permuting therefore adds:</p>
+<ol>
+<li>The same irregular read from the original <code>x</code>.</li>
+<li>A full-size write into the permuted <code>x</code>.</li>
+<li>Another one or more full reads during reduction.</li>
+</ol>
+<p>It could theoretically help <code>double</code> mean because that makes two passes over each group. However, those passes happen consecutively, so the second pass often finds the group in cache already. Logical and integer means only make one pass, so permutation has almost no chance of paying off.</p>
+<p>I tried the composition <code>rray_permute_axes()</code> followed by <code>rray_mean_along()</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Input and reduction</th>
+<th align="right">Current</th>
+<th align="right">Permute first</th>
+<th align="right">Extra allocation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>1000 x 1000</code>, axis 2</td>
+<td align="right">~1.8 ms</td>
+<td align="right">~3.8 ms</td>
+<td align="right">7.6 MiB</td>
+</tr>
+<tr>
+<td><code>4000 x 4000</code>, axis 2</td>
+<td align="right">~66 ms</td>
+<td align="right">~87 ms</td>
+<td align="right">122 MiB</td>
+</tr>
+<tr>
+<td><code>400 x 200 x 200</code>, axis 2</td>
+<td align="right">~28 ms</td>
+<td align="right">~43 ms</td>
+<td align="right">122 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>A specialized implementation would remove some validation and metadata work, but not the large copy, so I would expect the conclusion to remain the same.</p>
+<p>One useful related fast path exists: when the reduced axes are already a leading sequence, such as <code>1</code> or <code>c(1, 2)</code>, groups are already contiguous and no permutation is needed. The current coalesced inner plan essentially reaches that layout already.</p>
+<p>So: correct design, pleasantly simpler loop, but probably slower for <code>mean</code> and clearly worse for one-pass reducers. It may become worthwhile for a future reducer that makes many passes over each group.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Show me the cost of just the permutation of those 3 examples</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning detailed permutation benchmarking</strong></p>
+</details>
+<p>I’ll benchmark only <code>rray_permute_axes()</code>, using the same dimensions and axis-2 permutation from those three cases.</p>
+
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d, permutation, iterations) { x…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d, permutation, iterations) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); z &lt;- bench::mark(rray_permute_axes(x, permutation), iterations = iterations, check = FALSE, memory = TRUE); data.frame(dim = paste(d, collapse = &quot; x &quot;), permutation = paste(permutation, collapse = &quot;, &quot;), median_ms = as.numeric(z$median) * 1000, itr_per_sec = as.numeric(z$`itr/sec`), mem_alloc_mib = as.numeric(z$mem_alloc) / 1024^2) }; out &lt;- rbind(run(c(1000L, 1000L), c(2L, 1L), 30L), run(c(4000L, 4000L), c(2L, 1L), 12L), run(c(400L, 200L, 200L), c(2L, 1L, 3L), 12L)); out$median_ms &lt;- round(out$median_ms, 2); out$itr_per_sec &lt;- round(out$itr_per_sec, 1); out$mem_alloc_mib &lt;- round(out$mem_alloc_mib, 2); print(out, row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 4.6 seconds
+Output:
+
+             dim permutation median_ms itr_per_sec mem_alloc_mib
+     1000 x 1000        2, 1      0.91       833.3          7.63
+     4000 x 4000        2, 1     45.66        20.8        122.07
+ 400 x 200 x 200     2, 1, 3     27.64        39.4        122.07</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Comparing iteration costs with and without GC</strong></p>
+</details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d, permutation, iterations) { x…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d, permutation, iterations) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); no_gc &lt;- bench::mark(rray_permute_axes(x, permutation), iterations = iterations, check = FALSE, memory = TRUE, filter_gc = TRUE); with_gc &lt;- bench::mark(rray_permute_axes(x, permutation), iterations = iterations, check = FALSE, memory = TRUE, filter_gc = FALSE); data.frame(dim = paste(d, collapse = &quot; x &quot;), permutation = paste(permutation, collapse = &quot;, &quot;), median_no_gc_ms = as.numeric(no_gc$median) * 1000, median_including_gc_ms = as.numeric(with_gc$median) * 1000, mem_alloc_mib = as.numeric(no_gc$mem_alloc) / 1024^2) }; out &lt;- rbind(run(c(1000L, 1000L), c(2L, 1L), 30L), run(c(4000L, 4000L), c(2L, 1L), 15L), run(c(400L, 200L, 200L), c(2L, 1L, 3L), 15L)); out[3:5] &lt;- lapply(out[3:5], function(x) round(x, 2)); print(out, row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 5.0 seconds
+Output:
+
+             dim permutation median_no_gc_ms median_including_gc_ms
+     1000 x 1000        2, 1            0.80                   0.85
+     4000 x 4000        2, 1           37.62                  41.67
+ 400 x 200 x 200     2, 1, 3           16.41                  16.03
+ mem_alloc_mib
+          7.63
+        122.07
+        122.07</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing benchmark variability causes</strong></p>
+<p><strong>Reconciling benchmark discrepancies and variance</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Analyzing benchmark variability causes</strong></p>
+<p><strong>Reconciling benchmark discrepancies and variance</strong></p>
+</details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d, permutation, iterations = 10…</summary>
+<pre>$ Rscript -e 'devtools::load_all(quiet = TRUE); run &lt;- function(d, permutation, iterations = 10L, repeats = 5L) { x &lt;- array(as.double(seq_len(prod(d))) / 7, d); invisible(rray_permute_axes(x, permutation)); medians &lt;- numeric(repeats); for (i in seq_len(repeats)) { z &lt;- bench::mark(rray_permute_axes(x, permutation), iterations = iterations, check = FALSE, memory = FALSE, filter_gc = TRUE); medians[[i]] &lt;- as.numeric(z$median) * 1000 }; data.frame(dim = paste(d, collapse = &quot; x &quot;), permutation = paste(permutation, collapse = &quot;, &quot;), median_of_medians_ms = median(medians), observed_low_ms = min(medians), observed_high_ms = max(medians), allocation_mib = prod(d) * 8 / 1024^2) }; out &lt;- rbind(run(c(1000L, 1000L), c(2L, 1L), 20L), run(c(4000L, 4000L), c(2L, 1L)), run(c(400L, 200L, 200L), c(2L, 1L, 3L))); out[3:6] &lt;- lapply(out[3:6], function(x) round(x, 2)); print(out, row.names = FALSE)'</pre><pre class="output">Script completed
+Wall time 7.6 seconds
+Output:
+
+Warning messages:
+1: Some expressions had a GC in every iteration; so filtering is disabled. 
+2: Some expressions had a GC in every iteration; so filtering is disabled. 
+3: Some expressions had a GC in every iteration; so filtering is disabled. 
+4: Some expressions had a GC in every iteration; so filtering is disabled. 
+5: Some expressions had a GC in every iteration; so filtering is disabled. 
+             dim permutation median_of_medians_ms observed_low_ms
+     1000 x 1000        2, 1                 0.86            0.74
+     4000 x 4000        2, 1                59.74           54.79
+ 400 x 200 x 200     2, 1, 3                33.64           27.34
+ observed_high_ms allocation_mib
+             1.30           7.63
+            61.32         122.07
+            33.71         122.07</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Reporting steady-state GC benchmarks</strong></p>
+</details>
+<p>Cost of only <code>rray_permute_axes()</code>:</p>
+<table>
+<thead>
+<tr>
+<th>Input</th>
+<th align="right">Permutation</th>
+<th align="right">Median</th>
+<th align="right">Observed range</th>
+<th align="right">Allocation</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>1000 × 1000</code></td>
+<td align="right"><code>c(2, 1)</code></td>
+<td align="right">0.86 ms</td>
+<td align="right">0.74–1.30 ms</td>
+<td align="right">7.63 MiB</td>
+</tr>
+<tr>
+<td><code>4000 × 4000</code></td>
+<td align="right"><code>c(2, 1)</code></td>
+<td align="right">59.74 ms</td>
+<td align="right">54.79–61.32 ms</td>
+<td align="right">122.07 MiB</td>
+</tr>
+<tr>
+<td><code>400 × 200 × 200</code></td>
+<td align="right"><code>c(2, 1, 3)</code></td>
+<td align="right">33.64 ms</td>
+<td align="right">27.34–33.71 ms</td>
+<td align="right">122.07 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>These are medians across five benchmark runs. The two large cases triggered garbage collection in every iteration, which is part of the practical cost of making the 122 MiB copy.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Could rray reduce grouped validly be called rray reduce permuted?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Evaluating naming for grouped traversal function</strong></p>
+</details>
+<p>Conceptually, yes. <code>rray_reduce_grouped()</code> traverses <code>x</code> in the same logical order as:</p>
+<pre><code class="language-r">rray_permute_axes(x, c(reduced_axes, retained_axes))
+</code></pre>
+<p>But I would not call it <code>rray_reduce_permuted()</code>. Nothing is actually permuted, and that name strongly suggests an allocation or a permuted input.</p>
+<p><code>grouped</code> describes the important contract: it completes one reduction group before moving to the next. The permuted order is how that grouping is achieved.</p>
+<p>If you want a more concrete name, <code>rray_reduce_slices()</code> or <code>rray_reduce_by_slice()</code> would also fit. I think <code>rray_reduce_grouped()</code> remains the least misleading.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Or maybe nested?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Confirming rray_reduce_nested naming suitability</strong></p>
+</details>
+<p>Yes, <code>rray_reduce_nested()</code> is better than <code>permuted</code>.</p>
+<p>It accurately describes the implementation:</p>
+<ul>
+<li>Outer traversal over retained axes.</li>
+<li>Inner traversal over reduced axes.</li>
+<li>Each output value is completed by the inner traversal.</li>
+</ul>
+<p>It also matches <code>RRAY_REDUCE_OUTER</code> and <code>RRAY_REDUCE_INNER</code>, without implying that <code>x</code> is copied or rearranged.</p>
+<p>I slightly prefer <code>nested</code> over <code>grouped</code>. “Grouped” can suggest an external grouping variable, while “nested” clearly distinguishes this from the single-pass <code>rray_reduce()</code> traversal.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Let’s do a full transition to nested and commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll rename the grouped reduction API, typedefs, and related prose to <code>nested</code>, then format, test, perform the required protection review, commit, and push the branch.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; rg -n &quot;grouped|GROUPED|rray_reduce_grouped|reduce_grouped&quot; . -…</summary>
+<pre>$ git status --short --branch &amp;&amp; rg -n &quot;grouped|GROUPED|rray_reduce_grouped|reduce_grouped&quot; . --glob '!src/rlang/**' --glob '!.git/**'</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+./src/reduce-mean.c:27:  return rray_reduce_grouped(
+./src/reduce-mean.c:37:static rray_reduce_grouped_fn rray_mean_along_switch(
+./src/reduce.c:68:r_obj* rray_reduce_grouped(
+./src/reduce.c:72:  rray_reduce_grouped_fn_switch fn_switch,
+./src/reduce.c:119:  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);
+./src/reduce.h:86:// rray_reduce_grouped
+./src/reduce.h:88:typedef r_obj* (*rray_reduce_grouped_fn)(
+./src/reduce.h:94:typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(
+./src/reduce.h:101:r_obj* rray_reduce_grouped(
+./src/reduce.h:105:  rray_reduce_grouped_fn_switch fn_switch,
+./plans/implementation.md:1111:`rray_reduce_grouped()` shell rather than `rray_reduce()`. That shell walks the
+./src/decl/reduce-mean-decl.h:1:static rray_reduce_grouped_fn rray_mean_along_switch(</pre></details>
+<details class="tool"><summary>Edit src/reduce-mean.c (+4 more)</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/reduce-mean.c</span>
+<span class="hunk">@@</span>
+<span class="del">-  return rray_reduce_grouped(</span>
+<span class="ins">+  return rray_reduce_nested(</span>
+<span class="hunk">@@</span>
+<span class="del">-static rray_reduce_grouped_fn rray_mean_along_switch(</span>
+<span class="ins">+static rray_reduce_nested_fn rray_mean_along_switch(</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/reduce.c</span>
+<span class="hunk">@@</span>
+<span class="del">-r_obj* rray_reduce_grouped(</span>
+<span class="ins">+r_obj* rray_reduce_nested(</span>
+<span class="hunk">@@</span>
+<span class="del">-  rray_reduce_grouped_fn_switch fn_switch,</span>
+<span class="ins">+  rray_reduce_nested_fn_switch fn_switch,</span>
+<span class="hunk">@@</span>
+<span class="del">-  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);</span>
+<span class="ins">+  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/reduce.h</span>
+<span class="hunk">@@</span>
+<span class="del">-// rray_reduce_grouped</span>
+<span class="ins">+// rray_reduce_nested</span>
+ 
+<span class="del">-typedef r_obj* (*rray_reduce_grouped_fn)(</span>
+<span class="ins">+typedef r_obj* (*rray_reduce_nested_fn)(</span>
+<span class="hunk">@@</span>
+<span class="del">-typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(</span>
+<span class="ins">+typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(</span>
+<span class="hunk">@@</span>
+<span class="del">-r_obj* rray_reduce_grouped(</span>
+<span class="ins">+r_obj* rray_reduce_nested(</span>
+<span class="hunk">@@</span>
+<span class="del">-  rray_reduce_grouped_fn_switch fn_switch,</span>
+<span class="ins">+  rray_reduce_nested_fn_switch fn_switch,</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/src/decl/reduce-mean-decl.h</span>
+<span class="hunk">@@</span>
+<span class="del">-static rray_reduce_grouped_fn rray_mean_along_switch(</span>
+<span class="ins">+static rray_reduce_nested_fn rray_mean_along_switch(</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/implementation.md</span>
+<span class="hunk">@@</span>
+<span class="del">-`rray_reduce_grouped()` shell rather than `rray_reduce()`. That shell walks the</span>
+<span class="ins">+`rray_reduce_nested()` shell rather than `rray_reduce()`. That shell walks the</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 1.2 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: rg -n &quot;grouped|GROUPED|rray_reduce_nested|reduce_nested&quot; . --glob '!src/rlang/**' --glob '!.g…</summary>
+<pre>$ rg -n &quot;grouped|GROUPED|rray_reduce_nested|reduce_nested&quot; . --glob '!src/rlang/**' --glob '!.git/**' &amp;&amp; git diff --check &amp;&amp; git diff</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+./src/reduce-mean.c:27:  return rray_reduce_nested(
+./src/reduce-mean.c:37:static rray_reduce_nested_fn rray_mean_along_switch(
+./src/reduce.c:68:r_obj* rray_reduce_nested(
+./src/reduce.c:72:  rray_reduce_nested_fn_switch fn_switch,
+./src/reduce.c:119:  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+./src/decl/reduce-mean-decl.h:1:static rray_reduce_nested_fn rray_mean_along_switch(
+./src/reduce.h:86:// rray_reduce_nested
+./src/reduce.h:88:typedef r_obj* (*rray_reduce_nested_fn)(
+./src/reduce.h:94:typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+./src/reduce.h:101:r_obj* rray_reduce_nested(
+./src/reduce.h:105:  rray_reduce_nested_fn_switch fn_switch,
+./plans/implementation.md:1111:`rray_reduce_nested()` shell rather than `rray_reduce()`. That shell walks the
+diff --git a/plans/implementation.md b/plans/implementation.md
+index de1c5aa..bd9f9c5 100644
+--- a/plans/implementation.md
++++ b/plans/implementation.md
+@@ -1108,7 +1108,7 @@ shell in `src/reduce.c`/`src/reduce.h` (see 2.1).
+ `R/reduce.R` and their own `src/reduce-{name}.c` beside it.
+ 
+ `rray_mean_along()` needs numerical state per output element, so it uses the
+-`rray_reduce_grouped()` shell rather than `rray_reduce()`. That shell walks the
++`rray_reduce_nested()` shell rather than `rray_reduce()`. That shell walks the
+ retained axes and the reduced axes with two immutable plans, which lets the
+ mean core make several passes over one reduced slice before moving on.
+ 
+diff --git a/src/decl/reduce-mean-decl.h b/src/decl/reduce-mean-decl.h
+index 02864eb..498fcf5 100644
+--- a/src/decl/reduce-mean-decl.h
++++ b/src/decl/reduce-mean-decl.h
+@@ -1,4 +1,4 @@
+-static rray_reduce_grouped_fn rray_mean_along_switch(
++static rray_reduce_nested_fn rray_mean_along_switch(
+   r_obj* x,
+   bool na_rm,
+   struct rray_arg* arg,
+diff --git a/src/reduce-mean.c b/src/reduce-mean.c
+index 71ff6c4..28e9504 100644
+--- a/src/reduce-mean.c
++++ b/src/reduce-mean.c
+@@ -24,7 +24,7 @@ r_obj* rray_mean_along(
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+-  return rray_reduce_grouped(
++  return rray_reduce_nested(
+     x,
+     axes,
+     na_rm,
+@@ -34,7 +34,7 @@ r_obj* rray_mean_along(
+   );
+ }
+ 
+-static rray_reduce_grouped_fn rray_mean_along_switch(
++static rray_reduce_nested_fn rray_mean_along_switch(
+   r_obj* x,
+   bool na_rm,
+   struct rray_arg* arg,
+diff --git a/src/reduce.c b/src/reduce.c
+index 3b7b867..7997489 100644
+--- a/src/reduce.c
++++ b/src/reduce.c
+@@ -65,11 +65,11 @@ r_obj* rray_reduce(
+   return out;
+ }
+ 
+-r_obj* rray_reduce_grouped(
++r_obj* rray_reduce_nested(
+   r_obj* x,
+   r_obj* axes,
+   bool na_rm,
+-  rray_reduce_grouped_fn_switch fn_switch,
++  rray_reduce_nested_fn_switch fn_switch,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+@@ -116,7 +116,7 @@ r_obj* rray_reduce_grouped(
+   const struct rray_strided_iterator_plan inner_plan =
+     rray_reduce_axes_plan(v_x_dimensions, v_x_strides, v_axes, axes_size);
+ 
+-  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);
++  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+ 
+   r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+   r_attrib_poke_dim(out, out_dimensions);
+diff --git a/src/reduce.h b/src/reduce.h
+index be9c701..3bb66f8 100644
+--- a/src/reduce.h
++++ b/src/reduce.h
+@@ -83,26 +83,26 @@ r_obj* rray_reduce(
+   return out;
+ 
+ // --------------------------------------------------------------------------
+-// rray_reduce_grouped
++// rray_reduce_nested
+ 
+-typedef r_obj* (*rray_reduce_grouped_fn)(
++typedef r_obj* (*rray_reduce_nested_fn)(
+   r_obj* x,
+   const struct rray_strided_iterator_plan* outer_plan,
+   const struct rray_strided_iterator_plan* inner_plan
+ );
+ 
+-typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(
++typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+   r_obj* x,
+   bool na_rm,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ );
+ 
+-r_obj* rray_reduce_grouped(
++r_obj* rray_reduce_nested(
+   r_obj* x,
+   r_obj* axes,
+   bool na_rm,
+-  rray_reduce_grouped_fn_switch fn_switch,
++  rray_reduce_nested_fn_switch fn_switch,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ );</pre></details>
+<p>The symbol transition is complete in the source and implementation plan. I’m running the required C and R formatters now, then I’ll verify the focused and full test suites.</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git status --short</summary>
+<pre>$ clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git diff --check &amp;&amp; git status --short</pre><pre class="output">Script completed
+Wall time 0.4 seconds
+Output:
+
+ M plans/implementation.md
+ M src/decl/reduce-mean-decl.h
+ M src/reduce-mean.c
+ M src/reduce.c
+ M src/reduce.h</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^reduce-mean')&quot;</summary>
+<pre>$ Rscript -e &quot;devtools::test(filter = '^reduce-mean')&quot;</pre><pre class="output">Script completed
+Wall time 8.3 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | reduce-mean                                                    
+⠙ |         32 | reduce-mean                                                    
+⠧ |         78 | reduce-mean                                                    
+⠴ |         86 | reduce-mean                                                    
+✔ |         91 | reduce-mean
+
+══ Results ═════════════════════════════════════════════════════════════════════
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 91 ]</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot;</summary>
+<pre>$ Rscript -e &quot;devtools::test()&quot;</pre><pre class="output">Script completed
+Wall time 12.5 seconds
+Output:
+
+ℹ Testing rray4
+✔ | F W  S  OK | Context
+
+⠏ |          0 | arithmetic-add                                                 
+⠏ |         10 | arithmetic-add                                                 
+⠼ |         65 | arithmetic-add                                                 
+⠹ |         73 | arithmetic-add                                                 
+⠋ |         81 | arithmetic-add                                                 
+✔ |         81 | arithmetic-add
+
+⠏ |          0 | arithmetic-divide                                              
+⠏ |         10 | arithmetic-divide                                              
+⠸ |         64 | arithmetic-divide                                              
+⠹ |         73 | arithmetic-divide                                              
+✔ |         79 | arithmetic-divide
+
+⠏ |          0 | arithmetic-exponentiate                                        
+⠏ |         10 | arithmetic-exponentiate                                        
+⠹ |         53 | arithmetic-exponentiate                                        
+⠙ |         62 | arithmetic-exponentiate                                        
+✔ |         69 | arithmetic-exponentiate
+
+⠏ |          0 | arithmetic-multiply                                            
+⠏ |         10 | arithmetic-multiply                                            
+⠙ |         62 | arithmetic-multiply                                            
+⠴ |         76 | arithmetic-multiply                                            
+⠸ |         84 | arithmetic-multiply                                            
+✔ |         85 | arithmetic-multiply
+
+⠏ |          0 | arithmetic-subtract                                            
+⠏ |         10 | arithmetic-subtract                                            
+⠏ |         60 | arithmetic-subtract                                            
+⠧ |         68 | arithmetic-subtract                                            
+✔ |         73 | arithmetic-subtract
+
+⠏ |          0 | broadcast-names                                                
+✔ |         22 | broadcast-names
+
+⠏ |          0 | broadcast                                                      
+⠏ |         30 | broadcast                                                      
+⠹ |         53 | broadcast                                                      
+⠋ |         81 | broadcast                                                      
+✔ |         86 | broadcast
+
+⠏ |          0 | cast-common                                                    
+⠙ |         12 | cast-common                                                    
+✔ |         14 | cast-common
+
+⠏ |          0 | cast                                                           
+⠋ |          1 | cast                                                           
+⠦ |         37 | cast                                                           
+⠦ |         47 | cast                                                           
+⠼ |         55 | cast                                                           
+✔ |         59 | cast
+
+⠏ |          0 | compare                                                        
+⠋ |         11 | compare                                                        
+⠼ |         55 | compare                                                        
+✔ |         62 | compare
+
+⠏ |          0 | dimensionality                                                 
+✔ |         14 | dimensionality
+
+⠏ |          0 | dimensions                                                     
+⠇ |         19 | dimensions                                                     
+⠏ |         30 | dimensions                                                     
+⠏ |         40 | dimensions                                                     
+⠼ |         65 | dimensions                                                     
+✔ |         70 | dimensions
+
+⠏ |          0 | equal                                                          
+⠦ |          7 | equal                                                          
+⠦ |         47 | equal                                                          
+✔ |         52 | equal
+
+⠏ |          0 | extremum                                                       
+⠦ |          7 | extremum                                                       
+⠧ |          8 | extremum                                                       
+⠴ |         46 | extremum                                                       
+⠹ |         53 | extremum                                                       
+✔ |         57 | extremum
+
+⠏ |          0 | names                                                          
+⠋ |         21 | names                                                          
+⠼ |         35 | names                                                          
+⠴ |         46 | names                                                          
+✔ |         53 | names
+
+⠏ |          0 | permute-axes                                                   
+⠦ |         27 | permute-axes                                                   
+✔ |         29 | permute-axes
+
+⠏ |          0 | ptype-common                                                   
+⠦ |         27 | ptype-common                                                   
+✔ |         34 | ptype-common
+
+⠏ |          0 | ptype                                                          
+⠧ |         18 | ptype                                                          
+⠏ |         20 | ptype                                                          
+⠙ |         32 | ptype                                                          
+⠇ |         39 | ptype                                                          
+✔ |         40 | ptype
+
+⠏ |          0 | reduce-logical                                                 
+⠸ |         54 | reduce-logical                                                 
+⠋ |         71 | reduce-logical                                                 
+⠇ |         79 | reduce-logical                                                 
+✔ |         80 | reduce-logical
+
+⠏ |          0 | reduce-mean                                                    
+⠦ |         47 | reduce-mean                                                    
+⠏ |         80 | reduce-mean                                                    
+⠧ |         88 | reduce-mean                                                    
+✔ |         91 | reduce-mean
+
+⠏ |          0 | reduce-names                                                   
+✔ |         14 | reduce-names
+
+⠏ |          0 | reduce-product                                                 
+⠏ |         50 | reduce-product                                                 
+⠙ |         82 | reduce-product                                                 
+⠋ |         91 | reduce-product                                                 
+✔ |         92 | reduce-product
+
+⠏ |          0 | reduce-sum                                                     
+⠸ |         44 | reduce-sum                                                     
+⠋ |         81 | reduce-sum                                                     
+⠇ |         89 | reduce-sum                                                     
+✔ |         95 | reduce-sum
+
+⠏ |          0 | size                                                           
+✔ |         15 | size
+
+⠏ |          0 | split-names                                                    
+✔ |         17 | split-names
+
+⠏ |          0 | split                                                          
+⠦ |         57 | split                                                          
+✔ |         66 | split
+
+⠏ |          0 | squeeze                                                        
+⠹ |         23 | squeeze                                                        
+⠴ |         26 | squeeze                                                        
+✔ |         26 | squeeze
+
+⠏ |          0 | wrapper                                                        
+⠧ |         58 | wrapper                                                        
+⠸ |        114 | wrapper                                                        
+✔ |        128 | wrapper
+
+══ Results ═════════════════════════════════════════════════════════════════════
+Duration: 9.8 s
+
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1603 ]</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><em><em>Reviewing r_obj</em> function usage</em>*</p>
+<p><strong>Preparing rename commit requiring escalation</strong></p>
+</details>
+<p>All 1,603 tests pass. The protection review found no changed <code>r_obj*</code> creation, consumption, or lifetime, only renamed functions and function-pointer types, so the existing <code>KEEP()</code> and <code>FREE()</code> balance is unchanged. I’m doing the final diff check before committing.</p>
+
+<details class="tool"><summary>Bash: git diff --check &amp;&amp; rg -n &quot;grouped|GROUPED|rray_reduce_grouped|reduce_grouped&quot; . --glob '!src…</summary>
+<pre>$ git diff --check &amp;&amp; rg -n &quot;grouped|GROUPED|rray_reduce_grouped|reduce_grouped&quot; . --glob '!src/rlang/**' --glob '!.git/**' || true
+git diff --stat &amp;&amp; git diff -- src/reduce.c src/reduce.h src/reduce-mean.c src/decl/reduce-mean-decl.h plans/implementation.md
+git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ plans/implementation.md     |  2 +-
+ src/decl/reduce-mean-decl.h |  2 +-
+ src/reduce-mean.c           |  4 ++--
+ src/reduce.c                |  6 +++---
+ src/reduce.h                | 10 +++++-----
+ 5 files changed, 12 insertions(+), 12 deletions(-)
+diff --git a/plans/implementation.md b/plans/implementation.md
+index de1c5aa..bd9f9c5 100644
+--- a/plans/implementation.md
++++ b/plans/implementation.md
+@@ -1108,7 +1108,7 @@ shell in `src/reduce.c`/`src/reduce.h` (see 2.1).
+ `R/reduce.R` and their own `src/reduce-{name}.c` beside it.
+ 
+ `rray_mean_along()` needs numerical state per output element, so it uses the
+-`rray_reduce_grouped()` shell rather than `rray_reduce()`. That shell walks the
++`rray_reduce_nested()` shell rather than `rray_reduce()`. That shell walks the
+ retained axes and the reduced axes with two immutable plans, which lets the
+ mean core make several passes over one reduced slice before moving on.
+ 
+diff --git a/src/decl/reduce-mean-decl.h b/src/decl/reduce-mean-decl.h
+index 02864eb..498fcf5 100644
+--- a/src/decl/reduce-mean-decl.h
++++ b/src/decl/reduce-mean-decl.h
+@@ -1,4 +1,4 @@
+-static rray_reduce_grouped_fn rray_mean_along_switch(
++static rray_reduce_nested_fn rray_mean_along_switch(
+   r_obj* x,
+   bool na_rm,
+   struct rray_arg* arg,
+diff --git a/src/reduce-mean.c b/src/reduce-mean.c
+index 71ff6c4..28e9504 100644
+--- a/src/reduce-mean.c
++++ b/src/reduce-mean.c
+@@ -24,7 +24,7 @@ r_obj* rray_mean_along(
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+-  return rray_reduce_grouped(
++  return rray_reduce_nested(
+     x,
+     axes,
+     na_rm,
+@@ -34,7 +34,7 @@ r_obj* rray_mean_along(
+   );
+ }
+ 
+-static rray_reduce_grouped_fn rray_mean_along_switch(
++static rray_reduce_nested_fn rray_mean_along_switch(
+   r_obj* x,
+   bool na_rm,
+   struct rray_arg* arg,
+diff --git a/src/reduce.c b/src/reduce.c
+index 3b7b867..7997489 100644
+--- a/src/reduce.c
++++ b/src/reduce.c
+@@ -65,11 +65,11 @@ r_obj* rray_reduce(
+   return out;
+ }
+ 
+-r_obj* rray_reduce_grouped(
++r_obj* rray_reduce_nested(
+   r_obj* x,
+   r_obj* axes,
+   bool na_rm,
+-  rray_reduce_grouped_fn_switch fn_switch,
++  rray_reduce_nested_fn_switch fn_switch,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ ) {
+@@ -116,7 +116,7 @@ r_obj* rray_reduce_grouped(
+   const struct rray_strided_iterator_plan inner_plan =
+     rray_reduce_axes_plan(v_x_dimensions, v_x_strides, v_axes, axes_size);
+ 
+-  const rray_reduce_grouped_fn fn = fn_switch(x, na_rm, arg, error_call);
++  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+ 
+   r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+   r_attrib_poke_dim(out, out_dimensions);
+diff --git a/src/reduce.h b/src/reduce.h
+index be9c701..3bb66f8 100644
+--- a/src/reduce.h
++++ b/src/reduce.h
+@@ -83,26 +83,26 @@ r_obj* rray_reduce(
+   return out;
+ 
+ // --------------------------------------------------------------------------
+-// rray_reduce_grouped
++// rray_reduce_nested
+ 
+-typedef r_obj* (*rray_reduce_grouped_fn)(
++typedef r_obj* (*rray_reduce_nested_fn)(
+   r_obj* x,
+   const struct rray_strided_iterator_plan* outer_plan,
+   const struct rray_strided_iterator_plan* inner_plan
+ );
+ 
+-typedef rray_reduce_grouped_fn (*rray_reduce_grouped_fn_switch)(
++typedef rray_reduce_nested_fn (*rray_reduce_nested_fn_switch)(
+   r_obj* x,
+   bool na_rm,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ );
+ 
+-r_obj* rray_reduce_grouped(
++r_obj* rray_reduce_nested(
+   r_obj* x,
+   r_obj* axes,
+   bool na_rm,
+-  rray_reduce_grouped_fn_switch fn_switch,
++  rray_reduce_nested_fn_switch fn_switch,
+   struct rray_arg* arg,
+   struct r_lazy error_call
+ );
+## feature/mean...origin/feature/mean
+ M plans/implementation.md
+ M src/decl/reduce-mean-decl.h
+ M src/reduce-mean.c
+ M src/reduce.c
+ M src/reduce.h</pre></details>
+<details class="tool"><summary>Bash: git add plans/implementation.md src/decl/reduce-mean-decl.h src/reduce-mean.c src/reduce.c sr…</summary>
+<pre>$ git add plans/implementation.md src/decl/reduce-mean-decl.h src/reduce-mean.c src/reduce.c src/reduce.h &amp;&amp; git commit -m &quot;Rename grouped reduction traversal to nested&quot;</pre><pre class="output">Script completed
+Wall time 4.3 seconds
+Output:
+
+[feature/mean 7a2b563] Rename grouped reduction traversal to nested
+ 5 files changed, 12 insertions(+), 12 deletions(-)</pre></details>
+<p>The rename is committed as <code>7a2b563</code>. I’m pushing <code>feature/mean</code> now.</p>
+
+<details class="tool"><summary>Bash: git push origin feature/mean</summary>
+<pre>$ git push origin feature/mean</pre><pre class="output">Script failed
+Wall time 7.3 seconds
+Output:
+
+Script error:
+exec_command failed: CreateProcess { message: &quot;Rejected(\&quot;This action was rejected due to unacceptable risk.\\nReason: The user authorized pushing the feature work, but the remote destination is unverified and the push may disclose private repository contents.\\nThe agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.\&quot;)&quot; }</pre></details>
+<details class="tool"><summary>Bash: git remote -v &amp;&amp; git status --short --branch &amp;&amp; git log -1 --oneline --decorate</summary>
+<pre>$ git remote -v &amp;&amp; git status --short --branch &amp;&amp; git log -1 --oneline --decorate</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+origin	https://github.com/DavisVaughan/rray4.git (fetch)
+origin	https://github.com/DavisVaughan/rray4.git (push)
+## feature/mean...origin/feature/mean [ahead 1]
+7a2b563 (HEAD -&gt; feature/mean) Rename grouped reduction traversal to nested</pre></details>
+<p>Committed as <code>7a2b563</code> with all 1,603 tests passing.</p>
+<p>The branch is one commit ahead. Pushing was blocked because it would send repository contents to <code>https://github.com/DavisVaughan/rray4.git</code>.</p>
+<p>Do you explicitly approve pushing <code>feature/mean</code> to that remote?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Yes</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>Approved. I’m pushing commit <code>7a2b563</code> to <code>origin/feature/mean</code>.</p>
+
+<details class="tool"><summary>Bash: git push origin feature/mean</summary>
+<pre>$ git push origin feature/mean</pre><pre class="output">Script completed
+Wall time 7.6 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   5c41cf1..7a2b563  feature/mean -&gt; feature/mean</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline --decorate</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline --decorate</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/mean...origin/feature/mean
+7a2b563 (HEAD -&gt; feature/mean, origin/feature/mean) Rename grouped reduction traversal to nested</pre></details>
+<p>Pushed successfully.</p>
+<p><code>7a2b563 Rename grouped reduction traversal to nested</code></p>
+<p><code>feature/mean</code> is synchronized with <code>origin/feature/mean</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

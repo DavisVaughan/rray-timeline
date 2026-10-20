@@ -1,0 +1,1791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keeping titles in rray_slice() and the functions built on it</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-154">rray timeline</a>
+<h1>Keeping titles in <code>rray_slice()</code> and the functions built on it</h1>
+<p class="facts">Claude · Oct 18, 2026 · 1 prompt · 6 replies · <a href="https://github.com/r-lib/rray/pull/154">#154</a></p>
+</header>
+<main>
+<p class="divider">Oct 18, 2026, 16:59 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/slice-titles<br />
+Implement plans/titles.md part 1 about slice<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Check this section off in the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: pwd; ls; git status; git branch -a; cat plans/titles.md</summary>
+<pre>pwd; ls; git status; git branch -a; cat plans/titles.md</pre><pre class="output">~/files/r/packages/rray
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+codecov.yml
+compile_commands.json
+DESCRIPTION
+docs
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+panache.toml
+pkgdown
+plans
+R
+README.md
+README.Rmd
+rray.Rproj
+src
+tests
+vignettes
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+* main
+  remotes/origin/HEAD -&gt; origin/main
+  remotes/origin/gh-pages
+  remotes/origin/main
+# Titles plan
+
+## Goal
+
+Every function that takes one array and returns one array should keep the
+titles of `x` wherever its axes keep their meaning. Titles are the names on
+the dimnames list:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+
+rray_titles(x)
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+```
+
+Binary and n-ary functions are out of scope until we settle how names combine
+across inputs. See [Out of scope](#out-of-scope).
+
+## Rules
+
+These were decided up front and apply to every step.
+
+- A title labels an axis, not its positions. An axis that keeps its identity
+  keeps its title, even when it loses its names. `rray_sum(x, axes = 2)` keeps
+  title `&quot;B&quot;` on axis 2.
+
+- The result has a titles vector exactly when `x` has one. A new axis gets
+  the title `&quot;&quot;`. An all `&quot;&quot;` titles vector is never turned into `NULL`. This
+  matches `rray_set_axis_title(x, axis, NULL)`, which already leaves `&quot;&quot;` in
+  place.
+
+- Titles can exist with no axis names at all. The dimnames list is then all
+  `NULL` elements, like `list(A = NULL, B = NULL)`. Every helper must handle
+  this case, which is the main trap: most names helpers only allocate their
+  output list when some axis has names.
+
+- A function that drops all names drops all titles. Today that is
+  `rray_extract()`, `rray_index()`, and `rray_set_dimensions()`.
+
+- `rray_set_names(x, names)` replaces the whole dimnames list. The names of
+  `names` become the titles of `x`, so an unnamed list drops them and `NULL`
+  clears everything.
+
+- `rray_broadcast()` is left alone for now, see [Out of scope](#out-of-scope).
+
+## Current state
+
+From running each function on `x` above:
+
+| Function | Titles today | After this plan |
+|---|---|---|
+| `rray_slice()`, `rray_slice_axis()`, `rray_slice_rows()`, `rray_slice_columns()` | Dropped | Kept |
+| `rray_reverse()`, `rray_roll()`, `rray_rep()`, `rray_rep_each()` | Dropped | Kept |
+| `rray_sum()`, `rray_prod()`, `rray_mean()`, `rray_min()`, `rray_max()`, `rray_all()`, `rray_any()` | Dropped | Kept, including on reduced axes |
+| `rray_locate_max()`, `rray_locate_min()` | Dropped | Kept, including on the located axis |
+| `rray_roll_each()` | Dropped | Kept, including on `axis` |
+| `rray_permute_axes()`, `rray_move_axes()` | Dropped | Reordered with the axes |
+| `rray_insert_axes()` | Dropped | Kept, `&quot;&quot;` on new axes |
+| `rray_remove_axes()` | Dropped | Kept, removed axes lose theirs |
+| `rray_split()` | Kept only when `axis` has no names | Always kept |
+| `rray_unstack()` | Kept only when `axis` has no names | Always kept, minus `axis` |
+| `rray_set_axis_names()`, `rray_set_row_names()`, `rray_set_column_names()` | Dropped | Kept |
+| `rray_set_names()` | Taken from `names` | Unchanged, now documented and tested |
+| `rray_cumulative_*()` | Kept | Unchanged, already tested |
+| `rray_cast()` | Kept | Unchanged, add a test |
+| `rray_slice_assign()` and friends, `rray_extract_assign()` | Kept | Unchanged, add a test |
+| `rray_extract()`, `rray_index()`, `rray_set_dimensions()` | Dropped | Unchanged, add a test |
+| `rray_broadcast()` | Kept only on a no-op | Unchanged |
+
+## Implementation pattern
+
+Each step adds titles to an existing names helper rather than adding a new
+code path. The pattern is the same everywhere:
+
+1. Read `x_titles = r_names(x_names)` next to the existing `x_names`. It is
+   protected through `x`.
+
+2. If `x_titles != r_null`, allocate the output names list up front instead of
+   lazily, so a titles-only input still gets a list.
+
+3. Either reuse `x_titles` unchanged (when the result has the same axes as
+   `x`) or build an `out_titles` character vector in the same loop that builds
+   the output names (when axes move, appear, or disappear).
+
+4. Poke the titles onto the output list with `r_attrib_poke_names()`.
+
+`r_alloc_character()` fills with `&quot;&quot;`, so new axes need no explicit poke.
+
+Per the `AGENTS.md` protection review, `out_titles` is allocated while the
+output list is live, so `KEEP()` it until it is poked onto the list.
+
+## Steps
+
+Each step is one pull request, merged before the next one starts. Every step
+adds a `&quot;titles are kept&quot;` test next to the existing names tests for each
+function it touches, following the existing cumulative tests. Each test covers
+two inputs:
+
+```r
+x &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))
+y &lt;- array(1:24, c(2, 3, 4), dimnames = list(A = NULL, B = NULL, C = NULL))
+```
+
+`y` is the titles-only case. It catches helpers that skip allocating their
+output list when no axis has names.
+
+Where a function's roxygen already describes what happens to names, add one
+short sentence about titles next to it.
+
+### 1. Slice names
+
+`rray_slice_names()` in `src/slice.c` covers every function built on
+`rray_slice()`:
+
+- `rray_slice()`
+
+- `rray_slice_axis()`, `rray_slice_rows()`, `rray_slice_columns()`
+
+- `rray_reverse()`
+
+- `rray_roll()`
+
+- `rray_rep()`, `rray_rep_each()`
+
+Slicing never adds, removes, or moves axes, so the titles of `x` are reused
+unchanged. `rray_slice_names()` takes `x_names` instead of `v_x_names` and
+pokes `r_names(x_names)` onto its output. It already allocates its output
+whenever `x_names` exists, so the titles-only case needs no extra work.
+
+```r
+rray_titles(rray_slice(x, 1, TRUE, TRUE))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+
+rray_titles(rray_rep(x, times = 2, axes = 1))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+```
+
+Tests go in `test-slice.R`, `test-reverse.R`, `test-roll.R`, and
+`test-rep.R`.
+
+### 2. Reduce names
+
+`rray_reduce_names()` in `src/reduce-names.c` covers:
+
+- `rray_sum()`, `rray_prod()`, `rray_mean()`, `rray_min()`, `rray_max()`,
+  `rray_all()`, `rray_any()`
+
+- `rray_locate_max()`, `rray_locate_min()`
+
+- `rray_roll_each()`
+
+Reduced axes stay at dimension 1, so the result has the same axes as `x` and
+reuses its titles unchanged. The output list is allocated lazily today, so it
+moves up front when `x_titles` exists.
+
+```r
+rray_titles(rray_sum(x, axes = 2))
+# [1] &quot;A&quot; &quot;B&quot; &quot;C&quot;
+
+rray_names(rray_sum(y, axes = 2))
+# $A
+# NULL
+#
+# $B
+# NULL
+#
+# $C
+# NULL
+```</pre><p class="cut">186 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/slice.c; cat src/decl/slice-decl.h; cat src/slice.h; grep -rn &quot;rray_slice_names\|v_x_…</summary>
+<pre>cat src/slice.c; cat src/decl/slice-decl.h; cat src/slice.h; grep -rn &quot;rray_slice_names\|v_x_names&quot; src/ | grep -v &quot;^src/slice.c&quot;</pre><pre class="output">#include &quot;slice.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;slice-iterator.h&quot;
+#include &quot;slice-subscript.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/slice-decl.h&quot;
+
+r_obj* ffi_rray_slice(r_obj* ffi_x, r_obj* ffi_indices, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  // Checked at the FFI boundary to disallow names from the R side, but on the C
+  // side we allow them so that `rray_slice_axis()` and friends throw good error
+  // messages for `i`
+  check_slice_indices_unnamed(ffi_indices, error_call);
+  return rray_slice(
+    ffi_x,
+    ffi_indices,
+    rray_args.x,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_slice(
+  r_obj* x,
+  r_obj* indices,
+  struct rray_arg* x_arg,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  int n_prot = 0;
+
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP_N(arg_as_array(x, x_arg, error_call), &amp;n_prot);
+
+  r_obj* x_dimensions = r_dim(x);
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  r_obj* x_names = r_dim_names(x);
+  r_obj* const* v_x_names = x_names == r_null ? NULL : r_list_cbegin(x_names);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  check_slice_indices_size(indices, dimensionality, error_call);
+  r_obj* const* v_indices = r_list_cbegin(indices);
+  r_obj* indices_names = r_names(indices);
+
+  r_obj* dimensions = KEEP_N(r_alloc_integer(dimensionality), &amp;n_prot);
+  int* v_dimensions = r_int_begin(dimensions);
+
+  // `...` is capped by the dimensionality of `x`
+  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];
+
+  r_ssize i = 0;
+  struct rray_arg* index_arg =
+    new_subscript_arg(indices_arg, indices_names, dimensionality, &amp;i);
+  KEEP_N(index_arg-&gt;shelter, &amp;n_prot);
+
+  for (; i &lt; dimensionality; ++i) {
+    r_obj* index = v_indices[i];
+    const int x_dimension = v_x_dimensions[i];
+    r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[i];
+
+    const struct rray_subscript subscript = rray_as_slice_subscript(
+      index,
+      x_dimension,
+      x_axis_names,
+      index_arg,
+      error_call
+    );
+    KEEP_N(subscript.index, &amp;n_prot);
+
+    v_dimensions[i] = r_ssize_as_integer(subscript.size);
+
+    if (r_is_true(index)) {
+      // Optimization! No allocation for `TRUE`, which replaces a base R
+      // missing arg.
+      v_v_locations[i] = NULL;
+    } else {
+      r_obj* locations = KEEP_N(rray_slice_as_locations(subscript), &amp;n_prot);
+      v_v_locations[i] = r_int_cbegin(locations);
+    }
+  }
+
+  const r_ssize size =
+    rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+
+  const bool any_missing = rray_slice_locations_any_missing(
+    v_v_locations,
+    v_dimensions,
+    dimensionality
+  );
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_slice_lgl(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  case R_TYPE_integer:
+    out = rray_slice_int(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  case R_TYPE_double:
+    out = rray_slice_dbl(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  case R_TYPE_complex:
+    out = rray_slice_cpl(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  case R_TYPE_raw:
+    out = rray_slice_raw(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  case R_TYPE_character:
+    out = rray_slice_chr(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  case R_TYPE_list:
+    out = rray_slice_list(
+      x,
+      v_v_locations,
+      v_x_strides,
+      v_dimensions,
+      dimensionality,
+      size,
+      any_missing
+    );
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  KEEP_N(out, &amp;n_prot);
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* names = KEEP_N(
+    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),
+    &amp;n_prot
+  );
+
+  if (names != r_null) {
+    r_attrib_poke_dim_names(out, names);
+  }
+
+  FREE(n_prot);</pre><p class="cut">334 more lines cut</p></details>
+<details class="tool"><summary>Bash: ls tests/testthat | grep -E &quot;slice|reverse|roll|rep&quot;; grep -n &quot;titles&quot; tests/testthat/*.R | h…</summary>
+<pre>ls tests/testthat | grep -E &quot;slice|reverse|roll|rep&quot;; grep -n &quot;titles&quot; tests/testthat/*.R | head -30; grep -n &quot;names&quot; R/slice.R R/reverse.R R/roll.R R/rep.R | grep &quot;#'&quot;</pre><pre class="output">helper-rep.R
+helper-roll.R
+helper-slice.R
+test-rep.R
+test-reverse.R
+test-roll.R
+test-slice-subscript.R
+test-slice.R
+tests/testthat/test-cumulative-extremum.R:209:test_that(&quot;titles are kept&quot;, {
+tests/testthat/test-cumulative-extremum.R:216:    rray_titles(rray_cumulative_max(x, axis = 1L)),
+tests/testthat/test-cumulative-extremum.R:220:    rray_titles(rray_cumulative_min(x, axis = 2L)),
+tests/testthat/test-broadcast.R:207:test_that(&quot;dimension titles are lost&quot;, {
+tests/testthat/test-broadcast.R:210:  # When we actually perform any broadcasting, the titles are cleared
+tests/testthat/test-cumulative-logical.R:140:test_that(&quot;titles are kept&quot;, {
+tests/testthat/test-cumulative-logical.R:147:    rray_titles(rray_cumulative_all(x, axis = 1L)),
+tests/testthat/test-cumulative-logical.R:151:    rray_titles(rray_cumulative_any(x, axis = 2L)),
+tests/testthat/test-cumulative-sum.R:233:test_that(&quot;titles are kept&quot;, {
+tests/testthat/test-cumulative-sum.R:240:    rray_titles(rray_cumulative_sum(x, axis = 1L)),
+tests/testthat/test-cumulative-prod.R:213:test_that(&quot;titles are kept&quot;, {
+tests/testthat/test-cumulative-prod.R:220:    rray_titles(rray_cumulative_prod(x, axis = 1L)),
+tests/testthat/test-titles.R:9:  expect_identical(rray_titles(x), c(&quot;Row&quot;, &quot;Column&quot;))
+tests/testthat/test-titles.R:14:  expect_identical(rray_titles(x), c(&quot;Row&quot;, &quot;&quot;))
+tests/testthat/test-titles.R:21:test_that(&quot;title getters return NULL without a titles vector&quot;, {
+tests/testthat/test-titles.R:22:  expect_null(rray_titles(matrix(1:6, 2, 3)))
+tests/testthat/test-titles.R:24:  expect_null(rray_titles(c(a = 1, b = 2)))
+tests/testthat/test-titles.R:28:  expect_null(rray_titles(x))
+tests/testthat/test-titles.R:35:  out &lt;- rray_set_titles(x, c(&quot;Row&quot;, &quot;Column&quot;))
+tests/testthat/test-titles.R:60:  out &lt;- rray_set_titles(x, c(&quot;First&quot;, &quot;Second&quot;))
+tests/testthat/test-titles.R:81:    rray_set_titles(x, c(&quot;a&quot;, &quot;b&quot;)),
+tests/testthat/test-titles.R:92:    rray_set_titles(x, NULL),
+tests/testthat/test-titles.R:106:  out &lt;- rray_set_titles(y, &quot;Entry&quot;)
+tests/testthat/test-titles.R:110:test_that(&quot;title setters remove one or all titles&quot;, {
+tests/testthat/test-titles.R:119:  expect_identical(rray_titles(out), c(&quot;&quot;, &quot;Column&quot;))
+tests/testthat/test-titles.R:123:  expect_identical(rray_titles(out), c(&quot;&quot;, &quot;&quot;))
+tests/testthat/test-titles.R:125:  out &lt;- rray_set_titles(x, NULL)
+tests/testthat/test-titles.R:126:  expect_null(rray_titles(out))
+tests/testthat/test-titles.R:130:test_that(&quot;title setters keep empty titles&quot;, {
+tests/testthat/test-titles.R:139:  expect_identical(rray_titles(out), c(&quot;Row&quot;, &quot;&quot;))
+R/roll.R:46:#' Since a uniform roll is a slice, names on a rolled axis move with the data,
+R/roll.R:47:#' just like they do in `rray_slice()`. Every other axis keeps its names
+R/roll.R:62:#' `rray_roll_each()` drops names along `axis`, but keeps all other names. When
+R/roll.R:65:#' names are unlikely to make sense:
+R/roll.R:68:#' x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+R/roll.R:245:#' x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+R/roll.R:247:#' # Roll the columns, names move with the data
+R/reverse.R:7:#' Names on a reversed axis move with the data. Every other axis keeps its names
+R/reverse.R:23:#' x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+R/reverse.R:25:#' # Reverse the rows, names move with the data
+R/rep.R:19:#' duplicate names. Every other axis keeps its names untouched.
+R/rep.R:64:#' y &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+R/rep.R:65:#' rray_names(rray_rep(y, times = 2, axes = 1))
+R/rep.R:66:#' rray_names(rray_rep_each(y, times = 2, axis = 1))
+R/slice.R:17:#' has names, the name of a missing value is `&quot;&quot;`. For assignment, `NA` in a
+R/slice.R:50:#'   - A character vector of names, matched against the names of the axis. The
+R/slice.R:51:#'     first match is used when names are duplicated.
+R/slice.R:70:#'   positions selected on it. The names of each axis are selected along with
+R/slice.R:74:#'   The type, dimensions, and names of `x` are kept.
+R/slice.R:90:#' y &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,30p R/reverse.R; sed -n 40,70p R/roll.R; sed -n 1,30p R/rep.R; sed -n 60,80p R/slice…</summary>
+<pre>sed -n 1,30p R/reverse.R; sed -n 40,70p R/roll.R; sed -n 1,30p R/rep.R; sed -n 60,80p R/slice.R; sed -n 225,250p tests/testthat/test-cumulative-sum.R; grep -n &quot;rray_slice\|\.Call&quot; R/reverse.R R/roll.R R/rep.R R/slice.R</pre><pre class="output">#' Reverse elements along axes
+#'
+#' `rray_reverse()` reverses the order of the elements of `x` along one or more
+#' `axes`.
+#'
+#' @details
+#' Names on a reversed axis move with the data. Every other axis keeps its names
+#' untouched.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to reverse along.
+#'
+#' @returns
+#' An array with the same type and dimensions as `x`.
+#'
+#' @export
+#' @examples
+#' rray_reverse(1:5, axes = 1)
+#'
+#' x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+#'
+#' # Reverse the rows, names move with the data
+#' rray_reverse(x, axes = 1)
+#'
+#' # Reverse the columns
+#' rray_reverse(x, axes = 2)
+#'
+#' #&gt; 4 5 1 2 3
+#' ```
+#'
+#' Rolling several axes at once is one `rray_slice()`, with these locations on
+#' each rolled axis and `TRUE` on the rest.
+#'
+#' Since a uniform roll is a slice, names on a rolled axis move with the data,
+#' just like they do in `rray_slice()`. Every other axis keeps its names
+#' untouched.
+#'
+#' @section Roll each:
+#' `rray_roll_each()` rolls along a single `axis`, but each row, column, and so
+#' on can move by its own amount. That is why `n` is an array rather than a
+#' vector. It is broadcast to the dimensions of `x` with `axis` set to 1, so it
+#' holds one `n` for every row, column, and so on that gets rolled.
+#'
+#' Variable rolling can be mimicked with the more flexible indexing of
+#' [rray_index()]. Along `axis`, the coordinates come from the same
+#' `(i - 1 - n) %% d + 1` formula as `rray_roll()`, with a different `n` for
+#' each row, column, and so on. Along every other axis, the coordinates are
+#' just the positions themselves.
+#'
+#' `rray_roll_each()` drops names along `axis`, but keeps all other names. When
+#' rows move by different amounts, the output's column 1 can hold data from
+#' column `c` in one row and from column `b` in another, so the original column
+#' names are unlikely to make sense:
+#'
+#' ```r
+#' x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+#'
+#' rray_roll_each(x, n = matrix(c(1, 2), ncol = 1), axis = 2)
+#' Repeat an array
+#'
+#' @description
+#' - `rray_rep()` repeats whole axes of `x` in bulk, i.e. repeat all of the
+#'   columns 5 `times`. It can repeat several `axes` at once, with one `times`
+#'   per axis.
+#'
+#' - `rray_rep_each()` repeats each individual element of the `axis` of `x`
+#'   separately, i.e. repeat the first column 2 `times`, the second column 3
+#'   `times`, and so on. For convenience, you can also provide a single number
+#'   to repeat each element along the `axis` the same number of times.
+#'
+#' These are the array versions of `vctrs::vec_rep()` and
+#' `vctrs::vec_rep_each()`, which repeat along the size of a vector rather than
+#' along an axis.
+#'
+#' @details
+#' Names repeat alongside the data, so a repeated axis can come back with
+#' duplicate names. Every other axis keeps its names untouched.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param times For `rray_rep()`, a vector of integers greater than or equal
+#'   to 0, either size 1 or the size of `axes`.
+#'
+#'   For `rray_rep_each()`, a vector of integers greater than or equal to
+#'   0. It is recycled to the dimension of `x` along `axis`.
+#'
+#'
+#' @param axis A single integer. The axis to slice along.
+#'
+#' @param value An array to assign to the selected positions. It is cast to
+#'   the type of `x`, then broadcast to the dimensions of the selection.
+#'
+#' @returns
+#' - `rray_slice()`, `rray_slice_axis()`, `rray_slice_rows()`, and
+#'   `rray_slice_columns()` return an array with the same type and
+#'   dimensionality as `x`. The dimension of each axis is the number of
+#'   positions selected on it. The names of each axis are selected along with
+#'   the values.
+#'
+#' - The `_assign` versions return `x` with the selected positions replaced.
+#'   The type, dimensions, and names of `x` are kept.
+#'
+#' @export
+#' @examples
+#' x &lt;- array(1:24, c(2L, 3L, 4L))
+#'
+#' # The first row
+
+  x &lt;- array(1L, c(2L, 2L), dimnames = list(NULL, c(&quot;c&quot;, &quot;d&quot;)))
+  expect_identical(dimnames(rray_cumulative_sum(x, axis = 2L)), dimnames(x))
+
+  x &lt;- array(1L, c(2L, 2L))
+  expect_null(dimnames(rray_cumulative_sum(x, axis = 1L)))
+})
+
+test_that(&quot;titles are kept&quot;, {
+  x &lt;- array(
+    1L,
+    c(2L, 2L),
+    dimnames = list(Row = c(&quot;a&quot;, &quot;b&quot;), Column = NULL)
+  )
+  expect_identical(
+    rray_titles(rray_cumulative_sum(x, axis = 1L)),
+    c(&quot;Row&quot;, &quot;Column&quot;)
+  )
+})
+
+test_that(&quot;vectors become 1D arrays&quot;, {
+  expect_identical(
+    rray_cumulative_sum(c(a = 1, b = 3, c = 2), axis = 1L),
+    array(c(1, 4, 6), 3L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+  )
+  expect_identical(
+R/reverse.R:35:  .Call(ffi_rray_reverse, x, axes, environment())
+R/rep.R:73:  .Call(ffi_rray_rep, x, times, axes, environment())
+R/rep.R:80:  .Call(ffi_rray_rep_each, x, times, axis, environment())
+R/roll.R:21:#' [rray_slice()]. Along an axis with dimension `d`, position `i` of the result
+R/roll.R:38:#' rray_slice_axis(x, c(4, 5, 1, 2, 3), axis = 1)
+R/roll.R:43:#' Rolling several axes at once is one `rray_slice()`, with these locations on
+R/roll.R:47:#' just like they do in `rray_slice()`. Every other axis keeps its names
+R/roll.R:275:  .Call(ffi_rray_roll, x, n, axes, environment())
+R/roll.R:282:  .Call(ffi_rray_roll_each, x, n, axis, environment())
+R/slice.R:4:#' `rray_slice()` selects positions along each axis of `x`. The result always
+R/slice.R:7:#' `rray_slice_axis()` is `rray_slice()` restricted to a single axis, which can
+R/slice.R:8:#' be more ergonomic to write. `rray_slice_rows()` and `rray_slice_columns()`
+R/slice.R:31:#' rray_slice(x, 1, TRUE, TRUE)
+R/slice.R:34:#' rray_slice_axis(x, 1, axis = 1)
+R/slice.R:35:#' rray_slice_rows(x, 1)
+R/slice.R:55:#'   For `rray_slice_axis()` and `rray_slice_assign_axis()`, these dots must be
+R/slice.R:67:#' - `rray_slice()`, `rray_slice_axis()`, `rray_slice_rows()`, and
+R/slice.R:68:#'   `rray_slice_columns()` return an array with the same type and
+R/slice.R:81:#' rray_slice(x, 1, TRUE, TRUE)
+R/slice.R:84:#' rray_slice(x, c(2, 1, 2), 1, 4)
+R/slice.R:87:#' rray_slice(x, TRUE, -2, -(1:2))
+R/slice.R:91:#' rray_slice(y, &quot;b&quot;, c(&quot;e&quot;, &quot;c&quot;))
+R/slice.R:96:#' rray_slice(x, !!!subscripts)
+R/slice.R:99:#' rray_slice_axis(x, c(4, 1), axis = 3)
+R/slice.R:100:#' rray_slice_rows(y, c(&quot;b&quot;, &quot;a&quot;))
+R/slice.R:101:#' rray_slice_columns(x, -2)
+R/slice.R:104:#' rray_slice_assign(x, 1, TRUE, TRUE, value = 0L)
+R/slice.R:105:#' rray_slice_assign_rows(x, 1, 0L)
+R/slice.R:109:#' rray_slice_assign(x, TRUE, c(1, 3), 1, value = value)
+R/slice.R:112:#' rray_slice_assign_axis(x, 3, axis = 2, value = value)
+R/slice.R:113:rray_slice &lt;- function(x, ...) {
+R/slice.R:114:  .Call(ffi_rray_slice, x, list2(...), environment())
+R/slice.R:117:#' @rdname rray_slice
+R/slice.R:119:rray_slice_axis &lt;- function(x, i, ..., axis) {
+R/slice.R:121:  .Call(ffi_rray_slice_axis, x, i, axis, environment())
+R/slice.R:124:#' @rdname rray_slice
+R/slice.R:126:rray_slice_rows &lt;- function(x, i) {
+R/slice.R:127:  .Call(ffi_rray_slice_rows, x, i, environment())
+R/slice.R:130:#' @rdname rray_slice
+R/slice.R:132:rray_slice_columns &lt;- function(x, i) {
+R/slice.R:133:  .Call(ffi_rray_slice_columns, x, i, environment())
+R/slice.R:136:#' @rdname rray_slice
+R/slice.R:138:rray_slice_assign &lt;- function(x, ..., value) {
+R/slice.R:139:  .Call(ffi_rray_slice_assign, x, list2(...), value, environment())
+R/slice.R:142:#' @rdname rray_slice
+R/slice.R:144:rray_slice_assign_axis &lt;- function(x, i, ..., axis, value) {
+R/slice.R:146:  .Call(ffi_rray_slice_assign_axis, x, i, axis, value, environment())
+R/slice.R:149:#' @rdname rray_slice
+R/slice.R:151:rray_slice_assign_rows &lt;- function(x, i, value) {
+R/slice.R:152:  .Call(ffi_rray_slice_assign_rows, x, i, value, environment())
+R/slice.R:155:#' @rdname rray_slice
+R/slice.R:157:rray_slice_assign_columns &lt;- function(x, i, value) {
+R/slice.R:158:  .Call(ffi_rray_slice_assign_columns, x, i, value, environment())</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;rray_slice\|return x\|dim_names\|names&quot; src/reverse.c src/roll.c src/rep.c | head -40</summary>
+<pre>grep -n &quot;rray_slice\|return x\|dim_names\|names&quot; src/reverse.c src/roll.c src/rep.c | head -40</pre><pre class="output">src/reverse.c:45:  r_obj* out = rray_slice(x, indices, x_arg, rray_args.empty, error_call);
+src/rep.c:64:  r_obj* out = rray_slice(x, indices, x_arg, rray_args.empty, error_call);
+src/roll.c:56:  r_obj* out = rray_slice(x, indices, x_arg, rray_args.empty, error_call);</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;^SEXP dimnamesgets&quot; -A 75 attrib.c; grep -…</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;^SEXP dimnamesgets&quot; -A 75 attrib.c; grep -rn &quot;r_attrib_poke_names\|^r_obj\* r_names\|static inline r_obj\* r_names&quot; ~/files/r/packages/rray/src/rlang/*.h | head</pre><pre class="output">1114:SEXP dimnamesgets(SEXP vec, SEXP val)
+1115-{
+1116-    PROTECT(vec);
+1117-    PROTECT(val);
+1118-
+1119-    if (!isArray(vec) &amp;&amp; !isList(vec))
+1120-	error(_(&quot;'dimnames' applied to non-array&quot;));
+1121-    /* This is probably overkill, but you never know; */
+1122-    /* there may be old pair-lists out there */
+1123-    /* There are, when this gets used as names&lt;- for 1-d arrays */
+1124-    if (!isList(val) &amp;&amp; !isNewList(val))
+1125-	error(_(&quot;'%s' must be a list&quot;), &quot;dimnames&quot;);
+1126-    SEXP dims = getAttrib(vec, R_DimSymbol);
+1127-    int k = LENGTH(dims);
+1128-    if (k &lt; length(val))
+1129-	error(_(&quot;length of 'dimnames' [%d] must match that of 'dims' [%d]&quot;),
+1130-	      length(val), k);
+1131-    if (length(val) == 0) {
+1132-	removeAttrib(vec, R_DimNamesSymbol);
+1133-	UNPROTECT(2);
+1134-	return vec;
+1135-    }
+1136-    /* Old list to new list */
+1137-    SEXP newval;
+1138-    if (isList(val)) {
+1139-	newval = allocVector(VECSXP, k);
+1140-	for (int i = 0; i &lt; k; i++) {
+1141-	    SET_VECTOR_ELT(newval, i, CAR(val));
+1142-	    val = CDR(val);
+1143-	}
+1144-	UNPROTECT(1);
+1145-	PROTECT(val = newval);
+1146-    }
+1147-    if (length(val) &gt; 0 &amp;&amp; length(val) &lt; k) {
+1148-	newval = lengthgets(val, k);
+1149-	UNPROTECT(1);
+1150-	PROTECT(val = newval);
+1151-    }
+1152-    if (MAYBE_REFERENCED(val)) {
+1153-	newval = shallow_duplicate(val);
+1154-	UNPROTECT(1);
+1155-	PROTECT(val = newval);
+1156-    }
+1157-    if (k != length(val))
+1158-	error(_(&quot;length of 'dimnames' [%d] must match that of 'dims' [%d]&quot;),
+1159-	      length(val), k);
+1160-    for (int i = 0; i &lt; k; i++) {
+1161-	SEXP _this = VECTOR_ELT(val, i);
+1162-	if (_this != R_NilValue) {
+1163-	    if (!isVector(_this))
+1164-		error(_(&quot;invalid type (%s) for 'dimnames' (must be a vector)&quot;),
+1165-		      R_typeToChar(_this));
+1166-	    if (INTEGER(dims)[i] != LENGTH(_this) &amp;&amp; LENGTH(_this) != 0)
+1167-		error(_(&quot;length of 'dimnames' [%d] not equal to array extent&quot;),
+1168-		      i+1);
+1169-	    SET_VECTOR_ELT(val, i, as_char_simpl(_this));
+1170-	}
+1171-    }
+1172-    installAttrib(vec, R_DimNamesSymbol, val);
+1173-    if (isList(vec) &amp;&amp; k == 1) {
+1174-	SEXP top = VECTOR_ELT(val, 0);
+1175-	int i = 0;
+1176-	for (val = vec; !isNull(val); val = CDR(val))
+1177-	    SET_TAG(val, installTrChar(STRING_ELT(top, i++)));
+1178-    }
+1179-    UNPROTECT(2);
+1180-
+1181-    /* Mark as immutable so nested complex assignment can't make the
+1182-       dimnames attribute inconsistent with the length */
+1183-    MARK_NOT_MUTABLE(val);
+1184-
+1185-    return vec;
+1186-}
+1187-
+1188-attribute_hidden SEXP do_dimnames(SEXP call, SEXP op, SEXP args, SEXP env)
+1189-{
+~/files/r/packages/rray/src/rlang/attrib.h:53:static inline r_obj* r_names(r_obj* x) {
+~/files/r/packages/rray/src/rlang/attrib.h:65:#define r_attrib_poke_names(X, VALUE) Rf_setAttrib(X, r_syms.names, VALUE)
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>I've reviewed the plan and the slice code—since <code>rray_reverse()</code>, <code>rray_roll()</code>, and <code>rray_rep()</code> all route through <code>rray_slice()</code>, a single fix in <code>rray_slice_names()</code> should cover all three. I have one question before starting.</p>
+</details>
+<details class="tool"><summary>Question: You asked for branch `feature/slice-titles`, but this cloud session is set up to push to …</summary>
+<p>You asked for branch <code>feature/slice-titles</code>, but this cloud session is set up to push to <code>feature/titles</code>. Which branch should I create and push?</p>
+<ul>
+<li>feature/slice-titles (Recommended)</li>
+<li>feature/titles</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;You asked for branch `feature/slice-titles`, but this cloud session is set up to push to `feature/titles`. Which branch should I create and push?&quot;=&quot;feature/slice-titles (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/slice-titles; sed -n 50,66p src/rlang/attrib.h; grep -n &quot;test_that&quot; t…</summary>
+<pre>git checkout -b feature/slice-titles; sed -n 50,66p src/rlang/attrib.h; grep -n &quot;test_that&quot; tests/testthat/test-slice.R | head -40; grep -n &quot;test_that&quot; tests/testthat/test-reverse.R tests/testthat/test-roll.R tests/testthat/test-rep.R</pre><pre class="output">Switched to a new branch 'feature/slice-titles'
+    return r_attrib_get(x, r_syms.dim_names);
+}
+
+static inline r_obj* r_names(r_obj* x) {
+    return r_attrib_get(x, r_syms.names);
+}
+
+bool r_is_named(r_obj* x);
+
+// Defined as macros so rchk can see that `X` protects `VALUE`
+#define r_attrib_poke(X, SYM, VALUE) Rf_setAttrib(X, SYM, VALUE)
+#define r_attrib_poke_class(X, VALUE) Rf_setAttrib(X, r_syms.class_, VALUE)
+#define r_attrib_poke_dim(X, VALUE) Rf_setAttrib(X, r_syms.dim, VALUE)
+#define r_attrib_poke_dim_names(X, VALUE)                                      \
+    Rf_setAttrib(X, r_syms.dim_names, VALUE)
+#define r_attrib_poke_names(X, VALUE) Rf_setAttrib(X, r_syms.names, VALUE)
+
+4:test_that(&quot;selects the Cartesian product of the subscripts&quot;, {
+13:test_that(&quot;`TRUE` selects a whole axis&quot;, {
+21:test_that(&quot;scalar `TRUE` works on each axis with other subscripts&quot;, {
+45:test_that(&quot;matches base R for every kind of subscript&quot;, {
+66:test_that(&quot;returns every native storage type&quot;, {
+90:test_that(&quot;a missing location on any axis gives a missing value&quot;, {
+103:test_that(&quot;integer locations work with converted subscripts and missing axes&quot;, {
+112:test_that(&quot;works with a bare vector&quot;, {
+120:test_that(&quot;works with one dimension&quot;, {
+131:test_that(&quot;works with zero dimensions&quot;, {
+144:test_that(&quot;empty selections give a dimension of zero&quot;, {
+153:test_that(&quot;works with the maximum dimensionality&quot;, {
+163:test_that(&quot;slices four dimensions and falls back for higher dimensions&quot;, {
+193:test_that(&quot;matches `rray_index()` over an open mesh of locations&quot;, {
+210:test_that(&quot;selects names along with the values&quot;, {
+223:test_that(&quot;a missing location has an empty name&quot;, {
+244:test_that(&quot;keeps names of a whole axis&quot;, {
+251:test_that(&quot;an empty selection has no names&quot;, {
+261:test_that(&quot;subscripts can be spliced into `...`&quot;, {
+268:test_that(&quot;ignores a trailing empty argument&quot;, {
+274:test_that(&quot;requires one subscript per axis&quot;, {
+285:test_that(&quot;requires unnamed subscripts&quot;, {
+293:test_that(&quot;reports subscript errors with their position&quot;, {
+305:test_that(&quot;errors on unsupported `x` inputs&quot;, {
+316:test_that(&quot;matches `rray_slice()` with `TRUE` on every other axis&quot;, {
+333:test_that(&quot;follows the rules of every kind of subscript&quot;, {
+361:test_that(&quot;only changes the dimension of `axis`&quot;, {
+374:test_that(&quot;selects names of `axis` and keeps names of every other axis&quot;, {
+387:test_that(&quot;`rray_slice_axis()` works with a bare vector&quot;, {
+394:test_that(&quot;`rray_slice_axis()` works with the maximum dimensionality&quot;, {
+403:test_that(&quot;reports subscript errors as `i`&quot;, {
+416:test_that(&quot;`axis` is validated&quot;, {
+427:test_that(&quot;errors on unsupported `x` inputs to `rray_slice_axis()`&quot;, {
+437:test_that(&quot;is `rray_slice_axis()` with `axis = 1`&quot;, {
+446:test_that(&quot;reports errors from `rray_slice_rows()`&quot;, {
+455:test_that(&quot;is `rray_slice_axis()` with `axis = 2`&quot;, {
+468:test_that(&quot;errors if `x` doesn't have a second axis&quot;, {
+477:test_that(&quot;assigns the Cartesian product of the subscripts&quot;, {
+489:test_that(&quot;`TRUE` assigns a whole axis&quot;, {
+501:test_that(&quot;assignment matches base R for every kind of subscript&quot;, {
+tests/testthat/test-reverse.R:1:test_that(&quot;reverses along every axis&quot;, {
+tests/testthat/test-reverse.R:18:test_that(&quot;reverses several axes at once&quot;, {
+tests/testthat/test-reverse.R:31:test_that(&quot;reversing several axes is reversing them one at a time&quot;, {
+tests/testthat/test-reverse.R:40:test_that(&quot;reversing twice gives back `x`&quot;, {
+tests/testthat/test-reverse.R:50:test_that(&quot;works with every type&quot;, {
+tests/testthat/test-reverse.R:68:test_that(&quot;works with bare vectors&quot;, {
+tests/testthat/test-reverse.R:77:test_that(&quot;names reverse on reversed axes and are untouched elsewhere&quot;, {
+tests/testthat/test-reverse.R:94:test_that(&quot;partial and missing dimension names are handled&quot;, {
+tests/testthat/test-reverse.R:109:test_that(&quot;returns `x` when nothing moves&quot;, {
+tests/testthat/test-reverse.R:116:test_that(&quot;works with a zero dimension&quot;, {
+tests/testthat/test-reverse.R:125:test_that(&quot;names still reverse with a zero dimension on another axis&quot;, {
+tests/testthat/test-reverse.R:134:test_that(&quot;`axes` can be integerish doubles&quot;, {
+tests/testthat/test-reverse.R:143:test_that(&quot;`axes` is validated&quot;, {
+tests/testthat/test-reverse.R:155:test_that(&quot;`axes` must be named&quot;, {
+tests/testthat/test-reverse.R:159:test_that(&quot;errors on invalid input&quot;, {
+tests/testthat/test-rep.R:4:test_that(&quot;`rray_rep()` repeats the axis, `rray_rep_each()` repeats slices&quot;, {
+tests/testthat/test-rep.R:17:test_that(&quot;repeats along every axis&quot;, {
+tests/testthat/test-rep.R:34:test_that(&quot;repeats several axes at once&quot;, {
+tests/testthat/test-rep.R:47:test_that(&quot;`times[[i]]` is used for `axes[[i]]`&quot;, {
+tests/testthat/test-rep.R:56:test_that(&quot;repeating several axes is repeating them one at a time&quot;, {
+tests/testthat/test-rep.R:71:test_that(&quot;is a slice of the repeated axis with repeated locations&quot;, {
+tests/testthat/test-rep.R:88:test_that(&quot;skips axes with `times = 1`&quot;, {
+tests/testthat/test-rep.R:101:test_that(&quot;`times = 0` on one axis gives a zero dimension, others still repeat&quot;, {
+tests/testthat/test-rep.R:113:test_that(&quot;works with bare vectors&quot;, {
+tests/testthat/test-rep.R:117:test_that(&quot;works with 1D arrays&quot;, {
+tests/testthat/test-rep.R:124:test_that(&quot;works with every type&quot;, {
+tests/testthat/test-rep.R:152:test_that(&quot;`times = 0` gives a zero dimension&quot;, {
+tests/testthat/test-rep.R:159:test_that(&quot;`times = 1` returns the input&quot;, {
+tests/testthat/test-rep.R:166:test_that(&quot;empty `axes` returns the input&quot;, {
+tests/testthat/test-rep.R:172:test_that(&quot;works with a zero dimension axis&quot;, {
+tests/testthat/test-rep.R:178:test_that(&quot;does no work for a zero dimension on an axis not in `axes`&quot;, {
+tests/testthat/test-rep.R:186:test_that(&quot;`times` and `axes` can be doubles&quot;, {
+tests/testthat/test-rep.R:194:test_that(&quot;names on the repeated axes repeat, and can be duplicated&quot;, {
+tests/testthat/test-rep.R:211:test_that(&quot;partial and missing dimension names are handled&quot;, {
+tests/testthat/test-rep.R:229:test_that(&quot;`x` is not modified&quot;, {
+tests/testthat/test-rep.R:240:test_that(&quot;matches a reference implementation&quot;, {
+tests/testthat/test-rep.R:277:test_that(&quot;`times` and `axes` must be named&quot;, {
+tests/testthat/test-rep.R:287:test_that(&quot;`axes` is validated&quot;, {
+tests/testthat/test-rep.R:297:test_that(&quot;`times` is validated&quot;, {
+tests/testthat/test-rep.R:320:test_that(&quot;errors if the repeated dimension is too large&quot;, {
+tests/testthat/test-rep.R:328:test_that(&quot;errors if the repeated size is too large&quot;, {
+tests/testthat/test-rep.R:333:test_that(&quot;errors on invalid input&quot;, {
+tests/testthat/test-rep.R:343:test_that(&quot;repeats along every axis&quot;, {
+tests/testthat/test-rep.R:360:test_that(&quot;`times` is recycled to the dimension of `axis`&quot;, {
+tests/testthat/test-rep.R:368:test_that(&quot;`times` can vary by slice&quot;, {
+tests/testthat/test-rep.R:376:test_that(&quot;`times` can vary by slice along a middle axis&quot;, {
+tests/testthat/test-rep.R:388:test_that(&quot;zeroes in `times` drop individual slices&quot;, {
+tests/testthat/test-rep.R:397:test_that(&quot;is a slice of `axis` with each location repeated&quot;, {
+tests/testthat/test-rep.R:414:test_that(&quot;works with bare vectors&quot;, {
+tests/testthat/test-rep.R:421:test_that(&quot;works with 1D arrays&quot;, {
+tests/testthat/test-rep.R:428:test_that(&quot;works with every type&quot;, {
+tests/testthat/test-rep.R:460:test_that(&quot;`times = 1` returns the input&quot;, {
+tests/testthat/test-rep.R:466:test_that(&quot;works with a zero dimension axis&quot;, {
+tests/testthat/test-rep.R:472:test_that(&quot;does no work for a zero dimension with many slices&quot;, {
+tests/testthat/test-rep.R:482:test_that(&quot;`times` can be a double&quot;, {
+tests/testthat/test-rep.R:490:test_that(&quot;names on the repeated axis repeat, and can be duplicated&quot;, {
+tests/testthat/test-rep.R:503:test_that(&quot;partial and missing dimension names are handled&quot;, {
+tests/testthat/test-rep.R:513:test_that(&quot;matches a reference implementation&quot;, {
+tests/testthat/test-rep.R:550:test_that(&quot;`times` and `axis` must be named&quot;, {
+tests/testthat/test-rep.R:559:test_that(&quot;`axis` is validated&quot;, {
+tests/testthat/test-rep.R:565:test_that(&quot;`times` is validated&quot;, {
+tests/testthat/test-rep.R:573:test_that(&quot;errors if the repeated dimension is too large&quot;, {
+tests/testthat/test-rep.R:580:test_that(&quot;errors on invalid input&quot;, {
+tests/testthat/test-roll.R:4:test_that(&quot;positive shifts move toward the end, negative toward the start&quot;, {
+tests/testthat/test-roll.R:11:test_that(&quot;shifts wrap around the dimension&quot;, {
+tests/testthat/test-roll.R:18:test_that(&quot;rolls along every axis&quot;, {
+tests/testthat/test-roll.R:35:test_that(&quot;rolls several axes at once&quot;, {
+tests/testthat/test-roll.R:44:test_that(&quot;`n[[i]]` is the shift for `axes[[i]]`&quot;, {
+tests/testthat/test-roll.R:56:test_that(&quot;rolling several axes is rolling them one at a time&quot;, {
+tests/testthat/test-roll.R:71:test_that(&quot;rolling by `n` then `-n` gives back `x`&quot;, {
+tests/testthat/test-roll.R:83:test_that(&quot;is a slice of the rolled axis with rotated locations&quot;, {
+tests/testthat/test-roll.R:99:test_that(&quot;works with every type&quot;, {
+tests/testthat/test-roll.R:127:test_that(&quot;works with bare vectors&quot;, {
+tests/testthat/test-roll.R:136:test_that(&quot;names roll on rolled axes and are untouched elsewhere&quot;, {
+tests/testthat/test-roll.R:153:test_that(&quot;partial and missing dimension names are handled&quot;, {
+tests/testthat/test-roll.R:168:test_that(&quot;returns `x` when nothing moves&quot;, {
+tests/testthat/test-roll.R:177:test_that(&quot;works with a zero dimension on the rolled axis&quot;, {
+tests/testthat/test-roll.R:186:test_that(&quot;names still roll with a zero dimension on another axis&quot;, {
+tests/testthat/test-roll.R:195:test_that(&quot;`n` and `axes` can be integerish doubles&quot;, {
+tests/testthat/test-roll.R:204:test_that(&quot;`n` can be empty when `axes` is empty&quot;, {
+tests/testthat/test-roll.R:209:test_that(&quot;handles the largest shifts&quot;, {
+tests/testthat/test-roll.R:224:test_that(&quot;`n` and `axes` must be named&quot;, {
+tests/testthat/test-roll.R:233:test_that(&quot;`axes` is validated&quot;, {
+tests/testthat/test-roll.R:243:test_that(&quot;`n` is validated&quot;, {
+tests/testthat/test-roll.R:257:test_that(&quot;errors on invalid input&quot;, {
+tests/testthat/test-roll.R:267:test_that(&quot;rolls each row by its own `n`&quot;, {
+tests/testthat/test-roll.R:276:test_that(&quot;rolls each column by its own `n` given as a one row matrix&quot;, {
+tests/testthat/test-roll.R:285:test_that(&quot;rolls a three dimensional array by one `n` for everything&quot;, {
+tests/testthat/test-roll.R:293:test_that(&quot;rolls a three dimensional array by one `n` per row&quot;, {
+tests/testthat/test-roll.R:308:test_that(&quot;rolls a three dimensional array by one `n` per sheet&quot;, {
+tests/testthat/test-roll.R:327:test_that(&quot;rolls a three dimensional array by one `n` per row and sheet&quot;, {
+tests/testthat/test-roll.R:340:test_that(&quot;matches the expected roll along every axis&quot;, {
+tests/testthat/test-roll.R:374:test_that(&quot;a single `n` gives the same values as `rray_roll()`&quot;, {
+tests/testthat/test-roll.R:388:test_that(&quot;rolling each by `n` then `-n` gives back `x` without `axis` names&quot;, {
+tests/testthat/test-roll.R:400:test_that(&quot;rolls every type&quot;, {
+tests/testthat/test-roll.R:424:test_that(&quot;works with a bare vector `x` and a bare vector `n`&quot;, {
+tests/testthat/test-roll.R:435:test_that(&quot;drops names on `axis` and keeps the rest&quot;, {
+tests/testthat/test-roll.R:460:test_that(&quot;has no names when only `axis` had names&quot;, {
+tests/testthat/test-roll.R:465:test_that(&quot;ignores names on `n`&quot;, {
+tests/testthat/test-roll.R:481:test_that(&quot;`n` can be integerish doubles or logicals&quot;, {
+tests/testthat/test-roll.R:494:test_that(&quot;works with a zero dimension&quot;, {
+tests/testthat/test-roll.R:506:test_that(&quot;drops names on `axis` with a zero dimension on another axis&quot;, {
+tests/testthat/test-roll.R:514:test_that(&quot;handles the largest `n`&quot;, {
+tests/testthat/test-roll.R:529:test_that(&quot;does not modify `x` or `n`&quot;, {
+tests/testthat/test-roll.R:542:test_that(&quot;`n` and `axis` must be named&quot;, {
+tests/testthat/test-roll.R:551:test_that(&quot;`axis` is validated&quot;, {
+tests/testthat/test-roll.R:559:test_that(&quot;`n` must broadcast to `x` with `axis` set to 1&quot;, {
+tests/testthat/test-roll.R:572:test_that(&quot;`n` must be an integer array with no missing values&quot;, {
+tests/testthat/test-roll.R:582:test_that(&quot;`x` must be a bare array&quot;, {</pre></details>
+<details class="tool"><summary>Bash: sed -n 205,262p tests/testthat/test-slice.R; echo ----; sed -n 370,470p tests/testthat/test-s…</summary>
+<pre>sed -n 205,262p tests/testthat/test-slice.R; echo ----; sed -n 370,470p tests/testthat/test-slice.R</pre><pre class="output">      array(k, c(1L, 1L, 4L))
+    )
+  )
+})
+
+test_that(&quot;selects names along with the values&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2L, 3L, 4L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;), NULL)
+  )
+
+  expect_identical(
+    rray_slice(x, c(2L, 1L, 2L), c(&quot;e&quot;, &quot;c&quot;), 1L),
+    slice_base(x, c(2L, 1L, 2L), c(&quot;e&quot;, &quot;c&quot;), 1L)
+  )
+})
+
+test_that(&quot;a missing location has an empty name&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2L, 3L, 4L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;), NULL)
+  )
+
+  expected &lt;- slice_base(x, c(1L, NA), -2L, )
+  dimnames(expected)[[1]] &lt;- c(&quot;a&quot;, &quot;&quot;)
+  expect_identical(rray_slice(x, c(1L, NA), -2L, TRUE), expected)
+
+  expect_identical(
+    rray_slice(x, c(TRUE, FALSE), c(NA, &quot;d&quot;), 4L),
+    array(
+      c(NA, 21L),
+      c(1L, 2L, 1L),
+      dimnames = list(&quot;a&quot;, c(&quot;&quot;, &quot;d&quot;), NULL)
+    )
+  )
+})
+
+test_that(&quot;keeps names of a whole axis&quot;, {
+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+
+  expect_identical(rray_slice(x, TRUE, TRUE), x)
+  expect_identical(rray_slice(x, 1:2, 3L), slice_base(x, , 3L))
+})
+
+test_that(&quot;an empty selection has no names&quot;, {
+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+
+  expect_identical(
+    rray_slice(x, NULL, 2L),
+    array(integer(), c(0L, 1L), dimnames = list(NULL, &quot;d&quot;))
+  )
+  expect_identical(rray_slice(x, numeric(), TRUE), slice_base(x, numeric(), ))
+})
+
+test_that(&quot;subscripts can be spliced into `...`&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L))
+----
+    c(2L, 3L, 0L)
+  )
+})
+
+test_that(&quot;selects names of `axis` and keeps names of every other axis&quot;, {
+  x &lt;- array(
+    1:6,
+    c(2L, 3L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;))
+  )
+
+  expect_identical(
+    rray_names(rray_slice_axis(x, c(3L, NA, 1L), axis = 2)),
+    list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;e&quot;, &quot;&quot;, &quot;c&quot;))
+  )
+})
+
+test_that(&quot;`rray_slice_axis()` works with a bare vector&quot;, {
+  expect_identical(
+    rray_slice_axis(c(a = 1L, b = 2L), c(2L, 1L), axis = 1),
+    array(c(2L, 1L), 2L, dimnames = list(c(&quot;b&quot;, &quot;a&quot;)))
+  )
+})
+
+test_that(&quot;`rray_slice_axis()` works with the maximum dimensionality&quot;, {
+  x &lt;- array(1:2, c(rep(1L, 49L), 2L))
+
+  expect_identical(
+    rray_slice_axis(x, 2L, axis = 50),
+    array(2L, rep(1L, 50L))
+  )
+})
+
+test_that(&quot;reports subscript errors as `i`&quot;, {
+  x &lt;- array(1:6, c(2L, 3L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+
+  expect_snapshot(error = TRUE, {
+    rray_slice_axis(x, 4L, axis = 2)
+    rray_slice_axis(x, &quot;z&quot;, axis = 1)
+    rray_slice_axis(x, &quot;c&quot;, axis = 2)
+    rray_slice_axis(x, c(TRUE, FALSE, TRUE), axis = 1)
+    rray_slice_axis(x, matrix(1L), axis = 1)
+    rray_slice_axis(x, list(1L), axis = 1)
+  })
+})
+
+test_that(&quot;`axis` is validated&quot;, {
+  x &lt;- array(1:6, c(2L, 3L))
+
+  expect_snapshot(error = TRUE, {
+    rray_slice_axis(x, 1L, axis = 0)
+    rray_slice_axis(x, 1L, axis = 3)
+    rray_slice_axis(x, 1L, axis = c(1, 2))
+    rray_slice_axis(x, 1L, axis = NA_integer_)
+  })
+})
+
+test_that(&quot;errors on unsupported `x` inputs to `rray_slice_axis()`&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_slice_axis(NULL, 1L, axis = 1)
+    rray_slice_axis(structure(1:2, class = &quot;foo&quot;), 1L, axis = 1)
+  })
+})
+
+# ------------------------------------------------------------------------------
+# rray_slice_rows()
+
+test_that(&quot;is `rray_slice_axis()` with `axis = 1`&quot;, {
+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL, NULL))
+
+  expect_identical(
+    rray_slice_rows(x, c(&quot;b&quot;, &quot;a&quot;)),
+    rray_slice_axis(x, c(&quot;b&quot;, &quot;a&quot;), axis = 1)
+  )
+})
+
+test_that(&quot;reports errors from `rray_slice_rows()`&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_slice_rows(array(1:6, c(2L, 3L)), 3L)
+  })
+})
+
+# ------------------------------------------------------------------------------
+# rray_slice_columns()
+
+test_that(&quot;is `rray_slice_axis()` with `axis = 2`&quot;, {
+  x &lt;- array(
+    1:24,
+    c(2L, 3L, 4L),
+    dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL)
+  )
+
+  expect_identical(
+    rray_slice_columns(x, c(&quot;c&quot;, &quot;a&quot;)),
+    rray_slice_axis(x, c(&quot;c&quot;, &quot;a&quot;), axis = 2)
+  )
+})
+
+test_that(&quot;errors if `x` doesn't have a second axis&quot;, {
+  expect_snapshot(error = TRUE, {
+    rray_slice_columns(1:3, 1L)</pre></details>
+<details class="tool"><summary>Bash: sed -n 77,115p tests/testthat/test-reverse.R; echo ----; sed -n 136,176p tests/testthat/test-…</summary>
+<pre>sed -n 77,115p tests/testthat/test-reverse.R; echo ----; sed -n 136,176p tests/testthat/test-roll.R; echo ----; sed -n 194,230p tests/testthat/test-rep.R; echo -----; sed -n 488,513p tests/testthat/test-rep.R; cat tests/testthat/helper-rep.R</pre><pre class="output">test_that(&quot;names reverse on reversed axes and are untouched elsewhere&quot;, {
+  x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  expect_identical(
+    dimnames(rray_reverse(x, axes = 1)),
+    list(c(&quot;r2&quot;, &quot;r1&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+  )
+  expect_identical(
+    dimnames(rray_reverse(x, axes = 2)),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c&quot;, &quot;b&quot;, &quot;a&quot;))
+  )
+  expect_identical(
+    dimnames(rray_reverse(x, axes = c(1, 2))),
+    list(c(&quot;r2&quot;, &quot;r1&quot;), c(&quot;c&quot;, &quot;b&quot;, &quot;a&quot;))
+  )
+})
+
+test_that(&quot;partial and missing dimension names are handled&quot;, {
+  x &lt;- matrix(1:6, nrow = 2, dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  expect_identical(
+    dimnames(rray_reverse(x, axes = 1)),
+    list(NULL, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+  )
+  expect_identical(
+    dimnames(rray_reverse(x, axes = 2)),
+    list(NULL, c(&quot;c&quot;, &quot;b&quot;, &quot;a&quot;))
+  )
+
+  expect_null(dimnames(rray_reverse(matrix(1:6, nrow = 2), axes = 1)))
+})
+
+test_that(&quot;returns `x` when nothing moves&quot;, {
+  x &lt;- matrix(1:3, nrow = 1, dimnames = list(&quot;r1&quot;, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  expect_identical(rray_reverse(x, axes = 1), x)
+  expect_identical(rray_reverse(x, axes = integer()), x)
+})
+
+----
+test_that(&quot;names roll on rolled axes and are untouched elsewhere&quot;, {
+  x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  expect_identical(
+    dimnames(rray_roll(x, n = 1, axes = 2)),
+    list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c&quot;, &quot;a&quot;, &quot;b&quot;))
+  )
+  expect_identical(
+    dimnames(rray_roll(x, n = 1, axes = 1)),
+    list(c(&quot;r2&quot;, &quot;r1&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+  )
+  expect_identical(
+    dimnames(rray_roll(x, n = 1, axes = c(1, 2))),
+    list(c(&quot;r2&quot;, &quot;r1&quot;), c(&quot;c&quot;, &quot;a&quot;, &quot;b&quot;))
+  )
+})
+
+test_that(&quot;partial and missing dimension names are handled&quot;, {
+  x &lt;- matrix(1:6, nrow = 2, dimnames = list(NULL, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  expect_identical(
+    dimnames(rray_roll(x, n = 1, axes = 1)),
+    list(NULL, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+  )
+  expect_identical(
+    dimnames(rray_roll(x, n = 1, axes = 2)),
+    list(NULL, c(&quot;c&quot;, &quot;a&quot;, &quot;b&quot;))
+  )
+
+  expect_null(dimnames(rray_roll(matrix(1:6, nrow = 2), n = 1, axes = 1)))
+})
+
+test_that(&quot;returns `x` when nothing moves&quot;, {
+  x &lt;- matrix(1:6, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)))
+
+  expect_identical(rray_roll(x, n = 0, axes = 2), x)
+  expect_identical(rray_roll(x, n = 3, axes = 2), x)
+  expect_identical(rray_roll(x, n = -6, axes = 2), x)
+  expect_identical(rray_roll(x, n = 1, axes = integer()), x)
+})
+
+----
+test_that(&quot;names on the repeated axes repeat, and can be duplicated&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axes = 1)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;, &quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;))
+  )
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axes = 2)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;x&quot;, &quot;y&quot;))
+  )
+  expect_identical(
+    dimnames(rray_rep(x, times = c(2, 3), axes = c(1, 2))),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;, &quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;x&quot;, &quot;y&quot;, &quot;x&quot;, &quot;y&quot;))
+  )
+})
+
+test_that(&quot;partial and missing dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL))
+
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axes = 2)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL)
+  )
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axes = c(1, 2))),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;, &quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL)
+  )
+
+  expect_null(dimnames(rray_rep(array(1:6, c(3, 2)), times = 2, axes = 1)))
+  expect_null(
+    dimnames(rray_rep(array(1:6, c(3, 2)), times = 2, axes = c(1, 2)))
+  )
+})
+
+test_that(&quot;`x` is not modified&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+-----
+})
+
+test_that(&quot;names on the repeated axis repeat, and can be duplicated&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+
+  expect_identical(
+    dimnames(rray_rep_each(x, times = 2, axis = 1)),
+    list(c(&quot;a&quot;, &quot;a&quot;, &quot;b&quot;, &quot;b&quot;, &quot;c&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;))
+  )
+  expect_identical(
+    dimnames(rray_rep_each(x, times = c(1, 0, 2), axis = 1)),
+    list(c(&quot;a&quot;, &quot;c&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;))
+  )
+})
+
+test_that(&quot;partial and missing dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL))
+  expect_identical(
+    dimnames(rray_rep_each(x, times = 2, axis = 2)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL)
+  )
+
+  expect_null(dimnames(rray_rep_each(array(1:6, c(3, 2)), times = 2, axis = 1)))
+})
+
+test_that(&quot;matches a reference implementation&quot;, {
+expected_rep &lt;- function(x, times, axes) {
+  times &lt;- rep_len(times, length(axes))
+  indices &lt;- lapply(dim(x), seq_len)
+
+  for (i in seq_along(axes)) {
+    axis &lt;- axes[[i]]
+    indices[[axis]] &lt;- rep.int(indices[[axis]], times[[i]])
+  }
+
+  do.call(`[`, c(list(x), indices, list(drop = FALSE)))
+}
+
+expected_rep_each &lt;- function(x, times, axis) {
+  dimension &lt;- dim(x)[[axis]]
+
+  indices &lt;- lapply(dim(x), seq_len)
+  indices[[axis]] &lt;- rep(seq_len(dimension), times = rep_len(times, dimension))
+
+  do.call(`[`, c(list(x), indices, list(drop = FALSE)))
+}</pre></details>
+<p>Now the C change.</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+p='src/slice.c'
+s=open(p).read()
+s=s.replace(&quot;&quot;&quot;    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),&quot;&quot;&quot;,&quot;&quot;&quot;    rray_slice_names(x_names, v_dimensions, dimensionality, v_v_locations),&quot;&quot;&quot;)
+s=s.replace(&quot;&quot;&quot;static r_obj* rray_slice_names(
+  r_obj* const* v_x_names,
+  const int* v_dimensions,
+  int dimensionality,
+  const int* const* v_v_locations
+) {
+  if (v_x_names == NULL) {
+    return r_null;
+  }
+
+  r_obj* out = KEEP(r_alloc_list(dimensionality));
+&quot;&quot;&quot;,&quot;&quot;&quot;static r_obj* rray_slice_names(
+  r_obj* x_names,
+  const int* v_dimensions,
+  int dimensionality,
+  const int* const* v_v_locations
+) {
+  if (x_names == r_null) {
+    return r_null;
+  }
+
+  r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+  r_obj* out = KEEP(r_alloc_list(dimensionality));
+  r_attrib_poke_names(out, r_names(x_names));
+&quot;&quot;&quot;)
+open(p,'w').write(s)
+p='src/decl/slice-decl.h'
+s=open(p).read()
+s=s.replace(&quot;&quot;&quot;static r_obj* rray_slice_names(
+  r_obj* const* v_x_names,&quot;&quot;&quot;,&quot;&quot;&quot;static r_obj* rray_slice_names(
+  r_obj* x_names,&quot;&quot;&quot;,1)
+open(p,'w').write(s)
+EOF
+git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/slice.c</summary>
+<pre class="output">185	    r_stop_unreachable();
+186	  }
+187	
+188	  KEEP_N(out, &amp;n_prot);
+189	  r_attrib_poke_dim(out, dimensions);
+190	
+191	  r_obj* names = KEEP_N(
+192	    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),
+193	    &amp;n_prot
+194	  );
+195	
+196	  if (names != r_null) {
+197	    r_attrib_poke_dim_names(out, names);
+198	  }
+199	
+200	  FREE(n_prot);
+201	  return out;
+202	}
+203	
+204	static r_obj* rray_slice_names(
+205	  r_obj* const* v_x_names,
+206	  const int* v_dimensions,
+207	  int dimensionality,
+208	  const int* const* v_v_locations
+209	) {</pre></details>
+<details class="tool"><summary>Read src/decl/slice-decl.h</summary>
+<pre class="output">1	static r_obj* rray_slice_names(
+2	  r_obj* const* v_x_names,
+3	  const int* v_dimensions,
+4	  int dimensionality,
+5	  const int* const* v_v_locations
+6	);</pre></details>
+<details class="tool"><summary>Edit src/decl/slice-decl.h</summary>
+<pre class="diff"><span class="del">-static r_obj* rray_slice_names(</span>
+<span class="del">-  r_obj* const* v_x_names,</span>
+<span class="ins">+static r_obj* rray_slice_names(</span>
+<span class="ins">+  r_obj* x_names,</span></pre><pre class="output">The file ~/files/r/packages/rray/src/decl/slice-decl.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),</span>
+<span class="ins">+    rray_slice_names(x_names, v_dimensions, dimensionality, v_v_locations),</span></pre><pre class="output">The file ~/files/r/packages/rray/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-static r_obj* rray_slice_names(</span>
+<span class="del">-  r_obj* const* v_x_names,</span>
+<span class="del">-  const int* v_dimensions,</span>
+<span class="del">-  int dimensionality,</span>
+<span class="del">-  const int* const* v_v_locations</span>
+<span class="del">-) {</span>
+<span class="del">-  if (v_x_names == NULL) {</span>
+<span class="del">-    return r_null;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out = KEEP(r_alloc_list(dimensionality));</span>
+<span class="ins">+static r_obj* rray_slice_names(</span>
+<span class="ins">+  r_obj* x_names,</span>
+<span class="ins">+  const int* v_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  const int* const* v_v_locations</span>
+<span class="ins">+) {</span>
+<span class="ins">+  if (x_names == r_null) {</span>
+<span class="ins">+    return r_null;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* const* v_x_names = r_list_cbegin(x_names);</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out = KEEP(r_alloc_list(dimensionality));</span>
+<span class="ins">+  r_attrib_poke_names(out, r_names(x_names));</span></pre><pre class="output">The file ~/files/r/packages/rray/src/slice.c has been updated successfully.</pre></details>
+<p>The decl header diagnostics are expected (it has no includes by design). Now the tests.</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-slice.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(rray_slice(x, numeric(), TRUE), slice_base(x, numeric(), ))</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_identical(rray_slice(x, numeric(), TRUE), slice_base(x, numeric(), ))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;titles are kept&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_titles(rray_slice(x, 2L, c(3L, NA), TRUE)),</span>
+<span class="ins">+    c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    dimnames(rray_slice(y, 2L, c(3L, NA), TRUE)),</span>
+<span class="ins">+    dimnames(y)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-slice.R</summary>
+<pre class="diff"><span class="del">-    list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;e&quot;, &quot;&quot;, &quot;c&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;e&quot;, &quot;&quot;, &quot;c&quot;))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;`rray_slice_axis()` keeps titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_titles(rray_slice_axis(x, c(2L, 1L), axis = 1)),</span>
+<span class="ins">+    c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    dimnames(rray_slice_axis(y, c(2L, 1L), axis = 1)),</span>
+<span class="ins">+    dimnames(y)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-slice.R</summary>
+<pre class="diff"><span class="del">-    rray_slice_axis(x, c(&quot;b&quot;, &quot;a&quot;), axis = 1)</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    rray_slice_axis(x, c(&quot;b&quot;, &quot;a&quot;), axis = 1)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;`rray_slice_rows()` keeps titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_titles(rray_slice_rows(x, &quot;b&quot;)), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(rray_slice_rows(y, 2L)), dimnames(y))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-slice.R</summary>
+<pre class="diff"><span class="del">-    rray_slice_axis(x, c(&quot;c&quot;, &quot;a&quot;), axis = 2)</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    rray_slice_axis(x, c(&quot;c&quot;, &quot;a&quot;), axis = 2)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;`rray_slice_columns()` keeps titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_titles(rray_slice_columns(x, -2L)), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(rray_slice_columns(y, -2L)), dimnames(y))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reverse.R</summary>
+<pre class="diff"><span class="del">-  expect_null(dimnames(rray_reverse(matrix(1:6, nrow = 2), axes = 1)))</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_null(dimnames(rray_reverse(matrix(1:6, nrow = 2), axes = 1)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;titles are kept&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_titles(rray_reverse(x, axes = 1)), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(rray_reverse(y, axes = 1)), dimnames(y))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-reverse.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-roll.R</summary>
+<pre class="diff"><span class="del">-  expect_null(dimnames(rray_roll(matrix(1:6, nrow = 2), n = 1, axes = 1)))</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_null(dimnames(rray_roll(matrix(1:6, nrow = 2), n = 1, axes = 1)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;titles are kept&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_titles(rray_roll(x, n = 1, axes = 1)), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(rray_roll(y, n = 1, axes = 1)), dimnames(y))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-roll.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-rep.R</summary>
+<pre class="diff"><span class="del">-  expect_null(</span>
+<span class="del">-    dimnames(rray_rep(array(1:6, c(3, 2)), times = 2, axes = c(1, 2)))</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_null(</span>
+<span class="ins">+    dimnames(rray_rep(array(1:6, c(3, 2)), times = 2, axes = c(1, 2)))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;titles are kept&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(rray_titles(rray_rep(x, times = 2, axes = 1)), c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    dimnames(rray_rep(y, times = 2, axes = 1)),</span>
+<span class="ins">+    dimnames(y)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-rep.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-rep.R</summary>
+<pre class="diff"><span class="del">-  expect_null(dimnames(rray_rep_each(array(1:6, c(3, 2)), times = 2, axis = 1)))</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_null(dimnames(rray_rep_each(array(1:6, c(3, 2)), times = 2, axis = 1)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;`rray_rep_each()` keeps titles&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = c(&quot;a&quot;, &quot;b&quot;), B = NULL, C = NULL))</span>
+<span class="ins">+  y &lt;- array(1:24, c(2L, 3L, 4L), dimnames = list(A = NULL, B = NULL, C = NULL))</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_titles(rray_rep_each(x, times = 2, axis = 1)),</span>
+<span class="ins">+    c(&quot;A&quot;, &quot;B&quot;, &quot;C&quot;)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    dimnames(rray_rep_each(y, times = 2, axis = 1)),</span>
+<span class="ins">+    dimnames(y)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-rep.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-rep.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;`rray_rep_each()` keeps titles&quot;, {</span>
+<span class="ins">+test_that(&quot;titles are kept&quot;, {</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-rep.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;Names on a reversed\|untouched\|selected along with&quot; R/reverse.R R/roll.R R/rep.R R/…</summary>
+<pre>grep -n &quot;Names on a reversed\|untouched\|selected along with&quot; R/reverse.R R/roll.R R/rep.R R/slice.R</pre><pre class="output">R/slice.R:70:#'   positions selected on it. The names of each axis are selected along with
+R/rep.R:19:#' duplicate names. Every other axis keeps its names untouched.
+R/reverse.R:7:#' Names on a reversed axis move with the data. Every other axis keeps its names
+R/reverse.R:8:#' untouched.
+R/roll.R:48:#' untouched.</pre></details>
+<p>Now the roxygen sentences.</p>
+
+<details class="tool"><summary>Edit R/slice.R</summary>
+<pre class="diff"><span class="del">-#'   positions selected on it. The names of each axis are selected along with</span>
+<span class="del">-#'   the values.</span>
+<span class="ins">+#'   positions selected on it. The names of each axis are selected along with</span>
+<span class="ins">+#'   the values. The titles of `x` are kept.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/slice.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/reverse.R</summary>
+<pre class="diff"><span class="del">-#' Names on a reversed axis move with the data. Every other axis keeps its names</span>
+<span class="del">-#' untouched.</span>
+<span class="ins">+#' Names on a reversed axis move with the data. Every other axis keeps its names</span>
+<span class="ins">+#' untouched. The titles of `x` are kept.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/reverse.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/roll.R</summary>
+<pre class="diff"><span class="del">-#' just like they do in `rray_slice()`. Every other axis keeps its names</span>
+<span class="del">-#' untouched.</span>
+<span class="ins">+#' just like they do in `rray_slice()`. Every other axis keeps its names</span>
+<span class="ins">+#' untouched. The titles of `x` are kept.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/roll.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit R/rep.R</summary>
+<pre class="diff"><span class="del">-#' duplicate names. Every other axis keeps its names untouched.</span>
+<span class="ins">+#' duplicate names. Every other axis keeps its names untouched. The titles of</span>
+<span class="ins">+#' `x` are kept.</span></pre><pre class="output">The file ~/files/r/packages/rray/R/rep.R has been updated successfully.</pre></details>
+<p>Formatting, re-documenting, and running the focused tests.</p>
+
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | t…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e &quot;devtools::document()&quot; 2&gt;&amp;1 | tail -5 &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(slice|reverse|roll|rep)$')&quot; 2&gt;&amp;1 | tail -15; git status --short</pre><pre class="output">* DONE (rray)
+Writing 'rray-rep.Rd'
+Writing 'rray_reverse.Rd'
+Writing 'rray-roll.Rd'
+Writing 'rray_slice.Rd'
+ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1049 ]
+ M R/rep.R
+ M R/reverse.R
+ M R/roll.R
+ M R/slice.R
+ M man/rray-rep.Rd
+ M man/rray-roll.Rd
+ M man/rray_reverse.Rd
+ M man/rray_slice.Rd
+ M src/decl/slice-decl.h
+ M src/slice.c
+ M tests/testthat/test-rep.R
+ M tests/testthat/test-reverse.R
+ M tests/testthat/test-roll.R
+ M tests/testthat/test-slice.R</pre></details>
+<p>Focused tests pass (the file change notices are from <code>air format</code>). Running the full suite and reviewing the diff.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; git diff src R man</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -4; git diff src R man</pre><pre class="output">SKIP: 'test-reduce-sum.R:506:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 7699 ]
+diff --git a/R/rep.R b/R/rep.R
+index f36e21d..1521303 100644
+--- a/R/rep.R
++++ b/R/rep.R
+@@ -16,7 +16,8 @@
+ #'
+ #' @details
+ #' Names repeat alongside the data, so a repeated axis can come back with
+-#' duplicate names. Every other axis keeps its names untouched.
++#' duplicate names. Every other axis keeps its names untouched. The titles of
++#' `x` are kept.
+ #'
+ #' @inheritParams rlang::args_dots_empty
+ #'
+diff --git a/R/reverse.R b/R/reverse.R
+index fa1cd78..7a10f54 100644
+--- a/R/reverse.R
++++ b/R/reverse.R
+@@ -5,7 +5,7 @@
+ #'
+ #' @details
+ #' Names on a reversed axis move with the data. Every other axis keeps its names
+-#' untouched.
++#' untouched. The titles of `x` are kept.
+ #'
+ #' @inheritParams rlang::args_dots_empty
+ #'
+diff --git a/R/roll.R b/R/roll.R
+index ef64b1b..70be91f 100644
+--- a/R/roll.R
++++ b/R/roll.R
+@@ -45,7 +45,7 @@
+ #'
+ #' Since a uniform roll is a slice, names on a rolled axis move with the data,
+ #' just like they do in `rray_slice()`. Every other axis keeps its names
+-#' untouched.
++#' untouched. The titles of `x` are kept.
+ #'
+ #' @section Roll each:
+ #' `rray_roll_each()` rolls along a single `axis`, but each row, column, and so
+diff --git a/R/slice.R b/R/slice.R
+index e1d791d..becba2a 100644
+--- a/R/slice.R
++++ b/R/slice.R
+@@ -68,7 +68,7 @@
+ #'   `rray_slice_columns()` return an array with the same type and
+ #'   dimensionality as `x`. The dimension of each axis is the number of
+ #'   positions selected on it. The names of each axis are selected along with
+-#'   the values.
++#'   the values. The titles of `x` are kept.
+ #'
+ #' - The `_assign` versions return `x` with the selected positions replaced.
+ #'   The type, dimensions, and names of `x` are kept.
+diff --git a/man/rray-rep.Rd b/man/rray-rep.Rd
+index 9fb8e13..f06d728 100644
+--- a/man/rray-rep.Rd
++++ b/man/rray-rep.Rd
+@@ -45,7 +45,8 @@ along an axis.
+ }
+ \details{
+ Names repeat alongside the data, so a repeated axis can come back with
+-duplicate names. Every other axis keeps its names untouched.
++duplicate names. Every other axis keeps its names untouched. The titles of
++\code{x} are kept.
+ }
+ \examples{
+ x &lt;- array(1:6, c(3, 2))
+diff --git a/man/rray-roll.Rd b/man/rray-roll.Rd
+index 3ed8448..0b867e7 100644
+--- a/man/rray-roll.Rd
++++ b/man/rray-roll.Rd
+@@ -75,7 +75,7 @@ each rolled axis and \code{TRUE} on the rest.
+ 
+ Since a uniform roll is a slice, names on a rolled axis move with the data,
+ just like they do in \code{rray_slice()}. Every other axis keeps its names
+-untouched.
++untouched. The titles of \code{x} are kept.
+ }
+ 
+ \section{Roll each}{
+diff --git a/man/rray_reverse.Rd b/man/rray_reverse.Rd
+index 1ecb82a..5d68d38 100644
+--- a/man/rray_reverse.Rd
++++ b/man/rray_reverse.Rd
+@@ -22,7 +22,7 @@ An array with the same type and dimensions as \code{x}.
+ }
+ \details{
+ Names on a reversed axis move with the data. Every other axis keeps its names
+-untouched.
++untouched. The titles of \code{x} are kept.
+ }
+ \examples{
+ rray_reverse(1:5, axes = 1)
+diff --git a/man/rray_slice.Rd b/man/rray_slice.Rd
+index 701814f..b1fd154 100644
+--- a/man/rray_slice.Rd
++++ b/man/rray_slice.Rd
+@@ -59,7 +59,7 @@ the type of \code{x}, then broadcast to the dimensions of the selection.}
+ \code{rray_slice_columns()} return an array with the same type and
+ dimensionality as \code{x}. The dimension of each axis is the number of
+ positions selected on it. The names of each axis are selected along with
+-the values.
++the values. The titles of \code{x} are kept.
+ \item The \verb{_assign} versions return \code{x} with the selected positions replaced.
+ The type, dimensions, and names of \code{x} are kept.
+ }
+diff --git a/src/decl/slice-decl.h b/src/decl/slice-decl.h
+index 404941d..3d9e92c 100644
+--- a/src/decl/slice-decl.h
++++ b/src/decl/slice-decl.h
+@@ -1,5 +1,5 @@
+ static r_obj* rray_slice_names(
+-  r_obj* const* v_x_names,
++  r_obj* x_names,
+   const int* v_dimensions,
+   int dimensionality,
+   const int* const* v_v_locations
+diff --git a/src/slice.c b/src/slice.c
+index 21cce0e..d438b23 100644
+--- a/src/slice.c
++++ b/src/slice.c
+@@ -189,7 +189,7 @@ r_obj* rray_slice(
+   r_attrib_poke_dim(out, dimensions);
+ 
+   r_obj* names = KEEP_N(
+-    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),
++    rray_slice_names(x_names, v_dimensions, dimensionality, v_v_locations),
+     &amp;n_prot
+   );
+ 
+@@ -202,16 +202,19 @@ r_obj* rray_slice(
+ }
+ 
+ static r_obj* rray_slice_names(
+-  r_obj* const* v_x_names,
++  r_obj* x_names,
+   const int* v_dimensions,
+   int dimensionality,
+   const int* const* v_v_locations
+ ) {
+-  if (v_x_names == NULL) {
++  if (x_names == r_null) {
+     return r_null;
+   }
+ 
++  r_obj* const* v_x_names = r_list_cbegin(x_names);
++
+   r_obj* out = KEEP(r_alloc_list(dimensionality));
++  r_attrib_poke_names(out, r_names(x_names));
+ 
+   for (int axis = 0; axis &lt; dimensionality; ++axis) {
+     r_obj* x_axis_names = v_x_names[axis];</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>All 7699 tests pass, and I've verified <code>x_names</code>/titles stay protected via <code>x</code> while <code>out</code> is protected before titles are added. Checking off the plan and committing now.</p>
+</details>
+<details class="tool"><summary>Edit plans/titles.md</summary>
+<pre class="diff"><span class="del">-- [ ] 1. Slice names</span>
+<span class="ins">+- [x] 1. Slice names</span></pre><pre class="output">The file ~/files/r/packages/rray/plans/titles.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -q -m &quot;Keep titles in rray_slice() and the functions built on it&quot; &amp;&amp;…</summary>
+<pre>git add -A &amp;&amp; git commit -q -m &quot;Keep titles in rray_slice() and the functions built on it&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/slice-titles 2&gt;&amp;1 | tail -3</pre><pre class="output">8f05cc8 Keep titles in rray_slice() and the functions built on it
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/slice-titles -&gt; feature/slice-titles
+branch 'feature/slice-titles' set up to track 'origin/feature/slice-titles'.</pre></details>
+<p>Step 1 of the titles plan is done and pushed to <code>feature/slice-titles</code> as commit <code>8f05cc8</code>. All slice functions now keep the titles of <code>x</code>. The full test suite passes: 7699 passed, 0 failed, 6 skipped (the long-vector skips).</p>
+<p><strong>The C change</strong> (<code>src/slice.c</code>, <code>src/decl/slice-decl.h</code>)</p>
+<ul>
+<li>
+<p><code>rray_slice_names()</code> now takes <code>x_names</code> instead of <code>v_x_names</code>. It reads the list pointer itself and copies the titles of <code>x</code> onto its output.</p>
+</li>
+<li>
+<p><code>rray_reverse()</code>, <code>rray_roll()</code>, <code>rray_rep()</code> and <code>rray_rep_each()</code> all call <code>rray_slice()</code>, so this one change covers them.</p>
+</li>
+<li>
+<p>When <code>x</code> has no titles, the copy just leaves the output without titles, so no extra branch was needed.</p>
+</li>
+<li>
+<p>Titles-only input (dimnames like <code>list(A = NULL, B = NULL)</code>) needed no special handling, because the output list is already created whenever <code>x</code> has dimnames.</p>
+</li>
+<li>
+<p>I also checked R's C <code>dimnamesgets()</code>: it keeps the names of the dimnames list as they are. So titles that are all <code>&quot;&quot;</code> stay as they are, which matches the plan's rules.</p>
+</li>
+<li>
+<p>Protection check: <code>x_names</code> and its titles are reached through <code>x</code>, which <code>rray_slice()</code> keeps protected. <code>out</code> is protected before the titles are set on it.</p>
+</li>
+</ul>
+<p><strong>Tests</strong></p>
+<p>Each function has a titles test placed next to its existing names tests:</p>
+<ul>
+<li>
+<p><code>rray_slice()</code>, <code>rray_slice_axis()</code>, <code>rray_slice_rows()</code> and <code>rray_slice_columns()</code> in <code>test-slice.R</code></p>
+</li>
+<li>
+<p><code>rray_reverse()</code> in <code>test-reverse.R</code></p>
+</li>
+<li>
+<p><code>rray_roll()</code> in <code>test-roll.R</code></p>
+</li>
+<li>
+<p><code>rray_rep()</code> and <code>rray_rep_each()</code> in <code>test-rep.R</code></p>
+</li>
+</ul>
+<p>Each test checks two inputs: <code>x</code> must keep its titles, and for the titles-only <code>y</code> the whole <code>dimnames()</code> must come back unchanged. Before the fix, <code>y</code> would have lost its titles, so these tests catch the bug.</p>
+<p><strong>Docs</strong></p>
+<p>I added &quot;The titles of <code>x</code> are kept.&quot; next to the existing sentence about names in <code>rray_slice()</code>, <code>rray_reverse()</code>, <code>rray_roll()</code> and <code>rray_rep()</code>, and re-documented. The plan has step 1 checked off.</p>
+<p>No pull request was opened.</p>
+
+</section>
+</main>
+</body>
+</html>

@@ -1,0 +1,681 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Alternative names for rray_index() and how it relates to torch gather</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-83">rray timeline</a>
+<h1>Alternative names for <code>rray_index()</code> and how it relates to torch gather</h1>
+<p class="facts">Claude · Sep 22, 2026 · 4 prompts · 4 replies · <a href="https://github.com/r-lib/rray/pull/83">#83</a></p>
+</header>
+<main>
+<p class="divider">Sep 22, 2026, 21:41 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Any alternative names to rray_index ?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls plans/ &amp;&amp; ls R/ | head -50</summary>
+<pre>ls plans/ &amp;&amp; ls R/ | head -50</pre><pre class="output">extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extremum.R
+insert-axes.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+rray4-package.R
+size.R
+split.R
+stack.R
+unstack.R
+zzz.R</pre></details>
+<details class="tool"><summary>Bash: grep -rl &quot;rray_index&quot; . --include=*.md --include=*.R --include=*.c --include=*.h | head -20</summary>
+<pre>grep -rl &quot;rray_index&quot; . --include=*.md --include=*.R --include=*.c --include=*.h | head -20</pre><pre class="output">(eval):1: no matches found: --include=*.md</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,200p plans/index.md</summary>
+<pre>sed -n 1,200p plans/index.md</pre><pre class="output"># Integer coordinate indexing plan
+
+## Recommendation
+
+Add one fully specified coordinate function and one directional one-axis
+specialization:
+
+```r
+rray_index(x, ...)
+rray_index_assign(x, ..., value)
+
+rray_index_axis(x, i, axis)
+rray_index_assign_axis(x, i, axis, value)
+```
+
+`rray_index()` requires exactly one integer coordinate array for every source
+axis. The arrays broadcast to common dimensions and are read pointwise. The
+common dimensions are the result dimensions.
+
+`rray_index_axis()` accepts one integer array for the selected source axis and
+supplies identity coordinates for every other axis. `i` must broadcast to the
+dimensions of `x` outside `axis`. The result has the same dimensionality as
+`x`, every unselected axis keeps its source dimension, and only the selected
+axis can change.
+
+Every source coordinate is explicit. Different partial indexing behaviors are
+represented by shaping full coordinate arrays in different ways.
+
+The complete family is:
+
+| Operation | Read | Assign |
+|---|---|---|
+| Orthogonal subscripts | `rray_slice()` | `rray_slice_assign()` |
+| One-axis subscript | `rray_slice_axis()` | `rray_slice_assign_axis()` |
+| First axis subscript | `rray_slice_rows()` | `rray_slice_assign_rows()` |
+| Second axis subscript | `rray_slice_columns()` | `rray_slice_assign_columns()` |
+| One-axis coordinate array | `rray_index_axis()` | `rray_index_assign_axis()` |
+| Full coordinate arrays | `rray_index()` | `rray_index_assign()` |
+| Flat subscript or point matrix | `rray_extract()` | `rray_extract_assign()` |
+
+Do not add replacement functions. Every `_assign()` function returns a
+modified copy of `x`.
+
+## Subscripts and coordinates
+
+A subscript describes a set of positions. It can be negative, logical,
+character, missing, or `NULL`. Subscript normalization produces a
+one-dimensional sequence of positive or missing locations. Subscripts on
+different axes form a Cartesian product.
+
+A coordinate array has a narrower meaning. Each non-missing element is one
+positive, one-based position on one source axis. Its dimensions connect that
+coordinate to an output point. Coordinates on different source axes broadcast
+and pair pointwise.
+
+```r
+rray_slice_axis(x, -1L, axis = 2L)
+# Complement selection
+
+rray_index_axis(x, array(-1L, rray_dimensions(x)), axis = 2L)
+# Error: coordinates must be positive
+```
+
+The function name determines the input rules. The shape or class of `i` never
+changes a slice into coordinate indexing.
+
+## Full coordinate model
+
+Let:
+
+- `D` be the source dimensions.
+- `n` be the dimensionality of `x`.
+- `L[a]` be the coordinate array supplied for source axis `a`.
+- `G` be the common dimensions of all `L[a]`.
+
+`rray_index()` requires exactly `n` coordinate arrays. At every output point
+`g` in `G`, each broadcast coordinate array supplies one component of the
+source coordinate:
+
+```text
+source[a] = broadcast(L[a])[g]
+out[g] = x[source[1], source[2], ..., source[n]]
+```
+
+The result dimensions are exactly `G`:
+
+```text
+out_dimensions = common_dimensions(L[1], ..., L[n])
+```
+
+The output can have lower, equal, or greater dimensionality than `x`. There is
+no source-axis placement rule because every output axis belongs to the common
+coordinate space.
+
+Singleton dimensions and missing trailing dimensions follow rray's
+left-aligned broadcasting rules.
+
+## Coordinate validation
+
+Each argument in `...` and `i` in `rray_index_axis()` must be a bare integer
+vector or array. Bare vectors are one-dimensional arrays. Factors and other
+classed integer objects are errors.
+
+Every non-missing coordinate must be positive, one based, and no greater than
+the dimension of its source axis:
+
+- Positive integers identify one source position.
+- Zero and negative integers are errors.
+- Missing coordinates produce missing output when reading.
+- Missing coordinates are errors when assigning.
+- Out-of-bounds coordinates are errors.
+
+Logical, character, and double inputs are errors. Logical values are masks,
+character values require name matching, and doubles weaken the strict
+coordinate contract. Those inputs belong to slicing or extraction.
+
+Validation happens before allocating or copying the result. Every coordinate
+array is validated even when the common result has size zero.
+
+## `rray_index()`
+
+```r
+rray_index(x, ...)
+rray_index_assign(x, ..., value)
+```
+
+### Argument rules
+
+- `x` must be an array or bare vector supported by rray.
+- Bare vectors normalize to one-dimensional arrays.
+- `...` must contain exactly one coordinate array per source axis.
+- Argument position identifies the source axis.
+- Coordinate arguments must be unnamed.
+- Dynamic splicing is supported.
+- All coordinate arrays broadcast to common dimensions.
+- The result has the same storage type as `x`.
+- The resulting dimensionality must not exceed rray's supported maximum.
+
+```r
+coordinates &lt;- list(rows, columns)
+rray_index(x, !!!coordinates)
+```
+
+Missing arguments, omitted trailing arguments, and `NULL` are errors.
+
+`value` follows `...` in `rray_index_assign()`, so it must be supplied by
+name.
+
+### Missing coordinates
+
+If any coordinate at an output point is missing, the result at that point is
+missing:
+
+| Type | Missing output |
+|---|---|
+| logical | `NA` |
+| integer | `NA_integer_` |
+| double | `NA_real_` |
+| complex | `NA_complex_` |
+| character | `NA_character_` |
+| raw | `as.raw(0)` |
+| list | `NULL` |
+
+### Zero dimensions
+
+Zero dimensions follow the existing common-dimension rules:
+
+- Equal zero dimensions are compatible.
+- Zero and one combine to zero.
+- Zero and a dimension greater than one are incompatible.
+- Every coordinate is still validated before returning an empty result.
+
+## `rray_index_axis()`
+
+```r
+rray_index_axis(x, i, axis)
+rray_index_assign_axis(x, i, axis, value)
+```
+
+`rray_index_axis()` supplies coordinates for one source axis while every other
+axis receives an implicit identity coordinate. It is the rray form of a
+directional take-along-axis operation.
+
+`i` must have the same dimensionality as `x`. Let `D` be the source dimensions
+and `I` be the dimensions of `i`. For every unselected axis `a`:
+
+```text
+I[a] must be 1 or D[a]
+```
+
+The selected dimension `I[axis]` can be any valid dimension `J`. The result
+dimensions are:
+
+```text
+out_dimensions = D
+out_dimensions[axis] = J
+```
+
+For source dimensions `(A, B, C)` and `axis = 2`:</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -n 200,400p plans/index.md; echo ====; grep -n &quot;extract\|gather\|take\|vindex\|name&quot; plan…</summary>
+<pre>sed -n 200,400p plans/index.md; echo ====; grep -n &quot;extract\|gather\|take\|vindex\|name&quot; plans/index.md | tail -40</pre><pre class="output">Exit code 1
+
+```text
+i dimensions      = (A or 1, J, C or 1)
+result dimensions = (A, J, C)
+```
+
+The direction matters. `i` broadcasts to `x` outside the selected axis, but
+`x` never expands to dimensions introduced by `i`. If `D[a]` is one and
+`I[a]` is greater than one on an unselected axis, the call errors. Users can
+explicitly broadcast `x` first or use full coordinate indexing when expansion
+is intended.
+
+At an output point `h`:
+
+```text
+source[axis] = broadcast(i)[h]
+source[a] = h[a] for every unselected axis a
+out[h] = x[source]
+```
+
+Only the selected axis dimension can change. This invariant distinguishes
+`rray_index_axis()` from the unrestricted common dimensions of
+`rray_index()`.
+
+### Connection to full coordinate indexing
+
+For `x` dimensions `(A, B, C)`, `axis = 2`, and `i` dimensions `(1, J, C)`, the
+axis operation is equivalent in values and dimensions to:
+
+```r
+axis1 &lt;- array(seq_len(A), c(A, 1L, 1L))
+axis2 &lt;- i
+axis3 &lt;- array(seq_len(C), c(1L, 1L, C))
+
+rray_index(x, axis1, axis2, axis3)
+```
+
+All three arrays broadcast to `(A, J, C)`. The specialized function does not
+need to allocate the identity arrays.
+
+Errors from the public axis function should use the argument names `i` and
+`axis`.
+
+## Worked examples
+
+### 1. Full pointwise indexing
+
+```r
+x &lt;- matrix(1:12, nrow = 3)
+
+rows &lt;- c(1L, 3L, 2L)
+columns &lt;- c(4L, 1L, 3L)
+
+out &lt;- rray_index(x, rows, columns)
+
+out
+# [1] 10 3 8
+
+dim(out)
+# [1] 3
+```
+
+The calculation is:
+
+```text
+out[1] = x[rows[1], columns[1]] = x[1, 4] = 10
+out[2] = x[rows[2], columns[2]] = x[3, 1] = 3
+out[3] = x[rows[3], columns[3]] = x[2, 3] = 8
+```
+
+Every source axis is explicit and the result dimensions are the common
+coordinate dimensions `(3)`.
+
+### 2. Cartesian indexing through an open mesh
+
+Coordinate arrays always pair through broadcasting. Shape them onto different
+output axes to request a Cartesian product:
+
+```r
+rows &lt;- array(c(3L, 1L), c(2L, 1L))
+columns &lt;- array(c(4L, 2L, 1L), c(1L, 3L))
+
+out &lt;- rray_index(x, rows, columns)
+
+dim(out)
+# [1] 2 3
+```
+
+The common dimensions are `(2, 3)`. Every row coordinate pairs with every
+column coordinate because their singleton dimensions form an open mesh.
+
+Ordinary vectors of lengths two and three do not silently form a Cartesian
+product:
+
+```r
+rray_index(x, c(1L, 2L), c(1L, 2L, 3L))
+# Error: dimensions 2 and 3 cannot broadcast
+```
+
+### 3. One-axis coordinate indexing
+
+```r
+x &lt;- matrix(
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80
+  ),
+  nrow = 2,
+  byrow = TRUE
+)
+
+i &lt;- rbind(
+  c(4L, 1L),
+  c(2L, 3L)
+)
+
+out &lt;- rray_index_axis(x, i, axis = 2)
+
+out
+#      [,1] [,2]
+# [1,]   40   10
+# [2,]   60   70
+```
+
+The row coordinate is an implicit identity:
+
+```text
+out[row, column] = x[row, i[row, column]]
+```
+
+Only the selected column dimension can change.
+
+The same operation with full coordinates is:
+
+```r
+rows &lt;- array(seq_len(2L), c(2L, 1L))
+rray_index(x, rows, i)
+```
+
+### 4. Independent source rows through full coordinates
+
+The same `i` can be crossed with every source row by making the row identity
+an independent output axis:
+
+```r
+rows &lt;- array(seq_len(2L), c(2L, 1L, 1L))
+columns &lt;- array(i, c(1L, 2L, 2L))
+
+out &lt;- rray_index(x, rows, columns)
+
+dim(out)
+# [1] 2 2 2
+```
+
+The first output axis is the source row. The next two axes are the dimensions
+of `i`:
+
+```text
+out[a, j, k] = x[a, i[j, k]]
+```
+
+For `k = 1`:
+
+```r
+out[, , 1]
+#      [,1] [,2]
+# [1,]   40   20
+# [2,]   80   60
+```
+
+For `k = 2`:
+
+```r
+out[, , 2]
+#      [,1] [,2]
+# [1,]   10   30
+# [2,]   50   70
+```
+
+Nothing in `rray_index()` decides whether rows align with or cross the column
+coordinates. The explicit shapes decide.
+
+### 5. Directional broadcasting
+
+```r
+x &lt;- matrix(
+  c(
+    10, 20, 30, 40,
+    50, 60, 70, 80,
+    90, 100, 110, 120
+  ),
+  nrow = 3,
+  byrow = TRUE
+)
+
+i &lt;- matrix(c(4L, 1L), nrow = 1)
+
+out &lt;- rray_index_axis(x, i, axis = 2)
+</pre><p class="cut">3 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray &amp;&amp; grep -rhoE &quot;^rray_[a-z_]+&quot; NAMESPACE | sort -u | head -60</summary>
+<pre>cd ~/files/r/packages/rray &amp;&amp; grep -rhoE &quot;^rray_[a-z_]+&quot; NAMESPACE | sort -u | head -60</pre><pre class="output">Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: grep -oE &quot;rray_[a-z_0-9]+&quot; ~/files/r/packages/rray/NAMESPACE | sort -u | tr '\n' ' '</summary>
+<pre>grep -oE &quot;rray_[a-z_0-9]+&quot; ~/files/r/packages/rray/NAMESPACE | sort -u | tr '\n' ' '</pre><pre class="output">rray_add rray_all rray_all_equal rray_any rray_any_not_equal rray_axis_names rray_bind rray_broadcast rray_cbind rray_clip rray_col_names rray_dbl rray_diag rray_dim rray_dim_common rray_dim_n rray_dim_names rray_dim_names_common rray_dim_names2 rray_divide rray_dot rray_duplicate_any rray_duplicate_detect rray_duplicate_id rray_elems rray_equal rray_expand rray_extract rray_extract_assign rray_flatten rray_flip rray_full_like rray_greater rray_greater_equal rray_hypot rray_identity rray_if_else rray_int rray_lesser rray_lesser_equal rray_lgl rray_logical_and rray_logical_not rray_logical_or rray_max rray_max_pos rray_maximum rray_mean rray_min rray_min_pos rray_minimum rray_multiply rray_multiply_add rray_not_equal rray_ones_like rray_opposite rray_pow rray_prod rray_rbind rray_reshape rray_rotate rray_row_names rray_set_axis_names rray_set_col_names rray_set_dim_names rray_set_row_names rray_slice rray_slice_assign rray_sort rray_split rray_squeeze rray_subset rray_subset_assign rray_subtract rray_sum rray_tile rray_transpose rray_unique rray_unique_count rray_unique_loc rray_yank rray_yank_assign rray_zeros_like</pre></details>
+<p>Short answer: <code>rray_index()</code> is the one name in the family that is a noun, and in vctrs land &quot;index&quot; and &quot;locate&quot; mean positions, so it reads like it returns positions rather than values. Worth replacing. Ranked alternatives:</p>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Axis form</th>
+<th>Prior art</th>
+<th>Concern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rray_gather()</code></td>
+<td><code>rray_gather_axis()</code></td>
+<td><code>torch.gather()</code> is exactly the axis form, <code>tf.gather_nd()</code> is exactly the full form</td>
+<td>tidyr's deprecated <code>gather()</code> means reshape long; the assign form is really &quot;scatter&quot;</td>
+</tr>
+<tr>
+<td><code>rray_take()</code></td>
+<td><code>rray_take_axis()</code></td>
+<td><code>np.take_along_axis()</code> matches the axis form</td>
+<td><code>np.take()</code> itself is flat, one axis, so numpy users may expect different semantics from the full form</td>
+</tr>
+<tr>
+<td><code>rray_pick()</code></td>
+<td><code>rray_pick_axis()</code></td>
+<td>none</td>
+<td>dplyr's <code>pick()</code> is column selection, weak clash</td>
+</tr>
+<tr>
+<td><code>rray_point()</code></td>
+<td><code>rray_point_axis()</code></td>
+<td>xarray calls this &quot;pointwise indexing&quot;, old <code>sel_points</code></td>
+<td>reads like it returns a point, not values at points</td>
+</tr>
+<tr>
+<td><code>rray_at()</code></td>
+<td><code>rray_at_axis()</code></td>
+<td><code>.at[]</code> in pandas, JAX <code>.at[]</code> for the assign form</td>
+<td>too vague on its own</td>
+</tr>
+</tbody>
+</table>
+<p>I'd go with <code>rray_gather()</code> / <code>rray_gather_axis()</code> / <code>rray_gather_assign()</code> / <code>rray_gather_assign_axis()</code>. It is a verb, it sits beside <code>rray_slice()</code> and <code>rray_extract()</code> without overlap, and array programmers already know that <code>gather</code> means &quot;pair coordinates pointwise and read values&quot;. The tidyr association fades fast inside an array namespace.</p>
+<p>One wrinkle to decide if you take it: the technical name for <code>rray_gather_assign()</code> is scatter. You could use <code>rray_scatter()</code> for the write side, which is more accurate but breaks the <code>_assign()</code> pattern the rest of the family uses. I'd keep <code>_assign()</code>.</p>
+<p>Want me to update <code>plans/index.md</code> and the family table in <code>plans/slice.md</code> to the new name?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Is torch gather the same as rray index axis</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool tool-error"><summary>Bash: python3 -c &quot;</summary>
+<pre>python3 -c &quot;
+import numpy as np
+arr = np.arange(4).reshape(1,4)*10
+idx = np.array([[3,0],[1,2]])
+print('arr', arr.shape, 'idx', idx.shape)
+print(np.take_along_axis(arr, idx, axis=1))
+arr2 = np.arange(12).reshape(3,4)
+idx2 = np.array([[3,0]])
+print(np.take_along_axis(arr2, idx2, axis=1))
+&quot; 2&gt;&amp;1 | tail -20; python3 -c &quot;import torch; print(torch.__version__)&quot; 2&gt;&amp;1 | tail -1</pre><pre class="output">Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>No. Same idea, different shape rule.</p>
+<p><code>torch.gather(input, dim, index)</code> requires <code>index.ndim == input.ndim</code> and <code>index.size(d) &lt;= input.size(d)</code> for every <code>d != dim</code>, and the output has exactly the shape of <code>index</code>. A short index dimension on an unselected axis truncates, it does not broadcast:</p>
+<pre><code class="language-text">input (3, 4), index (1, 2), dim = 1
+torch.gather  -&gt; (1, 2)    reads row 0 only
+</code></pre>
+<p><code>rray_index_axis()</code> as planned broadcasts <code>i</code> up to the source dimensions on unselected axes, so the same call is example 5 in the plan:</p>
+<pre><code class="language-text">x (3, 4), i (1, 2), axis = 2
+rray_index_axis -&gt; (3, 2)  the single index row applies to all 3 rows
+</code></pre>
+<p>Where they agree: both require matching dimensionality, both fix the result to the source dimensions on unselected axes when those already match, both error when the index is larger than the source on an unselected axis, both reject negative coordinates.</p>
+<p>The closer match is <code>np.take_along_axis()</code>, which does broadcast <code>arr</code> and <code>indices</code> on every axis except <code>axis</code>. One difference remains: numpy broadcasts in both directions, so a source dimension of 1 expands to meet a larger index dimension. The plan forbids that direction on purpose, <code>x</code> never grows to fit <code>i</code>.</p>
+<p>So if you want prior art that matches the planned semantics, <code>take_along_axis</code> is it, and <code>rray_take_axis()</code> is the honest name. <code>gather</code> is the better known verb but carries torch's &quot;output takes the index shape&quot; rule, which is not what you specified.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Surely rray index can represent torch gather?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>You're right, it can, exactly. <code>rray_index()</code> is the superset. Torch's truncating behavior falls out of using a prefix identity instead of a full identity.</p>
+<p>For the earlier case, <code>x</code> is 3x4, <code>i</code> is 1x2, <code>dim = 1</code>:</p>
+<pre><code class="language-r">rows &lt;- array(1L, c(1L, 1L))
+rray_index(x, rows, i)
+# dims (1, 2), values x[1, i[1,1]] and x[1, i[1,2]]
+</code></pre>
+<p>The general recipe is one identity array per unselected axis, sized to <code>i</code> rather than to <code>x</code>:</p>
+<pre><code class="language-r">torch_gather &lt;- function(x, i, axis) {
+  dimensions &lt;- dim(i)
+
+  coordinates &lt;- map(seq_along(dimensions), function(a) {
+    if (a == axis) {
+      return(i)
+    }
+    d &lt;- rep(1L, length(dimensions))
+    d[[a]] &lt;- dimensions[[a]]
+    array(seq_len(dimensions[[a]]), d)
+  })
+
+  rray_index(x, !!!coordinates)
+}
+</code></pre>
+<p>Every coordinate array broadcasts to <code>dim(i)</code>, so the result is <code>dim(i)</code>, which is torch's rule. Torch's constraint that <code>index.size(d) &lt;= input.size(d)</code> needs no special handling: if it were violated, the identity <code>seq_len(dimensions[[a]])</code> would run past the source dimension and hit the normal out-of-bounds error.</p>
+<p>This is the plan's stated point, that shaping the coordinate arrays differently is what distinguishes these behaviors. The difference I described is only between <code>torch.gather()</code> and <code>rray_index_axis()</code>: the axis specialization picks the broadcasting rule of <code>np.take_along_axis()</code>, not the truncating rule of torch. That is still the argument for <code>rray_take_axis()</code> over <code>rray_gather_axis()</code> if you rename.</p>
+
+</section>
+<p class="divider">Sep 22, 2026, 22:40 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Does rray index axis feel like one arbitrary way to pin down rray index behavior rather than “index applied to one axis” like rray slice axis is to rray slice?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;slice_axis&quot; -A 12 plans/slice.md | sed -n 1,80p</summary>
+<pre>grep -n &quot;slice_axis&quot; -A 12 plans/slice.md | sed -n 1,80p</pre><pre class="output">11:rray_slice_axis(x, i, axis)
+12-rray_slice_assign_axis(x, i, axis, value)
+13-
+14-rray_slice_rows(x, i)
+15-rray_slice_assign_rows(x, i, value)
+16-
+17-rray_slice_columns(x, i)
+18-rray_slice_assign_columns(x, i, value)
+19-
+20-rray_extract(x, i)
+21-rray_extract_assign(x, i, value)
+22-```
+23-
+--
+26:selects a whole axis. `rray_slice_axis()` performs the same operation on one
+27-axis held in a variable, and `rray_slice_rows()` and `rray_slice_columns()`
+28-are its first and second axis shortcuts. `rray_extract()` accepts flat
+29-positions or coordinate points and always returns a one-dimensional array.
+30-
+31-Keep subscripts separate from integer coordinate arrays:
+32-
+33-| Property | Subscript | Coordinate array |
+34-|---|---|---|
+35:| Used by | `rray_slice()`, `rray_slice_axis()`, `rray_extract()` | `rray_index()`, `rray_index_axis()` |
+36-| Meaning | A set of positions | One source coordinate per output point |
+37-| Accepted forms | Integer, double, logical, character where defined, `NULL` | Bare integer vector or array |
+38-| Negative values | Select the complement | Error |
+39-| Zero | Ignored | Error |
+40-| Shape | Does not connect positions across axes | Connects coordinates pointwise through broadcasting |
+41-
+42-The function name determines the contract. The dimensions of `i` never turn a
+43-slice subscript into a coordinate array. `rray_extract()` has a separate,
+44-explicit matrix rule for coordinate points.
+45-
+46-Do not add replacement functions. Every `_assign()` function returns a
+47-modified copy of `x`. There are no `[` or `[[` methods because rray4 provides
+--
+57:| One-axis subscript | `rray_slice_axis(x, i, axis)` | Source dimensions with one axis replaced |
+58-| First or second axis subscript | `rray_slice_rows(x, i)`, `rray_slice_columns(x, i)` | Source dimensions with one axis replaced |
+59-| One-axis coordinate array | `rray_index_axis(x, i, axis)` | Source dimensions with one axis replaced |
+60-| Full coordinate arrays | `rray_index(x, ...)` | Common coordinate dimensions |
+61-| Flat subscript or point matrix | `rray_extract(x, i)` | One dimensional |
+62-
+63-`rray_index()` is the general coordinate operation. Every other operation can
+64-be described by constructing one explicit coordinate array for every source
+65-axis and then calling `rray_index()`. The public wrappers remain important
+66-because they accept different inputs, guarantee more specific shapes, retain
+67-more names, and can use faster implementations.
+68-
+69-See `plans/index.md` for strict coordinate arrays and the complete lowering of
+--
+83:rray_slice_axis(x, c(3, 1), axis = 2)
+84-# dimensions: c(2, 2, 4)
+85-```
+86-
+87-This is close to base R's `x[..., drop = FALSE]`. Slicing never drops axes.
+88-
+89-The same Cartesian product can be expressed through full coordinate indexing.
+90-After normalizing the three subscripts to positive locations, shape them as an
+91-open mesh:
+92-
+93-```text
+94-axis 1 coordinates: (I, 1, 1)
+95-axis 2 coordinates: (1, J, 1)
+--
+126:`rray_slice_axis()`.
+127-
+128-```r
+129-rray_slice(x, , , 1:2)
+130-# Error: `...` must not contain empty arguments.
+131:# Use `TRUE` to select a whole axis, or `rray_slice_axis()` for a single axis.
+132-```
+133-
+134-Too few and too many subscripts are the same error. Subscripts in `...` must
+135-be unnamed because selection is positional.
+136-
+137-Because every argument is an ordinary value, the dots are plain `list2()` dots
+138-and splicing needs no special handling:
+139-
+140-```r</pre></details>
+<p>Yes, and I think that's the right read. Three concrete signs.</p>
+<p>First, <code>rray_slice_axis()</code> is partial application. <code>rray_slice()</code> already has a neutral subscript spelling, so <code>rray_slice_axis(x, i, 2)</code> is <code>rray_slice(x, TRUE, i, TRUE)</code> with <code>axis</code> made dynamic. Nothing new is invented. <code>rray_index()</code> has no neutral coordinate, so the axis form cannot be written as the general form with the other arguments filled in by a value the general form accepts. It has to build arrays from <code>dim(x)</code> and <code>dim(i)</code>.</p>
+<p>Second, there is more than one identity to build, and the plan picks one without saying it is the canonical one. For unselected axis <code>a</code> the candidates are <code>seq_len(D[a])</code> on output axis <code>a</code> (broadcast, take_along_axis), <code>seq_len(I[a])</code> on output axis <code>a</code> (truncate, torch), and <code>seq_len(D[a])</code> on a fresh output axis (cross, your example 4). All three are equally expressible in <code>rray_index()</code>. Choosing the first is a judgment call, not a specialization.</p>
+<p>Third, and this is the sharp one, the axis form errors where its own lowering succeeds. The plan says the call errors when <code>D[a]</code> is 1 and <code>I[a]</code> is greater than 1 on an unselected axis. Write that same call out in full coordinates and the identity has dimension 1, it broadcasts against <code>I[a]</code>, and you get a clean result that reads the single source row repeatedly. So <code>rray_index_axis()</code> is not <code>rray_index()</code> restricted. It is <code>rray_index()</code> plus a rule that <code>rray_index()</code> does not have. <code>rray_slice_axis()</code> adds no rule to <code>rray_slice()</code>.</p>
+<p>Two ways out.</p>
+<p>Give <code>rray_index()</code> a neutral coordinate, spelled <code>TRUE</code> for symmetry with <code>rray_slice()</code>, meaning the identity <code>seq_len(D[a])</code> placed on output axis <code>a</code>. Then <code>rray_index(x, TRUE, i)</code> is <code>rray_index_axis(x, i, axis = 2)</code> by definition, and the directional error rule has to go, since the general form broadcasts symmetrically. Torch's truncation is still writable as the explicit prefix identity. This makes the family shape match slice exactly, at the cost of allowing a singleton source axis to expand under pairing.</p>
+<p>Or admit it is a separate operation rather than a specialization, keep the directional rule because it catches shape mistakes when <code>i</code> comes from an argsort of <code>x</code>, and name it for what it actually is: <code>rray_take_axis()</code>, the take-along-axis operation, sitting beside <code>rray_index()</code> rather than under it. The lowering in <code>plans/slice.md</code> then needs a caveat that this one is not an exact lowering.</p>
+<p>Which do you want? The first buys you a clean algebra where every function is <code>rray_index()</code> with neutral arguments. The second keeps the stricter contract and pays for it with an honest admission that the axis form is its own thing.</p>
+
+</section>
+</main>
+</body>
+</html>

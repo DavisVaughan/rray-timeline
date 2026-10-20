@@ -1,0 +1,2036 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Moving the add and sum kernels into one-add.h</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-107">rray timeline</a>
+<h1>Moving the add and sum kernels into <code>one-add.h</code></h1>
+<p class="facts">Claude · Oct 1, 2026 · 1 prompt · 9 replies · <a href="https://github.com/r-lib/rray/pull/107">#107</a></p>
+</header>
+<main>
+<p class="divider">Oct 1, 2026, 14:16 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In the past two PRs we’ve nicely rewritten one-extremum/logical</p>
+<p>Study how we did that carefully</p>
+<p>Then do the same for one-add.h, pulling from reduce sum and arithmetic add</p>
+<p>Ask any questions then commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat ~/.claude/projects/-Users-davis-files-…</summary>
+<pre>cd ~/files/r/packages/rray4; cat ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_no_shared_add_sum_kernels.md ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/feedback_no_int_helpers_for_logical.md; git log --oneline -8; git log --stat -4 | head -80; ls src</pre><pre class="output">---
+name: project_no_shared_add_sum_kernels
+description: &quot;Don't share \&quot;one\&quot; kernels between arithmetic ops and their reducers (add/sum); keep kernels local to each file&quot;
+metadata:
+  node_type: memory
+  type: project
+  originSessionId: 4437173f-4864-4ac1-a04c-9ef0f4223b9f
+  modified: 2026-10-01T13:30:22.068Z
+---
+
+On 2026-10-01 a `one-add.h` shared by `rray_add()` and `rray_sum()` was built and then abandoned (branch `feature/one-add` deleted). Kernels for arithmetic and their reducers stay local to each `.c` file, even with overlap.
+
+**Why:** The reducer's job differs from the elementwise op. Sum's logical kernel mixes an int accumulator with logical input, `na_rm` exists only for the reducer, and sharing forced `error_call` plumbing through every `RRAY_REDUCE` caller. The earlier `one-logical.h` / `one-extremum.h` split (#102) was also reverted on branch `feature/revert-one`, so no `one-*.h` headers exist. See [[feedback_no_int_helpers_for_logical]].
+
+Update 2026-10-01: the user then asked to keep `src/one-extremum.h` (branch `feature/extremum-one`, off `main`), split into `// Elementwise` (`rray_pmax_*_one`) and `// Reduce` (`rray_max_*_one`) sections. A reduce helper calls its elementwise twin only when they are exactly the same.
+
+**How to apply:** Don't propose `one-multiply.h` and similar for arithmetic/reducer pairs. Pending idea from that session: switch `rray_sum()` double and complex kernels to plain `+` (4x faster across rows), since base R leaves NA vs NaN unspecified for arithmetic.
+---
+name: feedback_no_int_helpers_for_logical
+description: &quot;Never run int \&quot;one\&quot; helpers on logical data, give logical its own helper even if NA values coincide&quot;
+metadata:
+  node_type: memory
+  type: feedback
+  originSessionId: 4437173f-4864-4ac1-a04c-9ef0f4223b9f
+  modified: 2026-10-01T11:38:44.827Z
+---
+
+Don't reuse integer &quot;one&quot; helpers (e.g. `rray_add_int_one()`) on logical input, even though `NA_LOGICAL == NA_INTEGER`.
+
+**Why:** The NA type is different, so relying on them having the same value is bad practice.
+
+**How to apply:** Write a dedicated `_lgl_` helper that checks against `r_globals.na_lgl`. Existing reduce-extremum code still does the reuse; don't copy that pattern.
+1d73133 Document the possible outputs of the elementwise logical helpers
+082b585 Split logical one helpers into elementwise and reduce sections
+140a1f3 Split extremum one helpers into elementwise and reduce sections (#105)
+19dd906 Move the one helpers into one-*.h (#102)
+47fcbd0 Prefix custom doc topic names with `rray-` (#101)
+eebc255 Reorder pkgdown reference sections and fold repeating, rolling, and reversing into indexing
+f7a008f Prefer NA over NaN in min/max (#100)
+d817c27 Add `rray_max()` and `rray_min()` (#99)
+commit 1d7313386aabb2ad82784389639ee587a8a57523
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Thu Oct 1 10:10:50 2026 -0400
+
+    Document the possible outputs of the elementwise logical helpers
+
+ src/one-logical.h | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+commit 082b5850b3922fd7ddea7ac14f433320eb90143d
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Thu Oct 1 10:05:05 2026 -0400
+
+    Split logical one helpers into elementwise and reduce sections
+
+ src/one-logical.h    | 40 ++++++++++++++++++++++++++++++++--------
+ src/reduce-logical.c |  8 ++++----
+ 2 files changed, 36 insertions(+), 12 deletions(-)
+
+commit 140a1f347701e499d155f6172c0fa55dce744aff
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Thu Oct 1 09:59:44 2026 -0400
+
+    Split extremum one helpers into elementwise and reduce sections (#105)
+
+ src/extremum.c        |  16 ++++----
+ src/one-extremum.h    | 112 +++++++++++++++++++++++++++++++++++++++++++++++---
+ src/reduce-extremum.c |  24 +++++------
+ src/utils.h           |   4 ++
+ 4 files changed, 130 insertions(+), 26 deletions(-)
+
+commit 19dd906cfd7044a0266e7973676824dbcf7ce434
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Thu Oct 1 07:01:23 2026 -0400
+
+    Move the one helpers into one-*.h (#102)
+
+ src/extremum.c        |   1 +
+ src/extremum.h        | 182 ------------------------------------------------
+ src/logical.c         |   1 +
+ src/logical.h         |  29 --------
+ src/one-extremum.h    | 189 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/one-logical.h     |  36 ++++++++++
+ src/reduce-extremum.c |   2 +-
+ src/reduce-logical.c  |   1 +
+ 8 files changed, 229 insertions(+), 212 deletions(-)
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+one-extremum.h
+one-logical.h
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-extremum.c
+reduce-extremum.h
+reduce-extremum.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-prod.c
+reduce-prod.h
+reduce-prod.o</pre><p class="cut">75 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git show 19dd906 140a1f3 082b585 1d73133 -- src/ | he…</summary>
+<pre>cd ~/files/r/packages/rray4; git show 19dd906 140a1f3 082b585 1d73133 -- src/ | head -900</pre><pre class="output">commit 19dd906cfd7044a0266e7973676824dbcf7ce434
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Thu Oct 1 07:01:23 2026 -0400
+
+    Move the one helpers into one-*.h (#102)
+
+diff --git a/src/extremum.c b/src/extremum.c
+index 5fd30a0..ca6ca86 100644
+--- a/src/extremum.c
++++ b/src/extremum.c
+@@ -5,6 +5,7 @@
+ #include &quot;cast.h&quot;
+ #include &quot;dimensionality.h&quot;
+ #include &quot;dimensions.h&quot;
++#include &quot;one-extremum.h&quot;
+ #include &quot;strided-iterator.h&quot;
+ #include &quot;type.h&quot;
+ #include &quot;typeof2.h&quot;
+diff --git a/src/extremum.h b/src/extremum.h
+index aac494d..5770287 100644
+--- a/src/extremum.h
++++ b/src/extremum.h
+@@ -4,7 +4,6 @@
+ #include &quot;rlang.h&quot;
+ 
+ #include &quot;arg.h&quot;
+-#include &quot;missing.h&quot;
+ 
+ r_obj* rray_pmax(
+   r_obj* x,
+@@ -24,185 +23,4 @@ r_obj* rray_pmin(
+   struct r_lazy error_call
+ );
+ 
+-// Each of the &quot;one&quot; functions below is carefully tuned to maximize
+-// the chance of the resulting loop being vectorized by the compiler.
+-// Anecdotally tested on an M2 Mac, where the assembly was analyzed.
+-// For doubles, the double switch is less likely to vectorize but seems
+-// to be the most stable when reducing across different combinations of
+-// axes.
+-
+-// Bitwise `|` improves efficiency here
+-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, `has_na = false`).
+-// - `x = 1`, `y = NA`: returns `NA` (`out = 1`, `has_na = true`).
+-// - `x = NA`, `y = 1`: returns `NA` (`out = 1`, `has_na = true`).
+-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, `has_na = true`).
+-static inline int rray_pmax_int_one(int x, int y) {
+-  const int out = x &lt; y ? y : x;
+-  const int na = r_globals.na_int;
+-  const bool has_na = (x == na) | (y == na);
+-  return has_na ? na : out;
+-}
+-
+-// Integer `NA` is `INT_MIN`
+-// - `x = 1`, `y = 1`: returns `1` (`out = 1`).
+-// - `x = 1`, `y = NA`: returns `1` (`out = 1`).
+-// - `x = NA`, `y = 1`: returns `1` (`out = 1`).
+-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).
+-static inline int rray_pmax_int_one_na_rm(int x, int y) {
+-  return x &lt; y ? y : x;
+-}
+-
+-static inline double rray_pmax_dbl_one(double x, double y) {
+-  switch (rray_dbl_classify(x)) {
+-  case RRAY_DBL_number: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return x &lt; y ? y : x;
+-    case RRAY_DBL_missing:
+-      return y;
+-    case RRAY_DBL_nan:
+-      return y;
+-    }
+-  }
+-  case RRAY_DBL_missing: {
+-    return x;
+-  }
+-  case RRAY_DBL_nan: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return x;
+-    case RRAY_DBL_missing:
+-      return y;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }
+-  }
+-  }
+-  r_stop_unreachable();
+-}
+-
+-static inline double rray_pmax_dbl_one_na_rm(double x, double y) {
+-  switch (rray_dbl_classify(x)) {
+-  case RRAY_DBL_number: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return x &lt; y ? y : x;
+-    case RRAY_DBL_missing:
+-      return x;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }
+-  }
+-  case RRAY_DBL_missing: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return y;
+-    case RRAY_DBL_missing:
+-      return x;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }
+-  }
+-  case RRAY_DBL_nan: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return y;
+-    case RRAY_DBL_missing:
+-      return y;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }
+-  }
+-  }
+-  r_stop_unreachable();
+-}
+-
+-// Integer `NA` is `INT_MIN`
+-// - `x = 1`, `y = 1`: returns `1` (`out = 1`).
+-// - `x = 1`, `y = NA`: returns `NA` (`out = NA`).
+-// - `x = NA`, `y = 1`: returns `NA` (`out = NA`).
+-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`).
+-static inline int rray_pmin_int_one(int x, int y) {
+-  return x &gt; y ? y : x;
+-}
+-
+-// A regular minimum selects `NA`, so each missing operand is replaced by the
+-// other operand:
+-// - `x = 1`, `y = 1`: returns `1` (`out = 1`, neither replacement applies).
+-// - `x = 1`, `y = NA`: returns `1` (`out = NA`, replace `y` with `x`).
+-// - `x = NA`, `y = 1`: returns `1` (`out = NA`, replace `x` with `y`).
+-// - `x = NA`, `y = NA`: returns `NA` (`out = NA`, both replacements are `NA`).
+-static inline int rray_pmin_int_one_na_rm(int x, int y) {
+-  const int na = r_globals.na_int;
+-  int out = x &gt; y ? y : x;
+-  out = y == na ? x : out;
+-  out = x == na ? y : out;
+-  return out;
+-}
+-
+-static inline double rray_pmin_dbl_one(double x, double y) {
+-  switch (rray_dbl_classify(x)) {
+-  case RRAY_DBL_number: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return x &gt; y ? y : x;
+-    case RRAY_DBL_missing:
+-      return y;
+-    case RRAY_DBL_nan:
+-      return y;
+-    }
+-  }
+-  case RRAY_DBL_missing: {
+-    return x;
+-  }
+-  case RRAY_DBL_nan: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return x;
+-    case RRAY_DBL_missing:
+-      return y;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }
+-  }
+-  }
+-  r_stop_unreachable();
+-}
+-
+-static inline double rray_pmin_dbl_one_na_rm(double x, double y) {
+-  switch (rray_dbl_classify(x)) {
+-  case RRAY_DBL_number: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return x &gt; y ? y : x;
+-    case RRAY_DBL_missing:
+-      return x;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }
+-  }
+-  case RRAY_DBL_missing: {
+-    switch (rray_dbl_classify(y)) {
+-    case RRAY_DBL_number:
+-      return y;
+-    case RRAY_DBL_missing:
+-      return x;
+-    case RRAY_DBL_nan:
+-      return x;
+-    }</pre><p class="cut">700 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat src/one-logical.h src/utils.h; cat src/arithmetic…</summary>
+<pre>cd ~/files/r/packages/rray4; cat src/one-logical.h src/utils.h; cat src/arithmetic-add.c src/arithmetic-add.h src/reduce-sum.c src/reduce-sum.h; ls src/decl</pre><pre class="output">#ifndef RRAY_ONE_LOGICAL_H
+#define RRAY_ONE_LOGICAL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// Logical `NA` is `INT_MIN`, so it is never false
+// - `x = 1`, `y = 1`: returns `1` (`any_false = false`, `equal = true`).
+// - `x = 1`, `y = 0`: returns `0` (`any_false = true`).
+// - `x = 1`, `y = NA`: returns `NA` (`any_false = false`, `equal = false`).
+// - `x = 0`, `y = NA`: returns `0` (`any_false = true`).
+// - `x = NA`, `y = NA`: returns `NA` (`any_false = false`, `equal = true`).
+static inline int rray_and_lgl_one(int x, int y) {
+  const bool any_false = !x || !y;
+  const bool equal = x == y;
+  return !any_false * (equal * x + !equal * r_globals.na_lgl);
+}
+
+// Logical `NA` is `INT_MIN`, so it is never `1`
+// - `x = 1`, `y = 0`: returns `1` (`any_true = true`).
+// - `x = 1`, `y = NA`: returns `1` (`any_true = true`).
+// - `x = 0`, `y = 0`: returns `0` (`any_true = false`, `equal = true`).
+// - `x = 0`, `y = NA`: returns `NA` (`any_true = false`, `equal = false`).
+// - `x = NA`, `y = NA`: returns `NA` (`any_true = false`, `equal = true`).
+static inline int rray_or_lgl_one(int x, int y) {
+  const bool any_true = (x == 1) || (y == 1);
+  const bool equal = x == y;
+  return any_true + !any_true * (equal * x + !equal * r_globals.na_lgl);
+}
+
+// Bitwise `|` improves efficiency here
+// - `x = 1`, `y = 0`: returns `1` (`elt = 1`, `missing = false`).
+// - `x = 1`, `y = 1`: returns `0` (`elt = 0`, `missing = false`).
+// - `x = 1`, `y = NA`: returns `NA` (`elt = 1`, `missing = true`).
+// - `x = NA`, `y = NA`: returns `NA` (`elt = 0`, `missing = true`).
+static inline int rray_xor_lgl_one(int x, int y) {
+  const bool missing =
+    bool_bitwise_or(rray_lgl_is_missing(x), rray_lgl_is_missing(y));
+  const int elt = x != y;
+  return missing ? r_globals.na_lgl : elt;
+}
+
+// --------------------------------------------------------------------------
+// Reduce
+
+static inline int rray_all_lgl_one(int out, int x) {
+  return rray_and_lgl_one(out, x);
+}
+
+// Logical `NA` is `INT_MIN`, and `out` is never `NA`
+// - `out = 1`, `x = 1`: returns `1`.
+// - `out = 1`, `x = 0`: returns `0`.
+// - `out = 1`, `x = NA`: returns `1`.
+// - `out = 0`, `x = 1`: returns `0`.
+static inline int rray_all_lgl_one_na_rm(int out, int x) {
+  return bool_bitwise_and(out, x != 0);
+}
+
+static inline int rray_any_lgl_one(int out, int x) {
+  return rray_or_lgl_one(out, x);
+}
+
+// Logical `NA` is `INT_MIN`, and `out` is never `NA`
+// - `out = 0`, `x = 0`: returns `0`.
+// - `out = 0`, `x = 1`: returns `1`.
+// - `out = 0`, `x = NA`: returns `0`.
+// - `out = 1`, `x = 0`: returns `1`.
+static inline int rray_any_lgl_one_na_rm(int out, int x) {
+  return bool_bitwise_or(out, x == 1);
+}
+
+#endif
+#ifndef RRAY_UTILS_H
+#define RRAY_UTILS_H
+
+#include &lt;complex.h&gt;
+#include &lt;string.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;type.h&quot;
+
+// Operations such as `*`, `/`, and `^` are either more efficient or more
+// correct (around infinities) if they go through the C99 `_Complex`. The C99
+// standard guarantees that `_Complex` has the same representation as a two
+// element array of its real type, so we can `memcpy()` it over. Analysis of
+// the assembly shows that this copy disappears entirely, so it's not a
+// performance hit.
+static inline double _Complex rray_cpl_to_c99(r_complex x) {
+  double _Complex out;
+  memcpy(&amp;out, &amp;x, sizeof(out));
+  return out;
+}
+
+static inline r_complex rray_c99_to_cpl(double _Complex x) {
+  r_complex out;
+  memcpy(&amp;out, &amp;x, sizeof(out));
+  return out;
+}
+
+// In tight loops, the compiler can often vectorize a bitwise `|` better than
+// `||`. Writing `f(x) | g(y)` directly on two `bool` calls triggers clang's
+// `-Wbitwise-instead-of-logical`, so we route it through this helper instead.
+static inline bool bool_bitwise_or(bool x, bool y) {
+  return (int) x | (int) y;
+}
+
+static inline bool bool_bitwise_and(bool x, bool y) {
+  return (int) x &amp; (int) y;
+}
+
+void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_no_return void stop_scalar_input(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+r_obj* vec_as_array(r_obj* x);
+
+r_obj* arg_as_array(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* arg_as_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+int arg_as_int(r_obj* x, struct rray_arg* arg, struct r_lazy error_call);
+
+r_obj* arg_as_non_negative_bare_integer(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+bool r_has_name_at(r_obj* names, r_ssize i);
+
+int int_add_checked(int x, int y);
+
+r_obj* vec_cast(
+  r_obj* x,
+  r_obj* to,
+  struct rray_arg* x_arg,
+  struct rray_arg* to_arg
+);
+
+#endif
+#include &quot;arithmetic-add.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;arithmetic.h&quot;
+#include &quot;binary.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;type.h&quot;
+#include &quot;typeof2.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/arithmetic-add-decl.h&quot;
+
+r_obj* ffi_rray_add(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_add(ffi_x, ffi_y, rray_args.x, rray_args.y, error_call);
+}
+
+r_obj* rray_add(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  return rray_binary_arithmetic(
+    x,
+    y,
+    rray_add_switch,
+    x_arg,
+    y_arg,
+    error_call
+  );
+}
+
+static rray_binary_arithmetic_fn rray_add_switch(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+) {
+  const enum rray_type x_type = rray_typeof(x);
+  const enum rray_type y_type = rray_typeof(y);
+</pre><p class="cut">777 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; cat src/decl/arithmetic-add-decl.h src/decl/reduce-su…</summary>
+<pre>cd ~/files/r/packages/rray4; cat src/decl/arithmetic-add-decl.h src/decl/reduce-sum-decl.h; grep -n &quot;RRAY_BINARY_ARGS\|define RRAY_BINARY\|fn(\|_one(&quot; src/binary.h | head -30; grep -n &quot;define RRAY_REDUCE&quot; -A40 src/reduce.h | head -60; grep -rn &quot;stop_int_overflow&quot; src/*.c src/*.h | head; grep -rn &quot;rray_sum_\|rray_add_&quot; src --include=*.c --include=*.h | grep -v &quot;^src/arithmetic-add.c\|^src/reduce-sum.c\|^src/decl&quot; | head; cat src/missing.h</pre><pre class="output">static rray_binary_arithmetic_fn rray_add_switch(
+  r_obj* x,
+  r_obj* y,
+  struct rray_arg* x_arg,
+  struct rray_arg* y_arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_add_lgl_lgl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_lgl_int(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_int_lgl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_lgl_dbl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_dbl_lgl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_lgl_cpl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_cpl_lgl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_int_int(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_int_dbl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_dbl_int(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_int_cpl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_cpl_int(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_dbl_dbl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_dbl_cpl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_cpl_dbl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+static r_obj* rray_add_cpl_cpl(
+  r_obj* x,
+  r_obj* y,
+  const struct rray_strided_iterator2_plan* plan,
+  struct r_lazy error_call
+);
+
+static inline int rray_add_int_one(int x, int y, struct r_lazy error_call);
+static inline double rray_add_dbl_one(
+  double x,
+  double y,
+  struct r_lazy error_call
+);
+static inline r_complex rray_add_cpl_one(
+  r_complex x,
+  r_complex y,
+  struct r_lazy error_call
+);
+static rray_reduce_fn rray_sum_switch(
+  r_obj* x,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+static r_obj* rray_sum_lgl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_lgl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_int(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_int_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_dbl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_dbl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_cpl(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+static r_obj* rray_sum_cpl_na_rm(
+  r_obj* x,
+  r_ssize out_size,
+  const struct rray_strided_iterator_plan* plan
+);
+
+static inline int rray_sum_lgl_one(int out, int x);
+static inline int rray_sum_lgl_one_na_rm(int out, int x);
+static inline int rray_sum_int_one(int out, int x);
+static inline int rray_sum_int_one_na_rm(int out, int x);
+static inline double rray_sum_dbl_one(double out, double x);
+static inline double rray_sum_dbl_one_na_rm(double out, double x);
+static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x);
+static inline r_complex rray_sum_cpl_one_na_rm(
+  r_complex out,
+  r_complex x
+);
+
+static inline void check_sum_int_overflow(int out, int x);
+2:#define RRAY_BINARY_H
+8:#define RRAY_BINARY_ARGS(...) , __VA_ARGS__
+9:#define RRAY_BINARY_NO_ARGS
+11:#define RRAY_BINARY(                                                           \
+2:#define RRAY_REDUCE_H
+3-
+4-#include &quot;rlang.h&quot;
+5-
+6-#include &quot;arg.h&quot;
+7-#include &quot;strided-iterator.h&quot;
+8-
+9-// --------------------------------------------------------------------------
+10-// rray_reduce
+11-
+12-// Flat reduction is useful when the output element is the only state carried
+13-// between input elements. It walks `x` once in storage order, updating the
+14-// output element that each input contributes to. This is faster than nested
+15-// reduction because it reads `x` linearly and avoids a separate inner traversal
+16-// for each output element.
+17-
+18-typedef r_obj* (*rray_reduce_fn)(
+19-  r_obj* x,
+20-  r_ssize out_size,</pre><p class="cut">106 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git fetch -q origin; git log --oneline origin/main -3…</summary>
+<pre>cd ~/files/r/packages/rray4; git fetch -q origin; git log --oneline origin/main -3; git status -sb | head -2; git branch -a | head -20; sed -n 1,80p src/binary.h; grep -n &quot;Integer overflow\|overflow&quot; -r tests/testthat/*.R tests/testthat/_snaps/*.md | head -20</pre><pre class="output">a6029ec Split logical one helpers into elementwise and reduce sections (#106)
+140a1f3 Split extremum one helpers into elementwise and reduce sections (#105)
+19dd906 Move the one helpers into one-*.h (#102)
+## feature/logical-one...origin/feature/logical-one
+  feature/extremum-one
+* feature/logical-one
+  feature/revert-one
+  main
+  remotes/origin/feature/extremum-one
+  remotes/origin/feature/logical-one
+  remotes/origin/feature/revert-one
+  remotes/origin/gh-pages
+  remotes/origin/main
+#ifndef RRAY_BINARY_H
+#define RRAY_BINARY_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;strided-iterator.h&quot;
+
+#define RRAY_BINARY_ARGS(...) , __VA_ARGS__
+#define RRAY_BINARY_NO_ARGS
+
+#define RRAY_BINARY(                                                           \
+  X_CTYPE,                                                                     \
+  X_CONST_DEREF,                                                               \
+  X_CAST,                                                                      \
+  Y_CTYPE,                                                                     \
+  Y_CONST_DEREF,                                                               \
+  Y_CAST,                                                                      \
+  OUT_RTYPE,                                                                   \
+  OUT_CTYPE,                                                                   \
+  OUT_DEREF,                                                                   \
+  ONE,                                                                         \
+  ONE_ARGS                                                                     \
+)                                                                              \
+  const r_ssize size = rray_strided_iterator2_plan_size(plan);                 \
+                                                                               \
+  r_obj* out = KEEP(r_alloc_vector(OUT_RTYPE, size));                          \
+  OUT_CTYPE* v_out = OUT_DEREF(out);                                           \
+                                                                               \
+  const X_CTYPE* v_x = X_CONST_DEREF(x);                                       \
+  const Y_CTYPE* v_y = Y_CONST_DEREF(y);                                       \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator2_plan_run_size(plan);         \
+                                                                               \
+  r_ssize x_start = 0;                                                         \
+  const r_ssize x_run_stride = rray_strided_iterator2_plan_run_stride1(plan);  \
+                                                                               \
+  r_ssize y_start = 0;                                                         \
+  const r_ssize y_run_stride = rray_strided_iterator2_plan_run_stride2(plan);  \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator2_plan_point_init(plan, v_point);                       \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize x_loc = x_start;                                                   \
+    r_ssize y_loc = y_start;                                                   \
+                                                                               \
+    if (x_run_stride == 0) {                                                   \
+      const X_CTYPE x_elt = v_x[x_loc];                                        \
+      if (y_run_stride == 0) {                                                 \
+        const Y_CTYPE y_elt = v_y[y_loc];                                      \
+        for (r_ssize i = run_start; i &lt; run_end; ++i) {                        \
+          v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);               \
+        }                                                                      \
+      } else {                                                                 \
+        for (r_ssize i = run_start; i &lt; run_end; ++i) {                        \
+          const Y_CTYPE y_elt = v_y[y_loc];                                    \
+          v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);               \
+          y_loc += y_run_stride;                                               \
+        }                                                                      \
+      }                                                                        \
+    } else if (y_run_stride == 0) {                                            \
+      const Y_CTYPE y_elt = v_y[y_loc];                                        \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        x_loc += x_run_stride;                                                 \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        const X_CTYPE x_elt = v_x[x_loc];                                      \
+        const Y_CTYPE y_elt = v_y[y_loc];                                      \
+        v_out[i] = ONE(X_CAST(x_elt), Y_CAST(y_elt) ONE_ARGS);                 \
+        x_loc += x_run_stride;                                                 \
+        y_loc += y_run_stride;                                                 \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+tests/testthat/test-arithmetic-divide.R:230:test_that(&quot;no integer overflow is possible, since the result is a double&quot;, {
+tests/testthat/test-arithmetic-add.R:121:test_that(&quot;missing values win over integer overflow&quot;, {
+tests/testthat/test-arithmetic-add.R:245:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-arithmetic-multiply.R:159:test_that(&quot;missing values win over integer overflow&quot;, {
+tests/testthat/test-arithmetic-multiply.R:241:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-arithmetic-exponentiate.R:204:test_that(&quot;no integer overflow is possible, since the result is a double&quot;, {
+tests/testthat/test-arithmetic-subtract.R:133:test_that(&quot;missing values win over integer overflow&quot;, {
+tests/testthat/test-arithmetic-subtract.R:215:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-reduce-mean.R:104:test_that(&quot;a sum that overflows to infinity is retried with scaled terms&quot;, {
+tests/testthat/test-reduce-sum.R:318:test_that(&quot;errors on integer overflow&quot;, {
+tests/testthat/test-reduce-sum.R:328:test_that(&quot;errors on integer overflow with `na_rm = TRUE`&quot;, {
+tests/testthat/_snaps/arithmetic-add.md:80:# errors on integer overflow
+tests/testthat/_snaps/arithmetic-add.md:86:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-add.md:94:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-multiply.md:80:# errors on integer overflow
+tests/testthat/_snaps/arithmetic-multiply.md:86:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-multiply.md:94:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-multiply.md:102:      ! Integer overflow.
+tests/testthat/_snaps/arithmetic-subtract.md:80:# errors on integer overflow
+tests/testthat/_snaps/arithmetic-subtract.md:86:      ! Integer overflow.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n '/overflow/,/^# /p' tests/testthat/_snaps/redu…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n '/overflow/,/^# /p' tests/testthat/_snaps/reduce-sum.md; sed -n 240,260p tests/testthat/test-arithmetic-add.R; sed -n 80,100p tests/testthat/_snaps/arithmetic-add.md; sed -n 80,95p src/arithmetic.c; grep -n &quot;include&quot; src/extremum.c src/reduce-extremum.c src/arithmetic.h</pre><pre class="output"># errors on integer overflow
+
+    Code
+      rray_sum(x, 1L)
+    Condition
+      Error in `rray_sum()`:
+      ! Integer overflow.
+
+# errors on integer underflow
+      ! Integer overflow.
+
+# errors on integer overflow with `na_rm = TRUE`
+      ! Integer overflow.
+
+# `na_rm` must be `TRUE` or `FALSE`
+  x &lt;- array(&quot;a&quot;, c(2L, 2L))
+  y &lt;- array(&quot;b&quot;, c(3L, 3L))
+  expect_snapshot(rray_add(x, y), error = TRUE)
+})
+
+test_that(&quot;errors on integer overflow&quot;, {
+  expect_snapshot(rray_add(.Machine$integer.max, 1L), error = TRUE)
+})
+
+test_that(&quot;errors on integer underflow&quot;, {
+  expect_snapshot(rray_add(-.Machine$integer.max, -1L), error = TRUE)
+})
+
+test_that(&quot;errors on scalar input&quot;, {
+  expect_snapshot(rray_add(NULL, 1L), error = TRUE)
+  expect_snapshot(rray_add(1L, NULL), error = TRUE)
+})
+
+test_that(&quot;errors on classed input&quot;, {
+  x &lt;- structure(array(1:4, c(2L, 2L)), class = &quot;foo&quot;)
+  expect_snapshot(rray_add(x, 1L), error = TRUE)
+# errors on integer overflow
+
+    Code
+      rray_add(.Machine$integer.max, 1L)
+    Condition
+      Error in `rray_add()`:
+      ! Integer overflow.
+
+# errors on integer underflow
+
+    Code
+      rray_add(-.Machine$integer.max, -1L)
+    Condition
+      Error in `rray_add()`:
+      ! Integer overflow.
+
+# errors on scalar input
+
+    Code
+      rray_add(NULL, 1L)
+    Condition
+    error_call,
+    &quot;Can't apply `%s` to %s and %s.&quot;,
+    op,
+    rray_arg_type_format(x_arg, rray_typeof(x)),
+    rray_arg_type_format(y_arg, rray_typeof(y))
+  );
+}
+
+r_no_return void stop_int_overflow(struct r_lazy error_call) {
+  r_abort_lazy_call(error_call, &quot;Integer overflow.&quot;);
+}
+src/arithmetic.h:4:#include &quot;rlang.h&quot;
+src/arithmetic.h:6:#include &quot;arg.h&quot;
+src/arithmetic.h:7:#include &quot;strided-iterator.h&quot;
+src/reduce-extremum.c:1:#include &quot;reduce-extremum.h&quot;
+src/reduce-extremum.c:3:#include &lt;limits.h&gt;
+src/reduce-extremum.c:4:#include &lt;math.h&gt;
+src/reduce-extremum.c:6:#include &quot;one-extremum.h&quot;
+src/reduce-extremum.c:7:#include &quot;reduce.h&quot;
+src/reduce-extremum.c:8:#include &quot;type.h&quot;
+src/reduce-extremum.c:9:#include &quot;utils.h&quot;
+src/reduce-extremum.c:11:#include &quot;decl/reduce-extremum-decl.h&quot;
+src/extremum.c:1:#include &quot;extremum.h&quot;
+src/extremum.c:3:#include &quot;binary.h&quot;
+src/extremum.c:4:#include &quot;broadcast-names.h&quot;
+src/extremum.c:5:#include &quot;cast.h&quot;
+src/extremum.c:6:#include &quot;dimensionality.h&quot;
+src/extremum.c:7:#include &quot;dimensions.h&quot;
+src/extremum.c:8:#include &quot;one-extremum.h&quot;
+src/extremum.c:9:#include &quot;strided-iterator.h&quot;
+src/extremum.c:10:#include &quot;type.h&quot;
+src/extremum.c:11:#include &quot;typeof2.h&quot;
+src/extremum.c:12:#include &quot;utils.h&quot;
+src/extremum.c:19:#include &quot;decl/extremum-decl.h&quot;</pre></details>
+<p>I've read both earlier PRs and the add and sum kernels. A few decisions are yours before I write <code>one-add.h</code>.</p>
+
+<details class="tool"><summary>Question: `main` already has the logical PR merged (#106). Can I create `feature/add-one` off `orig…</summary>
+<p><code>main</code> already has the logical PR merged (#106). Can I create <code>feature/add-one</code> off <code>origin/main</code> for this?</p>
+<ul>
+<li>feature/add-one off main (Recommended)</li>
+<li>Different name</li>
+</ul>
+<p>The elementwise <code>rray_add_int_one()</code> raises overflow with <code>stop_int_overflow(error_call)</code>. Sum raises it with a plain <code>r_abort()</code> (no error_call, since <code>RRAY_REDUCE</code> has no args slot). How should the shared header handle this?</p>
+<ul>
+<li>Share a predicate (Recommended)</li>
+<li>Keep them separate</li>
+</ul>
+<p>Sum's double/complex kernels make NA win over NaN, while add uses plain <code>+</code>. Per the extremum rule, sum only calls its add twin when they are exactly the same. What should I do with <code>rray_sum_dbl_one()</code>?</p>
+<ul>
+<li>Keep NA-over-NaN (Recommended)</li>
+<li>Switch sum to plain <code>+</code></li>
+</ul>
+<p>The logical and extremum PRs added short case-table comments (<code>- x = 1, y = NA: returns NA</code>) above the less obvious helpers. Should I write those for the add/sum helpers too?</p>
+<ul>
+<li>Yes, match those PRs (Recommended)</li>
+<li>No new comments</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;`main` already has the logical PR merged (#106). Can I create `feature/add-one` off `origin/main` for this?&quot;=&quot;feature/add-one off main (Recommended)&quot;, &quot;The elementwise `rray_add_int_one()` raises overflow with `stop_int_overflow(error_call)`. Sum raises it with a plain `r_abort()` (no error_call, since `RRAY_REDUCE` has no args slot). How should the shared header handle this?&quot;=&quot;Keep them separate&quot;, &quot;Sum's double/complex kernels make NA win over NaN, while add uses plain `+`. Per the extremum rule, sum only calls its add twin when they are exactly the same. What should I do with `rray_sum_dbl_one()`?&quot;=&quot;Switch sum to plain `+`&quot;, &quot;The logical and extremum PRs added short case-table comments (`- x = 1, y = NA: returns NA`) above the less obvious helpers. Should I write those for the add/sum helpers too?&quot;=&quot;Yes, match those PRs (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git checkout -q -b feature/add-one origin/main &amp;&amp; git…</summary>
+<pre>cd ~/files/r/packages/rray4; git checkout -q -b feature/add-one origin/main &amp;&amp; git status -sb | head -1; grep -rn &quot;RRAY_BINARY_NO_ARGS&quot; src/*.c | head; grep -rn &quot;_one(&quot; src/arithmetic-*.c | grep &quot;static inline&quot; ; grep -rln &quot;rray_sum\b\|rray_sum(&quot; src/*.c; grep -n &quot;r_lazy_null&quot; src/rlang/*.h | head -3</pre><pre class="output">## feature/add-one...origin/main
+src/compare.c:322:      RRAY_BINARY_NO_ARGS                                                      \
+src/compare.c:337:      RRAY_BINARY_NO_ARGS                                                      \
+src/compare.c:352:      RRAY_BINARY_NO_ARGS                                                      \
+src/compare.c:367:      RRAY_BINARY_NO_ARGS                                                      \
+src/equal.c:249:      RRAY_BINARY_NO_ARGS                                                      \
+src/equal.c:263:      RRAY_BINARY_NO_ARGS                                                      \
+src/extremum.c:317:      RRAY_BINARY_NO_ARGS                                                      \
+src/extremum.c:331:      RRAY_BINARY_NO_ARGS                                                      \
+src/logical.c:145:      RRAY_BINARY_NO_ARGS
+src/logical.c:160:      RRAY_BINARY_NO_ARGS
+src/arithmetic-exponentiate.c:296:static inline double rray_exponentiate_dbl_one(
+src/arithmetic-add.c:444:static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+src/arithmetic-add.c:456:static inline double rray_add_dbl_one(
+src/arithmetic-add.c:464:static inline r_complex rray_add_cpl_one(
+src/arithmetic-multiply.c:450:static inline int rray_multiply_int_one(
+src/arithmetic-multiply.c:469:static inline double rray_multiply_dbl_one(
+src/arithmetic-multiply.c:480:static inline r_complex rray_multiply_cpl_one(
+src/arithmetic-divide.c:448:static inline double rray_divide_dbl_one(
+src/arithmetic-divide.c:456:static inline r_complex rray_divide_cpl_one(
+src/arithmetic-subtract.c:450:static inline int rray_subtract_int_one(
+src/arithmetic-subtract.c:466:static inline double rray_subtract_dbl_one(
+src/arithmetic-subtract.c:474:static inline r_complex rray_subtract_cpl_one(
+src/init.c
+src/reduce-sum.c
+src/rlang/eval.h:204:extern struct r_lazy r_lazy_null;</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -n &quot;NaN&quot; tests/testthat/test-reduce-sum.R R/redu…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -n &quot;NaN&quot; tests/testthat/test-reduce-sum.R R/reduce-sum.R R/*.R | head -30; grep -n &quot;NaN&quot; -B3 -A12 tests/testthat/test-arithmetic-add.R | head -60</pre><pre class="output">ugrep: warning: R/reduce-sum.R: No such file or directory
+tests/testthat/test-reduce-sum.R:103:test_that(&quot;double NA / NaN propagates&quot;, {
+tests/testthat/test-reduce-sum.R:110:  x &lt;- c(1, NaN)
+tests/testthat/test-reduce-sum.R:111:  expect_identical(as.vector(rray_sum(x, 1L)), NaN)
+tests/testthat/test-reduce-sum.R:113:  x &lt;- c(NaN, 1)
+tests/testthat/test-reduce-sum.R:114:  expect_identical(as.vector(rray_sum(x, 1L)), NaN)
+tests/testthat/test-reduce-sum.R:116:  x &lt;- c(NA, NaN)
+tests/testthat/test-reduce-sum.R:119:  x &lt;- c(NaN, NA)
+tests/testthat/test-reduce-sum.R:145:    as.vector(rray_sum(c(Inf, NaN), 1L)),
+tests/testthat/test-reduce-sum.R:146:    sum(Inf, NaN)
+tests/testthat/test-reduce-sum.R:149:    as.vector(rray_sum(c(-Inf, NaN), 1L)),
+tests/testthat/test-reduce-sum.R:150:    sum(-Inf, NaN)
+tests/testthat/test-reduce-sum.R:157:    as.vector(rray_sum(c(Inf, -Inf, NaN), 1L)),
+tests/testthat/test-reduce-sum.R:158:    sum(Inf, -Inf, NaN)
+tests/testthat/test-reduce-sum.R:172:  x &lt;- c(complex(real = 1, imaginary = NaN), 1 + 1i)
+tests/testthat/test-reduce-sum.R:175:  expect_identical(Im(out), NaN)
+tests/testthat/test-reduce-sum.R:192:test_that(&quot;na_rm removes double NA and NaN&quot;, {
+tests/testthat/test-reduce-sum.R:196:  x &lt;- c(1, NaN, 3)
+tests/testthat/test-reduce-sum.R:199:  x &lt;- c(NA_real_, NaN)
+tests/testthat/test-reduce-sum.R:214:  x &lt;- c(complex(real = 1, imaginary = NaN), 1 + 1i)
+R/extremum.R:12:#' When `NA` and `NaN` are both present, `NA` wins, like [rray_max()],
+R/extremum.R:17:#' rray_pmax(NA, NaN) # NA
+R/extremum.R:18:#' rray_pmax(NaN, NA) # NA
+R/extremum.R:20:#' pmax(NA, NaN) # NaN
+R/reduce.R:42:#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+R/reduce.R:45:#' rray_max(c(NA, NaN), 1L) # NA
+R/reduce.R:46:#' rray_max(c(NaN, NA), 1L) # NA
+99-test_that(&quot;double missing values propagate&quot;, {
+100-  expect_identical(rray_add(NA_real_, 1), array(NA_real_, 1L))
+101-  expect_identical(rray_add(1, NA_real_), array(NA_real_, 1L))
+102:  expect_identical(rray_add(NaN, 1), array(NaN, 1L))
+103:  expect_identical(rray_add(1, NaN), array(NaN, 1L))
+104-})
+105-
+106-test_that(&quot;complex missing values propagate&quot;, {
+107-  expect_identical(rray_add(NA_complex_, 1 + 1i), array(NA_complex_, 1L))
+108-
+109:  out &lt;- as.vector(rray_add(complex(real = 1, imaginary = NaN), 1 + 1i))
+110-  expect_identical(Re(out), 2)
+111:  expect_identical(Im(out), NaN)
+112-})
+113-
+114-test_that(&quot;infinities match base R&quot;, {
+115-  expect_identical(as.vector(rray_add(Inf, 1)), Inf + 1)
+116-  expect_identical(as.vector(rray_add(Inf, -Inf)), Inf + -Inf)
+117-  expect_identical(as.vector(rray_add(Inf, NA_real_)), Inf + NA_real_)
+118:  expect_identical(as.vector(rray_add(Inf, NaN)), Inf + NaN)
+119-})
+120-
+121-test_that(&quot;missing values win over integer overflow&quot;, {
+122-  expect_identical(
+123-    rray_add(NA_integer_, .Machine$integer.max),
+124-    array(NA_integer_, 1L)
+125-  )
+126-})
+127-
+128-test_that(&quot;broadcasting carries through alternating singleton axes&quot;, {
+129-  x &lt;- array(1:6, c(2L, 1L, 3L, 1L))
+130-  y &lt;- array(as.double(11:18), c(1L, 4L, 1L, 2L))</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; sed -n 95,190p tests/testthat/test-reduce-sum.R; grep…</summary>
+<pre>cd ~/files/r/packages/rray4; sed -n 95,190p tests/testthat/test-reduce-sum.R; grep -n &quot;NA\b\|NaN\|missing&quot; R/reduce.R | sed -n 1,40p</pre><pre class="output">test_that(&quot;integer NA propagates&quot;, {
+  x &lt;- array(c(1L, NA_integer_), c(2L, 1L))
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_integer_)
+
+  x &lt;- array(c(NA_integer_, 1L), c(2L, 1L))
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_integer_)
+})
+
+test_that(&quot;double NA / NaN propagates&quot;, {
+  x &lt;- c(1, NA_real_)
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_real_)
+
+  x &lt;- c(NA_real_, 1)
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_real_)
+
+  x &lt;- c(1, NaN)
+  expect_identical(as.vector(rray_sum(x, 1L)), NaN)
+
+  x &lt;- c(NaN, 1)
+  expect_identical(as.vector(rray_sum(x, 1L)), NaN)
+
+  x &lt;- c(NA, NaN)
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_real_)
+
+  x &lt;- c(NaN, NA)
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_real_)
+})
+
+test_that(&quot;Inf matches base R sum&quot;, {
+  expect_identical(
+    as.vector(rray_sum(c(Inf, 1), 1L)),
+    sum(Inf, 1)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(-Inf, 1), 1L)),
+    sum(-Inf, 1)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(Inf, -Inf), 1L)),
+    sum(Inf, -Inf)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(Inf, NA), 1L)),
+    sum(Inf, NA)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(-Inf, NA), 1L)),
+    sum(-Inf, NA)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(Inf, NaN), 1L)),
+    sum(Inf, NaN)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(-Inf, NaN), 1L)),
+    sum(-Inf, NaN)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(Inf, -Inf, NA), 1L)),
+    sum(Inf, -Inf, NA)
+  )
+  expect_identical(
+    as.vector(rray_sum(c(Inf, -Inf, NaN), 1L)),
+    sum(Inf, -Inf, NaN)
+  )
+})
+
+test_that(&quot;complex sum works&quot;, {
+  x &lt;- array(c(1 + 2i, 3 + 4i, 5 + 6i, 7 + 8i), c(2L, 2L))
+  expect_identical(as.vector(rray_sum(x, 1L)), c(4 + 6i, 12 + 14i))
+  expect_identical(as.vector(rray_sum(x, 2L)), c(6 + 8i, 10 + 12i))
+})
+
+test_that(&quot;complex NA propagates independently per component&quot;, {
+  x &lt;- c(1 + 2i, NA_complex_)
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_complex_)
+
+  x &lt;- c(complex(real = 1, imaginary = NaN), 1 + 1i)
+  out &lt;- as.vector(rray_sum(x, 1L))
+  expect_identical(Re(out), 2)
+  expect_identical(Im(out), NaN)
+})
+
+test_that(&quot;logical NA propagates&quot;, {
+  x &lt;- array(c(TRUE, NA), c(2L, 1L))
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_integer_)
+
+  x &lt;- array(c(NA, TRUE), c(2L, 1L))
+  expect_identical(as.vector(rray_sum(x, 1L)), NA_integer_)
+})
+
+test_that(&quot;na_rm removes integer NA&quot;, {
+  x &lt;- array(c(1L, NA_integer_, 3L, 4L), c(2L, 2L))
+  out &lt;- rray_sum(x, 1L, na_rm = TRUE)
+  expect_identical(as.vector(out), c(1L, 7L))
+})
+42:#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+45:#' rray_max(c(NA, NaN), 1L) # NA
+46:#' rray_max(c(NaN, NA), 1L) # NA
+56:#' @param na_rm If `TRUE`, missing values are removed before reducing.</pre></details>
+<p>Writing the header now.</p>
+
+<details class="tool"><summary>Write src/one-add.h</summary>
+<pre>#ifndef RRAY_ONE_ADD_H
+#define RRAY_ONE_ADD_H
+
+#include &quot;rlang.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;arithmetic.h&quot;
+#include &quot;missing.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// Integer `NA` wins over overflow
+// - `x = 1`, `y = 1`: returns `2`.
+// - `x = 1`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = INT_MAX`: returns `NA`.
+// - `x = 1`, `y = INT_MAX`: errors.
+static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+    stop_int_overflow(error_call);
+  }
+
+  return x + y;
+}
+
+static inline double rray_add_dbl_one(double x, double y) {
+  return x + y;
+}
+
+static inline r_complex rray_add_cpl_one(r_complex x, r_complex y) {
+  return (r_complex){.r = x.r + y.r, .i = x.i + y.i};
+}
+
+// --------------------------------------------------------------------------
+// Reduce
+
+// `out` is an integer, `x` is a logical
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `NA`.
+// - `out = NA`, `x = 1`: returns `NA`.
+static inline int rray_sum_lgl_one(int out, int x) {
+  if (rray_int_is_missing(out)) {
+    return r_globals.na_int;
+  }
+
+  if (rray_lgl_is_missing(x)) {
+    return r_globals.na_int;
+  }
+
+  // Since long vectors aren't supported in arrays,
+  // we can't ever integer overflow in a logical array
+
+  return out + x;
+}
+
+// `out` is an integer that is never `NA`, `x` is a logical
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `1`.
+static inline int rray_sum_lgl_one_na_rm(int out, int x) {
+  if (rray_lgl_is_missing(x)) {
+    return out;
+  }
+
+  return out + x;
+}
+
+static inline void check_sum_int_overflow(int out, int x) {
+  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {
+    r_abort(&quot;Integer overflow.&quot;);
+  }
+}
+
+// Integer `NA` wins over overflow
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `NA`.
+// - `out = NA`, `x = INT_MAX`: returns `NA`.
+// - `out = 1`, `x = INT_MAX`: errors.
+static inline int rray_sum_int_one(int out, int x) {
+  if (rray_int_is_missing(out)) {
+    return r_globals.na_int;
+  }
+
+  if (rray_int_is_missing(x)) {
+    return r_globals.na_int;
+  }
+
+  check_sum_int_overflow(out, x);
+
+  return out + x;
+}
+
+// `out` is never `NA`
+// - `out = 1`, `x = 1`: returns `2`.
+// - `out = 1`, `x = NA`: returns `1`.
+// - `out = 1`, `x = INT_MAX`: errors.
+static inline int rray_sum_int_one_na_rm(int out, int x) {
+  if (rray_int_is_missing(x)) {
+    return out;
+  }
+
+  check_sum_int_overflow(out, x);
+
+  return out + x;
+}
+
+static inline double rray_sum_dbl_one(double out, double x) {
+  return rray_add_dbl_one(out, x);
+}
+
+// `out` is never missing
+// - `out = 1`, `x = 2`: returns `3`.
+// - `out = 1`, `x = NA`: returns `1`.
+// - `out = 1`, `x = NaN`: returns `1`.
+static inline double rray_sum_dbl_one_na_rm(double out, double x) {
+  if (rray_dbl_is_missing(x)) {
+    return out;
+  }
+
+  return out + x;
+}
+
+static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x) {
+  return rray_add_cpl_one(out, x);
+}
+
+// Each part is removed on its own
+// - `out = 1+1i`, `x = 2+2i`: returns `3+3i`.
+// - `out = 1+1i`, `x = NA`: returns `1+1i`.
+// - `out = 1+1i`, `x = complex(real = 2, imaginary = NaN)`: returns `3+1i`.
+static inline r_complex rray_sum_cpl_one_na_rm(r_complex out, r_complex x) {
+  return (r_complex){
+    .r = rray_sum_dbl_one_na_rm(out.r, x.r),
+    .i = rray_sum_dbl_one_na_rm(out.i, x.i),
+  };
+}
+
+#endif</pre><pre class="output">File created successfully at: ~/files/r/packages/rray4/src/one-add.h (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray4; python3 - &lt;&lt;'EOF'</summary>
+<pre>cd ~/files/r/packages/rray4; python3 - &lt;&lt;'EOF'
+import re
+p='src/arithmetic-add.c'
+s=open(p).read()
+s=s[:s.index('static inline int rray_add_int_one')].rstrip()+&quot;\n&quot;
+s=s.replace('#include &lt;limits.h&gt;\n\n','')
+s=s.replace('#include &quot;cast.h&quot;\n','#include &quot;cast.h&quot;\n#include &quot;one-add.h&quot;\n')
+for f in ['rray_add_dbl_one','rray_add_cpl_one']:
+    s=s.replace(f+',\n    RRAY_BINARY_ARGS(error_call)', f+',\n    RRAY_BINARY_NO_ARGS')
+open(p,'w').write(s)
+p='src/decl/arithmetic-add-decl.h'
+s=open(p).read()
+s=s[:s.index('\nstatic inline int rray_add_int_one')].rstrip()+&quot;\n&quot;
+open(p,'w').write(s)
+p='src/reduce-sum.c'
+s=open(p).read()
+s=s[:s.index('static inline int rray_sum_lgl_one')].rstrip()+&quot;\n&quot;
+s=s.replace('#include &lt;limits.h&gt;\n\n','')
+s=s.replace('#include &quot;reduce.h&quot;\n','#include &quot;one-add.h&quot;\n#include &quot;reduce.h&quot;\n')
+open(p,'w').write(s)
+p='src/decl/reduce-sum-decl.h'
+s=open(p).read()
+s=s[:s.index('\nstatic inline int rray_sum_lgl_one')].rstrip()+&quot;\n&quot;
+open(p,'w').write(s)
+EOF
+git diff --stat; head -12 src/arithmetic-add.c src/reduce-sum.c; grep -c &quot;RRAY_BINARY_NO_ARGS&quot; src/arithmetic-add.c; tail -5 src/decl/*sum-decl.h src/decl/arithmetic-add-decl.h</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>I'll make the edits with the Edit tool instead.</p>
+
+<details class="tool"><summary>Read src/arithmetic-add.c</summary>
+<pre class="output">1	#include &quot;arithmetic-add.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	
+5	#include &quot;arithmetic.h&quot;
+6	#include &quot;binary.h&quot;
+7	#include &quot;cast.h&quot;
+8	#include &quot;type.h&quot;
+9	#include &quot;typeof2.h&quot;
+10	#include &quot;utils.h&quot;
+11	
+12	#include &quot;decl/arithmetic-add-decl.h&quot;</pre></details>
+<details class="tool"><summary>Read src/arithmetic-add.c</summary>
+<pre class="output">425	  r_obj* y,
+426	  const struct rray_strided_iterator2_plan* plan,
+427	  struct r_lazy error_call
+428	) {
+429	  RRAY_BINARY(
+430	    r_complex,
+431	    r_cpl_cbegin,
+432	    rray_cast_cpl_to_cpl_one,
+433	    r_complex,
+434	    r_cpl_cbegin,
+435	    rray_cast_cpl_to_cpl_one,
+436	    R_TYPE_complex,
+437	    r_complex,
+438	    r_cpl_begin,
+439	    rray_add_cpl_one,
+440	    RRAY_BINARY_ARGS(error_call)
+441	  );
+442	}
+443	
+444	static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {
+445	  if (x == r_globals.na_int || y == r_globals.na_int) {
+446	    return r_globals.na_int;
+447	  }
+448	
+449	  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {
+450	    stop_int_overflow(error_call);
+451	  }
+452	
+453	  return x + y;
+454	}
+455	
+456	static inline double rray_add_dbl_one(
+457	  double x,
+458	  double y,
+459	  struct r_lazy error_call
+460	) {
+461	  return x + y;
+462	}
+463	
+464	static inline r_complex rray_add_cpl_one(
+465	  r_complex x,
+466	  r_complex y,
+467	  struct r_lazy error_call
+468	) {
+469	  return (r_complex){.r = x.r + y.r, .i = x.i + y.i};
+470	}
+471	</pre></details>
+<details class="tool"><summary>Read src/reduce-sum.c</summary>
+<pre class="output">1	#include &quot;reduce-sum.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	
+5	#include &quot;reduce.h&quot;
+6	#include &quot;type.h&quot;
+7	#include &quot;utils.h&quot;
+8	
+9	#include &quot;decl/reduce-sum-decl.h&quot;
+10	</pre></details>
+<details class="tool"><summary>Read src/decl/arithmetic-add-decl.h</summary>
+<pre class="output">100	  r_obj* x,
+101	  r_obj* y,
+102	  const struct rray_strided_iterator2_plan* plan,
+103	  struct r_lazy error_call
+104	);
+105	
+106	static inline int rray_add_int_one(int x, int y, struct r_lazy error_call);
+107	static inline double rray_add_dbl_one(
+108	  double x,
+109	  double y,
+110	  struct r_lazy error_call
+111	);
+112	static inline r_complex rray_add_cpl_one(
+113	  r_complex x,
+114	  r_complex y,
+115	  struct r_lazy error_call
+116	);
+117	</pre></details>
+<details class="tool"><summary>Read src/decl/reduce-sum-decl.h</summary>
+<pre class="output">48	
+49	static inline int rray_sum_lgl_one(int out, int x);
+50	static inline int rray_sum_lgl_one_na_rm(int out, int x);
+51	static inline int rray_sum_int_one(int out, int x);
+52	static inline int rray_sum_int_one_na_rm(int out, int x);
+53	static inline double rray_sum_dbl_one(double out, double x);
+54	static inline double rray_sum_dbl_one_na_rm(double out, double x);
+55	static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x);
+56	static inline r_complex rray_sum_cpl_one_na_rm(
+57	  r_complex out,
+58	  r_complex x
+59	);
+60	
+61	static inline void check_sum_int_overflow(int out, int x);
+62	</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-add.c</summary>
+<pre class="diff"><span class="del">-    RRAY_BINARY_ARGS(error_call)</span>
+<span class="del">-  );</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_add_int_one(int x, int y, struct r_lazy error_call) {</span>
+<span class="del">-  if (x == r_globals.na_int || y == r_globals.na_int) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  if ((y &gt; 0 &amp;&amp; x &gt; INT_MAX - y) || (y &lt; 0 &amp;&amp; x &lt; -INT_MAX - y)) {</span>
+<span class="del">-    stop_int_overflow(error_call);</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return x + y;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline double rray_add_dbl_one(</span>
+<span class="del">-  double x,</span>
+<span class="del">-  double y,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-) {</span>
+<span class="del">-  return x + y;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline r_complex rray_add_cpl_one(</span>
+<span class="del">-  r_complex x,</span>
+<span class="del">-  r_complex y,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-) {</span>
+<span class="del">-  return (r_complex){.r = x.r + y.r, .i = x.i + y.i};</span>
+<span class="del">-}</span>
+<span class="ins">+    RRAY_BINARY_ARGS(error_call)</span>
+<span class="ins">+  );</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/arithmetic-add.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-add.c</summary>
+<pre class="diff"><span class="del">-#include &lt;limits.h&gt;</span>
+<span class="del">-</span>
+<span class="del">-#include &quot;arithmetic.h&quot;</span>
+<span class="del">-#include &quot;binary.h&quot;</span>
+<span class="del">-#include &quot;cast.h&quot;</span>
+<span class="ins">+#include &quot;arithmetic.h&quot;</span>
+<span class="ins">+#include &quot;binary.h&quot;</span>
+<span class="ins">+#include &quot;cast.h&quot;</span>
+<span class="ins">+#include &quot;one-add.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/arithmetic-add.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-add.c</summary>
+<pre class="diff"><span class="del">-    rray_add_dbl_one,</span>
+<span class="del">-    RRAY_BINARY_ARGS(error_call)</span>
+<span class="ins">+    rray_add_dbl_one,</span>
+<span class="ins">+    RRAY_BINARY_NO_ARGS</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/arithmetic-add.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/arithmetic-add.c</summary>
+<pre class="diff"><span class="del">-    rray_add_cpl_one,</span>
+<span class="del">-    RRAY_BINARY_ARGS(error_call)</span>
+<span class="ins">+    rray_add_cpl_one,</span>
+<span class="ins">+    RRAY_BINARY_NO_ARGS</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/arithmetic-add.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-#include &lt;limits.h&gt;</span>
+<span class="del">-</span>
+<span class="del">-#include &quot;reduce.h&quot;</span>
+<span class="ins">+#include &quot;one-add.h&quot;</span>
+<span class="ins">+#include &quot;reduce.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/decl/arithmetic-add-decl.h</summary>
+<pre class="diff"><span class="del">-);</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_add_int_one(int x, int y, struct r_lazy error_call);</span>
+<span class="del">-static inline double rray_add_dbl_one(</span>
+<span class="del">-  double x,</span>
+<span class="del">-  double y,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-);</span>
+<span class="del">-static inline r_complex rray_add_cpl_one(</span>
+<span class="del">-  r_complex x,</span>
+<span class="del">-  r_complex y,</span>
+<span class="del">-  struct r_lazy error_call</span>
+<span class="del">-);</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/arithmetic-add-decl.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/decl/reduce-sum-decl.h</summary>
+<pre class="diff"><span class="del">-);</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_sum_lgl_one(int out, int x);</span>
+<span class="del">-static inline int rray_sum_lgl_one_na_rm(int out, int x);</span>
+<span class="del">-static inline int rray_sum_int_one(int out, int x);</span>
+<span class="del">-static inline int rray_sum_int_one_na_rm(int out, int x);</span>
+<span class="del">-static inline double rray_sum_dbl_one(double out, double x);</span>
+<span class="del">-static inline double rray_sum_dbl_one_na_rm(double out, double x);</span>
+<span class="del">-static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x);</span>
+<span class="del">-static inline r_complex rray_sum_cpl_one_na_rm(</span>
+<span class="del">-  r_complex out,</span>
+<span class="del">-  r_complex x</span>
+<span class="del">-);</span>
+<span class="del">-</span>
+<span class="del">-static inline void check_sum_int_overflow(int out, int x);</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/reduce-sum-decl.h has been updated successfully.</pre></details>
+<p>Now removing the old sum kernels from <code>reduce-sum.c</code>.</p>
+
+<details class="tool"><summary>Read src/reduce-sum.c</summary>
+<pre class="output">170	
+171	static r_obj* rray_sum_cpl_na_rm(
+172	  r_obj* x,
+173	  r_ssize out_size,
+174	  const struct rray_strided_iterator_plan* plan
+175	) {
+176	  RRAY_REDUCE(
+177	    r_complex,
+178	    r_cpl_cbegin,
+179	    R_TYPE_complex,
+180	    r_complex,
+181	    r_cpl_begin,
+182	    ((r_complex){.r = 0, .i = 0}),
+183	    rray_sum_cpl_one_na_rm
+184	  );
+185	}
+186	
+187	static inline int rray_sum_lgl_one(int out, int x) {
+188	  if (out == r_globals.na_int) {
+189	    return r_globals.na_int;
+190	  }
+191	
+192	  if (x == r_globals.na_lgl) {
+193	    return r_globals.na_int;
+194	  }
+195	
+196	  // Since long vectors aren't supported in arrays,
+197	  // we can't ever integer overflow in a logical array
+198	
+199	  return out + x;
+200	}
+201	
+202	static inline int rray_sum_lgl_one_na_rm(int out, int x) {
+203	  if (x == r_globals.na_lgl) {
+204	    return out;
+205	  }
+206	
+207	  return out + x;
+208	}
+209	
+210	static inline int rray_sum_int_one(int out, int x) {
+211	  if (out == r_globals.na_int) {
+212	    return r_globals.na_int;
+213	  }
+214	
+215	  if (x == r_globals.na_int) {
+216	    return r_globals.na_int;
+217	  }
+218	
+219	  check_sum_int_overflow(out, x);
+220	
+221	  return out + x;
+222	}
+223	
+224	static inline int rray_sum_int_one_na_rm(int out, int x) {
+225	  if (x == r_globals.na_int) {
+226	    return out;
+227	  }
+228	
+229	  check_sum_int_overflow(out, x);
+230	
+231	  return out + x;
+232	}
+233	
+234	static inline double rray_sum_dbl_one(double out, double x) {
+235	  if (ISNAN(out) || ISNAN(x)) {
+236	    if (R_IsNA(out) || R_IsNA(x)) {
+237	      // `NA` wins over numbers and `NaN`
+238	      return r_globals.na_dbl;
+239	    } else {
+240	      // `NaN` wins over numbers
+241	      return R_NaN;
+242	    }
+243	  } else {
+244	    return out + x;
+245	  }
+246	}
+247	
+248	static inline double rray_sum_dbl_one_na_rm(double out, double x) {
+249	  if (ISNAN(x)) {
+250	    return out;
+251	  }
+252	
+253	  return out + x;
+254	}
+255	
+256	static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x) {
+257	  return (r_complex){
+258	    .r = rray_sum_dbl_one(out.r, x.r),
+259	    .i = rray_sum_dbl_one(out.i, x.i),
+260	  };
+261	}
+262	
+263	static inline r_complex rray_sum_cpl_one_na_rm(r_complex out, r_complex x) {
+264	  return (r_complex){
+265	    .r = rray_sum_dbl_one_na_rm(out.r, x.r),
+266	    .i = rray_sum_dbl_one_na_rm(out.i, x.i),
+267	  };
+268	}
+269	
+270	static inline void check_sum_int_overflow(int out, int x) {
+271	  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {
+272	    r_abort(&quot;Integer overflow.&quot;);
+273	  }
+274	}
+275	</pre></details>
+<details class="tool"><summary>Edit src/reduce-sum.c</summary>
+<pre class="diff"><span class="del">-    rray_sum_cpl_one_na_rm</span>
+<span class="del">-  );</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_sum_lgl_one(int out, int x) {</span>
+<span class="del">-  if (out == r_globals.na_int) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  if (x == r_globals.na_lgl) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  // Since long vectors aren't supported in arrays,</span>
+<span class="del">-  // we can't ever integer overflow in a logical array</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_sum_lgl_one_na_rm(int out, int x) {</span>
+<span class="del">-  if (x == r_globals.na_lgl) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_sum_int_one(int out, int x) {</span>
+<span class="del">-  if (out == r_globals.na_int) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  if (x == r_globals.na_int) {</span>
+<span class="del">-    return r_globals.na_int;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  check_sum_int_overflow(out, x);</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline int rray_sum_int_one_na_rm(int out, int x) {</span>
+<span class="del">-  if (x == r_globals.na_int) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  check_sum_int_overflow(out, x);</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline double rray_sum_dbl_one(double out, double x) {</span>
+<span class="del">-  if (ISNAN(out) || ISNAN(x)) {</span>
+<span class="del">-    if (R_IsNA(out) || R_IsNA(x)) {</span>
+<span class="del">-      // `NA` wins over numbers and `NaN`</span>
+<span class="del">-      return r_globals.na_dbl;</span>
+<span class="del">-    } else {</span>
+<span class="del">-      // `NaN` wins over numbers</span>
+<span class="del">-      return R_NaN;</span>
+<span class="del">-    }</span>
+<span class="del">-  } else {</span>
+<span class="del">-    return out + x;</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline double rray_sum_dbl_one_na_rm(double out, double x) {</span>
+<span class="del">-  if (ISNAN(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out + x;</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline r_complex rray_sum_cpl_one(r_complex out, r_complex x) {</span>
+<span class="del">-  return (r_complex){</span>
+<span class="del">-    .r = rray_sum_dbl_one(out.r, x.r),</span>
+<span class="del">-    .i = rray_sum_dbl_one(out.i, x.i),</span>
+<span class="del">-  };</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline r_complex rray_sum_cpl_one_na_rm(r_complex out, r_complex x) {</span>
+<span class="del">-  return (r_complex){</span>
+<span class="del">-    .r = rray_sum_dbl_one_na_rm(out.r, x.r),</span>
+<span class="del">-    .i = rray_sum_dbl_one_na_rm(out.i, x.i),</span>
+<span class="del">-  };</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-static inline void check_sum_int_overflow(int out, int x) {</span>
+<span class="del">-  if ((x &gt; 0 &amp;&amp; out &gt; INT_MAX - x) || (x &lt; 0 &amp;&amp; out &lt; -INT_MAX - x)) {</span>
+<span class="del">-    r_abort(&quot;Integer overflow.&quot;);</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="ins">+    rray_sum_cpl_one_na_rm</span>
+<span class="ins">+  );</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/reduce-sum.c has been updated successfully.</pre></details>
+<p>Now the sum test for mixed <code>NA</code>/<code>NaN</code>, then build and test.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -rn &quot;rray_sum&quot; R/*.R | head; grep -n &quot;NaN&quot; man/r…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -rn &quot;rray_sum&quot; R/*.R | head; grep -n &quot;NaN&quot; man/rray_sum*.Rd man/*reduce*.Rd 2&gt;/dev/null | head</pre><pre class="output">R/reduce.R:4:#' - `rray_sum()` computes the sum along the specified `axes`.
+R/reduce.R:67:#' rray_sum(x, 1L)
+R/reduce.R:70:#' rray_sum(x, 2L)
+R/reduce.R:73:#' rray_sum(x, c(1L, 2L))
+R/reduce.R:93:rray_sum &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:95:  .Call(ffi_rray_sum, x, axes, na_rm, environment())
+(eval):1: no matches found: man/rray_sum*.Rd</pre></details>
+<details class="tool"><summary>Read R/reduce.R</summary>
+<pre class="output">30	#'
+31	#' @section Min / Max:
+32	#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,
+33	#' such as an axis of dimension 0, `rray_max()` returns the smallest value of
+34	#' that type and `rray_min()` returns the largest:
+35	#'
+36	#' | type    | `rray_max()`            | `rray_min()`           |
+37	#' |---------|-------------------------|------------------------|
+38	#' | logical | `FALSE`                 | `TRUE`                 |
+39	#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |
+40	#' | double  | `-Inf`                  | `Inf`                  |
+41	#'
+42	#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+43	#'
+44	#' ```r
+45	#' rray_max(c(NA, NaN), 1L) # NA
+46	#' rray_max(c(NaN, NA), 1L) # NA
+47	#' ```
+48	#'
+49	#' @inheritParams rlang::args_dots_empty
+50	#'
+51	#' @param x An array.
+52	#'
+53	#' @param axes An integer vector of axes to reduce over. `1` reduces
+54	#'   rows, `2` reduces columns, and so on.
+55	#'
+56	#' @param na_rm If `TRUE`, missing values are removed before reducing.
+57	#'
+58	#' @returns
+59	#' An array with the same dimensionality as `x`, but with the dimensions along</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-sum.R</summary>
+<pre class="diff"><span class="del">-  x &lt;- c(NA, NaN)</span>
+<span class="del">-  expect_identical(as.vector(rray_sum(x, 1L)), NA_real_)</span>
+<span class="del">-</span>
+<span class="del">-  x &lt;- c(NaN, NA)</span>
+<span class="del">-  expect_identical(as.vector(rray_sum(x, 1L)), NA_real_)</span>
+<span class="del">-})</span>
+<span class="ins">+  x &lt;- c(NA, NaN)</span>
+<span class="ins">+  expect_identical(is.na(rray_sum(x, 1L)), array(TRUE, 1L))</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(NaN, NA)</span>
+<span class="ins">+  expect_identical(is.na(rray_sum(x, 1L)), array(TRUE, 1L))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray4/tests/testthat/test-reduce-sum.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; gi…</summary>
+<pre>cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::load_all(quiet = TRUE)&quot; 2&gt;&amp;1 | grep -i &quot;warning\|error&quot; | head; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output"> M src/arithmetic-add.c
+ M src/decl/arithmetic-add-decl.h
+ M src/decl/reduce-sum-decl.h
+ M src/reduce-sum.c
+ M tests/testthat/test-reduce-sum.R
+?? src/one-add.h
+ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 3498 ]</pre></details>
+<p>All 3498 tests pass. clang-format added a space in <code>(r_complex) {</code> in the header only. Checking whether that matches other headers:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; grep -rn &quot;(r_complex) {\|(r_complex){&quot; src/*.h src/*.…</summary>
+<pre>cd ~/files/r/packages/rray4; grep -rn &quot;(r_complex) {\|(r_complex){&quot; src/*.h src/*.c | head; cat .clang-format 2&gt;/dev/null | head -20</pre><pre class="output">src/cast.h:60:  return (r_complex) {.r = out, .i = 0};
+src/cast.h:73:  return (r_complex) {.r = out, .i = 0};
+src/cast.h:77:  return (r_complex) {.r = x, .i = 0};
+src/one-add.h:36:  return (r_complex) {.r = x.r + y.r, .i = x.i + y.i};
+src/one-add.h:136:  return (r_complex) {
+src/arithmetic-subtract.c:479:  return (r_complex){.r = x.r - y.r, .i = x.i - y.i};
+src/reduce-sum.c:166:    ((r_complex){.r = 0, .i = 0}),
+src/reduce-sum.c:182:    ((r_complex){.r = 0, .i = 0}),
+src/reduce-prod.c:165:    ((r_complex){.r = 1, .i = 0}),
+src/reduce-prod.c:181:    ((r_complex){.r = 1, .i = 0}),
+IndentWidth: 2
+ContinuationIndentWidth: 2
+SortIncludes: Never
+BinPackArguments: false
+BinPackParameters: false
+InsertBraces: true
+PointerAlignment: Left
+SpaceAfterCStyleCast: true
+Cpp11BracedListStyle: true
+AllowAllArgumentsOnNextLine: false
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AlignAfterOpenBracket: BlockIndent
+AlignOperands: DontAlign
+BreakBeforeTernaryOperators: true
+BreakAfterReturnType: Automatic
+PenaltyReturnTypeOnItsOwnLine: 10000</pre></details>
+<p>Matches <code>cast.h</code>, so I'll keep it. One more style fix: <code>utils.h</code> puts system includes before <code>&quot;rlang.h&quot;</code>, so I'll match that.</p>
+
+<details class="tool"><summary>Edit src/one-add.h</summary>
+<pre class="diff"><span class="del">-#include &quot;rlang.h&quot;</span>
+<span class="del">-</span>
+<span class="del">-#include &lt;limits.h&gt;</span>
+<span class="del">-</span>
+<span class="del">-#include &quot;arithmetic.h&quot;</span>
+<span class="ins">+#include &lt;limits.h&gt;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &quot;rlang.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &quot;arithmetic.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/one-add.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtoo…</summary>
+<pre>cd ~/files/r/packages/rray4; clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(reduce-sum|arithmetic-add|reduce-mean)')&quot; 2&gt;&amp;1 | tail -3; git diff --stat</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 270 ]
+ src/arithmetic-add.c             | 55 ++++++------------------
+ src/decl/arithmetic-add-decl.h   | 12 ------
+ src/decl/reduce-sum-decl.h       | 14 ------
+ src/reduce-sum.c                 | 92 +---------------------------------------
+ tests/testthat/test-reduce-sum.R |  4 +-
+ 5 files changed, 16 insertions(+), 161 deletions(-)</pre></details>
+<p>Tests pass. Committing and pushing.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4; git add -A src/one-add.h src/arithmetic-add.c src/dec…</summary>
+<pre>cd ~/files/r/packages/rray4; git add -A src/one-add.h src/arithmetic-add.c src/decl/arithmetic-add-decl.h src/decl/reduce-sum-decl.h src/reduce-sum.c tests/testthat/test-reduce-sum.R &amp;&amp; git commit -q -m &quot;Move the add and sum one helpers into one-add.h&quot; &amp;&amp; git push -u origin feature/add-one 2&gt;&amp;1 | tail -3; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/add-one -&gt; feature/add-one
+branch 'feature/add-one' set up to track 'origin/feature/add-one'.
+f9f85d7 Move the add and sum one helpers into one-add.h</pre></details>
+<details class="tool tool-error"><summary>Bash: cat &gt; ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_no_sha…</summary>
+<pre>cat &gt; ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_no_shared_add_sum_kernels.md &lt;&lt;'EOF'
+---
+name: project_no_shared_add_sum_kernels
+description: &quot;Arithmetic/reducer pairs now share kernels in one-*.h headers (one-extremum.h, one-logical.h, one-add.h), split into Elementwise and Reduce sections&quot;
+metadata:
+  type: project
+---
+
+As of 2026-10-01 the user wants shared `src/one-*.h` headers: `one-extremum.h`, `one-logical.h`, and `one-add.h` (branch `feature/add-one`). Each has a `// Elementwise` section and a `// Reduce` section. A reduce helper calls its elementwise twin only when they are exactly the same.
+
+An earlier attempt at `one-add.h` was abandoned, then redone on request. This memory replaces the old &quot;keep kernels local&quot; rule.
+
+**Why:** Consistency across operator/reducer pairs. Integer overflow stays separate: elementwise uses `stop_int_overflow(error_call)`, sum uses `check_sum_int_overflow()` with `r_abort()`, because `RRAY_REDUCE` has no args slot.
+
+**How to apply:** For `one-multiply.h` / prod and similar, follow `one-add.h`. Elementwise dbl/cpl helpers drop the unused `error_call` and use `RRAY_BINARY_NO_ARGS`. `rray_sum()` dbl/cpl now use plain `+`, so NA vs NaN is unspecified, like base R. See [[feedback_no_int_helpers_for_logical]].
+EOF
+cd ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory &amp;&amp; grep -n &quot;no_shared&quot; MEMORY.md</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Write ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_no_shared_ad…</summary>
+<pre>---
+name: project_no_shared_add_sum_kernels
+description: &quot;Arithmetic/reducer pairs now share kernels in one-*.h headers (one-extremum.h, one-logical.h, one-add.h), split into Elementwise and Reduce sections&quot;
+metadata:
+  type: project
+---
+
+As of 2026-10-01 the user wants shared `src/one-*.h` headers: `one-extremum.h`, `one-logical.h`, and `one-add.h` (branch `feature/add-one`). Each has a `// Elementwise` section and a `// Reduce` section. A reduce helper calls its elementwise twin only when they are exactly the same.
+
+An earlier attempt at `one-add.h` was abandoned, then redone on request. This memory replaces the old &quot;keep kernels local&quot; rule.
+
+**Why:** Consistency across operator/reducer pairs. Integer overflow stays separate: elementwise uses `stop_int_overflow(error_call)`, sum uses `check_sum_int_overflow()` with `r_abort()`, because `RRAY_REDUCE` has no args slot.
+
+**How to apply:** For `one-multiply.h` / prod and similar, follow `one-add.h`. Elementwise dbl/cpl helpers drop the unused `error_call` and use `RRAY_BINARY_NO_ARGS`. `rray_sum()` dbl/cpl now use plain `+`, so NA vs NaN is unspecified, like base R. See [[feedback_no_int_helpers_for_logical]].</pre><pre class="output">The file ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/project_no_shared_add_sum_kernels.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Read ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/MEMORY.md</summary>
+<pre class="output">1	- [feedback_no_section_comments_in_tests.md](feedback_no_section_comments_in_tests.md) - Test `# ----` headers separate functions, never subgroups within one function, none in single-function files
+2	- [feedback_no_section_comments_in_c.md](feedback_no_section_comments_in_c.md) - Don't add section divider comments in C files, except the shell/per-operator split in `src/arithmetic.c`
+3	- [feedback_prefer_r_ssize.md](feedback_prefer_r_ssize.md) - Always use r_ssize instead of R_xlen_t in C code
+4	- [feedback_never_say_load_bearing.md](feedback_never_say_load_bearing.md) - Never use the phrase &quot;load bearing&quot; anywhere, say what the thing does
+5	- [feedback_exhaustive_type_switch.md](feedback_exhaustive_type_switch.md) - Type dispatch is an exhaustive pair switch like vctrs, never a rank shortcut
+6	- [feedback_no_p_prefix_on_args.md](feedback_no_p_prefix_on_args.md) - Name `struct rray_arg*` plainly (`x_arg`), never `p_x_arg`, unlike vctrs
+7	- [project_arithmetic_tests_one_file_per_op.md](project_arithmetic_tests_one_file_per_op.md) - Arithmetic tests are `test-arithmetic-{op}.R`, one per operator, not `test-arithmetic.R`
+8	- [feedback_named_dimension_locals.md](feedback_named_dimension_locals.md) - Always bind `v_{x}_dimensions` / `{x}_dimensionality` locals in C, never inline them as arguments
+9	- [project_plans_live_in_repo.md](project_plans_live_in_repo.md) - Plans live in the repo's `plans/`, not the global plans folder
+10	- [feedback_no_int_helpers_for_logical.md](feedback_no_int_helpers_for_logical.md) - Never run int &quot;one&quot; helpers on logical data, NA types differ even if values match
+11	- [project_no_shared_add_sum_kernels.md](project_no_shared_add_sum_kernels.md) - Kernels stay local per file, no `one-*.h` headers (#102 reverted)
+12	- [feedback_no_connector_auth_notices.md](feedback_no_connector_auth_notices.md) - Never mention that MCP connectors need authorization
+13	</pre></details>
+<details class="tool"><summary>Edit ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/MEMORY.md</summary>
+<pre class="diff"><span class="del">- - Kernels stay local per file, no `one-*.h` headers (#102 reverted)</span>
+<span class="ins">+ - Op/reducer pairs share `one-*.h` headers (extremum, logical, add) with Elementwise and Reduce sections</span></pre><pre class="output">The file ~/.claude/projects/-Users-davis-files-r-packages-rray4/memory/MEMORY.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>I created <code>src/one-add.h</code>, committed it as <code>f9f85d7</code> &quot;Move the add and sum one helpers into one-add.h&quot;, and pushed it on a new branch, <code>feature/add-one</code>, off <code>main</code>. All 3498 tests pass. I didn't open a PR.</p>
+<p><strong>How it follows the extremum and logical PRs</strong></p>
+<ul>
+<li>
+<p>The header has the same <code>// Elementwise</code> and <code>// Reduce</code> sections. Elementwise holds <code>rray_add_{int,dbl,cpl}_one()</code>. Reduce holds <code>rray_sum_{lgl,int,dbl,cpl}_one()</code> and their <code>_na_rm</code> versions.</p>
+</li>
+<li>
+<p>Raw <code>== r_globals.na_*</code> and <code>ISNAN()</code> checks now use <code>rray_int_is_missing()</code>, <code>rray_lgl_is_missing()</code> and <code>rray_dbl_is_missing()</code>.</p>
+</li>
+<li>
+<p>I added short example tables (like <code>- out = 1, x = NA: returns 1</code>) above the helpers whose missing-value handling isn't obvious. The comment that was already in sum's logical helper is unchanged.</p>
+</li>
+<li>
+<p>The old helper declarations are gone from <code>decl/arithmetic-add-decl.h</code> and <code>decl/reduce-sum-decl.h</code>.</p>
+</li>
+</ul>
+<p><strong>Your decisions, applied</strong></p>
+<ul>
+<li>
+<p><strong>Overflow kept separate:</strong> add still raises it with <code>stop_int_overflow(error_call)</code>. Sum still uses <code>check_sum_int_overflow()</code>, now moved into <code>one-add.h</code>. Error messages are unchanged.</p>
+</li>
+<li>
+<p><strong>Sum uses plain <code>+</code>:</strong> <code>rray_sum_dbl_one()</code> and <code>rray_sum_cpl_one()</code> now just call <code>rray_add_dbl_one()</code> and <code>rray_add_cpl_one()</code>. The <code>_na_rm</code> versions keep their own logic. Sum no longer makes <code>NA</code> win over <code>NaN</code>, which makes it faster. In <code>test-reduce-sum.R</code>, the <code>c(NA, NaN)</code> and <code>c(NaN, NA)</code> cases now only check that the result is missing, not which kind.</p>
+</li>
+</ul>
+<p><strong>One change you didn't explicitly ask for</strong></p>
+<ul>
+<li>So that sum can call the add helpers directly, <code>rray_add_dbl_one()</code> and <code>rray_add_cpl_one()</code> no longer take <code>error_call</code>. They never used it. The add double and complex functions pass <code>RRAY_BINARY_NO_ARGS</code> instead. Subtract and multiply still pass <code>error_call</code>, so they will differ until they get the same treatment.</li>
+</ul>
+<p>I also updated my saved notes for this project. They had said to keep these helpers local to each file, which no longer matches what you want.</p>
+
+</section>
+</main>
+</body>
+</html>

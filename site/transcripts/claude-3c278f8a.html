@@ -1,0 +1,1641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rethinking how broadcast operations combine dimnames across inputs</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-160">rray timeline</a>
+<h1>Rethinking how broadcast operations combine dimnames across inputs</h1>
+<p class="facts">Claude · Sep 29, 2026 · 8 prompts · 10 replies · <a href="https://github.com/r-lib/rray/pull/160">#160</a></p>
+</header>
+<main>
+<p class="divider">Sep 29, 2026, 19:38 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I don’t love that names handling of binary (or more) operations in rray can merge names across inputs. That feels wrong to me and likely not meaningful?</p>
+<p>I’m thinking of an alternate set of rules</p>
+<ul>
+<li>if names are the exact same along an axis, that’s not a conflict</li>
+<li>if an axis broadcasts, it can’t contribute names and isn’t a conflict</li>
+<li>if x and y have different names along an axis, it is a conflict</li>
+<li>if x contributes axis 1 names and y contributes axis 2 names, it’s a conflict</li>
+<li>if any axis  names conflict, ALL names are dropped</li>
+</ul>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls src R &amp;&amp; grep -n &quot;names&quot; src/broadcast.c | head -80</summary>
+<pre>ls src R &amp;&amp; grep -n &quot;names&quot; src/broadcast.c | head -80</pre><pre class="output">R:
+arithmetic.R
+broadcast-names.R
+broadcast.R
+cast-common.R
+cast.R
+combine.R
+compare.R
+dimensionality.R
+dimensions.R
+equal.R
+extract-subscript.R
+extract.R
+extremum.R
+index.R
+insert-axes.R
+logical.R
+move-axes.R
+names.R
+permute-axes.R
+ptype-common.R
+ptype.R
+reduce-names.R
+reduce.R
+remove-axes.R
+rep.R
+roll.R
+rray4-package.R
+size.R
+slice-subscript.R
+slice.R
+split.R
+stack.R
+unstack.R
+zzz.R
+
+src:
+arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+logical.c
+logical.h
+logical.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-prod.c
+reduce-prod.h
+reduce-prod.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rep-each.c
+rep-each.h
+rep-each.o
+rep.c
+rep.h
+rep.o
+rlang
+rlang.c
+rlang.o
+roll-each.c
+roll-each.h
+roll-each.o
+roll.c
+roll.h
+roll.o
+rray4.so
+size.c
+size.h
+size.o
+slice-assign.c
+slice-assign.h
+slice-assign.o
+slice-axis.c
+slice-axis.h
+slice-axis.o
+slice-iterator.h
+slice-subscript.c
+slice-subscript.h
+slice-subscript.o
+slice.c
+slice.h
+slice.o
+split.c
+split.h
+split.o
+stack.c
+stack.h
+stack.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+subscript.c
+subscript.h
+subscript.o</pre><p class="cut">25 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/broadcast-names.c R/broadcast-names.R; grep -rn &quot;broadcast_names\|common_names&quot; src/*…</summary>
+<pre>cat src/broadcast-names.c R/broadcast-names.R; grep -rn &quot;broadcast_names\|common_names&quot; src/*.c | grep -v &quot;^src/broadcast-names.c&quot; | head -30</pre><pre class="output">#include &quot;broadcast-names.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;names.h&quot;
+
+#include &quot;decl/broadcast-names-decl.h&quot;
+
+static const bool V_IGNORED_FALSE[RRAY_MAX_DIMENSIONALITY] = {false};
+
+r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions) {
+  return rray_broadcast_names(ffi_x, ffi_dimensions);
+}
+
+r_obj* rray_broadcast_names(r_obj* x, r_obj* dimensions) {
+  return rray_broadcast_names_fill(r_null, x, dimensions, V_IGNORED_FALSE);
+}
+
+r_obj* ffi_rray_broadcast_names2(
+  r_obj* ffi_x,
+  r_obj* ffi_y,
+  r_obj* ffi_dimensions
+) {
+  return rray_broadcast_names2(ffi_x, ffi_y, ffi_dimensions);
+}
+
+r_obj* rray_broadcast_names2(r_obj* x, r_obj* y, r_obj* dimensions) {
+  r_obj* out =
+    KEEP(rray_broadcast_names_fill(r_null, x, dimensions, V_IGNORED_FALSE));
+  out = rray_broadcast_names_fill(out, y, dimensions, V_IGNORED_FALSE);
+  FREE(1);
+  return out;
+}
+
+r_obj* ffi_rray_broadcast_names_common(r_obj* ffi_xs, r_obj* ffi_dimensions) {
+  return rray_broadcast_names_common(ffi_xs, ffi_dimensions);
+}
+
+r_obj* rray_broadcast_names_common(r_obj* xs, r_obj* dimensions) {
+  return rray_broadcast_names_common_opts(xs, dimensions, NULL, 0);
+}
+
+r_obj* rray_broadcast_names_common_opts(
+  r_obj* xs,
+  r_obj* dimensions,
+  const int* v_ignore,
+  r_ssize ignore_size
+) {
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  bool v_ignored[RRAY_MAX_DIMENSIONALITY];
+  r_memset(v_ignored, 0, sizeof(bool) * RRAY_MAX_DIMENSIONALITY);
+
+  for (r_ssize i = 0; i &lt; ignore_size; ++i) {
+    v_ignored[v_ignore[i] - 1] = true;
+  }
+
+  r_obj* out = r_null;
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  for (r_ssize i = 0; i &lt; n; ++i) {
+    out = rray_broadcast_names_fill(out, v_xs[i], dimensions, v_ignored);
+    KEEP_AT(out, out_loc);
+  }
+
+  FREE(1);
+  return out;
+}
+
+// Broadcasting of array names
+//
+// Assumes the inputs are validated arrays and are broadcastable to the
+// `dimensions`. The caller typically checks all of this already.
+static r_obj* rray_broadcast_names_fill(
+  r_obj* out,
+  r_obj* x,
+  r_obj* dimensions,
+  const bool* v_ignored
+) {
+  r_obj* x_names = rray_names(x, rray_args.x, r_lazy_null);
+  if (x_names == r_null) {
+    return out;
+  }
+  KEEP(x_names);
+
+  r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, rray_args.x, r_lazy_null));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    if (v_ignored[i]) {
+      continue;
+    }
+    if (v_x_names[i] == r_null) {
+      // No names to contribute on this axis
+      continue;
+    }
+    if (v_x_dimensions[i] != v_dimensions[i]) {
+      // No names to contribute when axis is broadcast
+      continue;
+    }
+    if (out != r_null &amp;&amp; r_list_get(out, i) != r_null) {
+      // Names already exist on this axis
+      continue;
+    }
+    if (out == r_null) {
+      out = r_alloc_list(dimensionality);
+      KEEP_AT(out, out_loc);
+    }
+    r_list_poke(out, i, v_x_names[i]);
+  }
+
+  FREE(3);
+  return out;
+}
+# Test only, no validation
+rray_broadcast_names &lt;- function(x, dimensions) {
+  .Call(ffi_rray_broadcast_names, x, dimensions)
+}
+
+rray_broadcast_names2 &lt;- function(x, y, dimensions) {
+  .Call(ffi_rray_broadcast_names2, x, y, dimensions)
+}
+
+rray_broadcast_names_common &lt;- function(..., .dimensions) {
+  .Call(ffi_rray_broadcast_names_common, list2(...), .dimensions)
+}
+src/arithmetic.c:61:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/broadcast.c:100:  r_obj* out_names = KEEP(rray_broadcast_names(x, dimensions));
+src/combine.c:156:  r_obj* out = rray_broadcast_names_common_opts(xs, dimensions, &amp;axis, 1);
+src/compare.c:176:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/equal.c:103:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/extremum.c:132:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/init.c:118:extern r_obj* ffi_rray_broadcast_names(r_obj* ffi_x, r_obj* ffi_dimensions);
+src/init.c:119:extern r_obj* ffi_rray_broadcast_names2(
+src/init.c:124:extern r_obj* ffi_rray_broadcast_names_common(
+src/init.c:325:  {&quot;ffi_rray_broadcast_names&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names, 2},
+src/init.c:326:  {&quot;ffi_rray_broadcast_names2&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names2, 3},
+src/init.c:327:  {&quot;ffi_rray_broadcast_names_common&quot;,
+src/init.c:328:   (DL_FUNC) &amp;ffi_rray_broadcast_names_common,
+src/logical.c:115:  r_obj* out_names = KEEP(rray_broadcast_names2(x, y, dimensions));
+src/reduce-names.c:18:// Mimics `rray_broadcast_names()` ideas, but reduction only ever has 1 input</pre></details>
+<p>I agree. Right now the code merges names per axis, and the first input wins. You can see it in <code>rray_broadcast_names_fill()</code> in <code>src/broadcast-names.c:95-115</code>. That causes two problems:</p>
+<ul>
+<li>
+<p><strong>Different names on the same axis are ignored.</strong> If x has rownames <code>a, b</code> and y has rownames <code>c, d</code>, you get <code>a, b</code> without any signal.</p>
+</li>
+<li>
+<p><strong>Names from different inputs get mixed.</strong> If x has only rownames and y has only colnames, the result gets both, even though no input ever had those names together.</p>
+</li>
+</ul>
+<p>Base R doesn't merge either. For <code>x + y</code>, it takes all of x's dimnames if x has any, and otherwise all of y's. Your rules are stricter than that, which I think is right for rray.</p>
+<h2>A tighter way to state your rules</h2>
+<p>Your five rules reduce to one:</p>
+<ol>
+<li>
+<p>For each input, work out what names it contributes: its names, with every broadcast axis set to <code>NULL</code>. An input that ends up with no names contributes nothing.</p>
+</li>
+<li>
+<p>If every input that contributes has the same names on every axis (<code>NULL</code> included), use those names. Otherwise, drop all names.</p>
+</li>
+</ol>
+<p>Rules 1 to 4 are special cases of this. Rule 5 is the &quot;otherwise&quot;.</p>
+<h2>One case your rules leave open</h2>
+<p>x has names <code>(r, c)</code> and y has names <code>(r, NULL)</code>, with the same <code>r</code>.</p>
+<ul>
+<li>
+<p><strong>Under the formulation above</strong>, this is a conflict because the lists differ on axis 2. All names are dropped.</p>
+</li>
+<li>
+<p><strong>Under a per-axis reading of your rules 1 and 3</strong>, axis 1 matches and only x contributes on axis 2. That gives <code>(r, c)</code>. But then rule 4 can't hold as stated, because now names come from two inputs.</p>
+</li>
+</ul>
+<p>I'd go with the strict version (conflict). It's the only reading where rule 4 fits cleanly, and it means the result's names always match some single input's names exactly. The lenient version brings back a mild form of merging.</p>
+<h2>Other things to decide</h2>
+<ul>
+<li>
+<p><strong>Silent drop, warning, or error?</strong> I'd drop silently. An error would make plain <code>x + y</code> fail too often. A warning would be noisy in pipelines where names are incidental.</p>
+</li>
+<li>
+<p><strong>N-ary functions.</strong> <code>rray_broadcast_names_common_opts()</code> (used by <code>combine.c</code>) would follow the same rule: any conflict among any inputs drops everything. The axis being combined along is skipped as it is now. For bind-style functions that seems right, but it's worth confirming, since one stray rowname on one input would remove every name on the result.</p>
+</li>
+<li>
+<p><strong>What &quot;the same&quot; means.</strong> I'd compare element by element. R reuses one object for equal strings (it caches them), so a pointer check is usually enough, with a fallback for strings in different encodings. There's also a fast path when both inputs share the very same names vector, like <code>x + x</code>.</p>
+</li>
+<li>
+<p><strong>What stays the same.</strong> Single-input <code>rray_broadcast_names()</code> and the reduce names in <code>src/reduce-names.c</code> only ever have one input, so they don't change.</p>
+</li>
+</ul>
+<p>If you settle the <code>(r, c)</code> vs <code>(r, NULL)</code> case and the silent-drop question, I can write this up as a plan in <code>plans/</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>One thought about the (r,c) case. Isn’t what you describe what would happen if you sum along columns and then divide by that sum?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, 2, dimnames=list(c(&quot;a&quot;,&quot;b&quot;), c(&quot;…</summary>
+<pre>Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, 2, dimnames=list(c(&quot;a&quot;,&quot;b&quot;), c(&quot;x&quot;,&quot;y&quot;,&quot;z&quot;))); s &lt;- rray_sum(x, 2); str(dimnames(s)); str(dimnames(x / s))' 2&gt;&amp;1 | tail -8</pre><pre class="output">List of 2
+ $ : chr [1:2] &quot;a&quot; &quot;b&quot;
+ $ : NULL
+Error in x/s : non-conformable arrays
+Calls: str
+Execution halted</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, 2, dimnames=list(c(&quot;a&quot;,&quot;b&quot;), c(&quot;…</summary>
+<pre>Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, 2, dimnames=list(c(&quot;a&quot;,&quot;b&quot;), c(&quot;x&quot;,&quot;y&quot;,&quot;z&quot;))); s &lt;- rray_sum(x, 2); str(dimnames(rray_divide(x, s)))' 2&gt;&amp;1 | tail -4</pre><pre class="output">List of 2
+ $ : chr [1:2] &quot;a&quot; &quot;b&quot;
+ $ : chr [1:3] &quot;x&quot; &quot;y&quot; &quot;z&quot;</pre></details>
+<p>Yes. My version of the rule would break that case, so it was wrong.</p>
+<p>Here's what happens today with <code>x / rray_sum(x, 2)</code>:</p>
+<pre><code class="language-r">x &lt;- matrix(1:6, 2, dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+s &lt;- rray_sum(x, 2)
+dimnames(s)
+#&gt; [[1]] &quot;a&quot; &quot;b&quot;
+#&gt; [[2]] NULL
+
+dimnames(rray_divide(x, s))
+#&gt; [[1]] &quot;a&quot; &quot;b&quot;
+#&gt; [[2]] &quot;x&quot; &quot;y&quot; &quot;z&quot;
+</code></pre>
+<p><code>s</code> is 2x1 with names <code>(r, NULL)</code>. My formulation turned its broadcast axis 2 into <code>NULL</code>, compared <code>(r, NULL)</code> against x's <code>(r, c)</code>, called it a conflict, and dropped everything. That's clearly the wrong answer for one of the most common array patterns.</p>
+<p>The fix is that a broadcast axis has no say at all. It's not the same as &quot;unnamed&quot;. Per axis, each input is in one of three states:</p>
+<ul>
+<li>
+<p><strong>Broadcast.</strong> It has no say on this axis and never conflicts.</p>
+</li>
+<li>
+<p><strong>Unnamed.</strong> Full dimension, no names.</p>
+</li>
+<li>
+<p><strong>Named.</strong> Full dimension, with names.</p>
+</li>
+</ul>
+<p>With that, <code>s</code> is <code>(r, no say)</code> and x is <code>(r, c)</code>. They agree, so the result is <code>(r, c)</code>, as it should be.</p>
+<p>That narrows the open question. It now only covers an input whose axis is full size and has no names, like y being a full 2x3 matrix with rownames only. That case really is different from the sum case: y has the full column axis and chose not to name it. You could go either way:</p>
+<ul>
+<li>
+<p><strong>Strict:</strong> unnamed vs named on a full axis is a conflict, so all names are dropped.</p>
+</li>
+<li>
+<p><strong>Lenient:</strong> unnamed has no say either, so the result is <code>(r, c)</code>. This is still per-axis merging, but only of names that never disagree.</p>
+</li>
+</ul>
+<p>With broadcast axes handled correctly, I now lean lenient. Strict mostly punishes inputs that were built without names, which is common, and it doesn't protect against any real disagreement. Under lenient, your rule 4 becomes &quot;different inputs may name different axes as long as no axis has two different sets of names&quot;. Is that acceptable to you, or is rule 4 the part you care about most?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Is that a fully commutative / associative (not sure which) rule with &gt;2 inputs?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>It is commutative but not associative. No rule shaped like this one can be associative.</p>
+<p><strong>Commutative: yes.</strong> Order doesn't matter, whether there are 2 inputs or many. The rule only asks, per axis, whether the named inputs agree, and swapping inputs doesn't change that answer.</p>
+<p><strong>Associative: no.</strong> A conflict drops the names, and an unnamed result has no say in the next step. So the conflict is forgotten. Here's a one-axis example with three 2x2 matrices, where <code>r1</code> and <code>r2</code> are different rownames:</p>
+<pre><code class="language-r">a: rownames r1
+b: rownames r1
+c: rownames r2
+
+(a + b) + c   # a + b is r1, then r1 vs r2 conflicts: no names
+a + (b + c)   # b + c conflicts, so no names; then a + that is r1
+</code></pre>
+<p>An n-ary function that sees all three inputs at once finds the conflict and drops everything. So <code>rray_bind(a, b, c)</code> can differ from <code>rray_bind(rray_bind(a, b), c)</code>. For arithmetic, R always groups left to right, so <code>a + b + c</code> gives the first of the two answers above.</p>
+<p><strong>Why no fix exists within this rule.</strong> To be associative, a conflict would have to stick: once it happens, every later step would also have to drop names. But the result is a plain array with <code>dimnames</code>, and it has nowhere to record &quot;this conflicted&quot;. Unnamed is the only way to show a conflict, and unnamed has to be neutral or the sum case breaks. Dropping only the conflicting axis doesn't help either. The same example still fails.</p>
+<p>The current first-wins rule is the reverse: associative but not commutative. It fills each axis from the first input that has names, so grouping doesn't matter but order does.</p>
+<p>I think commutativity is the one to keep. <code>x + y</code> and <code>y + x</code> giving different names would be a real surprise. Associativity only fails when there's already a conflict, and in that case every answer is &quot;names were lost somewhere&quot;, which is the signal you wanted. The main thing to document is that the n-ary functions check all their inputs together, so they can drop names in cases where a chain of two-input calls would keep some.</p>
+
+</section>
+<p class="divider">Sep 29, 2026, 21:30 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>What does xarray do?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool tool-error"><summary>Bash: python3 -c &quot;import xarray; print(xarray.__version__)&quot; 2&gt;&amp;1 | tail -1</summary>
+<pre>python3 -c &quot;import xarray; print(xarray.__version__)&quot; 2&gt;&amp;1 | tail -1</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<p>xarray avoids the problem instead of solving it. It treats labels as keys that choose which data lines up, not as metadata carried along for the ride. I couldn't run xarray here (a hook blocks inline scripts), so this is from memory, not something I tested.</p>
+<p><strong>Axes are matched by name, not position.</strong> Every dimension has a name, like <code>&quot;time&quot;</code> or <code>&quot;station&quot;</code>. Broadcasting lines dimensions up by name, and a dimension missing from one input gets broadcast. There's no position-based broadcasting, so &quot;x's axis 1 vs y's axis 2&quot; can't come up.</p>
+<p><strong>Mismatched labels change the data.</strong> If x and y have different labels on <code>&quot;station&quot;</code>, the default for arithmetic is an inner join. The result keeps only the labels in both, and the values are lined up by label. Labels in a different order get reordered. You can change this with <code>xr.set_options(arithmetic_join = ...)</code>: <code>&quot;outer&quot;</code> fills gaps with <code>NaN</code>, and <code>&quot;exact&quot;</code> raises an error.</p>
+<p><strong>An axis with no labels matches by position.</strong> If one input has labels on a dimension and the other doesn't, the sizes must match and the labels are kept. That is the lenient choice from before.</p>
+<p><strong>Reductions drop the dimension.</strong> <code>x.sum(&quot;col&quot;)</code> removes <code>&quot;col&quot;</code> completely, so the size-1 axis from the divide-by-sum case never exists. Broadcasting it back works by name.</p>
+<p><strong>Extra labels that don't index anything are dropped one at a time.</strong> xarray also has coordinates that aren't the main index of a dimension. If two inputs disagree on one of those, I believe that coordinate is dropped and the others are kept. That's per-item, not &quot;drop everything&quot;.</p>
+<h2>What this means for rray</h2>
+<p>xarray's approach doesn't carry over, because rray names are R <code>dimnames</code>. Base R never matches on them, and a user who writes <code>x + y</code> expects position-based math. Joining on names would change results depending on the names, which is a big step away from base R.</p>
+<p>Parts of it do match what we've discussed:</p>
+<ul>
+<li>
+<p><strong>Unnamed has no say</strong> (the lenient rule). xarray does the same.</p>
+</li>
+<li>
+<p><strong>Conflicts are handled per axis, not by dropping everything.</strong> For index labels, that's a join or an error. For other coordinates, it's a per-item drop. Nothing in xarray drops all labels because one axis conflicted.</p>
+</li>
+</ul>
+<p>That second point is a reason to reconsider your rule 5. Dropping only the conflicting axis is closer to what xarray does. It's still commutative. It isn't associative, but as we saw, neither is dropping everything. The case for dropping everything is that a conflict on one axis suggests the inputs weren't meant to line up at all, so the other axes' names shouldn't be trusted either. Which of those two views matches what you're after?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>So give me a refined set of rules based on this</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Here are the refined rules. The rest of the design follows from our discussion. You still need to confirm how conflicts are handled, which I cover at the end.</p>
+<h2>Rules</h2>
+<p>Each axis is decided on its own. On a given axis, each input is in one of three states:</p>
+<ul>
+<li>
+<p><strong>Broadcast:</strong> its dimension is 1 and the output's dimension is larger, or the input doesn't have this axis at all.</p>
+</li>
+<li>
+<p><strong>Unnamed:</strong> full dimension, no names.</p>
+</li>
+<li>
+<p><strong>Named:</strong> full dimension, with names.</p>
+</li>
+</ul>
+<p>The output names for that axis are then:</p>
+<ol>
+<li>
+<p><strong>Broadcast inputs have no say.</strong></p>
+</li>
+<li>
+<p><strong>Unnamed inputs have no say.</strong></p>
+</li>
+<li>
+<p><strong>If no input is named, the axis has no names.</strong></p>
+</li>
+<li>
+<p><strong>If every named input has the same names, the axis gets those names.</strong></p>
+</li>
+<li>
+<p><strong>If named inputs disagree, the axis has no names.</strong> Other axes are not affected.</p>
+</li>
+</ol>
+<p>If every axis ends up without names, the result has no <code>dimnames</code> at all.</p>
+<h2>Examples</h2>
+<pre><code class="language-r"># Divide by a sum: s broadcasts on axis 2, so it has no say there
+x: (r, c)    s: (r, broadcast)     -&gt;  (r, c)
+
+# Unnamed has no say
+x: (r, c)    y: (r, NULL)          -&gt;  (r, c)
+
+# Names on different axes combine
+x: (r, NULL) y: (NULL, c)          -&gt;  (r, c)
+
+# A conflict only affects its own axis
+x: (r1, c)   y: (r2, c)            -&gt;  (NULL, c)
+</code></pre>
+<h2>Details</h2>
+<ul>
+<li>
+<p><strong>If every input has dimension 1 on an axis</strong>, none of them are broadcast, so their names are compared as usual. This matches the current check in <code>rray_broadcast_names_fill()</code>.</p>
+</li>
+<li>
+<p><strong>N-ary functions check every input at once.</strong> The axis being combined along is skipped, as it is now.</p>
+</li>
+<li>
+<p><strong>&quot;Same names&quot; means the same strings in the same order</strong>, compared one by one. Two inputs that share the exact same names vector (like <code>x + x</code>) can skip the comparison.</p>
+</li>
+<li>
+<p><strong>Order of inputs doesn't matter, but grouping does.</strong> <code>(a + b) + c</code> can differ from <code>a + (b + c)</code>. That only happens once there's a conflict.</p>
+</li>
+</ul>
+<h2>How much changes</h2>
+<p>Very little. Today's code already gives broadcast and unnamed inputs no say, and it already fills different axes from different inputs. The only change is rule 5: today the first input wins a conflict, and under these rules the axis loses its names.</p>
+<h2>Your decision</h2>
+<p>Rule 5 is where this differs from what you first proposed. You wanted any conflict to drop all names. I'd recommend dropping only the conflicting axis:</p>
+<ul>
+<li>
+<p>It's one rule applied to each axis, which is easier to explain.</p>
+</li>
+<li>
+<p>Agreement on the other axes is real evidence that they line up.</p>
+</li>
+<li>
+<p>It matches xarray, where nothing drops every label because one axis conflicted.</p>
+</li>
+</ul>
+<p>The case for dropping everything: a conflict anywhere means the inputs probably weren't meant to line up, so none of their names should be trusted. If that's the behaviour you want, only rule 5 changes, to &quot;if named inputs disagree on any axis, the result has no names&quot;.</p>
+<p>Which version of rule 5 do you want? Once you've picked, I can write the plan in <code>plans/</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Do any other array libraries have to deal with this?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;xnames\|ynames&quot; arithmetic.c | head -30</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;xnames\|ynames&quot; arithmetic.c | head -30</pre><pre class="output">594:    SEXP dims, xnames, ynames;
+611:	    PROTECT(xnames = getAttrib(x, R_DimNamesSymbol));
+614:	else xnames = R_NilValue;
+616:	    PROTECT(ynames = getAttrib(y, R_DimNamesSymbol));
+619:	else ynames = R_NilValue;
+624:	    PROTECT(xnames = getAttrib(x, R_NamesSymbol));
+627:	else xnames = R_NilValue;
+629:	    PROTECT(ynames = getAttrib(y, R_NamesSymbol));
+632:	else ynames = R_NilValue;
+693:	    if (xnames != R_NilValue)
+694:		setAttrib(val, R_DimNamesSymbol, xnames);
+695:	    else if (ynames != R_NilValue)
+696:		setAttrib(val, R_DimNamesSymbol, ynames);
+699:	if (XLENGTH(val) == xlength(xnames))
+700:	    setAttrib(val, R_NamesSymbol, xnames);
+701:	else if (XLENGTH(val) == xlength(ynames))
+702:	    setAttrib(val, R_NamesSymbol, ynames);
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Yes, several do. There are two different things a library might label:</p>
+<ul>
+<li>
+<p><strong>Axis names</strong>, like <code>&quot;time&quot;</code> or <code>&quot;station&quot;</code>.</p>
+</li>
+<li>
+<p><strong>Labels along an axis</strong>, which is what R <code>dimnames</code> holds.</p>
+</li>
+</ul>
+<p>The libraries that are closest to your rules are the ones that name axes. Only base R is checked against source. The rest is from memory, and I couldn't run any of them here.</p>
+<h2>Libraries that name axes</h2>
+<p><strong>PyTorch named tensors (prototype feature).</strong> This is the closest match. Two axis names are compatible if they're equal or if one of them is <code>None</code>, and the output keeps the name that isn't <code>None</code>. So an unnamed axis has no say, which is your rule 2. Broadcasting lines axes up from the right, like NumPy. Mismatched names raise an error. Dropping names is not an option.</p>
+<p><strong>Julia NamedDims.jl.</strong> Same idea. The wildcard name <code>:_</code> matches anything, and a mismatch is an error.</p>
+<p><strong>pandas, for the name of an index.</strong> A pandas axis has a single optional <code>.name</code>. When two inputs are combined, the result keeps the name if both inputs share it and sets it to <code>None</code> if they differ. That's your rule 5 applied per axis, and the result drops the name without any warning.</p>
+<h2>Libraries that label along an axis</h2>
+<p><strong>Base R (checked in <code>src/main/arithmetic.c:693-696</code>).</strong> If x has dimnames, the result takes all of x's dimnames. Otherwise it takes all of y's. There's no per-axis merge and no conflict check. For plain vectors (<code>arithmetic.c:699-702</code>), names come from whichever input has the same length as the result.</p>
+<p><strong>pandas, for the labels themselves.</strong> Labels are keys. Arithmetic lines rows up by label using an outer join and fills the gaps with <code>NaN</code>, so it changes the data rather than the names. It's the same approach as xarray's, but with a different default join.</p>
+<p><strong>Julia AxisKeys.jl and DimensionalData.jl.</strong> As far as I remember, broadcasting checks that the labels match and raises an error if they don't. DimensionalData lets you relax that check. I'm less sure of the details here.</p>
+<p><strong>NumPy, JAX and MATLAB arrays</strong> don't have labels, so the problem doesn't come up.</p>
+<h2>What this means for your rules</h2>
+<ul>
+<li>
+<p><strong>Rules 1 to 4 are well supported.</strong> Every library with names treats &quot;no name&quot; as a wildcard, and each output axis takes the name that isn't missing.</p>
+</li>
+<li>
+<p><strong>Handling conflicts splits three ways.</strong></p>
+<ul>
+<li>
+<p>Error: PyTorch, NamedDims, AxisKeys.</p>
+</li>
+<li>
+<p>Silent drop on that axis only: pandas index names.</p>
+</li>
+<li>
+<p>Change the data by joining on labels: pandas, xarray.</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>Nothing I know of drops every axis's names because of a conflict on one axis.</strong> That's more evidence for dropping per axis.</p>
+</li>
+</ul>
+<p>Raising an error is a real third option that we haven't discussed. It would be strictest and would also fix the associativity problem, because a conflict would stop the computation instead of being forgotten. The downside is that <code>x + y</code> would fail on inputs that base R handles fine, which seems too harsh for R dimnames. Most R users treat dimnames as labels for printing, not as something to check. I'd still go with dropping per axis, but raising an error would be consistent with PyTorch and Julia if you want rray to be strict.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I’ve blocked you from running Python to avoid you using it instead of Edit. Can you refine that rule to allow Python in general, but refuse it for edits?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool tool-error"><summary>Bash: ls -la .claude ~/.claude 2&gt;/dev/null; grep -rln &quot;inline interpreter&quot; .claude ~/.claude/settin…</summary>
+<pre>ls -la .claude ~/.claude 2&gt;/dev/null; grep -rln &quot;inline interpreter&quot; .claude ~/.claude/settings*.json ~/.claude/hooks 2&gt;/dev/null</pre><pre class="output">Exit code 2
+.claude:
+total 8
+drwxr-xr-x@  4 davis  staff  128 Sep  5 02:12 .
+drwxr-xr-x@ 26 davis  staff  832 Sep 28 11:58 ..
+drwxr-xr-x@  3 davis  staff   96 Sep  5 02:12 hooks
+-rw-r--r--@  1 davis  staff  298 Sep  5 02:12 settings.json
+
+~/.claude:
+total 1288
+drwxr-xr-x@  30 davis  staff     960 Sep 29 13:20 .
+drwxr-x---+  92 davis  staff    2944 Sep 29 15:36 ..
+-rw-r--r--@   1 davis  staff    6148 Jun 27 16:52 .DS_Store
+-rw-r--r--@   1 davis  staff      24 Sep 29 15:35 .last-cleanup
+-rw-r--r--@   1 davis  staff     161 Sep 29 12:42 .last-update-result.json
+drwxr-xr-x@   7 davis  staff     224 Sep 29 15:36 backups
+drwx------@   5 davis  staff     160 Sep 29 15:25 bridge-spawn
+drwxr-xr-x@   5 davis  staff     160 Sep 29 12:42 cache
+-rw-r--r--@   1 davis  staff    2141 Sep 27 13:18 CLAUDE.md
+drwx------@   5 davis  staff     160 Sep  3 13:38 daemon
+-rw-r--r--@   1 davis  staff      13 Sep  3 12:52 daemon-auth-cooldown
+-rw-r--r--@   1 davis  staff      48 Sep  3 12:52 daemon-auth-status.json
+-rw-r--r--@   1 davis  staff   69230 Sep  3 13:19 daemon.log
+drwx------@   3 davis  staff      96 Apr  7 15:25 debug
+drwxr-xr-x    2 davis  staff      64 Mar 20  2026 downloads
+-rw-r--r--@   1 davis  staff  542570 Sep 24 07:04 history.jsonl
+drwxr-xr-x@   3 davis  staff      96 Sep 29 12:26 ide
+drwxr-xr-x@   4 davis  staff     128 Jun 29 08:58 jobs
+-rw-r--r--@   1 davis  staff      92 Sep 17 03:57 mcp-needs-auth-cache.json
+drwxr-xr-x@   2 davis  staff      64 Aug 24 17:21 paste-cache
+drwxr-xr-x@   3 davis  staff      96 Sep 11 07:41 plans
+drwxr-xr-x@  13 davis  staff     416 Sep 29 15:31 plugins
+drwxr-xr-x@  15 davis  staff     480 Sep  3 13:14 projects
+drwxr-xr-x@ 153 davis  staff    4896 Sep 29 15:38 session-env
+drwx------@   8 davis  staff     256 Sep 29 15:25 sessions
+-rw-r--r--@   1 davis  staff     485 Jul  3 09:43 settings.json
+drwxr-xr-x@   4 davis  staff     128 Sep 29 15:25 shell-snapshots
+drwxr-xr-x    5 davis  staff     160 Sep 24 07:04 skills
+drwx------@   3 davis  staff      96 Sep 27 13:00 state
+-rw-------@   1 davis  staff    5826 Feb 17  2026 stats-cache.json
+.claude/hooks/deny-shell-edits.sh</pre></details>
+<details class="tool"><summary>Read .claude/hooks/deny-shell-edits.sh</summary>
+<pre class="output">1	#!/usr/bin/env bash
+2	
+3	cmd=$(jq -r '.tool_input.command // &quot;&quot;')
+4	
+5	sinks=$(printf '%s' &quot;$cmd&quot; | sed -E 's#&gt;&gt;?[[:space:]]*/(dev|tmp)/[^[:space:];&amp;|)]*##g')
+6	
+7	reason=''
+8	
+9	printf '%s' &quot;$cmd&quot; |
+10	  grep -Eq '(^|[[:space:];&amp;|(])(python3?|ruby|node)[[:space:]]+(-c([[:space:]]|$)|-[[:space:]]*(&lt;&lt;|$))' &amp;&amp;
+11	  reason='an inline interpreter script'
+12	
+13	printf '%s' &quot;$cmd&quot; |
+14	  grep -Eq '(^|[[:space:];&amp;|(])perl[[:space:]]+[^|;&amp;]*-[[:alnum:]]*i' &amp;&amp;
+15	  reason='a perl in-place edit'
+16	
+17	printf '%s' &quot;$cmd&quot; |
+18	  grep -Eq '(^|[[:space:];&amp;|(])sed[[:space:]]+[^|;&amp;]*-i([[:space:]]|$)' &amp;&amp;
+19	  reason='a sed in-place edit'
+20	
+21	printf '%s' &quot;$sinks&quot; |
+22	  grep -Eq '(^|[[:space:];&amp;|(])tee([[:space:]]|$)' &amp;&amp;
+23	  reason='a tee write'
+24	
+25	printf '%s' &quot;$sinks&quot; |
+26	  grep -Eq '&gt;&gt;?[[:space:]]*&quot;?[^[:space:];&amp;|&quot;]*(\.(c|h|R|r|md|json|yml|yaml|Rd)([[:space:]]|$|;)|(src|tests|plans|man|R)/)' &amp;&amp;
+27	  reason='a shell redirect into a file'
+28	
+29	if [ -n &quot;$reason&quot; ]; then
+30	  jq -n --arg reason &quot;$reason&quot; '{
+31	    hookSpecificOutput: {
+32	      hookEventName: &quot;PreToolUse&quot;,
+33	      permissionDecision: &quot;deny&quot;,
+34	      permissionDecisionReason: (
+35	        &quot;Blocked: this is &quot; + $reason + &quot;. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.&quot;
+36	      )
+37	    }
+38	  }'
+39	fi
+40	</pre></details>
+<details class="tool"><summary>Read .claude/settings.json</summary>
+<pre class="output">1	{
+2	  &quot;hooks&quot;: {
+3	    &quot;PreToolUse&quot;: [
+4	      {
+5	        &quot;matcher&quot;: &quot;Bash&quot;,
+6	        &quot;hooks&quot;: [
+7	          {
+8	            &quot;type&quot;: &quot;command&quot;,
+9	            &quot;command&quot;: &quot;.claude/hooks/deny-shell-edits.sh&quot;,
+10	            &quot;statusMessage&quot;: &quot;Checking for shell file edits...&quot;
+11	          }
+12	        ]
+13	      }
+14	    ]
+15	  }
+16	}
+17	</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Found the hook at <code>.claude/hooks/deny-shell-edits.sh</code>, which currently blocks all inline <code>python -c</code>, heredoc, <code>ruby</code>, and <code>node</code> scripts. I'll update it to only block those cases when the script writes to a file.</p>
+</details>
+<details class="tool"><summary>Edit .claude/hooks/deny-shell-edits.sh</summary>
+<pre class="diff"><span class="del">-reason=''</span>
+<span class="del">-</span>
+<span class="del">-printf '%s' &quot;$cmd&quot; |</span>
+<span class="del">-  grep -Eq '(^|[[:space:];&amp;|(])(python3?|ruby|node)[[:space:]]+(-c([[:space:]]|$)|-[[:space:]]*(&lt;&lt;|$))' &amp;&amp;</span>
+<span class="del">-  reason='an inline interpreter script'</span>
+<span class="ins">+q=&quot;['\&quot;]&quot;</span>
+<span class="ins">+mode=&quot;$q[rbt]*[wax+][rwaxbt+]*$q&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+script_writes=(</span>
+<span class="ins">+  &quot;open\(.*,[[:space:]]*(mode[[:space:]]*=[[:space:]]*)?$mode&quot;</span>
+<span class="ins">+  &quot;\.open\([[:space:]]*$mode&quot;</span>
+<span class="ins">+  '\.write(lines)?\('</span>
+<span class="ins">+  '\.write_(text|bytes)\('</span>
+<span class="ins">+  '\.(unlink|touch)\('</span>
+<span class="ins">+  '(os|shutil)\.(rename|replace|remove|unlink|move|copy[a-z0-9]*)\('</span>
+<span class="ins">+  'fileinput'</span>
+<span class="ins">+  '(writeFile|appendFile|createWriteStream|renameSync|unlinkSync|rmSync|copyFile)'</span>
+<span class="ins">+  'fs\.(write|rename|unlink|rm)\('</span>
+<span class="ins">+  '(File|IO)\.write'</span>
+<span class="ins">+  &quot;File\.open\(.*,[[:space:]]*$mode&quot;</span>
+<span class="ins">+  'FileUtils'</span>
+<span class="ins">+)</span>
+<span class="ins">+script_writes=$(IFS='|'; printf '%s' &quot;${script_writes[*]}&quot;)</span>
+<span class="ins">+</span>
+<span class="ins">+script=$(printf '%s' &quot;$cmd&quot; | sed -E 's#(sys\.|process\.)?std(out|err)\.write##g')</span>
+<span class="ins">+</span>
+<span class="ins">+reason=''</span>
+<span class="ins">+</span>
+<span class="ins">+printf '%s' &quot;$cmd&quot; |</span>
+<span class="ins">+  grep -Eq '(^|[[:space:];&amp;|(])(python3?|ruby|node)[[:space:]]+(-c([[:space:]]|$)|-[[:space:]]*(&lt;&lt;|$))' &amp;&amp;</span>
+<span class="ins">+  printf '%s' &quot;$script&quot; | grep -Eq &quot;$script_writes&quot; &amp;&amp;</span>
+<span class="ins">+  reason='an inline interpreter script that writes files'</span></pre><pre class="output">The file ~/files/r/packages/rray4/.claude/hooks/deny-shell-edits.sh has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now I'll test it against scripts that should be allowed and scripts that should be blocked.</p>
+
+<details class="tool"><summary>Write /tmp/hook-cases.sh</summary>
+<pre>#!/usr/bin/env bash
+
+hook=~/files/r/packages/rray4/.claude/hooks/deny-shell-edits.sh
+
+check() {
+  local expect=$1 cmd=$2
+  local out
+  out=$(jq -n --arg c &quot;$cmd&quot; '{tool_input: {command: $c}}' | bash &quot;$hook&quot;)
+  local got=allow
+  [ -n &quot;$out&quot; ] &amp;&amp; got=deny
+  local mark=ok
+  [ &quot;$got&quot; != &quot;$expect&quot; ] &amp;&amp; mark=FAIL
+  printf '%-4s %-5s %s\n' &quot;$mark&quot; &quot;$got&quot; &quot;$(printf '%s' &quot;$cmd&quot; | head -1)&quot;
+}
+
+check allow 'python3 -c &quot;import xarray; print(xarray.__version__)&quot;'
+check allow 'python3 -c &quot;import sys; sys.stdout.write(\&quot;hi\&quot;)&quot;'
+check allow 'python3 -c &quot;print(open(\&quot;R/rray.R\&quot;).read())&quot;'
+check allow 'python3 -c &quot;print(open(\&quot;workflow.json\&quot;, \&quot;r\&quot;).read())&quot;'
+check allow 'python3 -c &quot;import pandas as pd; df = pd.DataFrame(); df.rename(columns={})&quot;'
+check allow 'python3 -c &quot;print(\&quot;a b\&quot;.replace(\&quot;a\&quot;, \&quot;b\&quot;))&quot;'
+check allow 'node -e &quot;console.log(1)&quot;'
+check allow 'node -c &quot;process.stdout.write(\&quot;x\&quot;)&quot;'
+check allow &quot;python3 - &lt;&lt;'EOF'
+import xarray as xr
+print(xr.DataArray([1, 2]))
+EOF&quot;
+check allow 'python3 script.py'
+
+check deny 'python3 -c &quot;open(\&quot;src/foo.c\&quot;, \&quot;w\&quot;).write(\&quot;x\&quot;)&quot;'
+check deny 'python3 -c &quot;open(\&quot;src/foo.c\&quot;, mode=\&quot;a\&quot;)&quot;'
+check deny 'python3 -c &quot;from pathlib import Path; Path(\&quot;R/x.R\&quot;).write_text(\&quot;x\&quot;)&quot;'
+check deny 'python3 -c &quot;from pathlib import Path; Path(\&quot;R/x.R\&quot;).open(\&quot;w\&quot;)&quot;'
+check deny 'python3 -c &quot;import os; os.rename(\&quot;a\&quot;, \&quot;b\&quot;)&quot;'
+check deny 'python3 -c &quot;import shutil; shutil.copyfile(\&quot;a\&quot;, \&quot;b\&quot;)&quot;'
+check deny 'python3 -c &quot;import fileinput&quot;'
+check deny &quot;python3 - &lt;&lt;'EOF'
+p = 'src/foo.c'
+s = open(p).read()
+open(p, 'w').write(s.replace('a', 'b'))
+EOF&quot;
+check deny 'node -c &quot;require(\&quot;fs\&quot;).writeFileSync(\&quot;a\&quot;, \&quot;b\&quot;)&quot;'
+check deny 'ruby -c &quot;File.write(\&quot;a\&quot;, \&quot;b\&quot;)&quot;'
+check deny 'sed -i &quot;&quot; s/a/b/ src/foo.c'
+check deny 'echo x &gt; src/foo.c'</pre><pre class="output">File created successfully at: /tmp/hook-cases.sh (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: bash /tmp/hook-cases.sh</summary>
+<pre>bash /tmp/hook-cases.sh</pre><pre class="output">ok   allow python3 -c &quot;import xarray; print(xarray.__version__)&quot;
+ok   allow python3 -c &quot;import sys; sys.stdout.write(\&quot;hi\&quot;)&quot;
+ok   allow python3 -c &quot;print(open(\&quot;R/rray.R\&quot;).read())&quot;
+ok   allow python3 -c &quot;print(open(\&quot;workflow.json\&quot;, \&quot;r\&quot;).read())&quot;
+ok   allow python3 -c &quot;import pandas as pd; df = pd.DataFrame(); df.rename(columns={})&quot;
+ok   allow python3 -c &quot;print(\&quot;a b\&quot;.replace(\&quot;a\&quot;, \&quot;b\&quot;))&quot;
+ok   allow node -e &quot;console.log(1)&quot;
+ok   allow node -c &quot;process.stdout.write(\&quot;x\&quot;)&quot;
+ok   allow python3 - &lt;&lt;'EOF'
+ok   allow python3 script.py
+ok   deny  python3 -c &quot;open(\&quot;src/foo.c\&quot;, \&quot;w\&quot;).write(\&quot;x\&quot;)&quot;
+FAIL allow python3 -c &quot;open(\&quot;src/foo.c\&quot;, mode=\&quot;a\&quot;)&quot;
+ok   deny  python3 -c &quot;from pathlib import Path; Path(\&quot;R/x.R\&quot;).write_text(\&quot;x\&quot;)&quot;
+FAIL allow python3 -c &quot;from pathlib import Path; Path(\&quot;R/x.R\&quot;).open(\&quot;w\&quot;)&quot;
+ok   deny  python3 -c &quot;import os; os.rename(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  python3 -c &quot;import shutil; shutil.copyfile(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  python3 -c &quot;import fileinput&quot;
+ok   deny  python3 - &lt;&lt;'EOF'
+ok   deny  node -c &quot;require(\&quot;fs\&quot;).writeFileSync(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  ruby -c &quot;File.write(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  sed -i &quot;&quot; s/a/b/ src/foo.c
+ok   deny  echo x &gt; src/foo.c</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Two blocked cases slipped through because the mode pattern didn't account for escaped quotes like <code>\&quot;w\&quot;</code>. I'll update it to allow an optional backslash before each quote.</p>
+</details>
+<details class="tool"><summary>Edit .claude/hooks/deny-shell-edits.sh</summary>
+<pre class="diff"><span class="del">-q=&quot;['\&quot;]&quot;</span>
+<span class="ins">+q=&quot;\\\\?['\&quot;]&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/.claude/hooks/deny-shell-edits.sh has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: bash /tmp/hook-cases.sh</summary>
+<pre>bash /tmp/hook-cases.sh</pre><pre class="output">ok   allow python3 -c &quot;import xarray; print(xarray.__version__)&quot;
+ok   allow python3 -c &quot;import sys; sys.stdout.write(\&quot;hi\&quot;)&quot;
+ok   allow python3 -c &quot;print(open(\&quot;R/rray.R\&quot;).read())&quot;
+ok   allow python3 -c &quot;print(open(\&quot;workflow.json\&quot;, \&quot;r\&quot;).read())&quot;
+ok   allow python3 -c &quot;import pandas as pd; df = pd.DataFrame(); df.rename(columns={})&quot;
+ok   allow python3 -c &quot;print(\&quot;a b\&quot;.replace(\&quot;a\&quot;, \&quot;b\&quot;))&quot;
+ok   allow node -e &quot;console.log(1)&quot;
+ok   allow node -c &quot;process.stdout.write(\&quot;x\&quot;)&quot;
+ok   allow python3 - &lt;&lt;'EOF'
+ok   allow python3 script.py
+ok   deny  python3 -c &quot;open(\&quot;src/foo.c\&quot;, \&quot;w\&quot;).write(\&quot;x\&quot;)&quot;
+ok   deny  python3 -c &quot;open(\&quot;src/foo.c\&quot;, mode=\&quot;a\&quot;)&quot;
+ok   deny  python3 -c &quot;from pathlib import Path; Path(\&quot;R/x.R\&quot;).write_text(\&quot;x\&quot;)&quot;
+ok   deny  python3 -c &quot;from pathlib import Path; Path(\&quot;R/x.R\&quot;).open(\&quot;w\&quot;)&quot;
+ok   deny  python3 -c &quot;import os; os.rename(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  python3 -c &quot;import shutil; shutil.copyfile(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  python3 -c &quot;import fileinput&quot;
+ok   deny  python3 - &lt;&lt;'EOF'
+ok   deny  node -c &quot;require(\&quot;fs\&quot;).writeFileSync(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  ruby -c &quot;File.write(\&quot;a\&quot;, \&quot;b\&quot;)&quot;
+ok   deny  sed -i &quot;&quot; s/a/b/ src/foo.c
+ok   deny  echo x &gt; src/foo.c</pre></details>
+<p>I changed the hook so inline Python is allowed unless the script writes to a file. I ran 22 test commands through it (10 that should be allowed, 12 that should be blocked) and all 22 now give the right answer.</p>
+<p>The change is in <code>.claude/hooks/deny-shell-edits.sh</code>. Inline <code>python -c ...</code> and <code>python - &lt;&lt;EOF</code> scripts now run unless the script text matches one of these write patterns:</p>
+<ul>
+<li>
+<p><strong>Python:</strong> <code>open(..., &quot;w&quot;)</code>, including the <code>a</code>, <code>x</code> and <code>+</code> modes and <code>mode=</code>; <code>Path.open(&quot;w&quot;)</code>; <code>.write()</code>, <code>.writelines()</code>, <code>.write_text()</code>, <code>.write_bytes()</code>; <code>.unlink()</code>, <code>.touch()</code>; <code>os.</code>/<code>shutil.</code> rename, replace, remove, move and copy; <code>fileinput</code>.</p>
+</li>
+<li>
+<p><strong>Node:</strong> <code>writeFile</code>, <code>appendFile</code>, <code>createWriteStream</code>, <code>renameSync</code>, <code>unlinkSync</code>, <code>rmSync</code>, <code>copyFile</code>, and <code>fs.write</code>/<code>rename</code>/<code>unlink</code>/<code>rm</code>.</p>
+</li>
+<li>
+<p><strong>Ruby:</strong> <code>File.write</code>, <code>IO.write</code>, <code>File.open(..., &quot;w&quot;)</code>, <code>FileUtils</code>.</p>
+</li>
+</ul>
+<p><code>sys.stdout.write</code>, <code>sys.stderr.write</code> and <code>process.stdout.write</code> are allowed. Reading files, <code>str.replace()</code> and pandas <code>df.rename()</code> are also allowed. The blocked message now says &quot;an inline interpreter script that writes files&quot;. The checks for <code>sed -i</code>, <code>perl -i</code>, <code>tee</code> and shell redirects haven't changed.</p>
+<p>My first test run found a bug: a mode like <code>\&quot;w\&quot;</code> inside a double-quoted command wasn't caught, because of the backslash before the quote. Commands I send look like that, so I fixed the pattern to allow the backslash. The 22 cases passed on the second run.</p>
+<p>This is a text match, so there are two limits:</p>
+<ul>
+<li>
+<p><strong>A script can still get past it.</strong> For example, it could build the name <code>open</code> at runtime or call <code>subprocess</code> to run a separate write command. It stops accidental edits, not deliberate workarounds.</p>
+</li>
+<li>
+<p><strong><code>python3 script.py</code>, <code>node -e</code> and <code>ruby -e</code> are not checked.</strong> That was already true before this change. The check only looks at <code>-c</code> and <code>-</code>. If you want <code>-e</code> covered too, it's a one-line change.</p>
+</li>
+</ul>
+<p>The test script is at <code>/tmp/hook-cases.sh</code> if you want to rerun it. Nothing is committed.</p>
+
+</section>
+<p class="divider">Sep 29, 2026, 22:24 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Look at the posterior package and how they use array dimnames and their names</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool tool-error"><summary>Bash: ls -d ~/files/r/packages/posterior 2&gt;/dev/null; Rscript -e 'cat(system.file(package=&quot;posterio…</summary>
+<pre>ls -d ~/files/r/packages/posterior 2&gt;/dev/null; Rscript -e 'cat(system.file(package=&quot;posterior&quot;), packageDescription(&quot;posterior&quot;)$Version)' 2&gt;&amp;1</pre><pre class="output">Exit code 1
+Error in packageDescription(&quot;posterior&quot;)$Version : 
+  $ operator is invalid for atomic vectors
+Calls: cat
+In addition: Warning message:
+In packageDescription(&quot;posterior&quot;) : no package 'posterior' was found
+Execution halted</pre></details>
+<p>Posterior isn't installed or checked out locally, so I'll clone the source into <code>/tmp</code> to read it.</p>
+
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; git clone --depth 1 https://github.com/stan-dev/posterior.git 2&gt;&amp;1 | tail -2 &amp;&amp; cd…</summary>
+<pre>cd /tmp &amp;&amp; git clone --depth 1 https://github.com/stan-dev/posterior.git 2&gt;&amp;1 | tail -2 &amp;&amp; cd posterior &amp;&amp; git log -1 --format='%h %cd' &amp;&amp; ls R | grep -i rvar</pre><pre class="output">Cloning into 'posterior'...
+acf2447 Sun Sep 27 17:26:37 2026 -0700
+as_draws_rvars.R
+rvar-.R
+rvar-apply.R
+rvar-bind.R
+rvar-cast.R
+rvar-dim.R
+rvar-dist.R
+rvar-factor.R
+rvar-math.R
+rvar-print.R
+rvar-rfun.R
+rvar-slice.R
+rvar-summaries-over-draws.R
+rvar-summaries-within-draws.R
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/posterior/R &amp;&amp; grep -n &quot;dimnames\|names(dimnames\|broadcast&quot; rvar-math.R rvar-.R rvar…</summary>
+<pre>cd /tmp/posterior/R &amp;&amp; grep -n &quot;dimnames\|names(dimnames\|broadcast&quot; rvar-math.R rvar-.R rvar-bind.R rvar-dim.R | head -120</pre><pre class="output">rvar-math.R:21:  # broadcast draws to common dimension
+rvar-math.R:23:  # Most of the time we don't broadcast scalars (constant rvars of length 1).
+rvar-math.R:24:  # With broadcast_scalars = FALSE broadcast_array will return a vector (no dims)
+rvar-math.R:27:  # broadcast both x and y in case their dimensions are not equal; e.g. if x is
+rvar-math.R:28:  # 1x1 and y is 1x1x1x1 we must broadcast both to 1x1x1x1)
+rvar-math.R:29:  broadcast_scalars = length(draws_x) == 1 &amp;&amp; length(draws_y) == 1
+rvar-math.R:30:  draws_x &lt;- broadcast_array(draws_x, new_dim, broadcast_scalars = broadcast_scalars)
+rvar-math.R:31:  draws_y &lt;- broadcast_array(draws_y, new_dim, broadcast_scalars = broadcast_scalars)
+rvar-math.R:134:#' by [`rvar`]s and are broadcasted across all draws of the [`rvar`] argument. Tensor multiplication
+rvar-math.R:206:  result &lt;- copy_dimnames(draws_of(x), 1:2, result, 1:2)
+rvar-math.R:207:  result &lt;- copy_dimnames(draws_of(y), 3, result, 3)
+rvar-math.R:256:  dimnames(result) &lt;- NULL
+rvar-math.R:334:    .dimnames = dimnames(.draws)
+rvar-math.R:336:    dimnames(.draws) = c(.dimnames[1], list(NULL), .dimnames[2])
+rvar-bind.R:22:    out &lt;- broadcast_and_bind_rvars(out, arg)
+rvar-bind.R:67:    out &lt;- broadcast_and_bind_rvars(out, arg, axis)
+rvar-bind.R:76:#' broadcast two rvars to compatible dimensions and bind along the `axis` dimension
+rvar-bind.R:78:broadcast_and_bind_rvars &lt;- function(x, y, axis = 1) {
+rvar-bind.R:79:  UseMethod(&quot;broadcast_and_bind_rvars&quot;)
+rvar-bind.R:83:broadcast_and_bind_rvars.rvar &lt;- function(x, y, axis = 1) {
+rvar-bind.R:85:  # conforms their chains, broadcasts them all to common dimensions and uses a
+rvar-bind.R:93:  # (don't need to do draws here since that's part of the broadcast below)
+rvar-bind.R:96:  # broadcast each array to the desired dimensions
+rvar-bind.R:103:  draws_x &lt;- broadcast_array(draws_x, new_dim)
+rvar-bind.R:106:  draws_y &lt;- broadcast_array(draws_y, new_dim)
+rvar-bind.R:120:broadcast_and_bind_rvars.rvar_factor &lt;- function(x, y, axis = 1) {
+rvar-bind.R:192:      dimnames(x)[[axis]] &lt;- axis_name
+rvar-.R:18:#' @template args-rvar-dimnames
+rvar-.R:42:#' - Rather than base R-style recycling, `rvar`s use a limited form of broadcasting:
+rvar-.R:93:rvar &lt;- function(x = double(), dim = NULL, dimnames = NULL, nchains = NULL, with_chains = FALSE) {
+rvar-.R:113:  if (!is.null(dimnames)) {
+rvar-.R:114:    dimnames(out) &lt;- dimnames
+rvar-.R:210:    draws &lt;- copy_dimnames(x, x_dim_i, draws, x_dim_i + 2)
+rvar-.R:402:#' `vctrs::vec_cast_common()`) and a shape determined by broadcasting `test`,
+rvar-.R:403:#' `yes`, and `no` to a common shape (see the section on broadcasting rules in
+rvar-.R:508:# find common ndraws for the ndraws of two rvars to be broadcast to
+rvar-.R:571:  # broadcast to a common number of chains. If keep_constants = TRUE,
+rvar-.R:572:  # constants will not be broadcast.
+rvar-.R:575:    rvars[[i]] &lt;- broadcast_draws(rvars[[i]], .ndraws, keep_constants)
+rvar-.R:634:      dimnames(draws) &lt;- dimnames(variable)
+rvar-.R:642:  # find common dim for two arrays to be broadcast to
+rvar-.R:659:# given a list of arrays, broadcast their dimensions to be equal
+rvar-.R:662:  lapply(arrays, broadcast_array, .dim)
+rvar-.R:666:broadcast_array  &lt;- function(x, dim, broadcast_scalars = TRUE) {
+rvar-.R:667:  if (!broadcast_scalars &amp;&amp; length(x) == 1) {
+rvar-.R:668:    # quick exit: not broadcasting scalars; return them as vectors
+rvar-.R:674:  current_dimnames &lt;- dimnames(x)
+rvar-.R:677:    # add dimensions of size 1 as necessary so we can broadcast those
+rvar-.R:681:    if (!is.null(current_dimnames)) {
+rvar-.R:682:      current_dimnames[new_dim] &lt;- list(NULL)
+rvar-.R:683:      dimnames(x) &lt;- current_dimnames
+rvar-.R:687:      &quot;Cannot broadcast array of shape [&quot;, paste(current_dim, collapse = &quot;,&quot;), &quot;] &quot;,
+rvar-.R:693:  dim_to_broadcast &lt;- which(current_dim != dim)
+rvar-.R:695:  if (length(dim_to_broadcast) == 0) {
+rvar-.R:700:  if (any(current_dim[dim_to_broadcast] != 1)) {
+rvar-.R:702:      &quot;Cannot broadcast array of shape [&quot;, paste(current_dim, collapse = &quot;,&quot;), &quot;] &quot;,
+rvar-.R:708:  if (!is.null(current_dimnames)) {
+rvar-.R:709:    # the slice (below) should correctly preserve dimnames that are not broadcast,
+rvar-.R:710:    # but it will also duplicate dimnames that were broadcast --- which is probably
+rvar-.R:711:    # undesirable as those dimnames are no longer unique. So, drop those before
+rvar-.R:712:    # we do the broadcast (this can be much faster than dropping afterwards if
+rvar-.R:713:    # the broadcast dimensions are large)
+rvar-.R:714:    dimnames(x)[dim_to_broadcast] &lt;- list(NULL)
+rvar-.R:717:  # construct the indices used in a slice that will broadcast the array
+rvar-.R:718:  # e.g. if we want to broadcast x with dim c(2,1,2,4) to dim c(2,3,2,4), we
+rvar-.R:719:  # need to do the slice x[,c(1,1,1),,], which broadcasts the second dimension
+rvar-.R:723:  # second, fill in the appropriate number of 1s in the dims we want to broadcast
+rvar-.R:724:  indices[dim_to_broadcast] &lt;- lapply(dim[dim_to_broadcast], rep, x = 1L)
+rvar-.R:726:  # do the slice to broadcast the array
+rvar-.R:730:# broadcast the draws dimension of an rvar to the requested size
+rvar-.R:731:broadcast_draws &lt;- function(x, .ndraws, keep_constants = FALSE) {
+rvar-.R:743:    new_rvar(broadcast_array(draws, new_dim), .nchains = nchains(x))
+rvar-.R:750:copy_dimnames &lt;- function(src, src_i, dst, dst_i) {
+rvar-.R:751:  if (is.null(dimnames(dst))) {
+rvar-.R:752:    if (is.null(dimnames(src))) {
+rvar-.R:755:    dimnames(dst) &lt;- list(NULL)
+rvar-.R:758:  if (is.null(dimnames(src))) {
+rvar-.R:759:    dimnames(src) &lt;- list(NULL)
+rvar-.R:761:  if (is.null(names(dimnames(src)))) {
+rvar-.R:762:    names(dimnames(src)) &lt;- rep(&quot;&quot;, length(dim(src)))
+rvar-.R:765:  dimnames(dst)[dst_i] &lt;- dimnames(src)[src_i]
+rvar-.R:766:  names(dimnames(dst))[dst_i] &lt;- names(dimnames(src))[src_i]
+rvar-.R:767:  names(dimnames(dst))[is.na(names(dimnames(dst)))] &lt;- &quot;&quot;
+rvar-.R:769:  dst_dimnames &lt;- names(dimnames(dst))
+rvar-.R:770:  empty_names &lt;- is.na(dst_dimnames) | dst_dimnames == &quot;&quot;
+rvar-.R:772:    names(dimnames(dst)) &lt;- NULL
+rvar-.R:795:  out &lt;- copy_dimnames(x, x_dim_i, out, x_dim_i - 1)
+rvar-.R:800:#' Ensures that dim and dimnames are set, that the array has at least two dimensions
+rvar-.R:823:  # ensure dimnames is set (makes comparison easier for tests)
+rvar-.R:824:  if (length(dimnames(x)) == 0) {
+rvar-.R:825:    dimnames(x) &lt;- list(NULL)
+rvar-.R:841:#' Copy dims and dimnames of `src` to `dst`.
+rvar-.R:844:#' @param src a variable, possibly with dims and dimnames
+rvar-.R:849:  dimnames(dst) &lt;- dimnames(src)
+rvar-.R:964:#' @param .extra_dimnames extra dimension names for dims added by `.f` to the output
+rvar-.R:970:  x, .name, .f, .extra_dim = NULL, .extra_dimnames = NULL, .ordered_okay = TRUE, .factor_okay = FALSE, ...
+rvar-.R:973:  .dimnames &lt;- dimnames(x)
+rvar-.R:991:    names(x) &lt;- .dimnames[[1]]
+rvar-.R:995:    names(x) &lt;- .extra_dimnames[[1]]
+rvar-.R:998:    dimnames(x) &lt;- c(.extra_dimnames, .dimnames)
+rvar-dim.R:26:dimnames.rvar &lt;- function(x) {
+rvar-dim.R:27:  .dimnames &lt;- dimnames(draws_of(x))
+rvar-dim.R:28:  .dimnames[-1]
+rvar-dim.R:32:`dimnames&lt;-.rvar` &lt;- function(x, value) {
+rvar-dim.R:35:  dimnames(.draws) &lt;- c(list(dimnames(.draws)[[1]]), value)
+rvar-dim.R:43:  .dimnames &lt;- dimnames(draws_of(x))
+rvar-dim.R:44:  .dimnames[[2]]
+rvar-dim.R:49:  dimnames(draws_of(x))[2] &lt;- list(value)
+rvar-dim.R:90:    .dimnames &lt;- dimnames(x)
+rvar-dim.R:92:    # for comparison / testing, ensure if no dimnames have names that we
+rvar-dim.R:94:    new_dimnames &lt;- .dimnames[keep_dim]
+rvar-dim.R:95:    if (all(names(new_dimnames) == &quot;&quot;)) names(new_dimnames) &lt;- NULL
+rvar-dim.R:96:    dimnames(x) &lt;- new_dimnames
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/posterior/R &amp;&amp; sed -n 1,80p rvar-math.R; sed -n 150,260p rvar-math.R; sed -n 740,800p…</summary>
+<pre>cd /tmp/posterior/R &amp;&amp; sed -n 1,80p rvar-math.R; sed -n 150,260p rvar-math.R; sed -n 740,800p rvar-.R; sed -n 76,200p rvar-bind.R</pre><pre class="output"># Ops: math operators ---------------------------------------------------
+
+#' @export
+Ops.rvar &lt;- function(e1, e2) {
+  e1 &lt;- as_rvar(e1)
+  f &lt;- get(.Generic)
+
+  if (missing(e2)) {
+    # unary operators
+    rvar_apply_vec_fun(f, e1)
+  } else {
+    .Ops.rvar(f, e1, as_rvar(e2))
+  }
+}
+
+.Ops.rvar &lt;- function(f, e1, e2, preserve_dims = FALSE) {
+  c(e1, e2) %&lt;-% conform_rvar_nchains(list(e1, e2))
+  draws_x &lt;- draws_of(e1)
+  draws_y &lt;- draws_of(e2)
+
+  # broadcast draws to common dimension
+  new_dim &lt;- dim2_common(dim(draws_x), dim(draws_y))
+  # Most of the time we don't broadcast scalars (constant rvars of length 1).
+  # With broadcast_scalars = FALSE broadcast_array will return a vector (no dims)
+  # version of the input, which works unless *both* x and y are constants
+  # (because then the correct output shape is lost; in this case we do need to
+  # broadcast both x and y in case their dimensions are not equal; e.g. if x is
+  # 1x1 and y is 1x1x1x1 we must broadcast both to 1x1x1x1)
+  broadcast_scalars = length(draws_x) == 1 &amp;&amp; length(draws_y) == 1
+  draws_x &lt;- broadcast_array(draws_x, new_dim, broadcast_scalars = broadcast_scalars)
+  draws_y &lt;- broadcast_array(draws_y, new_dim, broadcast_scalars = broadcast_scalars)
+
+  draws &lt;- f(draws_x, draws_y)
+
+  # for factors, we must copy the dims back over after, because base-R factor
+  # operations destroy dims (while base-R numeric array operations do not)
+  if (preserve_dims) {
+    # in the case where one of e1 or e2 is scalar and the other is not,
+    # we need to source the dims from whichever is *not* scalar, which will be
+    # the longer of the two. In any other case, we give preference to e1
+    # (draws_x) to be consistent with base R behavior
+    if (length(draws_y) &gt; length(draws_x)) {
+      dim_source &lt;- draws_y
+    } else {
+      dim_source &lt;- draws_x
+    }
+    draws &lt;- copy_dims(dim_source, draws)
+  }
+
+  new_rvar(draws, .nchains = nchains(e1))
+}
+
+#' @export
+Ops.rvar_factor &lt;- function(e1, e2) {
+  if (missing(e2) || !(.Generic %in% c(&quot;==&quot;, &quot;!=&quot;))) {
+    stop_no_call(&quot;Cannot apply `&quot;, .Generic, &quot;` operator to rvar_factor objects.&quot;)
+  }
+
+  .Ops.rvar_factor(.Generic, e1, e2)
+}
+
+.Ops.rvar_factor &lt;- function(.Generic, e1, e2, ordered = FALSE) {
+  # if one arg is a character vector, must convert it to a factor first, and
+  # if the operation is comparison must make sure that it is a level in the
+  # factor object we are comparing to (otherwise we end up with NAs)
+  if (is.character(e1)) {
+    if (.Generic %in% c(&quot;==&quot;, &quot;!=&quot;)) {
+      levels(e2) &lt;- c(levels(e2), setdiff(e1, levels(e2)))
+    }
+    e1 &lt;- as_rvar_factor(e1, levels = levels(e2), ordered = ordered)
+  }
+  if (is.character(e2)) {
+    if (.Generic %in% c(&quot;==&quot;, &quot;!=&quot;)) {
+      levels(e1) &lt;- c(levels(e1), setdiff(e2, levels(e1)))
+    }
+    e2 &lt;- as_rvar_factor(e2, levels = levels(e1), ordered = ordered)
+  }
+
+  .Ops.rvar(get(.Generic), as_rvar(e1), as_rvar(e2), preserve_dims = TRUE)
+}
+#' # trivial example: multiplication by a non-random matrix
+#' d$Sigma %**% diag(1:3)
+#'
+#' # Decompose Sigma into R s.t. R'R = Sigma ...
+#' R &lt;- chol(d$Sigma)
+#' # ... and recreate Sigma using matrix multiplication
+#' t(R) %**% R
+#'
+#' @importFrom tensorA mul.tensor as.tensor
+#' @export
+`%**%` &lt;- function(x, y) {
+  # Fast version of rdo(x %*% y)
+
+  # convert both objects into rvars if they aren't already (this will ensure
+  # we have a 3d draws array for each variable)
+  x &lt;- as_rvar(x)
+  y &lt;- as_rvar(y)
+
+  if (is_rvar_factor(x) || is_rvar_factor(y)) {
+    stop_no_call(&quot;Cannot apply `%**%` operator to rvar_factor objects.&quot;)
+  }
+
+  # ensure everything is a matrix by adding dimensions as necessary to make `x`
+  # a row vector and `y` a column vector
+  ndim_x &lt;- length(dim(x))
+  if (ndim_x == 1) {
+    dim(x) &lt;- c(1, dim(x))
+  } else if (ndim_x != 2) {
+    stop_no_call(&quot;First argument (`x`) is not a vector or matrix, cannot matrix-multiply&quot;)
+  }
+
+  ndim_y &lt;- length(dim(y))
+  if (ndim_y == 1) {
+    dim(y) &lt;- c(dim(y), 1)
+  } else if (ndim_y != 2) {
+    stop_no_call(&quot;Second argument (`y`) is not a vector or matrix, cannot matrix-multiply&quot;)
+  }
+
+  # conform the draws dimension in both variables
+  c(x, y) %&lt;-% conform_rvar_ndraws_nchains(list(x, y))
+
+  # drop the names of the dimensions (mul.tensor gets uppity if dimension names
+  # are duplicated, but we don't care about that)
+  x_tensor &lt;- as.tensor(draws_of(x))
+  y_tensor &lt;- as.tensor(draws_of(y))
+  names(dim(x_tensor)) &lt;- NULL
+  names(dim(y_tensor)) &lt;- NULL
+
+  # do a tensor multiplication equivalent of the requested matrix multiplication
+  result &lt;- unclass(mul.tensor(x_tensor, 3, y_tensor, 2, by = 1))
+
+  # move draws dimension back to the front
+  result &lt;- aperm(result, c(3,1,2))
+
+  # restore dimension names (as.tensor adds dummy names to dimensions)
+  names(dim(result)) &lt;- NULL
+  result &lt;- copy_dimnames(draws_of(x), 1:2, result, 1:2)
+  result &lt;- copy_dimnames(draws_of(y), 3, result, 3)
+
+  new_rvar(result, .nchains = nchains(x))
+}
+
+# This generic is not exported here as matrixOps is only in R &gt;= 4.3, so we must
+# conditionally export it in .onLoad() for compatibility with older versions
+#' @rdname rvar-matmult
+#' @method matrixOps rvar
+matrixOps.rvar &lt;- function(x, y) {
+  # as of R 4.3 this group generic is only used for %*%, but that may change
+  # in the future (crossprod and tcrossprod are planned), so we include this
+  # check for safety purposes
+  if (.Generic != &quot;%*%&quot;) {
+    stop_no_call(&quot;Cannot apply `&quot;, .Generic, &quot;` operator to rvar objects.&quot;)
+  }
+  x %**% y
+}
+
+
+#' Cholesky decomposition of random matrix
+#'
+#' Cholesky decomposition of an [`rvar`] containing a matrix.
+#'
+#' @param x (rvar) A 2-dimensional [`rvar`].
+#' @param ... Additional parameters passed on to `chol.tensor()`
+#'
+#' @return An [`rvar`] containing the upper triangular factor of the Cholesky
+#' decomposition, i.e., the matrix \eqn{R} such that \eqn{R'R = x}.
+#'
+#' @importFrom tensorA chol.tensor as.tensor
+#' @export
+chol.rvar &lt;- function(x, ...) {
+  # ensure x is a matrix
+  if (length(dim(x)) != 2 || is_rvar_factor(x)) {
+    stop_no_call(&quot;`x` must be a random matrix&quot;)
+  }
+
+  # must re-order draws dimension to the end, as chol.tensor expects it there
+  x_tensor &lt;- as.tensor(aperm(draws_of(x), c(2,3,1)))
+
+  # do the cholesky decomp
+  result &lt;- unclass(chol.tensor(x_tensor, 1, 2, ...))
+
+  # move draws dimension back to the front
+  result &lt;- aperm(result, c(3,1,2))
+
+  # drop dimension names (chol.tensor screws them around)
+  names(dim(result)) &lt;- NULL
+  dimnames(result) &lt;- NULL
+
+  new_rvar(result, .nchains = nchains(x))
+}
+
+    new_dim &lt;- dim(draws)
+    new_dim[1] &lt;- .ndraws
+
+    new_rvar(broadcast_array(draws, new_dim), .nchains = nchains(x))
+  }
+}
+
+#' copy the dimension names (and name of the dimension) from dimension src_i
+#' in array src to dimension dst_i in array dst</pre><p class="cut">174 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd /tmp/posterior &amp;&amp; grep -rn &quot;names(dimnames\|dnn\|use.dnns&quot; R | grep -v &quot;^R/rvar-.R:7[5-7]&quot;…</summary>
+<pre>cd /tmp/posterior &amp;&amp; grep -rn &quot;names(dimnames\|dnn\|use.dnns&quot; R | grep -v &quot;^R/rvar-.R:7[5-7]&quot; | head -40; echo ---; grep -rln &quot;dimnames&quot; tests/testthat | head; echo ---; grep -n &quot;dimnames&quot; tests/testthat/test-rvar-math.R | head -30</pre><pre class="output">R/rvar-bind.R:114:    abind(draws_x, draws_y, along = draws_axis, use.dnns = TRUE),
+R/variables.R:49:  out &lt;- remove_reserved_variable_names(dimnames(x)[[3L]], reserved)
+R/variables.R:148:  variable_names(dimnames(x)[[3L]], with_indices) &lt;- value
+---
+tests/testthat/test-rvar-bind.R
+tests/testthat/test-extract_variable_matrix.R
+tests/testthat/test-rvar-factor.R
+tests/testthat/test-rvar-cast.R
+tests/testthat/test-for_each_draw.R
+tests/testthat/test-rvar-math.R
+tests/testthat/test-summarise_draws.R
+tests/testthat/test-rvar-summaries-over-draws.R
+tests/testthat/test-rvar-dim.R
+tests/testthat/test-rvar-slice.R
+---
+4:  x_array = array(1:24, dim = c(4,2,3), dimnames = list(NULL,letters[1:2],letters[3:5]))
+40:  x_array = array(letters[1:24], dim = c(4,2,3), dimnames = list(NULL,letters[1:2],letters[3:5]))
+248:  dimnames(m1) &lt;- list(a = paste0(&quot;a&quot;, 1:3), b = paste0(&quot;b&quot;, 1:3))
+250:  dimnames(m2) &lt;- list(c = paste0(&quot;c&quot;, 1:3), d = paste0(&quot;d&quot;, 1:2))
+251:  expect_equal(dimnames(m1 %**% m2), list(a = paste0(&quot;a&quot;, 1:3), d = paste0(&quot;d&quot;, 1:2)))
+315:  dimnames(Sigma) &lt;- list(
+328:  x_array = array(1:6, dim = c(2,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;)))
+330:  x_array_t = array(1:6, dim = c(2,1,3), dimnames = list(NULL, NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;)))
+332:  x_array_t_t = array(1:6, dim = c(2,3,1), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;), NULL))
+335:  # ensure it works with dimnames...
+339:  # ... and without dimnames
+340:  dimnames(x) = NULL
+341:  dimnames(x_t) = NULL
+342:  dimnames(x_t_t) = NULL
+348:  x_array = array(letters[1:6], dim = c(2,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;)))
+350:  x_array_t = array(letters[1:6], dim = c(2,1,3), dimnames = list(NULL, NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;)))
+352:  x_array_t_t = array(letters[1:6], dim = c(2,3,1), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;), NULL))
+355:  # ensure it works with dimnames...
+361:  x_array = array(letters[1:6], dim = c(2,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;)))
+363:  x_array_t = array(letters[1:6], dim = c(2,1,3), dimnames = list(NULL, NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;)))
+365:  x_array_t_t = array(letters[1:6], dim = c(2,3,1), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;), NULL))
+368:  # ensure it works with dimnames...
+408:    dimnames = list(NULL, A = paste0(&quot;a&quot;, 1:2), B = paste0(&quot;b&quot;, 1:3), C = paste0(&quot;c&quot;, 1:2))
+419:    dimnames = list(NULL, A = paste0(&quot;a&quot;, 1:2), B = paste0(&quot;b&quot;, 1:3), C = paste0(&quot;c&quot;, 1:2))
+430:    dimnames = list(NULL, A = paste0(&quot;a&quot;, 1:2), B = paste0(&quot;b&quot;, 1:3), C = paste0(&quot;c&quot;, 1:2))
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/posterior/tests/testthat &amp;&amp; sed -n 400,440p test-rvar-math.R; echo ----; grep -n -B3 …</summary>
+<pre>cd /tmp/posterior/tests/testthat &amp;&amp; sed -n 400,440p test-rvar-math.R; echo ----; grep -n -B3 -A12 &quot;dimnames&quot; test-rvar-bind.R | head -120</pre><pre class="output">  expect_equal(t(x), x_t)
+  expect_equal(t(t(x)), x)
+})
+
+test_that(&quot;array permutation works&quot;, {
+  x_array = array(
+    1:24, dim = c(2,2,3,2),
+    dimnames = list(NULL, A = paste0(&quot;a&quot;, 1:2), B = paste0(&quot;b&quot;, 1:3), C = paste0(&quot;c&quot;, 1:2))
+  )
+  x = new_rvar(x_array)
+  x_perm = new_rvar(aperm(x_array, c(1,2,4,3)))
+
+  expect_equal(aperm(x, c(1,3,2)), x_perm)
+})
+
+test_that(&quot;array permutation works on rvar_factor&quot;, {
+  x_array = array(
+    letters[1:24], dim = c(2,2,3,2),
+    dimnames = list(NULL, A = paste0(&quot;a&quot;, 1:2), B = paste0(&quot;b&quot;, 1:3), C = paste0(&quot;c&quot;, 1:2))
+  )
+  x = rvar_factor(x_array)
+  x_perm = rvar_factor(aperm(x_array, c(1,2,4,3)))
+
+  expect_equal(aperm(x, c(1,3,2)), x_perm)
+})
+
+test_that(&quot;array permutation works on rvar_ordered&quot;, {
+  x_array = array(
+    letters[1:24], dim = c(2,2,3,2),
+    dimnames = list(NULL, A = paste0(&quot;a&quot;, 1:2), B = paste0(&quot;b&quot;, 1:3), C = paste0(&quot;c&quot;, 1:2))
+  )
+  x = rvar_ordered(x_array)
+  x_perm = rvar_ordered(aperm(x_array, c(1,2,4,3)))
+
+  expect_equal(aperm(x, c(1,3,2)), x_perm)
+})
+----
+3-
+4-test_that(&quot;c works on rvar&quot;, {
+5-  x &lt;- rvar(array(1:9, dim = c(3,3)))
+6:  y &lt;- rvar(array(2:10, dim = c(3,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))))
+7:  x_y &lt;- rvar(array(c(1:9, 2:10), dim = c(3,6), dimnames = list(NULL, c(&quot;&quot;,&quot;&quot;,&quot;&quot;,&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))))
+8-
+9-  expect_equal(c(x), x)
+10-  expect_equal(c(x, NULL), x)
+11-  expect_equal(c(x, y), x_y)
+12-  expect_equal(c(x, NULL, y), x_y)
+13-  expect_equal(c(x, x), rvar(array(c(1:9, 1:9), dim = c(3,6))))
+14-
+15-  expect_equal(c(z = x),
+16:    rvar(array(1:9, dim = c(3,3), dimnames = list(NULL, c(&quot;z1&quot;,&quot;z2&quot;,&quot;z3&quot;))))
+17-  )
+18-
+19-  expect_equal(c(z = c(x, y)),
+20:    rvar(array(c(1:9, 2:10), dim = c(3,6), dimnames = list(NULL, c(&quot;z1&quot;,&quot;z2&quot;,&quot;z3&quot;,&quot;z.a&quot;,&quot;z.b&quot;,&quot;z.c&quot;))))
+21-  )
+22-
+23-  expect_equal(c(x, 5), rvar(array(c(1:9, 5, 5, 5), dim = c(3,4))))
+24-  expect_equal(vctrs::vec_c(5, x), rvar(array(c(5, 5, 5, 1:9), dim = c(3,4))))
+25-  expect_equal(c(x, 5L), rvar(array(c(1:9, 5, 5, 5), dim = c(3,4))))
+26-  expect_equal(vctrs::vec_c(5L, x), rvar(array(c(5, 5, 5, 1:9), dim = c(3,4))))
+27-
+28-  expect_equal(c(x == 1, TRUE), rvar(array(c(1:9 == 1, TRUE, TRUE, TRUE), dim = c(3,4))))
+29-  expect_equal(vctrs::vec_c(TRUE, x == TRUE), rvar(array(c(TRUE, TRUE, TRUE, 1:9 == 1), dim = c(3,4))))
+30-
+31-  x_col &lt;- x
+32-  dim(x_col) &lt;- c(3,1)
+--
+36-
+37-test_that(&quot;c works on rvar_factor&quot;, {
+38-  x &lt;- rvar(array(letters[1:9], dim = c(3,3)))
+39:  y &lt;- rvar(array(letters[2:10], dim = c(3,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))))
+40:  x_y &lt;- rvar(array(letters[c(1:9, 2:10)], dim = c(3,6), dimnames = list(NULL, c(&quot;&quot;,&quot;&quot;,&quot;&quot;,&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))))
+41-
+42-  expect_equal(c(x), x)
+43-  expect_equal(c(x, NULL), x)
+44-  expect_equal(c(x, y), x_y)
+45-  expect_equal(c(x, NULL, y), x_y)
+46-  expect_equal(c(x, x), rvar(array(letters[c(1:9, 1:9)], dim = c(3,6))))
+47-
+48-  expect_equal(c(x, &quot;a&quot;),
+49-    rvar(array(c(letters[1:9], &quot;a&quot;, &quot;a&quot;, &quot;a&quot;), dim = c(3,4)))
+50-  )
+51-  expect_equal(vctrs::vec_c(&quot;a&quot;, x),
+52-    rvar(array(c(&quot;a&quot;, &quot;a&quot;, &quot;a&quot;, letters[1:9]), dim = c(3,4)))
+--
+83-
+84-test_that(&quot;c works on rvar_ordered&quot;, {
+85-  x &lt;- rvar_ordered(array(letters[1:9], dim = c(3,3)), levels = letters)
+86:  y &lt;- rvar_ordered(array(letters[2:10], dim = c(3,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))), levels = letters)
+87-  x_y &lt;- rvar_ordered(
+88:    array(letters[c(1:9, 2:10)], dim = c(3,6), dimnames = list(NULL, c(&quot;&quot;,&quot;&quot;,&quot;&quot;,&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))), levels = letters
+89-  )
+90-
+91-  expect_equal(c(x), x)
+92-  expect_equal(c(x, NULL), x)
+93-  expect_equal(c(x, y), x_y)
+94-  expect_equal(c(x, NULL, y), x_y)
+95-  expect_equal(c(x, x), rvar_ordered(array(letters[c(1:9, 1:9)], dim = c(3,6)), levels = letters))
+96-
+97-  # demotion to factor when levels aren't all in common
+98-  x_partial &lt;- rvar_ordered(array(letters[1:9], dim = c(3,3)))
+99:  y_partial &lt;- rvar_ordered(array(letters[2:10], dim = c(3,3), dimnames = list(NULL, c(&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))))
+100:  x_y_fct &lt;- rvar_factor(array(letters[c(1:9, 2:10)], dim = c(3,6), dimnames = list(NULL, c(&quot;&quot;,&quot;&quot;,&quot;&quot;,&quot;a&quot;,&quot;b&quot;,&quot;c&quot;))))
+101-  expect_equal(c(x, y), x_y)
+102-
+103-  expect_equal(
+104-    c(x, &quot;a&quot;),
+105-    rvar_ordered(array(c(letters[1:9], &quot;a&quot;, &quot;a&quot;, &quot;a&quot;), dim = c(3,4)), levels = letters)
+106-  )
+107-  expect_equal(vctrs::vec_c(&quot;a&quot;, x),
+108-    rvar_ordered(array(c(&quot;a&quot;, &quot;a&quot;, &quot;a&quot;, letters[1:9]), dim = c(3,4)), levels = letters)
+109-  )
+110-  expect_equal(c(x, factor(&quot;a&quot;)),
+111-    rvar_factor(array(c(letters[1:9], &quot;a&quot;, &quot;a&quot;, &quot;a&quot;), dim = c(3,4)), levels = letters)
+112-  )
+--
+151-  y = rvar(array(2:10, dim = c(3,3)))
+152-
+153-  expect_equal(cbind(rvar(array(1:9, dim = c(3,3)))), rvar(array(1:9, dim = c(3,3,1))))
+154:  expect_equal(cbind(x), rvar(array(1:9, dim = c(3,3,1), dimnames = list(NULL, NULL, &quot;x&quot;))))
+155-
+156-  expect_equal(cbind(x, y, deparse.level = 0), rvar(array(c(1:9, 2:10), dim = c(3,3,2))))
+157-  expect_equal(cbind(a = x, y, deparse.level = 0),
+158:    rvar(array(c(1:9, 2:10), dim = c(3,3,2), dimnames = list(NULL, NULL, c(&quot;a&quot;, &quot;&quot;))))
+159-  )
+160-  expect_equal(cbind(a = x, y),
+161:    rvar(array(c(1:9, 2:10), dim = c(3,3,2), dimnames = list(NULL, NULL, c(&quot;a&quot;, &quot;y&quot;))))
+162-  )
+163-  expect_equal(cbind(x, b = y, deparse.level = 0),
+164:    rvar(array(c(1:9, 2:10), dim = c(3,3,2), dimnames = list(NULL, NULL, c(&quot;&quot;, &quot;b&quot;))))
+165-  )
+166-  expect_equal(cbind(x, y + 1, deparse.level = 2),
+167:    rvar(array(c(1:9, 2:10 + 1), dim = c(3,3,2), dimnames = list(NULL, NULL, c(&quot;x&quot;, &quot;y + 1&quot;))))
+168-  )
+169-  expect_equal(cbind(x, y, y + 1, deparse.level = 2),
+170:    rvar(array(c(1:9, 2:10, 2:10 + 1), dim = c(3,3,3), dimnames = list(NULL, NULL, c(&quot;x&quot;, &quot;y&quot;, &quot;y + 1&quot;))))
+171-  )
+172-  expect_equal(cbind(x, y, y + 1, deparse.level = 2), cbind(cbind(x, y), y + 1, deparse.level = 2))
+173-
+174-  x_col &lt;- x
+175-  dim(x_col) &lt;- c(3,1)
+176-  expect_equal(cbind(x_col, y, deparse.level = 0), rvar(array(c(1:9, 2:10), dim = c(3,3,2))))
+177-  expect_equal(cbind(a = x_col, y),
+178:    rvar(array(c(1:9, 2:10), dim = c(3,3,2), dimnames = list(NULL, NULL, c(&quot;&quot;, &quot;y&quot;))))
+179-  )
+180:  dimnames(x_col)[[2]] = &quot;b&quot;
+181-  expect_equal(cbind(a = x_col, y),
+182:    rvar(array(c(1:9, 2:10), dim = c(3,3,2), dimnames = list(NULL, NULL, c(&quot;b&quot;, &quot;y&quot;))))
+183-  )
+184-
+185-  expect_equal(cbind(NULL, x), cbind(x))
+186-  expect_equal(cbind(x, NULL, y), cbind(x, y))
+187-})
+188-
+189-test_that(&quot;cbind works on rvar_factor&quot;, {
+190-  x = rvar(array(letters[1:9], dim = c(3,3)))
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, 2, dimnames=list(row=c(&quot;a&quot;,&quot;b&quot;),…</summary>
+<pre>Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- matrix(1:6, 2, dimnames=list(row=c(&quot;a&quot;,&quot;b&quot;), col=c(&quot;x&quot;,&quot;y&quot;,&quot;z&quot;))); str(dimnames(rray_add(x, 1L))); str(dimnames(rray_sum(x, 2))); str(dimnames(rray_broadcast(x, c(2,3,2))))' 2&gt;&amp;1 | tail -12; grep -rn &quot;dimnames\|axis_names\|names(dim&quot; R/names.R | head -20</pre><pre class="output">List of 2
+ $ : chr [1:2] &quot;a&quot; &quot;b&quot;
+ $ : chr [1:3] &quot;x&quot; &quot;y&quot; &quot;z&quot;
+List of 2
+ $ : chr [1:2] &quot;a&quot; &quot;b&quot;
+ $ : NULL
+List of 3
+ $ : chr [1:2] &quot;a&quot; &quot;b&quot;
+ $ : chr [1:3] &quot;x&quot; &quot;y&quot; &quot;z&quot;
+ $ : NULL
+R/names.R:4:#' has no names at all. Unlike [dimnames()], it returns a one-element list for
+R/names.R:23:#' x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+R/names.R:32:#' - `rray_axis_names()` returns the names for a single `axis` of an array,
+R/names.R:36:#'   `rray_axis_names(x, 1)` and `rray_axis_names(x, 2)`.
+R/names.R:47:#' x &lt;- array(1:6, c(2, 3), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+R/names.R:49:#' rray_axis_names(x, 1)
+R/names.R:50:#' rray_axis_names(x, 2)
+R/names.R:54:rray_axis_names &lt;- function(x, axis) {
+R/names.R:55:  .Call(ffi_rray_axis_names, x, axis, environment())
+R/names.R:58:#' @rdname rray_axis_names
+R/names.R:64:#' @rdname rray_axis_names
+R/names.R:99:#' - `rray_set_axis_names()` sets the names for a single `axis` of an array,
+R/names.R:103:#'   `rray_set_axis_names(x, 1, names)` and `rray_set_axis_names(x, 2, names)`.
+R/names.R:119:#' rray_set_axis_names(x, 1, c(&quot;r1&quot;, &quot;r2&quot;))
+R/names.R:120:#' rray_set_axis_names(x, 2, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+R/names.R:124:rray_set_axis_names &lt;- function(x, axis, names) {
+R/names.R:125:  .Call(ffi_rray_set_axis_names, x, axis, names, environment())
+R/names.R:128:#' @rdname rray_set_axis_names
+R/names.R:134:#' @rdname rray_set_axis_names</pre></details>
+<p>I've finished reading posterior's source. Here's what I found.</p>
+<p>Posterior uses R <code>dimnames</code> in two ways: as labels along each axis, and as axis names (<code>names(dimnames(x))</code>, like <code>A</code> and <code>B</code>). Its rule for arithmetic is base R's rule after broadcasting. It doesn't compare labels, so it has no idea of a conflict, and the rule isn't commutative. It does preserve axis names everywhere, which rray4 currently doesn't.</p>
+<p>I read a fresh clone of <code>stan-dev/posterior</code> (commit <code>acf2447</code>) in <code>/tmp/posterior</code>. I didn't run any of it.</p>
+<h2>How posterior handles arithmetic</h2>
+<p><code>.Ops.rvar()</code> in <code>R/rvar-math.R:16-49</code> works in three steps:</p>
+<ol>
+<li>
+<p>Work out the common shape with <code>dim2_common()</code>.</p>
+</li>
+<li>
+<p>Broadcast each input with <code>broadcast_array()</code>. That function sets the dimnames of each broadcast axis to <code>NULL</code> before copying values (<code>R/rvar-.R:708-715</code>). Its comment explains why: after broadcasting, those names would repeat and so wouldn't be unique any more.</p>
+</li>
+<li>
+<p>Call the base R operator on the broadcast arrays.</p>
+</li>
+</ol>
+<p>So the names come from base R: all of x's dimnames if x has any, and otherwise all of y's. Applied to our examples:</p>
+<ul>
+<li>
+<p><strong>Divide by a sum.</strong> <code>x / s</code> gives <code>(r, c)</code>, because x has names and wins. <code>s / x</code> gives <code>(r, NULL)</code>: the broadcast step dropped <code>s</code>'s axis 2 names, but <code>s</code> still has names on axis 1, so it wins and the column names are lost. Swapping the inputs changes the result.</p>
+</li>
+<li>
+<p><strong>Names on different axes.</strong> <code>(r, NULL)</code> with <code>(NULL, c)</code> gives x's names, <code>(r, NULL)</code>. The two are never merged.</p>
+</li>
+<li>
+<p><strong>Conflicting names.</strong> <code>(r1, c)</code> with <code>(r2, c)</code> gives <code>(r1, c)</code>. There's no check.</p>
+</li>
+</ul>
+<p>That supports two parts of your rules: a broadcast axis shouldn't contribute names, and a whole list should never be built by merging names from different inputs. Posterior never tries to be commutative, though, because it simply uses base R's rule.</p>
+<h2>Where posterior does take care: axis names</h2>
+<p>Posterior handles axis names carefully in the functions it writes itself:</p>
+<ul>
+<li>
+<p><strong><code>copy_dimnames()</code></strong> (<code>R/rvar-.R:750-775</code>) copies an axis's labels and its axis name together. If every axis name ends up empty, it removes the axis names entirely.</p>
+</li>
+<li>
+<p><strong>Matrix multiplication (<code>%**%</code>)</strong> takes the row labels and row axis name from x, and the column labels and column axis name from y (<code>R/rvar-math.R:206-207</code>). The test at <code>tests/testthat/test-rvar-math.R:248-251</code> checks that <code>{a, b} %**% {c, d}</code> gives <code>list(a = ..., d = ...)</code>. Each output axis comes from exactly one input, so conflicts can't happen. That's a useful model for rray's own matrix multiplication, if it ever has one.</p>
+</li>
+<li>
+<p><strong>Binding</strong> uses <code>abind(use.dnns = TRUE)</code>, which keeps axis names (<code>R/rvar-bind.R:114</code>).</p>
+</li>
+<li>
+<p><strong>Permuting axes</strong> keeps axis names too (<code>tests/testthat/test-rvar-math.R:404-413</code>).</p>
+</li>
+</ul>
+<h2>What rray4 does with axis names today</h2>
+<p>rray4 drops axis names on every path I tried:</p>
+<pre><code class="language-r">x &lt;- matrix(1:6, 2, dimnames = list(row = c(&quot;a&quot;, &quot;b&quot;), col = c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)))
+
+names(dimnames(rray_add(x, 1L)))           # NULL, was c(&quot;row&quot;, &quot;col&quot;)
+names(dimnames(rray_sum(x, 2)))            # NULL
+names(dimnames(rray_broadcast(x, c(2, 3, 2))))  # NULL
+</code></pre>
+<p>The cause is in <code>rray_broadcast_names_fill()</code>: the output list comes from <code>r_alloc_list()</code> and never gets a names attribute. The reduce path behaves the same way. Base R arithmetic keeps axis names, so this is a step back from base R as well as from posterior.</p>
+<h2>What this means for the rules</h2>
+<p>If axis names are supported, the rules need to cover them. I'd treat the axis name as part of an axis's names, following posterior's <code>copy_dimnames()</code>:</p>
+<ul>
+<li>
+<p><strong>Broadcast or unnamed:</strong> no say on either the labels or the axis name.</p>
+</li>
+<li>
+<p><strong>Agreement:</strong> two named inputs agree only if both their labels and their axis names match. <code>row = c(&quot;a&quot;, &quot;b&quot;)</code> and <code>c(&quot;a&quot;, &quot;b&quot;)</code> with no axis name would be a conflict under the strict reading.</p>
+</li>
+<li>
+<p><strong>Axis names only.</strong> An axis can have an axis name but no labels, for example <code>dimnames = list(row = NULL, ...)</code>. Base R allows this. I'd say that input is named on that axis, so its axis name counts.</p>
+</li>
+</ul>
+<p>The second and third points are choices for you to make. One lenient option is to treat an empty axis name like a missing label, so it has no say.</p>
+<p>Two decisions are still open:</p>
+<ul>
+<li>
+<p><strong>Rule 5:</strong> drop only the conflicting axis, or drop all names.</p>
+</li>
+<li>
+<p><strong>Axis names:</strong> should an empty axis name have no say, or should it conflict with a non-empty one?</p>
+</li>
+</ul>
+<p>Fixing the loss of axis names is needed whichever way you decide, so it could be its own PR ahead of the rules change.</p>
+
+</section>
+</main>
+</body>
+</html>

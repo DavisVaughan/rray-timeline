@@ -1,0 +1,1620 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Revising plans/rep.md for sorted axes and a separate rep-each.c</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-95">rray timeline</a>
+<h1>Revising <code>plans/rep.md</code> for sorted axes and a separate <code>rep-each.c</code></h1>
+<p class="facts">Claude · Sep 28, 2026 · 4 prompts · 6 replies · <a href="https://github.com/r-lib/rray/pull/95">#95</a></p>
+</header>
+<main>
+<p class="divider">Sep 28, 2026, 16:18 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>In the rep plan, axes should be strictly increasing like all other functions where order doesn’t matter</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls plans/ &amp;&amp; git show --stat HEAD~1 HEAD | head -30</summary>
+<pre>ls plans/ &amp;&amp; git show --stat HEAD~1 HEAD | head -30</pre><pre class="output">extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+rep.md
+slice.md
+commit de4cd1d093c08f9d5a555c5e38f70d031dfa14f4
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Mon Sep 28 03:31:33 2026 -0400
+
+    Add a plan for multi-axis `rray_rep()`
+
+ plans/rep.md | 714 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 714 insertions(+)
+
+commit 04c2611db8ff59085c081b3df624e28ddeb68012
+Author: Davis Vaughan &lt;davis@posit.co&gt;
+Date:   Mon Sep 28 03:52:18 2026 -0400
+
+    Drop the empty output special case from the rep plan
+
+ plans/rep.md | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: cat -n plans/rep.md</summary>
+<pre>cat -n plans/rep.md</pre><pre class="output">     1	# Multi-axis repeat plan
+     2	
+     3	## Recommendation
+     4	
+     5	Change `rray_rep()` to repeat one or more axes, with one `times` per axis:
+     6	
+     7	```r
+     8	rray_rep(x, ..., times, axes)
+     9	rray_rep_each(x, ..., times, axis)
+    10	```
+    11	
+    12	`rray_rep_each()` does not change.
+    13	
+    14	- `rray_rep()` repeats whole axes. `times` is size 1, used for every axis in
+    15	  `axes`, or the size of `axes`, with `times[[i]]` used for `axes[[i]]`. This
+    16	  is NumPy's `np.tile()` with explicit axes.
+    17	
+    18	- `rray_rep_each()` repeats each position along one axis. `times` is size 1 or
+    19	  the dimension of `axis`.
+    20	
+    21	This makes the rep pair match the roll pair in `plans/roll.md` exactly:
+    22	
+    23	| Every lane together | Each position on its own |
+    24	|---|---|
+    25	| `rray_rep(x, ..., times, axes)` | `rray_rep_each(x, ..., times, axis)` |
+    26	| `rray_roll(x, ..., n, axes)` | `rray_roll_each(x, ..., n, axis)` |
+    27	
+    28	The left column takes `axes` and one value per axis. The right column takes one
+    29	`axis` and one value per position or lane.
+    30	
+    31	This is a breaking change to an exported function. `axis` is renamed to `axes`,
+    32	with no deprecation path. An old call such as `rray_rep(x, times = 2, axis = 1)`
+    33	now fails in `check_dots_empty0()`, since `axis` lands in the dots.
+    34	
+    35	## Why multiple axes are well defined
+    36	
+    37	Repeating along axis 1 and then axis 2 gives the same result as the other order.
+    38	Every output position has exactly one source position:
+    39	
+    40	```text
+    41	out[i1, ..., iD] = x[i1 mod d1, ..., iD mod dD]    (zero-based)
+    42	```
+    43	
+    44	So one `times` per axis has a single meaning, the names rule stays the same,
+    45	and there is no ordering question.
+    46	
+    47	## `rray_rep()`
+    48	
+    49	### Arguments
+    50	
+    51	- `x`: an array or bare vector.
+    52	
+    53	- `...`: must be empty. It forces `times` and `axes` to be named.
+    54	
+    55	- `times`: a bare integer vector of values greater than or equal to 0, size 1
+    56	  or the size of `axes`. Validated with `arg_as_non_negative_bare_integer()`, as
+    57	  today.
+    58	
+    59	- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+    60	  An axis can't appear twice. `integer()` is allowed and repeats nothing.
+    61	  Validated with `arg_as_axes_unsorted()`, like `from` and `to` in
+    62	  `rray_move_axes()` and `axes` in `rray_roll()`.
+    63	
+    64	The result has the type and dimensionality of `x`. Each axis in `axes` has its
+    65	dimension multiplied by its `times`. Every other axis keeps its dimension.
+    66	
+    67	### Worked examples
+    68	
+    69	```r
+    70	x &lt;- matrix(1:4, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;)))
+    71	
+    72	x
+    73	#    a b
+    74	# r1 1 3
+    75	# r2 2 4
+    76	```
+    77	
+    78	One axis, as today:
+    79	
+    80	```r
+    81	rray_rep(x, times = 2, axes = 2)
+    82	#    a b a b
+    83	# r1 1 3 1 3
+    84	# r2 2 4 2 4
+    85	```
+    86	
+    87	Both axes with a size 1 `times`:
+    88	
+    89	```r
+    90	rray_rep(x, times = 2, axes = c(1, 2))
+    91	#    a b a b
+    92	# r1 1 3 1 3
+    93	# r2 2 4 2 4
+    94	# r1 1 3 1 3
+    95	# r2 2 4 2 4
+    96	```
+    97	
+    98	One `times` per axis. `times` pairs with `axes` in the order given, so these two
+    99	are identical:
+   100	
+   101	```r
+   102	rray_rep(x, times = c(2, 3), axes = c(1, 2))
+   103	rray_rep(x, times = c(3, 2), axes = c(2, 1))
+   104	#    a b a b a b
+   105	# r1 1 3 1 3 1 3
+   106	# r2 2 4 2 4 2 4
+   107	# r1 1 3 1 3 1 3
+   108	# r2 2 4 2 4 2 4
+   109	```
+   110	
+   111	A `times` of 0 gives a zero dimension on that axis. The other axes still
+   112	repeat:
+   113	
+   114	```r
+   115	out &lt;- rray_rep(x, times = c(2, 0), axes = c(1, 2))
+   116	
+   117	dim(out)
+   118	# [1] 4 0
+   119	
+   120	rray_names(out)
+   121	# [[1]]
+   122	# [1] &quot;r1&quot; &quot;r2&quot; &quot;r1&quot; &quot;r2&quot;
+   123	#
+   124	# [[2]]
+   125	# NULL
+   126	```
+   127	
+   128	Three dimensions, repeating the first and last axes:
+   129	
+   130	```r
+   131	y &lt;- array(1:8, c(2, 2, 2))
+   132	
+   133	out &lt;- rray_rep(y, times = 2, axes = c(1, 3))
+   134	
+   135	dim(out)
+   136	# [1] 4 2 4
+   137	
+   138	out[, , 1]
+   139	#      [,1] [,2]
+   140	# [1,]    1    3
+   141	# [2,]    2    4
+   142	# [3,]    1    3
+   143	# [4,]    2    4
+   144	
+   145	out[, , 3]
+   146	#      [,1] [,2]
+   147	# [1,]    1    3
+   148	# [2,]    2    4
+   149	# [3,]    1    3
+   150	# [4,]    2    4
+   151	```
+   152	
+   153	Nothing repeats. Each of these gives a new array identical to `x`, names
+   154	included:
+   155	
+   156	```r
+   157	rray_rep(x, times = 1, axes = c(1, 2))
+   158	rray_rep(x, times = 2, axes = integer())
+   159	rray_rep(x, times = integer(), axes = integer())
+   160	```
+   161	
+   162	### Names
+   163	
+   164	Each axis in `axes` repeats its own names `times` times, duplicates and all.
+   165	Every other axis keeps its names untouched. This is today's rule applied once
+   166	per axis, and is exactly what `rray_slice_axis()` does with the same locations.
+   167	
+   168	As today, names on the `dimnames` list itself are not kept. `rray_slice_axis()`
+   169	drops them too, so that is a separate question for all of rray4.
+   170	
+   171	### Relationship to NumPy
+   172	
+   173	| NumPy | rray4 |
+   174	|---|---|
+   175	| `np.tile(x, (2, 1))` | `rray_rep(x, times = 2, axes = 1)` |
+   176	| `np.tile(x, (2, 3))` | `rray_rep(x, times = c(2, 3), axes = c(1, 2))` |
+   177	| `np.tile(x, 2)` on a matrix | `rray_rep(x, times = 2, axes = 2)` |
+   178	| `np.tile(x, (2, 1, 1))` on a matrix | Not supported. Use `rray_insert_axes()` first |
+   179	
+   180	`np.tile()` lines `reps` up with the trailing axes, and adds new leading axes
+   181	when `reps` is longer than the dimensionality. rray4 names every axis
+   182	explicitly and never adds axes.
+   183	
+   184	### Errors
+   185	
+   186	```r
+   187	x &lt;- matrix(1:6, nrow = 2)
+   188	
+   189	rray_rep(x, times = 2, axes = c(1, 1))
+   190	# Error in `rray_rep()`:
+   191	# ! `axes` must not contain 1 more than once.
+   192	
+   193	rray_rep(x, times = 2, axes = 3)
+   194	# Error in `rray_rep()`:
+   195	# ! `axes` must contain values less than or equal to the dimensionality of 2,
+   196	#   not 3.
+   197	
+   198	rray_rep(x, times = c(1, 2, 3), axes = c(1, 2))
+   199	# Error in `rray_rep()`:
+   200	# ! `times` must be size 1 or size 2 to match `axes`, not size 3.</pre><p class="cut">512 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn &quot;arg_as_axes&quot; src/*.h src/*.c | grep -v &quot;^src/decl&quot; | head -40; grep -rn &quot;strictly i…</summary>
+<pre>grep -rn &quot;arg_as_axes&quot; src/*.h src/*.c | grep -v &quot;^src/decl&quot; | head -40; grep -rn &quot;strictly increasing&quot; src/ R/ tests/testthat/_snaps | head -20</pre><pre class="output">src/axes.h:8:r_obj* arg_as_axes(
+src/axes.h:15:r_obj* arg_as_axes_unsorted(
+src/axes.h:22:r_obj* arg_as_axes_permutation(
+src/axes.c:6:r_obj* arg_as_axes(
+src/axes.c:69:r_obj* arg_as_axes_unsorted(
+src/axes.c:132:r_obj* arg_as_axes_permutation(
+src/permute-axes.c:40:    arg_as_axes_permutation(axes, dimensionality, rray_args.axes, error_call)
+src/remove-axes.c:27:  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+src/move-axes.c:28:    arg_as_axes_unsorted(from, dimensionality, rray_args.from, error_call)
+src/move-axes.c:30:  to = KEEP(arg_as_axes_unsorted(to, dimensionality, rray_args.to, error_call));
+src/roll.c:35:  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+src/reduce.c:30:  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+src/reduce.c:90:  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+src/axes.c:62:        &quot;%s must be in strictly increasing order.&quot;,
+tests/testthat/_snaps/reduce-mean.md:9:# errors on axes not in strictly increasing order
+tests/testthat/_snaps/reduce-mean.md:15:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/reduce-mean.md:23:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/insert-axes.md:22:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/insert-axes.md:27:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/remove-axes.md:48:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/remove-axes.md:53:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/reduce-product.md:9:# errors on axes not in strictly increasing order
+tests/testthat/_snaps/reduce-product.md:15:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/reduce-product.md:23:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/reduce-sum.md:9:# errors on axes not in strictly increasing order
+tests/testthat/_snaps/reduce-sum.md:15:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/reduce-sum.md:23:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/roll.md:27:      ! `axes` must be in strictly increasing order.
+tests/testthat/_snaps/roll.md:35:      ! `axes` must be in strictly increasing order.</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,130p src/axes.c; sed -n 1,60p tests/testthat/_snaps/roll.md; grep -n &quot;axes&quot; R/roll.R…</summary>
+<pre>sed -n 1,130p src/axes.c; sed -n 1,60p tests/testthat/_snaps/roll.md; grep -n &quot;axes&quot; R/roll.R | head -30</pre><pre class="output">#include &quot;axes.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* arg_as_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+  check_axes(axes, dimensionality, arg, error_call);
+  FREE(1);
+  return axes;
+}
+
+void check_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize axes_size = r_length(axes);
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (i &gt; 0 &amp;&amp; axis &lt;= v_axes[i - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must be in strictly increasing order.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+  }
+}
+
+r_obj* arg_as_axes_unsorted(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+
+  const r_ssize axes_size = r_length(axes);
+
+  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (v_seen[axis - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain %d more than once.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    v_seen[axis - 1] = true;
+  }
+
+  FREE(1);
+  return axes;
+}
+# `n` and `axes` must be named
+
+    Code
+      rray_roll(x, 1, 2)
+    Condition
+      Error in `rray_roll()`:
+      ! `...` must be empty.
+      x Problematic arguments:
+      * ..1 = 1
+      * ..2 = 2
+      i Did you forget to name an argument?
+    Code
+      rray_roll(x, 1, axes = 2)
+    Condition
+      Error in `rray_roll()`:
+      ! `...` must be empty.
+      x Problematic argument:
+      * ..1 = 1
+      i Did you forget to name an argument?
+
+# `axes` is validated
+
+    Code
+      rray_roll(x, n = 1, axes = c(1, 1))
+    Condition
+      Error in `rray_roll()`:
+      ! `axes` must be in strictly increasing order.
+
+---
+
+    Code
+      rray_roll(x, n = 1, axes = c(2, 1))
+    Condition
+      Error in `rray_roll()`:
+      ! `axes` must be in strictly increasing order.
+
+---
+
+    Code
+      rray_roll(x, n = 1, axes = 3)
+    Condition
+      Error in `rray_roll()`:
+      ! `axes` must contain values less than or equal to the dimensionality of 2, not 3.
+
+---
+
+    Code
+      rray_roll(x, n = 1, axes = 0)
+    Condition
+      Error in `rray_roll()`:
+      ! `axes` must contain values greater than or equal to 1, not 0.
+
+---
+
+    Code
+      rray_roll(x, n = 1, axes = NA)
+    Condition
+      Error in `rray_roll()`:
+      ! `axes` must not contain missing values.
+
+4:#' - `rray_roll()` rolls the elements of `x` along one or more `axes`, with one
+34:#' rray_roll(x, n = n, axes = 1)
+43:#' Rolling several axes at once is one `rray_slice()`, with these locations on
+221:#'   either size 1 or the size of `axes`.
+227:#' @param axes An integer vector of axes to roll along.
+237:#' rray_roll(1:5, n = 2, axes = 1)
+240:#' rray_roll(1:5, n = -1, axes = 1)
+243:#' rray_roll(1:5, n = 7, axes = 1)
+248:#' rray_roll(x, n = 1, axes = 2)
+251:#' rray_roll(x, n = 1, axes = 1)</pre><p class="cut">5 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 1,70p src/roll.c; grep -n &quot;roll&quot; plans/*.md | grep -i &quot;axes&quot; | head</summary>
+<pre>sed -n 1,70p src/roll.c; grep -n &quot;roll&quot; plans/*.md | grep -i &quot;axes&quot; | head</pre><pre class="output">#include &quot;roll.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;slice.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/roll-decl.h&quot;
+
+r_obj* ffi_rray_roll(
+  r_obj* ffi_x,
+  r_obj* ffi_n,
+  r_obj* ffi_axes,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_roll(ffi_x, ffi_n, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_roll(
+  r_obj* x,
+  r_obj* n,
+  r_obj* axes,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP(arg_as_array(x, x_arg, error_call));
+
+  r_obj* x_dimensions = r_dim(x);
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  n = KEEP(arg_as_roll_n(n, axes_size, rray_args.n, error_call));
+  const int* v_n = r_int_cbegin(n);
+  const r_ssize n_size = r_length(n);
+
+  r_obj* indices = KEEP(r_alloc_list(dimensionality));
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    r_list_poke(indices, i, r_true);
+  }
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+    const int dimension = v_x_dimensions[axis - 1];
+    const int n = rray_roll_normalize(v_n[n_size == 1 ? 0 : i], dimension);
+    r_list_poke(indices, axis - 1, rray_roll_locations(dimension, n));
+  }
+
+  r_obj* out = rray_slice(x, indices, x_arg, rray_args.empty, error_call);
+
+  FREE(4);
+  return out;
+}
+
+static r_obj* arg_as_roll_n(
+  r_obj* n,
+  r_ssize axes_size,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  n = KEEP(arg_as_bare_integer(n, arg, error_call));
+  check_roll_n_not_missing(n, arg, error_call);
+
+plans/rep.md:26:| `rray_roll(x, ..., n, axes)` | `rray_roll_each(x, ..., n, axis)` |
+plans/rep.md:62:  `rray_move_axes()` and `axes` in `rray_roll()`.</pre></details>
+<p>Updating <code>plans/rep.md</code> so <code>axes</code> uses <code>arg_as_axes()</code> (strictly increasing, like <code>rray_roll()</code> and the reducers) instead of <code>arg_as_axes_unsorted()</code>.</p>
+
+<details class="tool"><summary>Read plans/rep.md</summary>
+<pre class="output">1	# Multi-axis repeat plan
+2	
+3	## Recommendation
+4	
+5	Change `rray_rep()` to repeat one or more axes, with one `times` per axis:</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- `axes`: a bare integer vector of axes. Required, with no default. Any order.</span>
+<span class="del">-  An axis can't appear twice. `integer()` is allowed and repeats nothing.</span>
+<span class="del">-  Validated with `arg_as_axes_unsorted()`, like `from` and `to` in</span>
+<span class="del">-  `rray_move_axes()` and `axes` in `rray_roll()`.</span>
+<span class="ins">+- `axes`: a bare integer vector of axes. Required, with no default. Must be in</span>
+<span class="ins">+  strictly increasing order, since the order does not change the result.</span>
+<span class="ins">+  `integer()` is allowed and repeats nothing. Validated with `arg_as_axes()`,</span>
+<span class="ins">+  like `axes` in `rray_roll()`, `rray_remove_axes()`, and the reducers.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-One `times` per axis. `times` pairs with `axes` in the order given, so these two</span>
+<span class="del">-are identical:</span>
+<span class="del">-</span>
+<span class="del">-```r</span>
+<span class="del">-rray_rep(x, times = c(2, 3), axes = c(1, 2))</span>
+<span class="del">-rray_rep(x, times = c(3, 2), axes = c(2, 1))</span>
+<span class="del">-#    a b a b a b</span>
+<span class="ins">+One `times` per axis, with `times[[i]]` used for `axes[[i]]`:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+rray_rep(x, times = c(2, 3), axes = c(1, 2))</span>
+<span class="ins">+#    a b a b a b</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-rray_rep(x, times = 2, axes = c(1, 1))</span>
+<span class="del">-# Error in `rray_rep()`:</span>
+<span class="del">-# ! `axes` must not contain 1 more than once.</span>
+<span class="ins">+rray_rep(x, times = 2, axes = c(1, 1))</span>
+<span class="ins">+# Error in `rray_rep()`:</span>
+<span class="ins">+# ! `axes` must be in strictly increasing order.</span>
+<span class="ins">+</span>
+<span class="ins">+rray_rep(x, times = 2, axes = c(2, 1))</span>
+<span class="ins">+# Error in `rray_rep()`:</span>
+<span class="ins">+# ! `axes` must be in strictly increasing order.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-dimensions, dimensionality</span>
+<span class="del">-</span>
+<span class="del">-axes = KEEP(arg_as_axes_unsorted(axes, dimensionality, rray_args.axes))</span>
+<span class="ins">+dimensions, dimensionality</span>
+<span class="ins">+check_dimensionality(dimensionality)</span>
+<span class="ins">+</span>
+<span class="ins">+axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes))</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- `arg_as_axes_unsorted()` calls `check_dimensionality()` itself.</span>
+<span class="ins">+- `arg_as_axes()` does not call `check_dimensionality()`, so `rray_rep()` calls</span>
+<span class="ins">+  it first, as `rray_roll()` does. The fill's stack array of current dimensions</span>
+<span class="ins">+  relies on it.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- `axes` from `arg_as_axes_unsorted()` and `times`</span>
+<span class="ins">+- `axes` from `arg_as_axes()` and `times`</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- A new `@param axes` for `rray_rep()`: the axes to repeat along, in any order,</span>
+<span class="del">-  with no axis twice.</span>
+<span class="ins">+- A new `@param axes` for `rray_rep()`: the axes to repeat along, in strictly</span>
+<span class="ins">+  increasing order.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- `times` pairs with `axes` in the order given, including unsorted `axes`.</span>
+<span class="ins">+- `times[[i]]` pairs with `axes[[i]]`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- The reference loop over the existing shapes, extended to every subset of</span>
+<span class="del">-  axes in both orders, with `times` of size 1 and one per axis, for named and</span>
+<span class="del">-  unnamed `x`.</span>
+<span class="ins">+- The reference loop over the existing shapes, extended to every subset of</span>
+<span class="ins">+  axes, with `times` of size 1 and one per axis, for named and unnamed `x`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- Errors, snapshotted: a repeated axis, an axis of 0,</span>
+<span class="ins">+- Errors, snapshotted: a repeated axis, axes out of order, an axis of 0,</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n -i &quot;unsorted\|any order\|order given\|random orders\|more than once&quot; plans/rep.md; gi…</summary>
+<pre>grep -n -i &quot;unsorted\|any order\|order given\|random orders\|more than once&quot; plans/rep.md; git diff --stat</pre><pre class="output">250:Repeating several axes is repeating them one at a time, in any order:
+469:in random orders, and `times` from 0 to 3.
+ plans/rep.md | 38 +++++++++++++++++++++-----------------
+ 1 file changed, 21 insertions(+), 17 deletions(-)</pre></details>
+<p>I've updated <code>plans/rep.md</code> so <code>axes</code> must be in strictly increasing order. It is now validated with <code>arg_as_axes()</code>, the same helper <code>rray_roll()</code>, <code>rray_remove_axes()</code> and the reducers use. Nothing is committed.</p>
+<p>What changed in the plan:</p>
+<ul>
+<li>
+<p><strong>Arguments:</strong> <code>axes</code> must be strictly increasing, because the order doesn't change the result. <code>integer()</code> is still allowed.</p>
+</li>
+<li>
+<p><strong>Worked examples:</strong> I removed the <code>times = c(3, 2), axes = c(2, 1)</code> example, since it now errors. The example that stays says <code>times[[i]]</code> goes with <code>axes[[i]]</code>.</p>
+</li>
+<li>
+<p><strong>Errors:</strong> <code>axes = c(1, 1)</code> and <code>axes = c(2, 1)</code> both now give <code>`axes` must be in strictly increasing order.</code></p>
+</li>
+<li>
+<p><strong>C outline:</strong> <code>rray_rep()</code> now calls <code>check_dimensionality()</code> itself, the way <code>rray_roll()</code> does. <code>arg_as_axes()</code> doesn't make that check, unlike <code>arg_as_axes_unsorted()</code>, and the fill's fixed-size array of current dimensions needs it.</p>
+</li>
+<li>
+<p><strong>Protection review:</strong> now refers to <code>arg_as_axes()</code> instead of <code>arg_as_axes_unsorted()</code>.</p>
+</li>
+<li>
+<p><strong>Docs:</strong> <code>@param axes</code> now says &quot;in strictly increasing order&quot;.</p>
+</li>
+<li>
+<p><strong>Tests:</strong> I removed the unsorted-<code>axes</code> pairing case and the &quot;in both orders&quot; part of the reference loop. I added &quot;axes out of order&quot; to the error snapshots.</p>
+</li>
+</ul>
+<p>I left two mentions of order alone on purpose:</p>
+<ul>
+<li>
+<p><strong>Line 250:</strong> says calling <code>rray_rep()</code> one axis at a time gives the same result in any order. That is about nested single-axis calls, so it still holds and is still a good property test.</p>
+</li>
+<li>
+<p><strong>Line 469:</strong> describes the simulation that was already run with axes in random orders. Increasing orders are a subset of what it tested, so the result still applies.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add plans/rep.md &amp;&amp; git commit -q -m &quot;Require strictly increasing axes in the rep plan&quot; &amp;…</summary>
+<pre>git add plans/rep.md &amp;&amp; git commit -q -m &quot;Require strictly increasing axes in the rep plan&quot; &amp;&amp; git push -u origin feature/rep-axes 2&gt;&amp;1 | tail -3 &amp;&amp; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   04c2611..ba541ca  feature/rep-axes -&gt; feature/rep-axes
+branch 'feature/rep-axes' set up to track 'origin/feature/rep-axes'.
+ba541ca Require strictly increasing axes in the rep plan</pre></details>
+<p>I committed the plan change as <code>ba541ca</code> (&quot;Require strictly increasing axes in the rep plan&quot;) and pushed it to <code>origin/feature/rep-axes</code>. The commit message has no attribution line.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Like rray-roll, since the function bodies are different now, we should have rep.c and rep-each.c</p>
+<p>Also if there is any obvious simplification that can be done to rep-each.c now then we should do so</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls src/ | grep -i &quot;roll\|rep&quot;; ls src/decl | grep -i &quot;roll\|rep&quot;; ls R tests/testthat | grep …</summary>
+<pre>ls src/ | grep -i &quot;roll\|rep&quot;; ls src/decl | grep -i &quot;roll\|rep&quot;; ls R tests/testthat | grep -i &quot;roll\|rep&quot;; cat src/roll.h src/roll-each.h 2&gt;/dev/null; grep -n &quot;roll&quot; src/init.c</pre><pre class="output">rep.c
+rep.h
+rep.o
+roll-each.c
+roll-each.h
+roll-each.o
+roll.c
+roll.h
+roll.o
+rep-decl.h
+roll-decl.h
+roll-each-decl.h
+rep.R
+roll.R
+helper-rep.R
+helper-roll.R
+test-rep.R
+test-roll.R
+#ifndef RRAY_ROLL_H
+#define RRAY_ROLL_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_roll(
+  r_obj* x,
+  r_obj* n,
+  r_obj* axes,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+);
+
+void check_roll_n_not_missing(
+  r_obj* n,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+
+// Bound `n` between `[0, dimension]`
+static inline int rray_roll_normalize(int n, int dimension) {
+  if (dimension == 0) {
+    return 0;
+  }
+
+  int out = n % dimension;
+
+  if (out &lt; 0) {
+    out += dimension;
+  }
+
+  return out;
+}
+
+#endif
+#ifndef RRAY_ROLL_EACH_H
+#define RRAY_ROLL_EACH_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_roll_each(
+  r_obj* x,
+  r_obj* n,
+  int axis,
+  struct rray_arg* x_arg,
+  struct r_lazy error_call
+);
+
+#endif
+164:extern r_obj* ffi_rray_roll(
+170:extern r_obj* ffi_rray_roll_each(
+338:  {&quot;ffi_rray_roll&quot;, (DL_FUNC) &amp;ffi_rray_roll, 4},
+339:  {&quot;ffi_rray_roll_each&quot;, (DL_FUNC) &amp;ffi_rray_roll_each, 4},</pre></details>
+<details class="tool"><summary>Bash: cat -n src/rep.c &amp;&amp; cat src/rep.h src/decl/rep-decl.h &amp;&amp; grep -n &quot;rep&quot; src/init.c</summary>
+<pre>cat -n src/rep.c &amp;&amp; cat src/rep.h src/decl/rep-decl.h &amp;&amp; grep -n &quot;rep&quot; src/init.c</pre><pre class="output">     1	#include &quot;rep.h&quot;
+     2	
+     3	#include &lt;limits.h&gt;
+     4	
+     5	#include &quot;axes.h&quot;
+     6	#include &quot;dimensionality.h&quot;
+     7	#include &quot;size.h&quot;
+     8	#include &quot;utils.h&quot;
+     9	
+    10	#include &quot;decl/rep-decl.h&quot;
+    11	
+    12	r_obj* ffi_rray_rep(
+    13	  r_obj* ffi_x,
+    14	  r_obj* ffi_times,
+    15	  r_obj* ffi_axis,
+    16	  r_obj* ffi_frame
+    17	) {
+    18	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+    19	  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+    20	  return rray_rep(ffi_x, ffi_times, axis, rray_args.x, error_call);
+    21	}
+    22	
+    23	r_obj* rray_rep(
+    24	  r_obj* x,
+    25	  r_obj* times,
+    26	  int axis,
+    27	  struct rray_arg* arg,
+    28	  struct r_lazy error_call
+    29	) {
+    30	  return rray_rep_impl(x, times, axis, false, arg, error_call);
+    31	}
+    32	
+    33	r_obj* ffi_rray_rep_each(
+    34	  r_obj* ffi_x,
+    35	  r_obj* ffi_times,
+    36	  r_obj* ffi_axis,
+    37	  r_obj* ffi_frame
+    38	) {
+    39	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+    40	  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+    41	  return rray_rep_each(ffi_x, ffi_times, axis, rray_args.x, error_call);
+    42	}
+    43	
+    44	r_obj* rray_rep_each(
+    45	  r_obj* x,
+    46	  r_obj* times,
+    47	  int axis,
+    48	  struct rray_arg* arg,
+    49	  struct r_lazy error_call
+    50	) {
+    51	  return rray_rep_impl(x, times, axis, true, arg, error_call);
+    52	}
+    53	
+    54	static r_obj* rray_rep_impl(
+    55	  r_obj* x,
+    56	  r_obj* times,
+    57	  int axis,
+    58	  bool each,
+    59	  struct rray_arg* arg,
+    60	  struct r_lazy error_call
+    61	) {
+    62	  check_unclassed(x, arg, error_call);
+    63	  x = KEEP(arg_as_array(x, arg, error_call));
+    64	
+    65	  r_obj* dimensions = r_dim(x);
+    66	  const int* v_dimensions = r_int_cbegin(dimensions);
+    67	  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+    68	  check_dimensionality(dimensionality);
+    69	
+    70	  check_axis(axis, dimensionality, rray_args.axis, error_call);
+    71	  const int axis_dimension = v_dimensions[axis - 1];
+    72	
+    73	  times = KEEP(
+    74	    arg_as_times(times, each ? axis_dimension : 1, rray_args.times, error_call)
+    75	  );
+    76	  const int* v_times = r_int_cbegin(times);
+    77	  const r_ssize times_size = r_length(times);
+    78	
+    79	  const int out_dimension =
+    80	    rray_rep_dimension(axis_dimension, v_times, times_size, error_call);
+    81	
+    82	  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+    83	  int* v_out_dimensions = r_int_begin(out_dimensions);
+    84	  r_memcpy(v_out_dimensions, v_dimensions, sizeof(int) * dimensionality);
+    85	  v_out_dimensions[axis - 1] = out_dimension;
+    86	
+    87	  const r_ssize out_size = rray_size_from_dimensions_checked(
+    88	    v_out_dimensions,
+    89	    dimensionality,
+    90	    error_call
+    91	  );
+    92	
+    93	  r_obj* out = KEEP(r_alloc_vector(r_typeof(x), out_size));
+    94	  r_attrib_poke_dim(out, out_dimensions);
+    95	
+    96	  r_ssize block_size = 1;
+    97	  for (int i = 0; i &lt; axis - 1; ++i) {
+    98	    block_size *= v_dimensions[i];
+    99	  }
+   100	
+   101	  if (!each) {
+   102	    block_size *= axis_dimension;
+   103	  }
+   104	
+   105	  r_ssize n_groups = 1;
+   106	  for (int i = axis; i &lt; dimensionality; ++i) {
+   107	    n_groups *= v_dimensions[i];
+   108	  }
+   109	
+   110	  const r_ssize n_blocks_per_group = each ? axis_dimension : 1;
+   111	
+   112	  if (times_size == 1) {
+   113	    // Groups flatten away with uniform `times`
+   114	    const int times = v_times[0];
+   115	    const r_ssize n_blocks = n_groups * n_blocks_per_group;
+   116	    rray_rep_fill_uniform(x, out, block_size, n_blocks, times);
+   117	  } else {
+   118	    rray_rep_fill_varying(
+   119	      x,
+   120	      out,
+   121	      block_size,
+   122	      n_blocks_per_group,
+   123	      n_groups,
+   124	      v_times
+   125	    );
+   126	  }
+   127	
+   128	  r_obj* out_names = KEEP(rray_rep_names(
+   129	    r_dim_names(x),
+   130	    axis,
+   131	    out_dimension,
+   132	    each,
+   133	    v_times,
+   134	    times_size
+   135	  ));
+   136	  if (out_names != r_null) {
+   137	    r_attrib_poke_dim_names(out, out_names);
+   138	  }
+   139	
+   140	  FREE(5);
+   141	  return out;
+   142	}
+   143	
+   144	static r_obj* arg_as_times(
+   145	  r_obj* times,
+   146	  r_ssize size,
+   147	  struct rray_arg* arg,
+   148	  struct r_lazy error_call
+   149	) {
+   150	  times = KEEP(arg_as_non_negative_bare_integer(times, arg, error_call));
+   151	
+   152	  const r_ssize times_size = r_length(times);
+   153	
+   154	  if (times_size != 1 &amp;&amp; times_size != size) {
+   155	    stop_times_size(times_size, size, arg, error_call);
+   156	  }
+   157	
+   158	  FREE(1);
+   159	  return times;
+   160	}
+   161	
+   162	static r_no_return void stop_times_size(
+   163	  r_ssize times_size,
+   164	  r_ssize size,
+   165	  struct rray_arg* arg,
+   166	  struct r_lazy error_call
+   167	) {
+   168	  if (size == 1) {
+   169	    r_abort_lazy_call(
+   170	      error_call,
+   171	      &quot;%s must be size 1, not size %&quot; R_PRI_SSIZE &quot;.&quot;,
+   172	      rray_arg_format(arg),
+   173	      times_size
+   174	    );
+   175	  } else {
+   176	    r_abort_lazy_call(
+   177	      error_call,
+   178	      &quot;%s must be size 1 or the `axis` dimension of %&quot; R_PRI_SSIZE &quot;, &quot;
+   179	      &quot;not size %&quot; R_PRI_SSIZE &quot;.&quot;,
+   180	      rray_arg_format(arg),
+   181	      size,
+   182	      times_size
+   183	    );
+   184	  }
+   185	}
+   186	
+   187	static int rray_rep_dimension(
+   188	  int axis_dimension,
+   189	  const int* v_times,
+   190	  r_ssize times_size,
+   191	  struct r_lazy error_call
+   192	) {
+   193	  if (times_size == 1) {
+   194	    // Single `times`. Multiply by `axis`'s `dimension` regardless of
+   195	    // rep / rep-each.
+   196	    const int times = v_times[0];
+   197	
+   198	    if (times != 0 &amp;&amp; axis_dimension &gt; INT_MAX / times) {
+   199	      stop_dimension_too_large(error_call);
+   200	    }</pre><p class="cut">656 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 1,20p src/roll-each.c; grep -n &quot;check_roll_n_not_missing\|rray_roll_normalize&quot; src/*.c…</summary>
+<pre>sed -n 1,20p src/roll-each.c; grep -n &quot;check_roll_n_not_missing\|rray_roll_normalize&quot; src/*.c | head; ls plans; grep -n &quot;roll-each\|roll_each&quot; plans/*.md | head -20</pre><pre class="output">#include &quot;roll-each.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;broadcast.h&quot;
+#include &quot;cast.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;reduce-names.h&quot;
+#include &quot;roll.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/roll-each-decl.h&quot;
+
+r_obj* ffi_rray_roll_each(
+  r_obj* ffi_x,
+  r_obj* ffi_n,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+src/roll-each.c:92:  check_roll_n_not_missing(n, arg, error_call);
+src/roll-each.c:109:    v_out[i] = rray_roll_normalize(v_n[i], axis_dimension);
+src/roll-each.c:124:    if (rray_roll_normalize(v_n[i], axis_dimension) != v_n[i]) {
+src/roll.c:52:    const int n = rray_roll_normalize(v_n[n_size == 1 ? 0 : i], dimension);
+src/roll.c:69:  check_roll_n_not_missing(n, arg, error_call);
+src/roll.c:118:void check_roll_n_not_missing(
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+rep.md
+slice.md
+plans/rep.md:26:| `rray_roll(x, ..., n, axes)` | `rray_roll_each(x, ..., n, axis)` |</pre></details>
+<details class="tool"><summary>Bash: sed -n 225,300p plans/rep.md; echo ----; sed -n 368,400p plans/rep.md; echo ----; sed -n 470,…</summary>
+<pre>sed -n 225,300p plans/rep.md; echo ----; sed -n 368,400p plans/rep.md; echo ----; sed -n 470,575p plans/rep.md</pre><pre class="output">Only the `times` size error that mentions `axes` is new text. It is written
+like the size error in `rray_roll()`, so both functions say the same thing. The
+rest comes from existing helpers. Snapshot them rather than retyping them.
+
+## `rray_rep_each()`
+
+No change in behavior. It keeps a single `axis`, for two reasons:
+
+- A varying `times` across several axes would need a list with one vector per
+  axis. That is a different argument shape from every other `times` in the
+  package.
+
+- NumPy's `np.repeat()` also takes one axis.
+
+Julia's `repeat(x; inner = (2, 2))` does allow a uniform count per axis. The one
+common use is upsampling, like turning each pixel into a 2x2 block. Two calls to
+`rray_rep_each()` do the same thing.
+
+Its C code does change shape, since it no longer shares an implementation with
+`rray_rep()`. See below.
+
+## Equivalences
+
+These describe the function exactly and make good property tests.
+
+Repeating several axes is repeating them one at a time, in any order:
+
+```r
+rray_rep(x, times = c(2, 3), axes = c(1, 3))
+rray_rep(rray_rep(x, times = 2, axes = 1), times = 3, axes = 3)
+rray_rep(rray_rep(x, times = 3, axes = 3), times = 2, axes = 1)
+```
+
+Repeating one axis is a slice of that axis, names included:
+
+```r
+rray_rep(x, times = t, axes = a)
+rray_slice_axis(x, rep(seq_len(d), times = t), axis = a)
+```
+
+## Implementation design
+
+### Files
+
+- `R/rep.R`: rename `axis` to `axes` in `rray_rep()`, and update the topic.
+
+- `src/rep.c`, `src/rep.h`, `src/decl/rep-decl.h`: split the shared
+  `rray_rep_impl()` into separate `rray_rep()` and `rray_rep_each()` bodies, and
+  add the in-place expand.
+
+- `src/init.c`: rename the `ffi_axis` parameter of the `ffi_rray_rep()` extern
+  to `ffi_axes`. The registration keeps 4 arguments.
+
+- `tests/testthat/test-rep.R`, `tests/testthat/helper-rep.R`, and the
+  regenerated `tests/testthat/_snaps/rep.md`.
+
+- `man/rray-rep.Rd`, regenerated.
+
+No new files, and no new argument tags. `rray_args.axes` and `rray_args.times`
+already exist.
+
+### R wrapper
+
+```r
+rray_rep &lt;- function(x, ..., times, axes) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_rep, x, times, axes, environment())
+}
+```
+
+### C entry points
+
+`ffi_rray_rep()` no longer converts its axis. It passes `ffi_axes` straight
+through, and `rray_rep()` validates it after it knows the dimensionality:
+
+```c
+----
+`stop_rep_times_size()` has two branches, like `stop_times_size()` today:
+
+- `axes_size == 1`: `` `times` must be size 1, not size 2. ``
+
+- otherwise: `` `times` must be size 1 or size 2 to match `axes`, not size 3. ``
+
+With `axes = integer()`, a size 0 or size 1 `times` is accepted and ignored.
+
+### `rray_rep_dimension()`
+
+Today's `rray_rep_dimension()` handles both a single `times` and a vector. Split
+it:
+
+- `rray_rep_dimension(int dimension, int times, error_call)` multiplies with
+  the overflow check. Both functions use it.
+
+- `rray_rep_each_dimension(axis_dimension, v_times, times_size, error_call)`
+  calls `rray_rep_dimension()` for a size 1 `times`, and otherwise sums with the
+  overflow check, as today.
+
+### The fill
+
+The fill has two steps.
+
+#### Step 1: the first axis, read from `x`
+
+The first axis in `axes` is repeated straight from `x` into the start of `out`
+with the existing `rray_rep_fill_uniform()`, exactly as single-axis
+`rray_rep()` does today:
+
+```text
+axis       = v_axes[0]
+block_size = product of dimensions 1 through axis, inclusive
+----
+
+Total work is at most about twice the size of `out`, since every in-place step
+at least doubles the data already written.
+
+#### Types
+
+`rray_rep_expand()` switches on `r_typeof(out)` to seven cores, like
+`rray_rep_fill_uniform()`. Each core is one macro call:
+
+- `RRAY_REP_EXPAND_ATOMIC(CTYPE, DEREF)` for logical, integer, double, complex,
+  and raw, with the loop above.
+
+- `RRAY_REP_EXPAND_BARRIER(CONST_DEREF, POKE)` for character and list. It reads
+  from `CONST_DEREF(out)` and writes with `POKE()` at the matching offset.
+
+Both copy element by element in a loop, like every other fill in `src/rep.c`.
+No `r_memcpy()`.
+
+Undefine both after the cores.
+
+`rray_rep_fill()` is the driver that runs step 1 and then calls
+`rray_rep_expand()` once per remaining axis.
+
+### Names
+
+```text
+rray_rep_names(names, v_axes, axes_size, v_times, times_size):
+  if names is NULL:
+    return NULL
+
+  if no axis in axes has non-NULL names:
+    return names
+
+  out = KEEP(new list with the elements of names)
+
+  for each i in axes:
+    axis_names = names[[axis]]
+    if axis_names is NULL: next
+    poke rray_rep_axis_names(axis_names, time) into out[[axis]]
+
+  return out
+```
+
+`rray_rep_axis_names()` is today's non-each branch of the axis names helper: the
+whole axis names, `times` times over.
+
+`rray_rep_each_names()` and `rray_rep_each_axis_names()` are today's helpers
+with the non-each branches removed and the `each` argument dropped.
+
+### `rray_rep_each()`
+
+Its body is today's `rray_rep_impl()` with `each` fixed to `true` and the
+non-each branches removed. Its helpers are renamed so each function has its own
+set:
+
+- `arg_as_times()` becomes `arg_as_rep_each_times()`.
+
+- `stop_times_size()` becomes `stop_rep_each_times_size()`, with the same two
+  messages as today.
+
+- `rray_rep_each_dimension()`, from the split above.
+
+- `rray_rep_fill_uniform()` for a size 1 `times`, with
+  `n_blocks = n_groups * axis_dimension`, and `rray_rep_fill_varying()`
+  otherwise, as today.
+
+- `rray_rep_each_names()` and `rray_rep_each_axis_names()`.
+
+`rray_rep_impl()` is removed.
+
+### File order
+
+`src/rep.c` reads top down:
+
+1. `ffi_rray_rep()`, `rray_rep()`
+
+2. `arg_as_rep_times()`, `stop_rep_times_size()`
+
+3. `rray_rep_fill()`, `rray_rep_expand()`, then its seven cores and macros
+
+4. `rray_rep_names()`, `rray_rep_axis_names()`
+
+5. `ffi_rray_rep_each()`, `rray_rep_each()`
+
+6. `arg_as_rep_each_times()`, `stop_rep_each_times_size()`
+
+7. `rray_rep_each_dimension()`
+
+8. `rray_rep_fill_varying()`, then its seven cores and macros</pre><p class="cut">17 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn '#include &quot;rep.h&quot;\|rray_rep_each\|rray_rep(' src/*.c src/*.h | grep -v &quot;^src/rep\.[c…</summary>
+<pre>grep -rn '#include &quot;rep.h&quot;\|rray_rep_each\|rray_rep(' src/*.c src/*.h | grep -v &quot;^src/rep\.[ch]&quot;; grep -n &quot;r_no_return&quot; src/*.h | head -5</pre><pre class="output">src/init.c:152:extern r_obj* ffi_rray_rep(
+src/init.c:158:extern r_obj* ffi_rray_rep_each(
+src/init.c:337:  {&quot;ffi_rray_rep_each&quot;, (DL_FUNC) &amp;ffi_rray_rep_each, 4},
+src/arithmetic.h:33:r_no_return void stop_unsupported_arithmetic(
+src/arithmetic.h:42:r_no_return void stop_int_overflow(struct r_lazy error_call);
+src/cast.h:19:r_no_return void stop_lossy_cast(
+src/reduce.h:196:r_no_return void stop_unsupported_reduce(
+src/subscript.h:52:r_no_return void stop_subscript_fractional(</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;test_that\|# ---&quot; tests/testthat/test-rep.R</summary>
+<pre>grep -n &quot;test_that\|# ---&quot; tests/testthat/test-rep.R</pre><pre class="output">1:# ------------------------------------------------------------------------------
+4:test_that(&quot;`rray_rep()` repeats the axis, `rray_rep_each()` repeats slices&quot;, {
+17:test_that(&quot;repeats along every axis&quot;, {
+34:test_that(&quot;works with bare vectors&quot;, {
+38:test_that(&quot;works with 1D arrays&quot;, {
+45:test_that(&quot;works with every type&quot;, {
+69:test_that(&quot;`times = 0` gives a zero dimension&quot;, {
+76:test_that(&quot;`times = 1` returns the input&quot;, {
+82:test_that(&quot;works with a zero dimension axis&quot;, {
+87:test_that(&quot;`times` can be a double&quot;, {
+95:test_that(&quot;names on the repeated axis repeat, and can be duplicated&quot;, {
+108:test_that(&quot;partial and missing dimension names are handled&quot;, {
+118:test_that(&quot;`x` is not modified&quot;, {
+129:test_that(&quot;matches a reference implementation&quot;, {
+155:test_that(&quot;`times` and `axis` must be named&quot;, {
+164:test_that(&quot;`axis` is validated&quot;, {
+172:test_that(&quot;`times` is validated&quot;, {
+185:test_that(&quot;errors if the repeated dimension is too large&quot;, {
+193:test_that(&quot;errors on invalid input&quot;, {
+200:# ------------------------------------------------------------------------------
+203:test_that(&quot;repeats along every axis&quot;, {
+220:test_that(&quot;`times` is recycled to the dimension of `axis`&quot;, {
+228:test_that(&quot;`times` can vary by slice&quot;, {
+236:test_that(&quot;`times` can vary by slice along a middle axis&quot;, {
+248:test_that(&quot;zeroes in `times` drop individual slices&quot;, {
+257:test_that(&quot;works with bare vectors&quot;, {
+264:test_that(&quot;works with 1D arrays&quot;, {
+271:test_that(&quot;works with every type&quot;, {
+295:test_that(&quot;`times = 1` returns the input&quot;, {
+301:test_that(&quot;works with a zero dimension axis&quot;, {
+307:test_that(&quot;`times` can be a double&quot;, {
+315:test_that(&quot;names on the repeated axis repeat, and can be duplicated&quot;, {
+328:test_that(&quot;partial and missing dimension names are handled&quot;, {
+338:test_that(&quot;matches a reference implementation&quot;, {
+375:test_that(&quot;`times` and `axis` must be named&quot;, {
+384:test_that(&quot;`axis` is validated&quot;, {
+390:test_that(&quot;`times` is validated&quot;, {
+398:test_that(&quot;errors if the repeated dimension is too large&quot;, {
+405:test_that(&quot;errors on invalid input&quot;, {</pre></details>
+<details class="tool"><summary>Bash: sed -n 271,294p tests/testthat/test-rep.R; sed -n 398,404p tests/testthat/test-rep.R</summary>
+<pre>sed -n 271,294p tests/testthat/test-rep.R; sed -n 398,404p tests/testthat/test-rep.R</pre><pre class="output">test_that(&quot;works with every type&quot;, {
+  inputs &lt;- list(
+    c(TRUE, NA, FALSE),
+    c(1L, NA, 3L),
+    c(1.5, NA, 3.5),
+    c(1 + 1i, NA, 3 + 3i),
+    as.raw(1:3),
+    c(&quot;a&quot;, NA, &quot;c&quot;),
+    list(1, &quot;a&quot;, NULL)
+  )
+
+  for (input in inputs) {
+    x &lt;- array(input, c(3, 2))
+    expect_identical(
+      rray_rep_each(x, times = 2, axis = 1),
+      expected_rep(x, 2, 1, TRUE)
+    )
+    expect_identical(
+      rray_rep_each(x, times = 2, axis = 2),
+      expected_rep(x, 2, 2, TRUE)
+    )
+  }
+})
+
+test_that(&quot;errors if the repeated dimension is too large&quot;, {
+  x &lt;- array(1:2, 2)
+  max &lt;- .Machine$integer.max
+  expect_snapshot(rray_rep_each(x, times = max, axis = 1), error = TRUE)
+  expect_snapshot(rray_rep_each(x, times = c(max, max), axis = 1), error = TRUE)
+})</pre></details>
+<p>Moving <code>rray_rep_each()</code> into its own <code>src/rep-each.c</code> in the plan and folding its two fills into one.</p>
+
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-Its C code does change shape, since it no longer shares an implementation with</span>
+<span class="del">-`rray_rep()`. See below.</span>
+<span class="ins">+Its C code moves to its own `src/rep-each.c`, like `rray_roll_each()`, since it</span>
+<span class="ins">+no longer shares a body with `rray_rep()`. See below.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- `src/rep.c`, `src/rep.h`, `src/decl/rep-decl.h`: split the shared</span>
+<span class="del">-  `rray_rep_impl()` into separate `rray_rep()` and `rray_rep_each()` bodies, and</span>
+<span class="del">-  add the in-place expand.</span>
+<span class="del">-</span>
+<span class="del">-- `src/init.c`: rename the `ffi_axis` parameter of the `ffi_rray_rep()` extern</span>
+<span class="del">-  to `ffi_axes`. The registration keeps 4 arguments.</span>
+<span class="del">-</span>
+<span class="del">-- `tests/testthat/test-rep.R`, `tests/testthat/helper-rep.R`, and the</span>
+<span class="del">-  regenerated `tests/testthat/_snaps/rep.md`.</span>
+<span class="del">-</span>
+<span class="del">-- `man/rray-rep.Rd`, regenerated.</span>
+<span class="del">-</span>
+<span class="del">-No new files, and no new argument tags. `rray_args.axes` and `rray_args.times`</span>
+<span class="del">-already exist.</span>
+<span class="ins">+- `src/rep.c`, `src/rep.h`, `src/decl/rep-decl.h`: `rray_rep()` with its own</span>
+<span class="ins">+  body, and the in-place expand. `rray_rep_impl()` is removed.</span>
+<span class="ins">+</span>
+<span class="ins">+- `src/rep-each.c`, `src/rep-each.h`, `src/decl/rep-each-decl.h`: new.</span>
+<span class="ins">+  `rray_rep_each()` and its helpers, moved out of `src/rep.c`.</span>
+<span class="ins">+</span>
+<span class="ins">+- `src/init.c`: rename the `ffi_axis` parameter of the `ffi_rray_rep()` extern</span>
+<span class="ins">+  to `ffi_axes`. The registration keeps 4 arguments.</span>
+<span class="ins">+</span>
+<span class="ins">+- `tests/testthat/test-rep.R`, `tests/testthat/helper-rep.R`, and the</span>
+<span class="ins">+  regenerated `tests/testthat/_snaps/rep.md`.</span>
+<span class="ins">+</span>
+<span class="ins">+- `man/rray-rep.Rd`, regenerated.</span>
+<span class="ins">+</span>
+<span class="ins">+The R code, tests, and topic stay shared in `rep` files, like `R/roll.R` and</span>
+<span class="ins">+`tests/testthat/test-roll.R`. No new argument tags. `rray_args.axes` and</span>
+<span class="ins">+`rray_args.times` already exist.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-Today's `rray_rep_dimension()` handles both a single `times` and a vector. Split</span>
+<span class="del">-it:</span>
+<span class="del">-</span>
+<span class="del">-- `rray_rep_dimension(int dimension, int times, error_call)` multiplies with</span>
+<span class="del">-  the overflow check. Both functions use it.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_rep_each_dimension(axis_dimension, v_times, times_size, error_call)`</span>
+<span class="del">-  calls `rray_rep_dimension()` for a size 1 `times`, and otherwise sums with the</span>
+<span class="del">-  overflow check, as today.</span>
+<span class="ins">+Today's `rray_rep_dimension()` handles both a single `times` and a vector. Split</span>
+<span class="ins">+it:</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_rep_dimension(int dimension, int times, error_call)` in `src/rep.c`</span>
+<span class="ins">+  multiplies with the overflow check.</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_rep_each_dimension()` in `src/rep-each.c`. See below.</span>
+<span class="ins">+</span>
+<span class="ins">+`stop_dimension_too_large()` is renamed `stop_rep_dimension_too_large()` and</span>
+<span class="ins">+declared in `src/rep.h`, so both files throw the same error. This is the only</span>
+<span class="ins">+thing the two files share, like `check_roll_n_not_missing()` in `src/roll.h`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-`rray_rep_axis_names()` is today's non-each branch of the axis names helper: the</span>
+<span class="del">-whole axis names, `times` times over.</span>
+<span class="del">-</span>
+<span class="del">-`rray_rep_each_names()` and `rray_rep_each_axis_names()` are today's helpers</span>
+<span class="del">-with the non-each branches removed and the `each` argument dropped.</span>
+<span class="del">-</span>
+<span class="del">-### `rray_rep_each()`</span>
+<span class="del">-</span>
+<span class="del">-Its body is today's `rray_rep_impl()` with `each` fixed to `true` and the</span>
+<span class="del">-non-each branches removed. Its helpers are renamed so each function has its own</span>
+<span class="del">-set:</span>
+<span class="del">-</span>
+<span class="del">-- `arg_as_times()` becomes `arg_as_rep_each_times()`.</span>
+<span class="del">-</span>
+<span class="del">-- `stop_times_size()` becomes `stop_rep_each_times_size()`, with the same two</span>
+<span class="del">-  messages as today.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_rep_each_dimension()`, from the split above.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_rep_fill_uniform()` for a size 1 `times`, with</span>
+<span class="del">-  `n_blocks = n_groups * axis_dimension`, and `rray_rep_fill_varying()`</span>
+<span class="del">-  otherwise, as today.</span>
+<span class="del">-</span>
+<span class="del">-- `rray_rep_each_names()` and `rray_rep_each_axis_names()`.</span>
+<span class="del">-</span>
+<span class="del">-`rray_rep_impl()` is removed.</span>
+<span class="del">-</span>
+<span class="del">-### File order</span>
+<span class="del">-</span>
+<span class="del">-`src/rep.c` reads top down:</span>
+<span class="del">-</span>
+<span class="del">-1. `ffi_rray_rep()`, `rray_rep()`</span>
+<span class="del">-</span>
+<span class="del">-2. `arg_as_rep_times()`, `stop_rep_times_size()`</span>
+<span class="del">-</span>
+<span class="del">-3. `rray_rep_fill()`, `rray_rep_expand()`, then its seven cores and macros</span>
+<span class="del">-</span>
+<span class="del">-4. `rray_rep_names()`, `rray_rep_axis_names()`</span>
+<span class="del">-</span>
+<span class="del">-5. `ffi_rray_rep_each()`, `rray_rep_each()`</span>
+<span class="del">-</span>
+<span class="del">-6. `arg_as_rep_each_times()`, `stop_rep_each_times_size()`</span>
+<span class="del">-</span>
+<span class="del">-7. `rray_rep_each_dimension()`</span>
+<span class="del">-</span>
+<span class="del">-8. `rray_rep_fill_varying()`, then its seven cores and macros</span>
+<span class="del">-</span>
+<span class="del">-9. `rray_rep_each_names()`, `rray_rep_each_axis_names()`</span>
+<span class="del">-</span>
+<span class="del">-10. Last, since both halves use them: `rray_rep_dimension()`,</span>
+<span class="del">-    `stop_dimension_too_large()`, and `rray_rep_fill_uniform()` with its seven</span>
+<span class="del">-    cores and macros</span>
+<span class="del">-</span>
+<span class="del">-`src/rep.h` declares `rray_rep()` with the new signature and `rray_rep_each()`</span>
+<span class="del">-unchanged. `src/decl/rep-decl.h` declares every static helper and core, in the</span>
+<span class="del">-same order, and drops `rray_rep_impl()`.</span>
+<span class="ins">+`rray_rep_axis_names()` is today's non-each branch of the axis names helper: the</span>
+<span class="ins">+whole axis names, `times` times over.</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_rep_each()`</span>
+<span class="ins">+</span>
+<span class="ins">+Its body is today's `rray_rep_impl()` with `each` fixed to `true` and the</span>
+<span class="ins">+non-each branches removed. Its helpers are renamed so each function has its own</span>
+<span class="ins">+set:</span>
+<span class="ins">+</span>
+<span class="ins">+- `arg_as_times()` becomes `arg_as_rep_each_times()`.</span>
+<span class="ins">+</span>
+<span class="ins">+- `stop_times_size()` becomes `stop_rep_each_times_size()`, with the same two</span>
+<span class="ins">+  messages as today.</span>
+<span class="ins">+</span>
+<span class="ins">+On its own, `rray_rep_each()` no longer needs separate code paths for a size 1</span>
+<span class="ins">+`times` and a varying `times`. Every helper reads its count the way</span>
+<span class="ins">+`rray_roll()` reads `n`:</span>
+<span class="ins">+</span>
+<span class="ins">+```c</span>
+<span class="ins">+const int times = v_times[times_size == 1 ? 0 : i];</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+That gives three simplifications:</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_rep_each_dimension(axis_dimension, v_times, times_size, error_call)`</span>
+<span class="ins">+  is one loop that sums the counts with the overflow check. A size 1 `times`</span>
+<span class="ins">+  no longer takes a separate multiply.</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_rep_each_fill()` replaces both `rray_rep_fill_uniform()` and</span>
+<span class="ins">+  `rray_rep_fill_varying()`. It is today's varying fill, reading its count with</span>
+<span class="ins">+  the line above, so `rray_rep_each()` has one fill with seven cores instead of</span>
+<span class="ins">+  two with fourteen. `n_blocks_per_group` is renamed `axis_dimension`, which is</span>
+<span class="ins">+  what it always was here. `rray_rep_fill_uniform()` stays in `src/rep.c` for</span>
+<span class="ins">+  step 1 of `rray_rep()`.</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_rep_each_names()` and `rray_rep_each_axis_names()` are today's helpers</span>
+<span class="ins">+  with the non-each branch and the `each` argument dropped. The two each</span>
+<span class="ins">+  branches of the axis names loop become one, the same way.</span>
+<span class="ins">+</span>
+<span class="ins">+The count lookup happens once per block, not once per element, so the fill</span>
+<span class="ins">+costs nothing extra for a size 1 `times`.</span>
+<span class="ins">+</span>
+<span class="ins">+### File order</span>
+<span class="ins">+</span>
+<span class="ins">+`src/rep.c` reads top down:</span>
+<span class="ins">+</span>
+<span class="ins">+1. `ffi_rray_rep()`, `rray_rep()`</span>
+<span class="ins">+</span>
+<span class="ins">+2. `arg_as_rep_times()`, `stop_rep_times_size()`</span>
+<span class="ins">+</span>
+<span class="ins">+3. `rray_rep_dimension()`, `stop_rep_dimension_too_large()`</span>
+<span class="ins">+</span>
+<span class="ins">+4. `rray_rep_fill()`, `rray_rep_expand()`, then its seven cores and macros</span>
+<span class="ins">+</span>
+<span class="ins">+5. `rray_rep_fill_uniform()`, then its seven cores and macros</span>
+<span class="ins">+</span>
+<span class="ins">+6. `rray_rep_names()`, `rray_rep_axis_names()`</span>
+<span class="ins">+</span>
+<span class="ins">+`src/rep-each.c` reads top down:</span>
+<span class="ins">+</span>
+<span class="ins">+1. `ffi_rray_rep_each()`, `rray_rep_each()`</span>
+<span class="ins">+</span>
+<span class="ins">+2. `arg_as_rep_each_times()`, `stop_rep_each_times_size()`</span>
+<span class="ins">+</span>
+<span class="ins">+3. `rray_rep_each_dimension()`</span>
+<span class="ins">+</span>
+<span class="ins">+4. `rray_rep_each_fill()`, then its seven cores and macros</span>
+<span class="ins">+</span>
+<span class="ins">+5. `rray_rep_each_names()`, `rray_rep_each_axis_names()`</span>
+<span class="ins">+</span>
+<span class="ins">+`src/rep.h` declares `rray_rep()` with the new signature and</span>
+<span class="ins">+`stop_rep_dimension_too_large()`. `src/rep-each.h` declares `rray_rep_each()`,</span>
+<span class="ins">+unchanged. Each decl header declares its file's static helpers and cores, in</span>
+<span class="ins">+file order. `src/rep-each.c` includes `rep.h` for the shared error.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;The fill does not allocate\|Existing tests, unchanged&quot; plans/rep.md &amp;&amp; sed -n '/^###…</summary>
+<pre>grep -n &quot;The fill does not allocate\|Existing tests, unchanged&quot; plans/rep.md &amp;&amp; sed -n '/^### `rray_rep_each()`$/,/^### Required/p' plans/rep.md | tail -8</pre><pre class="output">615:- The fill does not allocate.
+697:Existing tests, unchanged apart from the helper rename. The snapshots must not
+  name.
+
+### `rray_rep_each()`
+
+Existing tests, unchanged apart from the helper rename. The snapshots must not
+change. That confirms the split kept its behavior.
+
+### Required checks</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-- The fill does not allocate.</span>
+<span class="ins">+- The fill does not allocate.</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_rep_each()` keeps today's protection. Only its helpers change, and</span>
+<span class="ins">+  `rray_rep_each_dimension()` and `rray_rep_each_fill()` don't allocate.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-Existing tests, unchanged apart from the helper rename. The snapshots must not</span>
+<span class="del">-change. That confirms the split kept its behavior.</span>
+<span class="ins">+Existing tests, unchanged apart from the helper rename. The snapshots must not</span>
+<span class="ins">+change. That confirms the split and the single fill kept its behavior. The</span>
+<span class="ins">+overflow snapshot for a size 1 `times` now goes through the summing loop, so</span>
+<span class="ins">+it matters most here.</span>
+<span class="ins">+</span>
+<span class="ins">+Add a varying `times` to the every type test, alongside the size 1 `times`, so</span>
+<span class="ins">+both ways of reading the count run through every core.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;stop_dimension_too_large\|fill_varying\|n_blocks_per_group\|No new files\|plans/roll…</summary>
+<pre>grep -n &quot;stop_dimension_too_large\|fill_varying\|n_blocks_per_group\|No new files\|plans/roll.md&quot; plans/rep.md; git diff --stat</pre><pre class="output">21:This makes the rep pair match the roll pair in `plans/roll.md` exactly:
+389:`stop_dimension_too_large()` is renamed `stop_rep_dimension_too_large()` and
+547:  `rray_rep_fill_varying()`. It is today's varying fill, reading its count with
+549:  two with fourteen. `n_blocks_per_group` is renamed `axis_dimension`, which is
+729:table in `plans/roll.md` true when roll arrives.
+ plans/rep.md | 101 ++++++++++++++++++++++++++++++++++++++---------------------
+ 1 file changed, 66 insertions(+), 35 deletions(-)</pre></details>
+<p>I've updated <code>plans/rep.md</code>. <code>rray_rep_each()</code> now gets its own <code>src/rep-each.c</code>, <code>src/rep-each.h</code> and <code>src/decl/rep-each-decl.h</code>, the same way <code>rray_roll_each()</code> is split from <code>rray_roll()</code>. Nothing is committed.</p>
+<p><strong>The split</strong></p>
+<ul>
+<li>
+<p><code>src/rep.c</code> keeps only <code>rray_rep()</code>: the in-place expand and <code>rray_rep_fill_uniform()</code>, which step 1 still uses.</p>
+</li>
+<li>
+<p>The two files share one thing, the &quot;dimension too large&quot; error. It becomes <code>stop_rep_dimension_too_large()</code>, declared in <code>src/rep.h</code>, like <code>check_roll_n_not_missing()</code> in <code>src/roll.h</code>. <code>src/rep-each.c</code> includes <code>rep.h</code> for it.</p>
+</li>
+<li>
+<p>The R code, tests and help topic stay in the shared <code>rep</code> files, as <code>R/roll.R</code> and <code>test-roll.R</code> do.</p>
+</li>
+<li>
+<p>I rewrote the file order section as two lists, one per file.</p>
+</li>
+</ul>
+<p><strong>Simplifications to <code>rep-each.c</code></strong></p>
+<p>On its own, <code>rray_rep_each()</code> no longer needs separate code for a single <code>times</code> and a varying <code>times</code>. Each helper reads its count the way <code>rray_roll()</code> reads <code>n</code>: <code>v_times[times_size == 1 ? 0 : i]</code>.</p>
+<ul>
+<li>
+<p><strong>Dimension:</strong> <code>rray_rep_each_dimension()</code> becomes one summing loop with the overflow check. A single <code>times</code> no longer multiplies separately.</p>
+</li>
+<li>
+<p><strong>Fill:</strong> one <code>rray_rep_each_fill()</code> replaces the uniform and varying fills, so there are 7 type cores instead of 14. The count is looked up once per block, not per element, so a single <code>times</code> costs nothing extra. <code>n_blocks_per_group</code> is renamed <code>axis_dimension</code>, which is what it always was there.</p>
+</li>
+<li>
+<p><strong>Names:</strong> the two <code>each</code> branches of the axis names loop become one.</p>
+</li>
+</ul>
+<p><strong>Tests and protection</strong></p>
+<ul>
+<li>
+<p>The existing <code>rray_rep_each()</code> snapshots must not change. The overflow snapshot for a single <code>times</code> now goes through the summing loop, so it is the most useful check that behavior is unchanged.</p>
+</li>
+<li>
+<p>The every-type test gets a varying <code>times</code> next to the single one.</p>
+</li>
+<li>
+<p>I added a protection note: <code>rray_rep_each()</code> keeps today's protection, and its new helpers don't allocate.</p>
+</li>
+</ul>
+<p><strong>Two things to check</strong></p>
+<ul>
+<li>
+<p><strong>Your comments:</strong> two of your comments go away with the code they describe. One is <code>// Groups flatten away with uniform times</code>. The other is the &quot;Single <code>times</code>&quot; / &quot;Vector <code>times</code>&quot; pair in <code>rray_rep_dimension()</code>. The branches they sit on no longer exist.</p>
+</li>
+<li>
+<p><strong>Stale roll references:</strong> lines 21 and 729 still point to <code>plans/roll.md</code>. That file is gone, and roll has already merged (#94, #96). The Delivery section about landing this before the first roll pull request is out of date too. I left both alone. Should I remove them?</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>yes remove them, then commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: sed -n 19,30p plans/rep.md; echo ----; sed -n '/^## Delivery/,/^## Research/p' plans/rep.md</summary>
+<pre>sed -n 19,30p plans/rep.md; echo ----; sed -n '/^## Delivery/,/^## Research/p' plans/rep.md</pre><pre class="output">  the dimension of `axis`.
+
+This makes the rep pair match the roll pair in `plans/roll.md` exactly:
+
+| Every lane together | Each position on its own |
+|---|---|
+| `rray_rep(x, ..., times, axes)` | `rray_rep_each(x, ..., times, axis)` |
+| `rray_roll(x, ..., n, axes)` | `rray_roll_each(x, ..., n, axis)` |
+
+The left column takes `axes` and one value per axis. The right column takes one
+`axis` and one value per position or lane.
+
+----
+## Delivery
+
+One pull request, on its own branch from `main`, merged before the first roll
+pull request. It is independent of roll, but landing it first makes the pairs
+table in `plans/roll.md` true when roll arrives.
+
+## Research notes</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-This makes the rep pair match the roll pair in `plans/roll.md` exactly:</span>
+<span class="ins">+This makes the rep pair match the roll pair exactly:</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-One pull request, on its own branch from `main`, merged before the first roll</span>
+<span class="del">-pull request. It is independent of roll, but landing it first makes the pairs</span>
+<span class="del">-table in `plans/roll.md` true when roll arrives.</span>
+<span class="ins">+One pull request, on its own branch from `main`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n &quot;roll.md\|first roll&quot; plans/rep.md; git add plans/rep.md &amp;&amp; git commit -q -m &quot;Split r…</summary>
+<pre>grep -n &quot;roll.md\|first roll&quot; plans/rep.md; git add plans/rep.md &amp;&amp; git commit -q -m &quot;Split rep-each into its own file in the rep plan and simplify its fill&quot; &amp;&amp; git push -u origin feature/rep-axes 2&gt;&amp;1 | tail -2 &amp;&amp; git log --oneline -1</pre><pre class="output">   ba541ca..4fef04a  feature/rep-axes -&gt; feature/rep-axes
+branch 'feature/rep-axes' set up to track 'origin/feature/rep-axes'.
+4fef04a Split rep-each into its own file in the rep plan and simplify its fill</pre></details>
+<p>I removed the stale roll references, then committed and pushed to <code>origin/feature/rep-axes</code> as <code>4fef04a</code> (&quot;Split rep-each into its own file in the rep plan and simplify its fill&quot;).</p>
+<ul>
+<li>
+<p><strong>Pairs table:</strong> the sentence above it now reads &quot;match the roll pair exactly&quot;, with no link to <code>plans/roll.md</code>. The table itself stays.</p>
+</li>
+<li>
+<p><strong>Delivery:</strong> now just says &quot;One pull request, on its own branch from <code>main</code>.&quot;</p>
+</li>
+</ul>
+<p>No other mentions of <code>plans/roll.md</code> or landing before roll are left in the plan. The commit also includes the rep-each split and the simpler fill from the previous step.</p>
+
+</section>
+</main>
+</body>
+</html>

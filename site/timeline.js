@@ -127,6 +127,9 @@ class Timeline {
     this.hovered = null;
     this.highlighted = null;
 
+    // Unshipped session whose tooltip stays open until dismissed
+    this.pinned = null;
+
     // The one dot in the tab order
     this.active = model.prs[0];
 
@@ -141,10 +144,19 @@ class Timeline {
     root.on("keydown", (event) => {
       if (event.key !== "Escape") return;
       this.hover(null);
-      if (this.selected) {
+      if (this.pinned) {
+        event.preventDefault();
+        this.pin(null);
+      } else if (this.selected) {
         event.preventDefault();
         this.select(null);
       }
+    });
+
+    addEventListener("click", (event) => {
+      if (!this.pinned) return;
+      if (this.tooltip.node().contains(event.target) || event.target.closest(".tl-track a")) return;
+      this.pin(null);
     });
 
     this.renderPanel();
@@ -222,11 +234,16 @@ class Timeline {
       .selectAll("a")
       .data(model.unshipped)
       .join("a")
-      .attr("class", (session) => `tl-${session.tool}`)
       .attr("href", (session) => session.page)
       .attr("aria-label", (session) => `${session.title}, ${dayRange(session)}, didn't ship`)
-      .on("pointerenter", (event, session) => this.showSessionTooltip(event, session))
-      .on("pointerleave", () => this.hideTooltip());
+      .on("pointerenter", (event, session) => this.showSessionTooltip(session))
+      .on("pointerleave", () => this.hideTooltip())
+      .on("click", (event, session) => {
+        // Modified clicks still open the transcript
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        this.pin(session === this.pinned ? null : session);
+      });
 
     this.track
       .selectAll("rect")
@@ -257,8 +274,6 @@ class Timeline {
     });
     this.raise(this.selected);
 
-    this.labels = svg.append("g").attr("class", "tl-labels");
-
     // Pointer input goes through the nearest dot rather than each dot's tiny hit area
     this.overlay = svg
       .append("rect")
@@ -274,6 +289,9 @@ class Timeline {
         const pr = this.nearest(event);
         this.select(pr === this.selected ? null : pr);
       });
+
+    // Above the overlay so labels can be clicked
+    this.labels = svg.append("g").attr("class", "tl-labels");
 
     this.svg = svg;
   }
@@ -404,7 +422,13 @@ class Timeline {
       steps: model.steps,
       bounds: { x0: plot.x0, y0: 0, x1: plot.x1, y1: plot.y1 },
     });
-    this.labels.selectAll("*").classed("tl-faded", (pr) => selected && pr !== selected);
+    this.labels
+      .selectAll(":scope > *")
+      .classed("tl-faded", (pr) => selected && pr !== selected);
+    this.labels.selectAll("a").on("click", (event, pr) => {
+      event.preventDefault();
+      this.select(pr);
+    });
 
     this.x = x;
     this.y = y;
@@ -414,6 +438,12 @@ class Timeline {
       (pr) => x(pr.date),
       (pr) => y(pr.exports),
     );
+
+    if (this.pinned) {
+      const [start, end] = sessionExtent(this.pinned);
+      if (end < domain[0] || start > domain[1]) this.pin(null);
+      else if (!this.hovered) this.showSessionTooltip(this.pinned);
+    }
   }
 
   // Bands for the selected PR's conversations, and its open to merge window
@@ -428,7 +458,7 @@ class Timeline {
       .selectAll("rect")
       .data(segments)
       .join("rect")
-      .attr("class", (segment) => `tl-band tl-${segment.session.tool}`)
+      .attr("class", "tl-band")
       .call(spanX, x, (segment) => [segment.start, segment.end])
       .attr("y", y0)
       .attr("height", y1 - y0);
@@ -485,7 +515,14 @@ class Timeline {
     else this.hideTooltip();
   }
 
+  pin(session) {
+    this.pinned = session;
+    if (session) this.showSessionTooltip(session);
+    else this.hideTooltip();
+  }
+
   select(pr, { fit = false } = {}) {
+    if (this.pinned) this.pin(null);
     this.selected = pr;
     this.highlighted = null;
 
@@ -579,22 +616,31 @@ class Timeline {
     });
   }
 
-  showSessionTooltip(event, session) {
-    const point = d3.pointer(event, this.svg.node());
+  showSessionTooltip(session) {
+    const { plot } = this;
+    const [start, end] = sessionExtent(session);
+    const middle = this.x(new Date((+start + +end) / 2));
+    const point = [Math.max(plot.x0, Math.min(middle, plot.x1)), plot.y1 + TRACK.gap];
+    const pinned = session === this.pinned;
 
-    this.showTooltip(this.svg.node(), point, (tooltip) => {
+    const content = (tooltip) => {
       tooltip.append("div").attr("class", "tl-tooltip-title").call(inline, session.title);
       tooltip.append("div").text(`${TOOLS[session.tool]}, ${dayRange(session)}`);
       tooltip.append("div").attr("class", "tl-muted").text("Didn't lead to a merged PR");
-    });
+      if (pinned && session.page) {
+        tooltip.append("a").attr("class", "tl-tooltip-link").attr("href", session.page).text("Open transcript");
+      }
+    };
+
+    this.showTooltip(this.svg.node(), point, content, { pinned });
   }
 
   // Places the tooltip above `point`, given in the coordinates of `node`
-  showTooltip(node, [px, py], content) {
+  showTooltip(node, [px, py], content, { pinned = false } = {}) {
     const tooltip = this.tooltip;
     tooltip.selectAll("*").remove();
     content(tooltip);
-    tooltip.attr("hidden", null);
+    tooltip.attr("hidden", null).attr("aria-hidden", pinned ? null : true).classed("tl-pinned", pinned);
 
     const origin = this.root.node().getBoundingClientRect();
     const box = node.getBoundingClientRect();
@@ -609,7 +655,8 @@ class Timeline {
   }
 
   hideTooltip() {
-    this.tooltip.attr("hidden", "");
+    if (this.pinned) this.showSessionTooltip(this.pinned);
+    else this.tooltip.attr("hidden", "");
   }
 
   renderPanel() {
@@ -653,22 +700,19 @@ class Timeline {
       for (const { from, to } of pr.renamed) changes.append("code").text(`${fn(from)} → ${fn(to)}`);
     }
 
-    const complexity = panel.append("p").attr("class", "tl-complexity");
-    complexity.append("span").attr("class", "tl-swatch").style("background", fill(pr));
+    const complexity = panel.append("p");
 
     if (pr.score === null) {
-      complexity.append("span").text("Complexity unknown, the transcripts were lost");
+      complexity.text("Complexity unknown, the transcripts were lost");
     } else {
-      complexity
-        .append("span")
-        .text(
-          [
-            `Complexity ${pr.score.toFixed(2)}`,
-            plural(pr.parts.review_comments, "review thread"),
-            plural(pr.parts.messages, "prompt"),
-            `${formatTokens(pr.context.tokens)} tokens`,
-          ].join(" · "),
-        );
+      complexity.text(
+        [
+          `Complexity ${pr.score.toFixed(2)}`,
+          plural(pr.parts.review_comments, "review thread"),
+          plural(pr.parts.messages, "prompt"),
+          `${formatTokens(pr.context.tokens)} tokens`,
+        ].join(" · "),
+      );
     }
 
     if (!pr.sessions.length) return;
@@ -681,8 +725,6 @@ class Timeline {
       .join("li")
       .on("pointerenter", (event, session) => this.highlight(session))
       .on("pointerleave", () => this.highlight(null));
-
-    items.append("span").attr("class", (session) => `tl-swatch tl-${session.tool}`);
 
     items.each(function (session) {
       d3.select(this)
@@ -795,9 +837,12 @@ function inline(selection, text) {
   });
 }
 
+function sessionExtent(session) {
+  return [session.segments[0][0], session.segments.at(-1)[1]];
+}
+
 function dayRange(session) {
-  const start = session.segments[0][0];
-  const end = session.segments.at(-1)[1];
+  const [start, end] = sessionExtent(session);
 
   if (d3.timeDay.floor(start) - d3.timeDay.floor(end) === 0) return formatDay(start);
   if (start.getMonth() === end.getMonth()) return `${formatDay(start)} – ${end.getDate()}`;
@@ -876,7 +921,8 @@ function placeLabels(layer, labeled, prs, { x, y, steps, bounds }) {
   };
 
   for (const pr of labeled) {
-    const text = layer.append("text").datum(pr).attr("class", "tl-label").text(pr.label);
+    const link = layer.append("a").datum(pr).attr("href", `#pr-${pr.number}`);
+    const text = link.append("text").attr("class", "tl-label").text(pr.label);
     const bbox = text.node().getBBox();
 
     const cx = x(pr.date);
@@ -886,7 +932,7 @@ function placeLabels(layer, labeled, prs, { x, y, steps, bounds }) {
     const box = candidates(cx, cy, r, bbox.width, bbox.height).find((box) => fits(pr, box));
 
     if (!box) {
-      text.remove();
+      link.remove();
       continue;
     }
 
@@ -896,7 +942,7 @@ function placeLabels(layer, labeled, prs, { x, y, steps, bounds }) {
     leaders.push(box.leader);
     const [[x1, y1], [x2, y2]] = box.leader;
     layer
-      .insert("line", "text")
+      .insert("line", ":scope > a")
       .datum(pr)
       .attr("class", "tl-leader")
       .attr("x1", x1)
@@ -980,17 +1026,12 @@ function renderLegend(legend) {
     return svg.append("circle").attr("class", "tl-key-dot").attr("r", RADIUS[kind]);
   };
 
-  key("Adds exports", (item) => swatch(item, "add"));
+  key("New function", (item) => swatch(item, "add"));
   key("Other", (item) => swatch(item, "other"));
+  key("Lost transcript", (item) => swatch(item, "other").style("fill", "var(--tl-unknown)"));
 
   const ramp = legend.append("span").attr("class", "tl-key");
   ramp.append("span").text("Simple");
   ramp.append("span").attr("class", "tl-ramp");
   ramp.append("span").text("Complex");
-
-  key("Unknown", (item) => swatch(item, "add").style("fill", "var(--tl-unknown)"));
-
-  for (const [tool, name] of Object.entries(TOOLS)) {
-    key(name, (item) => item.append("span").attr("class", `tl-swatch tl-${tool}`));
-  }
 }

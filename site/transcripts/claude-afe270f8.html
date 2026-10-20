@@ -1,0 +1,1325 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Promoting broadcast stride filling into strides.h for rray_combine()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-71">rray timeline</a>
+<h1>Promoting broadcast stride filling into <code>strides.h</code> for <code>rray_combine()</code></h1>
+<p class="facts">Claude · Sep 18, 2026 · 6 prompts · 9 replies · <a href="https://github.com/r-lib/rray/pull/71">#71</a></p>
+</header>
+<main>
+<p class="divider">Sep 18, 2026, 00:29 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Let’s talk about the use of rray__fill_broadcast strides</p>
+<p>It’s supposed to be an internal function to strided iterator, but it seems like it’s useful elsewhere?</p>
+<p>Like this is clearly a case where we are walking 2 locations but only 1 is broadcast, right? So maybe it should be promoted to an actual function in strides.h?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>I'll look at the code first.</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;fill_broadcast_strides&quot; src/ --include=*.c --include=*.h</summary>
+<pre>grep -rn &quot;fill_broadcast_strides&quot; src/ --include=*.c --include=*.h</pre><pre class="output">(eval):1: no matches found: --include=*.c</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;fill_broadcast&quot; src/ | grep -v &quot;src/rlang/&quot;</summary>
+<pre>grep -rn &quot;fill_broadcast&quot; src/ | grep -v &quot;src/rlang/&quot;</pre><pre class="output">src/strided-iterator.h:206:  rray__fill_broadcast_strides(
+src/strided-iterator.h:320:  rray__fill_broadcast_strides(
+src/strided-iterator.h:327:  rray__fill_broadcast_strides(
+src/strided-iterator.h:499:static inline void rray__fill_broadcast_strides(
+src/combine.c:119:    rray__fill_broadcast_strides(
+src/decl/strided-iterator-decl.h:28:static inline void rray__fill_broadcast_strides(</pre></details>
+<details class="tool"><summary>Bash: cat src/strided-iterator.h</summary>
+<pre>cat src/strided-iterator.h</pre><pre class="output">#ifndef RRAY_STRIDED_ITERATOR_H
+#define RRAY_STRIDED_ITERATOR_H
+
+#include &quot;dimensionality.h&quot;
+#include &quot;rlang.h&quot;
+#include &quot;size.h&quot;
+
+#include &quot;decl/strided-iterator-decl.h&quot;
+
+// Strided iterator plan
+//
+// Optimizes and assists in walking a multidimensional point space defined by
+// `v_dimensions`. As it walks, it updates a user provided `start` in an
+// alternate subspace defined by `v_strides`.
+//
+// For performance and flexibility, the user is responsible for managing the run
+// loop along the first axis. We've tried many alternative approaches but they
+// tend to tank performance quickly as you increase the level of abstractions.
+//
+// The plan holds only immutable state. The positions that change as it walks
+// are managed by the caller. This lets the compiler keep these positions in
+// registers, which has significant performance implications.
+//
+// --------------------------------------------------------------------------
+// Examples
+//
+// For broadcasting, the dimensions you broadcast to make up the larger point
+// space. This is walked in order. The original dimensions of the array make
+// up the subspace. So as you walk the output's point space you can create
+// `location`s back into your original array to pull from.
+//
+// For reducing, it's actually a special form of broadcasting. The original
+// dimensions of the array are the point space. The reduced dimensions are the
+// subspace. So as you walk the original array, you can create `location`s into
+// the output to accumulate the reduced result at.
+//
+// For permuting axes, the permuted dimensions make up the point space. The
+// original dimensions of the array make up the subspace. So as you walk the
+// output's point space you can create `location`s back into your original
+// array to pull from.
+//
+// --------------------------------------------------------------------------
+// Optimization - First axis runs
+//
+// After coalescing, the iterator walks the entire first axis in one inner run
+// while holding all later axes fixed. It only updates the later point
+// coordinates between runs, rather than checking and carrying them after every
+// element. This gives the compiler a small loop where the index and locations
+// advance by fixed strides, making it much easier to optimize and vectorize.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two [2, 4, 5] arrays
+//   coalesces to dimensions [40], so the entire operation is one first axis run
+//   where both input locations advance contiguously.
+//
+// - Broadcasting over a later axis. Broadcasting a [2, 3] array to [2, 3, 4]
+//   coalesces to dimensions [6, 4] with location strides [1, 0]. The iterator
+//   performs four first axis runs of size 6, copying six contiguous values
+//   before updating the later axis.
+//
+// - Reducing over a later axis. Reducing a [2, 3, 4] array over its third axis
+//   also coalesces to dimensions [6, 4] with output strides [1, 0]. Each first
+//   axis run accumulates one contiguous slice into six output locations before
+//   advancing along the reduced axis.
+//
+// --------------------------------------------------------------------------
+// Optimization - Coalescing
+//
+// Coalescing axes is an important optimization used to reduce the number of
+// axes we have to iterate over by &quot;merging&quot; adjacent compatible ones. This can
+// improve performance by 3-5x on its own in some cases.
+//
+// Practical examples of when this is useful:
+//
+// - Identically shaped binary array operations. Adding two arrays with
+//   dimensions [2, 4, 5] gives both inputs strides [1, 2, 8]. All adjacent axes
+//   coalesce (2 * 1 = 2, 4 * 2 = 8) into one dimension [40] with stride [1],
+//   resulting in one flat vectorizable loop.
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array gives the array strides [1, 2, 8] and the scalar strides [0, 0, 0].
+//   Both coalesce completely, producing a [40] loop with array stride [1] and
+//   scalar stride [0].
+//
+// - Contiguous adjacent axes within a broadcast operation. Broadcasting a
+//   [2, 3] array over point dimensions [2, 3, 4] produces location strides
+//   [1, 2, 0]. The adjacent axes 1 and 2 coalesce (2 * 1 = 2) into size 6,
+//   leaving dimensions [6, 4] and strides [1, 0].
+//
+// - Contiguous regions within a reduction. Reducing a [2, 3, 4] array over its
+//   third axis maps into a [2, 3] result using location strides [1, 2, 0].
+//   Coalescing produces dimensions [6, 4], making it the same as the broadcast
+//   example above.
+//
+// - Point-space dimensions of size 1. Output point dimensions of [1, 3, 4] can
+//   have strides [0, 1, 3]. The dimension 1 first axis is absorbed into the
+//   dimension 3 second axis, adopting stride 1, after which the dimension 4
+//   third axis also coalesces. The result is one dimension [12] with stride
+//   [1]. Note that this isn't broadcasting. This is when both input and output
+//   have an axis that stays dimension 1, which is somewhat rare.
+//
+// For iterator2, note that both sets of location strides must be coalescible,
+// as coalescing changes the output dimensionality, so it's all or nothing.
+//
+// --------------------------------------------------------------------------
+// Optimization - Fixed zero stride paths
+//
+// After coalescing, the first axis is walked by the inner loop. A stride of 0
+// on this axis means that a subspace location stays fixed while the point space
+// moves along it. Broadcasting uses this to reuse an input value. Reducing uses
+// it to accumulate into the same output location. A zero stride on a later axis
+// does not use this path because later axes advance between inner runs.
+//
+// When the inner loop receives the stride as a runtime value, the compiler
+// can't prove that the location is fixed and falls back to a scalar loop. The
+// public iteration macros check for a zero stride and pass a literal 0 to a
+// specialized path. This lets the compiler see that the location does not
+// change. For binary operations, it can then hoist the fixed load out of the
+// loop and vectorize the remaining stride 1 work.
+//
+// Practical examples of when this is useful:
+//
+// - Scalar broadcasting across an entire array. Adding a scalar to a [2, 4, 5]
+//   array coalesces to point dimensions [40], with array strides [1] and scalar
+//   strides [0]. The scalar location stays fixed while the array and output
+//   advance contiguously. The same path is used by arithmetic, comparison,
+//   equality, and extrema operations.
+//
+// - Row broadcasting within a matrix. Adding a [1, 4] row to a [2, 4] array
+//   gives the array strides [1, 2] and row strides [0, 1]. Each inner run
+//   therefore reuses one row value while the array and output advance
+//   contiguously.
+//
+// - Higher dimensional row broadcasting. Adding a [1, 3, 4] array to a
+//   [2, 3, 4] array coalesces to dimensions [2, 12], with array strides [1, 2]
+//   and broadcast strides [0, 1]. Each of the 12 inner runs uses the fixed
+//   path.
+//
+// - Shared leading dimensions of size 1. Adding [1, 1, 4] to [1, 3, 4]
+//   absorbs the shared first axis and produces dimensions [3, 4], with first
+//   input strides [0, 1] and second input strides [1, 3].
+//
+// - Reducing over the first axis. Reducing a [2, 3, 4] array to [1, 3, 4]
+//   produces output strides [0, 1, 3], which coalesce to dimensions [2, 12]
+//   with output strides [0, 1]. Each inner run accumulates into one fixed
+//   output location.
+struct rray_strided_iterator_plan {
+  r_ssize size;
+
+  // Since coalescing can multiply two axes' dimensions together, we use an
+  // `r_ssize` here even though an individual dimension can't be above an `int`.
+  r_ssize v_dimensions[RRAY_MAX_DIMENSIONALITY];
+  int dimensionality;
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+};
+
+static inline struct rray_strided_iterator_plan rray_strided_iterator_plan(
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_strides
+) {
+  check_max_dimensionality(dimensionality);
+
+  struct rray_strided_iterator_plan plan;
+
+  plan.size = rray_size_from_dimensions(v_dimensions, dimensionality);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    plan.v_dimensions[i] = (r_ssize) v_dimensions[i];
+    plan.v_strides[i] = v_strides[i];
+  }
+
+  plan.dimensionality = rray__strided_iterator_axes_coalesce(
+    plan.v_dimensions,
+    plan.v_strides,
+    dimensionality
+  );
+
+  return plan;
+}
+
+// Strided iterator specific to broadcasting
+//
+// An axis of `from` with a dimension of 1 gets a stride of 0, so it stands
+// still while the matching axis of `to` walks. Axes past
+// `from_dimensionality` are treated as dimension 1.
+static inline struct rray_strided_iterator_plan rray_broadcast_iterator_plan(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+) {
+  check_max_dimensionality(to_dimensionality);
+
+  rray__check_broadcast_dimensions(
+    v_from_dimensions,
+    from_dimensionality,
+    v_to_dimensions,</pre><p class="cut">314 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 1,200p src/combine.c</summary>
+<pre>sed -n 1,200p src/combine.c</pre><pre class="output">#include &quot;combine.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;axes.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast-common.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;ptype-common.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/combine-decl.h&quot;
+
+r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+  return rray_combine(
+    ffi_xs,
+    axis,
+    r_null,
+    rray_args.empty,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+) {
+  if (r_length(xs) == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+
+  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+  check_max_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+
+  r_obj* out_dimensions =
+    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+
+  int axis_dimension = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? r_int_get(x_dimensions, axis - 1) : 1;
+    FREE(1);
+
+    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;The combined dimension on `.axis` is too large.&quot;
+      );
+    }
+
+    axis_dimension += x_axis_dimension;
+  }
+
+  v_out_dimensions[axis - 1] = axis_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    dimensionality,
+    v_out_strides
+  );
+
+  r_ssize axis_offset = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+
+    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+    r_memcpy(
+      v_x_broadcast_dimensions,
+      v_out_dimensions,
+      sizeof(int) * dimensionality
+    );
+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+
+    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+    rray__fill_broadcast_strides(
+      v_x_dimensions,
+      x_dimensionality,
+      dimensionality,
+      v_x_strides
+    );
+
+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+      v_x_broadcast_dimensions,
+      dimensionality,
+      v_out_strides,
+      v_x_strides
+    );
+
+    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+    rray_combine_fill(x, out, out_start, &amp;plan);
+    axis_offset += x_axis_dimension;
+
+    FREE(1);
+  }
+
+  r_obj* out_names =
+    KEEP(rray_combine_names(xs, out_dimensions, axis, axis_dimension));
+
+  r_attrib_poke_dim(out, out_dimensions);
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_combine_names(
+  r_obj* xs,
+  r_obj* dimensions,
+  int axis,
+  int axis_dimension
+) {
+  r_obj* out = rray_broadcast_names_common(xs, dimensions);
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  if (out != r_null) {
+    r_list_poke(out, axis - 1, r_null);
+  }
+
+  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis, axis_dimension));
+
+  if (axis_names != r_null) {
+    if (out == r_null) {
+      out = r_alloc_list(r_length(dimensions));
+      KEEP_AT(out, out_loc);
+    }
+    r_list_poke(out, axis - 1, axis_names);
+  }
+
+  FREE(2);
+  return out;
+}
+
+static r_obj* rray_combine_axis_names(r_obj* xs, int axis, int axis_dimension) {
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* out = r_null;
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  r_ssize out_i = 0;
+
+  for (r_ssize i = 0; i &lt; n; ++i) {
+    r_obj* x = v_xs[i];
+    r_obj* dimensions = r_dim(x);
+    const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+    const int dimension =
+      (axis &lt;= dimensionality) ? r_int_get(dimensions, axis - 1) : 1;
+
+    r_obj* names = r_dim_names(x);
+    r_obj* axis_names = (names != r_null &amp;&amp; axis &lt;= dimensionality)
+      ? r_list_get(names, axis - 1)
+      : r_null;</pre></details>
+<details class="tool"><summary>Bash: cat src/strides.h; echo ---; cat src/strides.c; echo ---; cat src/decl/strided-iterator-decl.h</summary>
+<pre>cat src/strides.h; echo ---; cat src/strides.c; echo ---; cat src/decl/strided-iterator-decl.h</pre><pre class="output">#ifndef RRAY_STRIDES_H
+#define RRAY_STRIDES_H
+
+#include &quot;rlang.h&quot;
+
+void rray_fill_strides_from_dimensions(
+  const int* v_dimensions,
+  int dimensionality,
+  r_ssize* v_out
+);
+
+#endif
+---
+#include &quot;strides.h&quot;
+
+void rray_fill_strides_from_dimensions(
+  const int* v_dimensions,
+  int dimensionality,
+  r_ssize* v_out
+) {
+  r_ssize stride = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    v_out[i] = stride;
+    stride *= v_dimensions[i];
+  }
+}
+---
+static inline int rray__strided_iterator_axes_coalesce(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides,
+  int dimensionality
+);
+
+static inline int rray__strided_iterator_axes_coalesce2(
+  r_ssize* v_dimensions,
+  r_ssize* v_strides1,
+  r_ssize* v_strides2,
+  int dimensionality
+);
+
+static inline bool rray__strided_iterator_axes_coalescible(
+  r_ssize left_dimension,
+  r_ssize left_stride,
+  r_ssize right_dimension,
+  r_ssize right_stride
+);
+
+static inline void rray__check_broadcast_dimensions(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  const int* v_to_dimensions,
+  int to_dimensionality
+);
+
+static inline void rray__fill_broadcast_strides(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  int to_dimensionality,
+  r_ssize* v_out
+);</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;rray_fill_strides_from_dimensions\|strides.h&quot; src/*.c src/*.h src/decl/*.h</summary>
+<pre>grep -rn &quot;rray_fill_strides_from_dimensions\|strides.h&quot; src/*.c src/*.h src/decl/*.h</pre><pre class="output">src/combine.c:13:#include &quot;strides.h&quot;
+src/combine.c:92:  rray_fill_strides_from_dimensions(
+src/permute-axes.c:7:#include &quot;strides.h&quot;
+src/permute-axes.c:33:  rray_fill_strides_from_dimensions(
+src/reduce.c:8:#include &quot;strides.h&quot;
+src/reduce.c:86:  rray_fill_strides_from_dimensions(
+src/strides.c:1:#include &quot;strides.h&quot;
+src/strides.c:3:void rray_fill_strides_from_dimensions(
+src/strides.h:6:void rray_fill_strides_from_dimensions(</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -n 60,130p src/reduce.c; echo === ; sed -n 20,70p src/permute-axes.c</summary>
+<pre>sed -n 60,130p src/reduce.c; echo === ; sed -n 20,70p src/permute-axes.c</pre><pre class="output">Exit code 1
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(6);
+  return out;
+}
+
+r_obj* rray_reduce_nested(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  rray_reduce_nested_fn_switch fn_switch,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_max_dimensionality(dimensionality);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  r_obj* retained_axes =
+    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+  const int* v_retained_axes = r_int_cbegin(retained_axes);
+  const r_ssize retained_axes_size = r_length(retained_axes);
+
+  const struct rray_strided_iterator_plan outer_plan =
+    rray_reduce_nested_iterator_plan(
+      v_x_dimensions,
+      v_x_strides,
+      v_retained_axes,
+      retained_axes_size
+    );
+
+  const struct rray_strided_iterator_plan inner_plan =
+    rray_reduce_nested_iterator_plan(
+      v_x_dimensions,
+      v_x_strides,
+      v_axes,
+      axes_size
+    );
+
+  const rray_reduce_nested_fn fn = fn_switch(x, na_rm, arg, error_call);
+
+  r_obj* out = KEEP(fn(x, &amp;outer_plan, &amp;inner_plan));
+
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+
+  r_attrib_poke_dim(out, out_dimensions);
+
+(eval):1: == not found</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,80p src/permute-axes.c</summary>
+<pre>sed -n 1,80p src/permute-axes.c</pre><pre class="output">#include &quot;permute-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/permute-axes-decl.h&quot;
+
+r_obj* ffi_rray_permute_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_permute_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_permute_axes(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_max_dimensionality(dimensionality);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+  axes = KEEP(
+    arg_as_axes_permutation(axes, dimensionality, rray_args.axes, error_call)
+  );
+  const int* v_axes = r_int_cbegin(axes);
+
+  r_obj* dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_dimensions = r_int_begin(dimensions);
+
+  r_ssize v_strides[RRAY_MAX_DIMENSIONALITY];
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int axis = v_axes[i] - 1;
+    v_dimensions[i] = v_x_dimensions[axis];
+    v_strides[i] = v_x_strides[axis];
+  }
+
+  struct rray_strided_iterator_plan plan =
+    rray_strided_iterator_plan(v_dimensions, dimensionality, v_strides);
+
+  r_obj* out;
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    out = rray_permute_axes_lgl(x, &amp;plan);
+    break;
+  case R_TYPE_integer:
+    out = rray_permute_axes_int(x, &amp;plan);
+    break;
+  case R_TYPE_double:
+    out = rray_permute_axes_dbl(x, &amp;plan);
+    break;
+  case R_TYPE_complex:
+    out = rray_permute_axes_cpl(x, &amp;plan);
+    break;
+  case R_TYPE_raw:
+    out = rray_permute_axes_raw(x, &amp;plan);
+    break;
+  case R_TYPE_character:
+    out = rray_permute_axes_chr(x, &amp;plan);
+    break;
+  case R_TYPE_list:
+    out = rray_permute_axes_list(x, &amp;plan);</pre></details>
+<p>Yes, promote it. Here's why, then the change.</p>
+<ul>
+<li>
+<p>It's the same family as <code>rray_fill_strides_from_dimensions()</code>: fill a stride vector from a set of dimensions. The broadcast variant only differs by zeroing dimension-1 axes and treating missing trailing axes as 1.</p>
+</li>
+<li>
+<p><code>src/combine.c:119</code> already reaches across the <code>__</code> boundary to call it, which is the signal that it isn't iterator-internal.</p>
+</li>
+<li>
+<p>Combine is genuinely the mixed case you describe. The point space is x's broadcast dimensions, location 1 is the output (plain strides off the full output dimensions, plus an axis offset), location 2 is x (broadcast strides). Neither <code>rray_broadcast_iterator2_plan()</code> (both sides broadcast) nor a hypothetical mixed plan constructor fits, because the output strides come from a <em>different, larger</em> dimension set than the point space.</p>
+</li>
+<li>
+<p>Dependency direction works: <code>strides.h</code> only needs <code>rlang.h</code>, so <code>strided-iterator.h</code> can include it.</p>
+</li>
+</ul>
+
+<details class="tool tool-error"><summary>Bash: cat &gt; src/strides.h &lt;&lt;'EOF'</summary>
+<pre>cat &gt; src/strides.h &lt;&lt;'EOF'
+#ifndef RRAY_STRIDES_H
+#define RRAY_STRIDES_H
+
+#include &quot;rlang.h&quot;
+
+void rray_fill_strides_from_dimensions(
+  const int* v_dimensions,
+  int dimensionality,
+  r_ssize* v_out
+);
+
+void rray_fill_broadcast_strides_from_dimensions(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  int to_dimensionality,
+  r_ssize* v_out
+);
+
+#endif
+EOF
+cat &gt; src/strides.c &lt;&lt;'EOF'
+#include &quot;strides.h&quot;
+
+void rray_fill_strides_from_dimensions(
+  const int* v_dimensions,
+  int dimensionality,
+  r_ssize* v_out
+) {
+  r_ssize stride = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    v_out[i] = stride;
+    stride *= v_dimensions[i];
+  }
+}
+
+void rray_fill_broadcast_strides_from_dimensions(
+  const int* v_from_dimensions,
+  int from_dimensionality,
+  int to_dimensionality,
+  r_ssize* v_out
+) {
+  r_ssize stride = 1;
+
+  for (int i = 0; i &lt; to_dimensionality; ++i) {
+    const int dimension = (i &lt; from_dimensionality) ? v_from_dimensions[i] : 1;
+    v_out[i] = (dimension == 1) ? 0 : stride;
+    stride *= dimension;
+  }
+}
+EOF</pre><pre class="output">Blocked: this is a shell redirect into a file. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Edit src/strides.h</summary>
+<pre class="diff"><span class="del">-void rray_fill_strides_from_dimensions(</span>
+<span class="del">-  const int* v_dimensions,</span>
+<span class="del">-  int dimensionality,</span>
+<span class="del">-  r_ssize* v_out</span>
+<span class="del">-);</span>
+<span class="del">-</span>
+<span class="del">-#endif</span>
+<span class="ins">+void rray_fill_strides_from_dimensions(</span>
+<span class="ins">+  const int* v_dimensions,</span>
+<span class="ins">+  int dimensionality,</span>
+<span class="ins">+  r_ssize* v_out</span>
+<span class="ins">+);</span>
+<span class="ins">+</span>
+<span class="ins">+void rray_fill_broadcast_strides_from_dimensions(</span>
+<span class="ins">+  const int* v_from_dimensions,</span>
+<span class="ins">+  int from_dimensionality,</span>
+<span class="ins">+  int to_dimensionality,</span>
+<span class="ins">+  r_ssize* v_out</span>
+<span class="ins">+);</span>
+<span class="ins">+</span>
+<span class="ins">+#endif</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strides.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/strides.c</summary>
+<pre class="diff"><span class="del">-  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-    v_out[i] = stride;</span>
+<span class="del">-    stride *= v_dimensions[i];</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="ins">+  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="ins">+    v_out[i] = stride;</span>
+<span class="ins">+    stride *= v_dimensions[i];</span>
+<span class="ins">+  }</span>
+<span class="ins">+}</span>
+<span class="ins">+</span>
+<span class="ins">+void rray_fill_broadcast_strides_from_dimensions(</span>
+<span class="ins">+  const int* v_from_dimensions,</span>
+<span class="ins">+  int from_dimensionality,</span>
+<span class="ins">+  int to_dimensionality,</span>
+<span class="ins">+  r_ssize* v_out</span>
+<span class="ins">+) {</span>
+<span class="ins">+  r_ssize stride = 1;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int i = 0; i &lt; to_dimensionality; ++i) {</span>
+<span class="ins">+    const int dimension = (i &lt; from_dimensionality) ? v_from_dimensions[i] : 1;</span>
+<span class="ins">+    v_out[i] = (dimension == 1) ? 0 : stride;</span>
+<span class="ins">+    stride *= dimension;</span>
+<span class="ins">+  }</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strides.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now update <code>strided-iterator.h</code> and its decl header.</p>
+
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="del">-#include &quot;dimensionality.h&quot;</span>
+<span class="del">-#include &quot;rlang.h&quot;</span>
+<span class="del">-#include &quot;size.h&quot;</span>
+<span class="ins">+#include &quot;dimensionality.h&quot;</span>
+<span class="ins">+#include &quot;rlang.h&quot;</span>
+<span class="ins">+#include &quot;size.h&quot;</span>
+<span class="ins">+#include &quot;strides.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="del">-  rray__fill_broadcast_strides(</span>
+<span class="ins">+  rray_fill_broadcast_strides_from_dimensions(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator.h has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/strided-iterator.h</summary>
+<pre class="diff"><span class="del">-</span>
+<span class="del">-static inline void rray__fill_broadcast_strides(</span>
+<span class="del">-  const int* v_from_dimensions,</span>
+<span class="del">-  int from_dimensionality,</span>
+<span class="del">-  int to_dimensionality,</span>
+<span class="del">-  r_ssize* v_out</span>
+<span class="del">-) {</span>
+<span class="del">-  r_ssize stride = 1;</span>
+<span class="del">-</span>
+<span class="del">-  for (int i = 0; i &lt; to_dimensionality; ++i) {</span>
+<span class="del">-    const int dimension = (i &lt; from_dimensionality) ? v_from_dimensions[i] : 1;</span>
+<span class="del">-    v_out[i] = (dimension == 1) ? 0 : stride;</span>
+<span class="del">-    stride *= dimension;</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="del">-</span>
+<span class="del">-#endif</span>
+<span class="ins">+</span>
+<span class="ins">+#endif</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/strided-iterator.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/decl/strided-iterator-decl.h</summary>
+<pre class="diff"><span class="del">-  int to_dimensionality</span>
+<span class="del">-);</span>
+<span class="del">-</span>
+<span class="del">-static inline void rray__fill_broadcast_strides(</span>
+<span class="del">-  const int* v_from_dimensions,</span>
+<span class="del">-  int from_dimensionality,</span>
+<span class="del">-  int to_dimensionality,</span>
+<span class="del">-  r_ssize* v_out</span>
+<span class="del">-);</span>
+<span class="ins">+  int to_dimensionality</span>
+<span class="ins">+);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/strided-iterator-decl.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-    rray__fill_broadcast_strides(</span>
+<span class="ins">+    rray_fill_broadcast_strides_from_dimensions(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE)' 2&gt;&amp;1 | tail …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE)' 2&gt;&amp;1 | tail -20</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -25</summary>
+<pre>Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -25</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1715 ]</pre></details>
+<details class="tool"><summary>Bash: git diff --stat</summary>
+<pre>git diff --stat</pre><pre class="output"> src/combine.c                    |  2 +-
+ src/decl/strided-iterator-decl.h |  7 -------
+ src/strided-iterator.h           | 22 ++++------------------
+ src/strides.c                    | 15 +++++++++++++++
+ src/strides.h                    |  7 +++++++
+ 5 files changed, 27 insertions(+), 26 deletions(-)</pre></details>
+<p>Done. Compiles clean, 1715 tests pass.</p>
+<p><code>rray__fill_broadcast_strides()</code> is now <code>rray_fill_broadcast_strides_from_dimensions()</code> in <code>src/strides.h</code>/<code>src/strides.c</code>, sitting next to <code>rray_fill_strides_from_dimensions()</code>. The three iterator call sites and the one in <code>combine.c</code> now go through the public name.</p>
+<p>Two things I deliberately left alone:</p>
+<ul>
+<li>
+<p><code>rray__check_broadcast_dimensions()</code> stays private in <code>strided-iterator.h</code>. It's validation, not stride computation, and it's still only called by the two broadcast plan constructors. <code>combine.c</code> doesn't need it since compatibility is guaranteed by <code>rray_dimensions_common_opts()</code>.</p>
+</li>
+<li>
+<p>I didn't add a mixed <code>rray_broadcast_iterator2_plan()</code> variant (one side broadcast, one side plain). It wouldn't help combine anyway, since the output strides come from the full output dimensions rather than the point space.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; echo &quot;--- branch ---&quot; &amp;&amp; git rev-parse --abbrev-ref HEAD &amp;&amp; echo &quot;--- u…</summary>
+<pre>git status --short &amp;&amp; echo &quot;--- branch ---&quot; &amp;&amp; git rev-parse --abbrev-ref HEAD &amp;&amp; echo &quot;--- upstream ---&quot; &amp;&amp; git rev-parse --abbrev-ref --symbolic-full-name @{u} 2&gt;&amp;1</pre><pre class="output"> M src/combine.c
+ M src/decl/strided-iterator-decl.h
+ M src/strided-iterator.h
+ M src/strides.c
+ M src/strides.h
+--- branch ---
+feature/combine
+--- upstream ---
+origin/feature/combine</pre></details>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -m &quot;Promote the broadcast stride fill to a public function in stride…</summary>
+<pre>git add -A &amp;&amp; git commit -m &quot;Promote the broadcast stride fill to a public function in strides.h&quot;</pre><pre class="output">[feature/combine 05ce177] Promote the broadcast stride fill to a public function in strides.h
+ 5 files changed, 27 insertions(+), 26 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push 2&gt;&amp;1 | tail -5</summary>
+<pre>git push 2&gt;&amp;1 | tail -5</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   913fa3f..05ce177  feature/combine -&gt; feature/combine</pre></details>
+<p>Committed and pushed to <code>feature/combine</code> as <code>05ce177</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Lift v_x_broadcast_dimensions out of the loop with the memcpy</p>
+<p>You set the axis slot every time and that’s all that is needed</p>
+<p>Also v_x_strides can be initialized once outside the loop and overwritten every time</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: sed -n 84,140p src/combine.c</summary>
+<pre>sed -n 84,140p src/combine.c</pre><pre class="output">    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    dimensionality,
+    v_out_strides
+  );
+
+  r_ssize axis_offset = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+
+    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+    r_memcpy(
+      v_x_broadcast_dimensions,
+      v_out_dimensions,
+      sizeof(int) * dimensionality
+    );
+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+
+    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+    rray_fill_broadcast_strides_from_dimensions(
+      v_x_dimensions,
+      x_dimensionality,
+      dimensionality,
+      v_x_strides
+    );
+
+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+      v_x_broadcast_dimensions,
+      dimensionality,
+      v_out_strides,
+      v_x_strides
+    );
+
+    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+    rray_combine_fill(x, out, out_start, &amp;plan);
+    axis_offset += x_axis_dimension;
+
+    FREE(1);
+  }
+
+  r_obj* out_names =</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  r_ssize axis_offset = 0;</span>
+<span class="del">-</span>
+<span class="del">-  for (r_ssize i = 0; i &lt; xs_size; ++i) {</span>
+<span class="del">-    r_obj* x = v_xs[i];</span>
+<span class="del">-</span>
+<span class="del">-    r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));</span>
+<span class="del">-    const int* v_x_dimensions = r_int_cbegin(x_dimensions);</span>
+<span class="del">-    const int x_dimensionality =</span>
+<span class="del">-      rray_dimensionality_from_dimensions(x_dimensions);</span>
+<span class="del">-    const int x_axis_dimension =</span>
+<span class="del">-      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;</span>
+<span class="del">-</span>
+<span class="del">-    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-    r_memcpy(</span>
+<span class="del">-      v_x_broadcast_dimensions,</span>
+<span class="del">-      v_out_dimensions,</span>
+<span class="del">-      sizeof(int) * dimensionality</span>
+<span class="del">-    );</span>
+<span class="del">-    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;</span>
+<span class="del">-</span>
+<span class="del">-    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-    rray_fill_broadcast_strides_from_dimensions(</span>
+<span class="ins">+  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+  r_memcpy(</span>
+<span class="ins">+    v_x_broadcast_dimensions,</span>
+<span class="ins">+    v_out_dimensions,</span>
+<span class="ins">+    sizeof(int) * dimensionality</span>
+<span class="ins">+  );</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize axis_offset = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (r_ssize i = 0; i &lt; xs_size; ++i) {</span>
+<span class="ins">+    r_obj* x = v_xs[i];</span>
+<span class="ins">+</span>
+<span class="ins">+    r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));</span>
+<span class="ins">+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);</span>
+<span class="ins">+    const int x_dimensionality =</span>
+<span class="ins">+      rray_dimensionality_from_dimensions(x_dimensions);</span>
+<span class="ins">+    const int x_axis_dimension =</span>
+<span class="ins">+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;</span>
+<span class="ins">+</span>
+<span class="ins">+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;</span>
+<span class="ins">+</span>
+<span class="ins">+    rray_fill_broadcast_strides_from_dimensions(</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE)' 2&gt;&amp;1 | tail …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE)' 2&gt;&amp;1 | tail -20</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -25</summary>
+<pre>Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -25</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1715 ]</pre></details>
+<details class="tool"><summary>Bash: git diff</summary>
+<pre>git diff</pre><pre class="output">diff --git a/src/combine.c b/src/combine.c
+index 452aabf..3e4b0ac 100644
+--- a/src/combine.c
++++ b/src/combine.c
+@@ -95,6 +95,15 @@ r_obj* rray_combine(
+     v_out_strides
+   );
+ 
++  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
++  r_memcpy(
++    v_x_broadcast_dimensions,
++    v_out_dimensions,
++    sizeof(int) * dimensionality
++  );
++
++  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
++
+   r_ssize axis_offset = 0;
+ 
+   for (r_ssize i = 0; i &lt; xs_size; ++i) {
+@@ -107,15 +116,8 @@ r_obj* rray_combine(
+     const int x_axis_dimension =
+       (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+ 
+-    int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+-    r_memcpy(
+-      v_x_broadcast_dimensions,
+-      v_out_dimensions,
+-      sizeof(int) * dimensionality
+-    );
+     v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+ 
+-    r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+     rray_fill_broadcast_strides_from_dimensions(
+       v_x_dimensions,
+       x_dimensionality,</pre></details>
+<p>Done. One memcpy instead of <code>xs_size</code> of them, and both scratch arrays declared once.</p>
+<p>Two things I checked before hoisting:</p>
+<ul>
+<li>
+<p><code>rray_strided_iterator2_plan()</code> takes <code>const int* v_dimensions</code> and copies into the plan, so it never writes back into <code>v_x_broadcast_dimensions</code>. Only slot <code>axis - 1</code> changes between iterations, and every iteration sets it.</p>
+</li>
+<li>
+<p><code>rray_fill_broadcast_strides_from_dimensions()</code> writes all of <code>0..dimensionality-1</code>, which is exactly the range the plan reads. No stale values carry over.</p>
+</li>
+</ul>
+<p>1715 tests pass. Not committed.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -m &quot;Hoist the combine scratch arrays out of the per-input loop&quot; &amp;&amp; g…</summary>
+<pre>git add -A &amp;&amp; git commit -m &quot;Hoist the combine scratch arrays out of the per-input loop&quot; &amp;&amp; git push 2&gt;&amp;1 | tail -5</pre><pre class="output">[feature/combine 2b6f268] Hoist the combine scratch arrays out of the per-input loop
+ 1 file changed, 9 insertions(+), 7 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   05ce177..2b6f268  feature/combine -&gt; feature/combine</pre></details>
+<p>Committed and pushed as <code>2b6f268</code>.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Rename dimensionality to out_dimensionality</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;dimensionality&quot; src/combine.c</summary>
+<pre>grep -n &quot;dimensionality&quot; src/combine.c</pre><pre class="output">8:#include &quot;dimensionality.h&quot;
+50:  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+51:  check_max_dimensionality(dimensionality);
+53:  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+65:    const int x_dimensionality =
+66:      rray_dimensionality_from_dimensions(x_dimensions);
+68:      (axis &lt;= x_dimensionality) ? r_int_get(x_dimensions, axis - 1) : 1;
+85:    dimensionality,
+94:    dimensionality,
+102:    sizeof(int) * dimensionality
+114:    const int x_dimensionality =
+115:      rray_dimensionality_from_dimensions(x_dimensions);
+117:      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+123:      x_dimensionality,
+124:      dimensionality,
+130:      dimensionality,
+195:    const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+197:      (axis &lt;= dimensionality) ? r_int_get(dimensions, axis - 1) : 1;
+200:    r_obj* axis_names = (names != r_null &amp;&amp; axis &lt;= dimensionality)
+273:  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \
+305:  r_memset(v_point, 0, sizeof(r_ssize) * (size_t) plan-&gt;dimensionality);       \</pre></details>
+<details class="tool"><summary>Bash: sed -n 44,56p src/combine.c</summary>
+<pre>sed -n 44,56p src/combine.c</pre><pre class="output">  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+  check_max_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
+
+  r_obj* out_dimensions =
+    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  const int dimensionality = list_max_dimensionality(xs, arg, error_call);</span>
+<span class="del">-  check_max_dimensionality(dimensionality);</span>
+<span class="del">-</span>
+<span class="del">-  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);</span>
+<span class="ins">+  const int out_dimensionality = list_max_dimensionality(xs, arg, error_call);</span>
+<span class="ins">+  check_max_dimensionality(out_dimensionality);</span>
+<span class="ins">+</span>
+<span class="ins">+  check_axis(axis, out_dimensionality, rray_args.dot_axis, error_call);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: sed -n 80,135p src/combine.c</summary>
+<pre>sed -n 80,135p src/combine.c</pre><pre class="output">  v_out_dimensions[axis - 1] = axis_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    dimensionality,
+    v_out_strides
+  );
+
+  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_memcpy(
+    v_x_broadcast_dimensions,
+    v_out_dimensions,
+    sizeof(int) * dimensionality
+  );
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+
+  r_ssize axis_offset = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+
+    r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+
+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+
+    rray_fill_broadcast_strides_from_dimensions(
+      v_x_dimensions,
+      x_dimensionality,
+      dimensionality,
+      v_x_strides
+    );
+
+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+      v_x_broadcast_dimensions,
+      dimensionality,
+      v_out_strides,
+      v_x_strides
+    );
+
+    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  const r_ssize out_size = rray_size_from_dimensions_checked(</span>
+<span class="del">-    v_out_dimensions,</span>
+<span class="del">-    dimensionality,</span>
+<span class="del">-    error_call</span>
+<span class="del">-  );</span>
+<span class="ins">+  const r_ssize out_size = rray_size_from_dimensions_checked(</span>
+<span class="ins">+    v_out_dimensions,</span>
+<span class="ins">+    out_dimensionality,</span>
+<span class="ins">+    error_call</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-  rray_fill_strides_from_dimensions(</span>
+<span class="del">-    v_out_dimensions,</span>
+<span class="del">-    dimensionality,</span>
+<span class="del">-    v_out_strides</span>
+<span class="del">-  );</span>
+<span class="del">-</span>
+<span class="del">-  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-  r_memcpy(</span>
+<span class="del">-    v_x_broadcast_dimensions,</span>
+<span class="del">-    v_out_dimensions,</span>
+<span class="del">-    sizeof(int) * dimensionality</span>
+<span class="del">-  );</span>
+<span class="ins">+  rray_fill_strides_from_dimensions(</span>
+<span class="ins">+    v_out_dimensions,</span>
+<span class="ins">+    out_dimensionality,</span>
+<span class="ins">+    v_out_strides</span>
+<span class="ins">+  );</span>
+<span class="ins">+</span>
+<span class="ins">+  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+  r_memcpy(</span>
+<span class="ins">+    v_x_broadcast_dimensions,</span>
+<span class="ins">+    v_out_dimensions,</span>
+<span class="ins">+    sizeof(int) * out_dimensionality</span>
+<span class="ins">+  );</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/combine.c</summary>
+<pre class="diff"><span class="del">-    rray_fill_broadcast_strides_from_dimensions(</span>
+<span class="del">-      v_x_dimensions,</span>
+<span class="del">-      x_dimensionality,</span>
+<span class="del">-      dimensionality,</span>
+<span class="del">-      v_x_strides</span>
+<span class="del">-    );</span>
+<span class="del">-</span>
+<span class="del">-    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(</span>
+<span class="del">-      v_x_broadcast_dimensions,</span>
+<span class="del">-      dimensionality,</span>
+<span class="ins">+    rray_fill_broadcast_strides_from_dimensions(</span>
+<span class="ins">+      v_x_dimensions,</span>
+<span class="ins">+      x_dimensionality,</span>
+<span class="ins">+      out_dimensionality,</span>
+<span class="ins">+      v_x_strides</span>
+<span class="ins">+    );</span>
+<span class="ins">+</span>
+<span class="ins">+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(</span>
+<span class="ins">+      v_x_broadcast_dimensions,</span>
+<span class="ins">+      out_dimensionality,</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/combine.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE)' 2&gt;&amp;1 | tail …</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; Rscript -e 'devtools::load_all(quiet = TRUE)' 2&gt;&amp;1 | tail -20 &amp;&amp; Rscript -e 'devtools::test()' 2&gt;&amp;1 | tail -10</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 1715 ]</pre></details>
+<details class="tool"><summary>Bash: git diff</summary>
+<pre>git diff</pre><pre class="output">diff --git a/src/combine.c b/src/combine.c
+index 3e4b0ac..1583f4a 100644
+--- a/src/combine.c
++++ b/src/combine.c
+@@ -47,10 +47,10 @@ r_obj* rray_combine(
+   const r_ssize xs_size = r_length(xs);
+   r_obj* const* v_xs = r_list_cbegin(xs);
+ 
+-  const int dimensionality = list_max_dimensionality(xs, arg, error_call);
+-  check_max_dimensionality(dimensionality);
++  const int out_dimensionality = list_max_dimensionality(xs, arg, error_call);
++  check_max_dimensionality(out_dimensionality);
+ 
+-  check_axis(axis, dimensionality, rray_args.dot_axis, error_call);
++  check_axis(axis, out_dimensionality, rray_args.dot_axis, error_call);
+ 
+   r_obj* out_dimensions =
+     KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+@@ -82,7 +82,7 @@ r_obj* rray_combine(
+ 
+   const r_ssize out_size = rray_size_from_dimensions_checked(
+     v_out_dimensions,
+-    dimensionality,
++    out_dimensionality,
+     error_call
+   );
+ 
+@@ -91,7 +91,7 @@ r_obj* rray_combine(
+   r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+   rray_fill_strides_from_dimensions(
+     v_out_dimensions,
+-    dimensionality,
++    out_dimensionality,
+     v_out_strides
+   );
+ 
+@@ -99,7 +99,7 @@ r_obj* rray_combine(
+   r_memcpy(
+     v_x_broadcast_dimensions,
+     v_out_dimensions,
+-    sizeof(int) * dimensionality
++    sizeof(int) * out_dimensionality
+   );
+ 
+   r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+@@ -121,13 +121,13 @@ r_obj* rray_combine(
+     rray_fill_broadcast_strides_from_dimensions(
+       v_x_dimensions,
+       x_dimensionality,
+-      dimensionality,
++      out_dimensionality,
+       v_x_strides
+     );
+ 
+     const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+       v_x_broadcast_dimensions,
+-      dimensionality,
++      out_dimensionality,
+       v_out_strides,
+       v_x_strides
+     );</pre></details>
+<p>Renamed, all 8 sites in <code>rray_combine()</code>. 1715 tests pass. Not committed.</p>
+<p>I deliberately left three other <code>dimensionality</code> names alone since they're unrelated:</p>
+<ul>
+<li>
+<p><code>rray_combine_axis_names()</code> has its own local <code>dimensionality</code> that means the <em>current input's</em> dimensionality, not the output's.</p>
+</li>
+<li>
+<p><code>plan-&gt;dimensionality</code> in the fill macros is a struct field.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add -A &amp;&amp; git commit -m &quot;Rename dimensionality to out_dimensionality in rray_combine()&quot; &amp;…</summary>
+<pre>git add -A &amp;&amp; git commit -m &quot;Rename dimensionality to out_dimensionality in rray_combine()&quot; &amp;&amp; git push 2&gt;&amp;1 | tail -5</pre><pre class="output">[feature/combine 494b856] Rename dimensionality to out_dimensionality in rray_combine()
+ 1 file changed, 8 insertions(+), 8 deletions(-)
+To https://github.com/DavisVaughan/rray4.git
+   2b6f268..494b856  feature/combine -&gt; feature/combine</pre></details>
+<p>Committed and pushed as <code>494b856</code>.</p>
+
+</section>
+</main>
+</body>
+</html>

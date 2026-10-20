@@ -1,0 +1,2505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rewriting the combine, split, stack, and unstack plan</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="codex">
+<header>
+<a class="back" href="../../#pr-76">rray timeline</a>
+<h1>Rewriting the combine, split, stack, and unstack plan</h1>
+<p class="facts">Codex · Sep 18, 2026 · 5 prompts · 14 replies · <a href="https://github.com/r-lib/rray/pull/76">#76</a></p>
+</header>
+<main>
+<p class="divider">Sep 18, 2026, 09:11 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>We are going to recreate the plans/combine-stack-undtack plan based on some new information</p>
+<p>First of all we’ve merged rray combine, and purposefully don’t expose lower level entry points but do expose ptype</p>
+<p>Second, we have plans/combine.md</p>
+<p>The major thing to change is to recognize that we can have a parallel family of functions</p>
+<ul>
+<li>rray_combine(…, .axis)</li>
+<li>rray_split(x, axis, sizes)</li>
+<li>rray_stack(…, .axis)</li>
+<li>rray_unstack(x, axis)</li>
+</ul>
+<p>Where split conceptually undoes a combine, and unstack undoes a stack</p>
+<p>Split sizes take either a size 1 integer that must split the axis dimension evenly or a vector of integers (allowing 0) that must sum to split the axis evenly. Hopefully the size 1 integer case optimizes well because supplying 1 is the common case.</p>
+<p>Rray stack should be just insert axes on axis + combine</p>
+<p>Rray unstack should be split with size 1 followed by remove axes on axis</p>
+<p>It’s possible for stack we will need something like rray_expand_dimensionality(x, dimensionality) which adds axes of 1 to x until it matches dimensionality. We’d use that to expand to axis-1 dimensionality, I think, before we insert the axis. This is a bit of a guess</p>
+<p>Think about this and rewrite the plan on feature/combine-plan-rewrite, then delete the existing combine.md plan since we merged that</p>
+<p>Ask any questions up front</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll inspect the two plans and the merged combine API first. Then I’ll ask any decisions that would materially change the rewrite before editing.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; rg --files plans R src tests | sort | sed -n '1,240p'</summary>
+<pre>$ git status --short --branch &amp;&amp; rg --files plans R src tests | sort | sed -n '1,240p'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+## main...origin/main
+R/arithmetic.R
+R/broadcast-names.R
+R/broadcast.R
+R/cast-common.R
+R/cast.R
+R/combine.R
+R/compare.R
+R/dimensionality.R
+R/dimensions.R
+R/equal.R
+R/extremum.R
+R/insert-axes.R
+R/move-axes.R
+R/names.R
+R/permute-axes.R
+R/ptype-common.R
+R/ptype.R
+R/reduce-names.R
+R/reduce.R
+R/remove-axes.R
+R/rray4-package.R
+R/size.R
+R/split-names.R
+R/split.R
+R/zzz.R
+plans/combine-stack-unstack.md
+plans/combine.md
+plans/extensions.md
+plans/implementation.md
+plans/mod-and-idiv.md
+plans/n-ary.md
+plans/null.md
+plans/rep.md
+plans/split-optimize.md
+src/Makevars
+src/arg.c
+src/arg.h
+src/arithmetic-add.c
+src/arithmetic-add.h
+src/arithmetic-divide.c
+src/arithmetic-divide.h
+src/arithmetic-exponentiate.c
+src/arithmetic-exponentiate.h
+src/arithmetic-multiply.c
+src/arithmetic-multiply.h
+src/arithmetic-subtract.c
+src/arithmetic-subtract.h
+src/arithmetic.c
+src/arithmetic.h
+src/axes.c
+src/axes.h
+src/binary.h
+src/broadcast-names.c
+src/broadcast-names.h
+src/broadcast.c
+src/broadcast.h
+src/cast-common.c
+src/cast-common.h
+src/cast.c
+src/cast.h
+src/combine.c
+src/combine.h
+src/compare.c
+src/compare.h
+src/decl/arg-decl.h
+src/decl/arithmetic-add-decl.h
+src/decl/arithmetic-divide-decl.h
+src/decl/arithmetic-exponentiate-decl.h
+src/decl/arithmetic-multiply-decl.h
+src/decl/arithmetic-subtract-decl.h
+src/decl/broadcast-decl.h
+src/decl/broadcast-names-decl.h
+src/decl/cast-decl.h
+src/decl/combine-decl.h
+src/decl/compare-decl.h
+src/decl/dimensions-decl.h
+src/decl/equal-decl.h
+src/decl/extremum-decl.h
+src/decl/names-decl.h
+src/decl/permute-axes-decl.h
+src/decl/ptype-decl.h
+src/decl/reduce-decl.h
+src/decl/reduce-logical-decl.h
+src/decl/reduce-mean-decl.h
+src/decl/reduce-names-decl.h
+src/decl/reduce-product-decl.h
+src/decl/reduce-sum-decl.h
+src/decl/size-decl.h
+src/decl/split-decl.h
+src/decl/split-names-decl.h
+src/decl/strided-iterator-decl.h
+src/decl/utils-decl.h
+src/decl/wrapper-decl.h
+src/dimensionality.c
+src/dimensionality.h
+src/dimensions.c
+src/dimensions.h
+src/equal.c
+src/equal.h
+src/extremum.c
+src/extremum.h
+src/init.c
+src/insert-axes.c
+src/insert-axes.h
+src/missing.h
+src/move-axes.c
+src/move-axes.h
+src/names.c
+src/names.h
+src/permute-axes.c
+src/permute-axes.h
+src/point-iterator.h
+src/ptype-common.c
+src/ptype-common.h
+src/ptype.c
+src/ptype.h
+src/reduce-logical.c
+src/reduce-logical.h
+src/reduce-mean.c
+src/reduce-mean.h
+src/reduce-names.c
+src/reduce-names.h
+src/reduce-product.c
+src/reduce-product.h
+src/reduce-sum.c
+src/reduce-sum.h
+src/reduce.c
+src/reduce.h
+src/remove-axes.c
+src/remove-axes.h
+src/rlang.c
+src/rlang/arg.c
+src/rlang/arg.h
+src/rlang/attrib.c
+src/rlang/attrib.h
+src/rlang/c-utils.c
+src/rlang/c-utils.h
+src/rlang/call.c
+src/rlang/call.h
+src/rlang/cnd.c
+src/rlang/cnd.h
+src/rlang/cpp/rlang.cpp
+src/rlang/cpp/vec.cpp
+src/rlang/debug.c
+src/rlang/debug.h
+src/rlang/decl/cnd-decl.h
+src/rlang/decl/df-decl.h
+src/rlang/decl/dict-decl.h
+src/rlang/decl/dyn-list-of-decl.h
+src/rlang/decl/env-binding-decl.h
+src/rlang/decl/env-decl.h
+src/rlang/decl/obj-decl.h
+src/rlang/decl/stack-decl.h
+src/rlang/decl/walk-decl.h
+src/rlang/df.c
+src/rlang/df.h
+src/rlang/dict.c
+src/rlang/dict.h
+src/rlang/dots-info.c
+src/rlang/dots-info.h
+src/rlang/dyn-array.c
+src/rlang/dyn-array.h
+src/rlang/dyn-list-of.c
+src/rlang/dyn-list-of.h
+src/rlang/env-binding.c
+src/rlang/env-binding.h
+src/rlang/env.c
+src/rlang/env.h
+src/rlang/eval.c
+src/rlang/eval.h
+src/rlang/export.c
+src/rlang/export.h
+src/rlang/fn.c
+src/rlang/fn.h
+src/rlang/formula.c
+src/rlang/formula.h
+src/rlang/globals.c
+src/rlang/globals.h
+src/rlang/node.c
+src/rlang/node.h
+src/rlang/obj.c
+src/rlang/obj.h
+src/rlang/parse.c
+src/rlang/parse.h
+src/rlang/quo.c
+src/rlang/quo.h
+src/rlang/rlang-types.h
+src/rlang/rlang.c
+src/rlang/rlang.h
+src/rlang/rlang.hpp
+src/rlang/session.c
+src/rlang/session.h
+src/rlang/stack.c
+src/rlang/stack.h
+src/rlang/state.h</pre><p class="cut">45 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,260p' plans/combine-stack-unstack.md &amp;&amp; sed -n '1,320p' plans/combine.md &amp;&amp; sed -n …</summary>
+<pre>$ sed -n '1,260p' plans/combine-stack-unstack.md &amp;&amp; sed -n '1,320p' plans/combine.md &amp;&amp; sed -n '1,280p' R/combine.R &amp;&amp; sed -n '1,260p' R/split.R &amp;&amp; sed -n '1,240p' R/insert-axes.R &amp;&amp; sed -n '1,240p' R/remove-axes.R &amp;&amp; sed -n '1,220p' R/dimensionality.R</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+# Combine, stack, and unstack
+
+## Status
+
+This document is an implementation plan. It does not describe code that is
+already present.
+
+The target branch is `feature/combine-stack-unstack`, based on `main`.
+
+## Goal
+
+Add three array manipulation functions:
+
+```r
+rray_combine(..., .axis)
+rray_stack(..., .axis)
+rray_unstack(x, .axis)
+```
+
+This family replaces `rray_split()`. Remove split in the same implementation
+change. There is no deprecation period and no private split engine left behind.
+
+They follow the main ideas of the Python Array API functions `concat()`,
+`stack()`, and `unstack()`:
+
+- `rray_combine()` joins arrays along an existing axis.
+- `rray_stack()` joins arrays along a new axis.
+- `rray_unstack()` removes one axis and returns its slices in a list.
+
+The Python references are:
+
+- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.concat.html&gt;
+- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.stack.html&gt;
+- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.unstack.html&gt;
+
+rray4 should differ in two deliberate ways:
+
+- Axes are one based and negative axes are not accepted.
+- `rray_combine()` and `rray_stack()` broadcast their inputs on every axis
+  except the axis being combined.
+
+`.axis` is required. Because it follows `...`, callers must name it. This
+matches the proposed R signatures and the package's existing axis-taking
+functions. Python uses the first axis as the default, so this is an intentional
+R API difference.
+
+## Decision summary
+
+- Implement broadcasting in the first version. It is well defined and fits
+  the rest of rray4.
+- Require callers to supply `.axis` by name. It has no default.
+- `rray_combine()` accepts `.axis` from 1 through the greatest input
+  dimensionality.
+- `rray_stack()` accepts `.axis` from 1 through the common input
+  dimensionality plus 1. For a 2D input, axes 1, 2, and 3 are all valid.
+- `rray_unstack()` accepts arrays with dimensionality 2 or greater. rray4 has
+  no 0D arrays, so unstacking a 1D array cannot return valid rray4 arrays.
+- Inputs use the common rray4 type. No `.ptype` argument is added.
+- Names on the combined axis are concatenated. Missing pieces are represented
+  by empty strings if another input supplies names.
+- Names of `...` become names on the new axis made by `rray_stack()`.
+- Names on the removed axis become names of the list returned by
+  `rray_unstack()`.
+- `rray_stack()` should be built as cheap dimension views followed by the
+  combine engine.
+- `rray_unstack()` replaces `rray_split()` and owns the slice engine directly.
+- Remove the old split API and all of its private name machinery.
+
+## Public behavior
+
+### `rray_combine()`
+
+`rray_combine()` joins one or more arrays along `.axis`. The selected axis
+keeps its dimension from each input, and those dimensions are added together.
+Every other axis is broadcast to a common dimension.
+
+For inputs with the same dimensionality:
+
+```text
+[2, 3] + [4, 3] along axis 1 -&gt; [6, 3]
+[2, 3] + [2, 5] along axis 2 -&gt; [2, 8]
+```
+
+The selected axis is not broadcast. A dimension of 1 on that axis contributes
+one position to the result. On all other axes, the usual rray4 rule applies:
+equal dimensions are compatible, and a dimension of 1 can expand.
+
+```text
+[2, 1, 3] + [3, 2] along axis 1
+
+pad the second input:       [3, 2, 1]
+broadcast the first chunk:  [2, 2, 3]
+broadcast the second chunk: [3, 2, 3]
+combine the chunks:         [5, 2, 3]
+```
+
+This confirms the example in the request. rray4 aligns dimensions from the
+first axis and adds missing singleton axes at the end. It does not use NumPy's
+right-aligned broadcasting rule.
+
+An axis that is missing from a lower-dimensional input is treated as an
+implicit dimension of 1. For example:
+
+```text
+[2] + [2, 3] along axis 2
+
+pad the first input: [2, 1]
+result:              [2, 4]
+```
+
+This follows directly from existing rray4 broadcasting. It should be shown in
+the documentation because it is less obvious than singleton broadcasting on
+an axis that is already present.
+
+One input is valid. It is normalized to an array and cast to its own common
+type. Its dimensions and names are otherwise unchanged.
+
+No inputs is an error. Named dots are used in error messages but do not add or
+prefix names on the combined axis.
+
+### `rray_stack()`
+
+`rray_stack()` first finds the common broadcast dimensions of its inputs. It
+then inserts a singleton axis into each input and combines along that axis.
+
+For two 2 by 3 arrays:
+
+```text
+axis 1: [2, 2, 3]
+axis 2: [2, 2, 3]
+axis 3: [2, 3, 2]
+```
+
+The first two results happen to have the same dimensions because there are two
+inputs. Their values are laid out differently. With three inputs the
+difference is clearer:
+
+```text
+three [2, 3] arrays on axis 1 -&gt; [3, 2, 3]
+three [2, 3] arrays on axis 2 -&gt; [2, 3, 3]
+three [2, 3] arrays on axis 3 -&gt; [2, 3, 3]
+```
+
+Again, the last two shapes happen to match because both an old dimension and
+the input count are 3. Indexing tests must check values, not just dimensions.
+
+The useful mechanical description is:
+
+```text
+stack [2, 3] on axis 1: [1, 2, 3], then combine on axis 1
+stack [2, 3] on axis 2: [2, 1, 3], then combine on axis 2
+stack [2, 3] on axis 3: [2, 3, 1], then combine on axis 3
+```
+
+For inputs with common dimensionality `D`, valid axes are `1` through `D + 1`.
+The output has dimensionality `D + 1`. This means the user's check was right:
+a 2D array may be stacked on axis 3 to put the new axis last.
+
+Broadcasting happens before the new axis is inserted:
+
+```text
+[2, 1, 3] and [1, 4, 3] -&gt; common dimensions [2, 4, 3]
+stack on axis 2              -&gt; [2, 2, 4, 3]
+```
+
+A useful feature of broadcasted stack is building feature planes over a grid:
+
+```r
+row &lt;- array(c(10, 20), c(2, 1))
+column &lt;- array(c(1, 2, 3), c(1, 3))
+
+out &lt;- rray_stack(
+  row = row,
+  column = column,
+  .axis = 3
+)
+```
+
+The inputs broadcast to `[2, 3]`, then stack to `[2, 3, 2]`:
+
+```text
+out[, , &quot;row&quot;]       out[, , &quot;column&quot;]
+
+10 10 10              1 2 3
+20 20 20              1 2 3
+```
+
+Each `out[i, j, ]` contains the row and column features for one grid position.
+The same pattern is useful for coordinate grids, model feature arrays, image
+channels, and parameter grids. Without broadcasted stack, callers must
+explicitly broadcast every input before packing them along the new axis.
+
+Use this as a main `rray_stack()` documentation example. It shows that
+broadcasting is a useful part of the function rather than only a relaxed shape
+check. It also shows dots names becoming names on the new axis.
+</pre><p class="cut">481 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '261,620p' plans/combine-stack-unstack.md; git log --oneline --decorate -12; git branc…</summary>
+<pre>$ sed -n '261,620p' plans/combine-stack-unstack.md; git log --oneline --decorate -12; git branch --all --list '*combine*'; rg -n &quot;rray_(combine|split|stack|unstack)|\.ptype|ptype&quot; R/combine.R src/combine.c tests/testthat/test-combine.R NAMESPACE _pkgdown.yml plans/combine-stack-unstack.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+
+### Costs and risks
+
+- The behavior differs from Python even though the functions use Python as
+  their model. The rray4 behavior must still have one clear definition.
+- A missing trailing axis acts like dimension 1. Combining on that implicit
+  axis is logical but may surprise a reader.
+- The output write is strided when the selected axis is not last. A flat
+  `memcpy()` implementation is not enough.
+- Names need separate rules for the combined axis and broadcast axes.
+
+These costs are manageable. The iterator already represents the required
+source and destination strides. The plan therefore recommends broadcasting in
+the first version, without a `.broadcast` switch.
+
+If implementation work finds a real blocker, strict shape matching can ship
+first and broadcasting can follow without breaking successful calls. That is
+a fallback, not the target behavior of this plan.
+
+## Type rules
+
+`rray_combine()` and `rray_stack()` find one common type across all inputs by
+using the existing `rray_ptype_common()` and `rray_cast_common()` rules.
+
+The supported results are:
+
+| Inputs | Result |
+|---|---|
+| logical only | logical |
+| logical and integer | integer |
+| logical, integer, double | widest of those types |
+| logical, integer, double, complex | widest of those types |
+| character only | character |
+| raw only | raw |
+| list only | list |
+
+Incompatible families remain an error. For example, integer and character do
+not combine. Classed inputs, `NULL`, functions, environments, and other scalar
+objects remain errors under the existing array checks.
+
+There is no `.ptype` argument in this API. It can be added later if users need
+an explicit type override. The first implementation should keep the surface
+small.
+
+The combine engine may materialize an input only when it must cast to the
+common type. Broadcasting must happen while copying into the final output, not
+by calling `rray_broadcast()` on every input.
+
+`rray_unstack()` does not combine types. Every output element has exactly the
+storage type of `x`.
+
+## Dimension rules
+
+### Common setup
+
+Bare vectors are normalized to 1D arrays before dimension work. Differing
+dimensionality follows the current package rule: shorter dimension vectors are
+padded with trailing ones.
+
+All outputs must stay within `RRAY_MAX_DIMENSIONALITY`, which is currently 64.
+
+### Combine dimensions
+
+Let `D` be the greatest dimensionality across the inputs. `.axis` must be from
+1 through `D`.
+
+Build `out_dimensions` as follows:
+
+- On `.axis`, use the sum of each input's dimension. Use 1 when the input does
+  not reach that axis.
+- On every other axis, merge dimensions with the current broadcasting rule.
+
+For each input, also build `chunk_dimensions`:
+
+- Start with `out_dimensions`.
+- Replace the combine-axis dimension with that input's actual or implicit
+  dimension.
+
+The input must broadcast to `chunk_dimensions`.
+
+### Stack dimensions
+
+Find ordinary common broadcast dimensions across the inputs first. Let their
+length be `D`. `.axis` must be from 1 through `D + 1`.
+
+Insert the number of inputs at `.axis` in the common dimensions. These are the
+output dimensions.
+
+Each input gets a cheap view whose dimensions are made in two steps:
+
+1. Pad its dimensions with trailing ones to length `D`.
+2. Insert a dimension of 1 at `.axis`.
+
+Combining those views on `.axis` produces the required result and lets the
+combine engine handle all data movement.
+
+Stack must reject common dimensionality 64 because its output would have
+dimensionality 65.
+
+### Unstack dimensions
+
+Copy the dimensions of `x` except for `.axis`. Since `x` must be at least 2D,
+at least one dimension remains.
+
+### Zero dimensions and overflow
+
+Zero dimensions remain valid.
+
+- A non-combine dimension of 1 can broadcast to 0, following current rray4
+  rules.
+- A combine-axis dimension of 0 contributes nothing to the sum.
+- Stacking zero-size arrays still adds a new axis whose dimension is the
+  number of inputs.
+- Unstacking an axis of dimension 0 returns an empty list.
+
+Dimension sums must be computed in `r_ssize`, checked against `INT_MAX`, and
+only then stored in the integer dimensions vector. The number of stack inputs
+must also fit in an R dimension.
+
+The full product of the output dimensions must be checked before allocation.
+Do not rely on signed overflow in `rray_size_from_dimensions()`. A checked
+helper must return 0 immediately if any dimension is 0, even if large earlier
+dimensions would overflow when multiplied. A local helper is enough unless
+another pending feature already adds a shared checked-size function.
+
+## Name rules
+
+Names are part of the operation, not an afterthought. The three functions must
+form a useful round trip when the inputs already share dimensions.
+
+### Names on non-combine axes
+
+Use the existing broadcast-name rule on every axis that is not being combined:
+
+- An input can contribute names only when its dimension on that axis is kept.
+- Names from a dimension that expands are dropped.
+- The first eligible input with names wins.
+- If no input contributes names on any axis, do not attach a `dimnames`
+  attribute.
+
+This is the behavior of `rray_broadcast_names_common()` and should be reused
+rather than copied.
+
+### Names on the axis combined by `rray_combine()`
+
+Concatenate axis names in input order.
+
+If every input lacks names on that axis, the output axis is unnamed. If any
+input supplies names, allocate the full axis-name vector and use `&quot;&quot;` for each
+position contributed by an unnamed input. Keep `NA` names as `NA`.
+
+For example:
+
+```text
+c(&quot;a&quot;, &quot;b&quot;) + unnamed length 2 + c(&quot;e&quot;)
+-&gt; c(&quot;a&quot;, &quot;b&quot;, &quot;&quot;, &quot;&quot;, &quot;e&quot;)
+```
+
+This preserves all available information and matches ordinary R vector
+concatenation. A stricter alternative is to drop the complete axis names when
+any input is unnamed. Confirm this choice before implementation.
+
+Names of dots do not affect `rray_combine()`. A named input may contribute
+many positions, so one dots name has no direct position-preserving meaning.
+
+### Names made by `rray_stack()`
+
+Names of `...` become names on the new axis. This gives:
+
+```r
+rray_stack(first = x, second = y, .axis = 2L)
+```
+
+a new second axis named `c(&quot;first&quot;, &quot;second&quot;)`.
+
+If no dots are named, the new axis is unnamed. If only some dots are named,
+`list2()` supplies empty strings for the others, and that partial name vector
+is kept.
+
+Names on all old axes use the common broadcast-name rule. The new axis names
+from dots replace any temporary names produced while using the combine engine.
+
+### Names returned by `rray_unstack()`
+
+Names from the removed axis become `names()` on the output list. If the axis
+has no names, the list is unnamed. This also applies to a zero-length named
+axis, where `character()` is a valid zero-length names attribute.
+
+Names on every surviving axis keep their order and shift left to close the
+removed position. The removed names must not remain as singleton dimension
+names on the output arrays.
+
+For a named input:
+
+```text
+dimensions: [2, 3]</pre><p class="cut">323 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n '1,180p' src/combine.c; sed -n '1,120p' src/combine.h; sed -n '1,90p' src/init.c; sed …</summary>
+<pre>$ sed -n '1,180p' src/combine.c; sed -n '1,120p' src/combine.h; sed -n '1,90p' src/init.c; sed -n '1,160p' R/ptype-common.R; sed -n '620,1060p' plans/combine-stack-unstack.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;combine.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;axes.h&quot;
+#include &quot;broadcast-names.h&quot;
+#include &quot;cast-common.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;ptype-common.h&quot;
+#include &quot;size.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/combine-decl.h&quot;
+
+r_obj* ffi_rray_combine(r_obj* ffi_xs, r_obj* ffi_axis, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+  return rray_combine(
+    ffi_xs,
+    axis,
+    r_null,
+    rray_args.empty,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+) {
+  if (r_length(xs) == 0) {
+    r_abort_lazy_call(error_call, &quot;Must supply at least one array to `...`.&quot;);
+  }
+
+  ptype = KEEP(rray_ptype_common(xs, ptype, arg, ptype_arg, error_call));
+
+  xs = KEEP(rray_cast_common(xs, ptype, arg, ptype_arg, error_call));
+
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  const int out_dimensionality = list_max_dimensionality(xs, arg, error_call);
+  check_max_dimensionality(out_dimensionality);
+
+  check_axis(axis, out_dimensionality, rray_args.dot_axis, error_call);
+
+  r_obj* out_dimensions =
+    KEEP(rray_dimensions_common_opts(xs, &amp;axis, 1, arg, error_call));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+
+  int axis_dimension = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+    r_obj* x_dimensions = r_dim(x);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? r_int_get(x_dimensions, axis - 1) : 1;
+
+    if (axis_dimension &gt; INT_MAX - x_axis_dimension) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;The combined dimension on `.axis` is too large.&quot;
+      );
+    }
+
+    axis_dimension += x_axis_dimension;
+  }
+
+  v_out_dimensions[axis - 1] = axis_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    out_dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(ptype), out_size));
+
+  r_ssize v_out_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_out_dimensions,
+    out_dimensionality,
+    v_out_strides
+  );
+
+  int v_x_broadcast_dimensions[RRAY_MAX_DIMENSIONALITY];
+  r_memcpy(
+    v_x_broadcast_dimensions,
+    v_out_dimensions,
+    sizeof(int) * out_dimensionality
+  );
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+
+  r_ssize axis_offset = 0;
+
+  for (r_ssize i = 0; i &lt; xs_size; ++i) {
+    r_obj* x = v_xs[i];
+    r_obj* x_dimensions = r_dim(x);
+    const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+    const int x_dimensionality =
+      rray_dimensionality_from_dimensions(x_dimensions);
+    const int x_axis_dimension =
+      (axis &lt;= x_dimensionality) ? v_x_dimensions[axis - 1] : 1;
+
+    v_x_broadcast_dimensions[axis - 1] = x_axis_dimension;
+
+    rray_fill_broadcast_strides_from_dimensions(
+      v_x_dimensions,
+      x_dimensionality,
+      out_dimensionality,
+      v_x_strides
+    );
+
+    const struct rray_strided_iterator2_plan plan = rray_strided_iterator2_plan(
+      v_x_broadcast_dimensions,
+      out_dimensionality,
+      v_out_strides,
+      v_x_strides
+    );
+
+    const r_ssize out_start = axis_offset * v_out_strides[axis - 1];
+    rray_combine_fill(x, out, out_start, &amp;plan);
+    axis_offset += x_axis_dimension;
+  }
+
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* out_names =
+    KEEP(rray_combine_names(xs, out_dimensions, axis, axis_dimension));
+
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* rray_combine_names(
+  r_obj* xs,
+  r_obj* dimensions,
+  int axis,
+  int axis_dimension
+) {
+  r_obj* out = rray_broadcast_names_common_opts(xs, dimensions, &amp;axis, 1);
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+
+  r_obj* axis_names = KEEP(rray_combine_axis_names(xs, axis, axis_dimension));
+
+  if (axis_names != r_null) {
+    if (out == r_null) {
+      out = r_alloc_list(r_length(dimensions));
+      KEEP_AT(out, out_loc);
+    }
+    r_list_poke(out, axis - 1, axis_names);
+  }
+
+  FREE(2);
+  return out;
+}
+
+static r_obj* rray_combine_axis_names(r_obj* xs, int axis, int axis_dimension) {
+  const r_ssize n = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* out = r_null;
+  r_keep_loc out_loc;
+  KEEP_HERE(out, &amp;out_loc);
+#ifndef RRAY_COMBINE_H
+#define RRAY_COMBINE_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+
+r_obj* rray_combine(
+  r_obj* xs,
+  int axis,
+  r_obj* ptype,
+  struct rray_arg* arg,
+  struct rray_arg* ptype_arg,
+  struct r_lazy error_call
+);
+</pre><p class="cut">517 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying combine and ptype exposure</strong></p>
+<p><strong>Drafting key questions on axis and ptype usage</strong></p>
+</details>
+<p>Two points need confirmation before I rewrite it:</p>
+<ol>
+<li>
+<p>Should both combining functions expose <code>.ptype</code>?</p>
+<pre><code class="language-r">rray_combine(..., .axis, .ptype = NULL)
+rray_stack(..., .axis, .ptype = NULL)
+</code></pre>
+<p>Current <code>main</code> has internal prototype support, but <code>rray_combine()</code> does not expose <code>.ptype</code>.</p>
+</li>
+<li>
+<p>Are the argument names intentionally different?</p>
+<pre><code class="language-r">rray_combine(..., .axis)
+rray_split(x, axis, sizes)
+rray_stack(..., .axis)
+rray_unstack(x, axis)
+</code></pre>
+<p>I read scalar <code>sizes = n</code> as splitting the selected dimension into equal chunks of size <code>n</code>, requiring exact divisibility. A vector supplies each chunk size, may contain zeroes, and must sum to the selected dimension. Is that correct?</p>
+</li>
+</ol>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>1 Not yet, internal for now</p>
+<ol start="2">
+<li>That description of sizes sounds correct</li>
+</ol>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>Got it. I’ll keep prototype selection internal, use <code>.axis</code> for variadic combine and stack, and use <code>axis</code> plus <code>sizes</code> for split and unstack. I’ll now rewrite the plan around the four-function family, remove <code>plans/combine.md</code>, and review the result on <code>feature/combine-plan-rewrite</code>.</p>
+
+<details class="tool"><summary>Bash: git switch -c feature/combine-plan-rewrite &amp;&amp; sed -n '1,320p' src/split.c &amp;&amp; sed -n '1,240p' …</summary>
+<pre>$ git switch -c feature/combine-plan-rewrite &amp;&amp; sed -n '1,320p' src/split.c &amp;&amp; sed -n '1,240p' src/split-names.c &amp;&amp; sed -n '1,220p' plans/split-optimize.md &amp;&amp; sed -n '1,260p' R/dimensions.R &amp;&amp; sed -n '1,260p' src/insert-axes.c &amp;&amp; sed -n '1,240p' src/remove-axes.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+fatal: cannot lock ref 'refs/heads/feature/combine-plan-rewrite': Unable to create '~/files/r/packages/rray4/.git/refs/heads/feature/combine-plan-rewrite.lock': Operation not permitted</pre></details>
+<details class="tool"><summary>Bash: git switch -c feature/combine-plan-rewrite</summary>
+<pre>$ git switch -c feature/combine-plan-rewrite</pre><pre class="output">Script completed
+Wall time 4.2 seconds
+Output:
+
+Switched to a new branch 'feature/combine-plan-rewrite'</pre></details>
+<details class="tool"><summary>Bash: sed -n '1,360p' src/split.c; sed -n '1,280p' src/split-names.c; sed -n '1,300p' plans/split-o…</summary>
+<pre>$ sed -n '1,360p' src/split.c; sed -n '1,280p' src/split-names.c; sed -n '1,300p' plans/split-optimize.md; sed -n '1,280p' R/dimensions.R; sed -n '1,320p' src/insert-axes.c; sed -n '1,300p' src/remove-axes.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+#include &quot;split.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;strided-iterator.h&quot;
+#include &quot;size.h&quot;
+#include &quot;split-names.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/split-decl.h&quot;
+
+r_obj* ffi_rray_split(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_split(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+
+r_obj* rray_split(
+  r_obj* x,
+  r_obj* axes,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+
+  axes = KEEP(arg_as_axes(axes, dimensionality, rray_args.axes, error_call));
+  const int* v_axes = r_int_cbegin(axes);
+  const r_ssize axes_size = r_length(axes);
+
+  // Splitting 4x3x2 on axis 3 gives 4x3x1 out dimensions
+  r_obj* out_elt_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes,
+    axes_size,
+    1
+  ));
+  const int* v_out_elt_dimensions = r_int_cbegin(out_elt_dimensions);
+
+  r_obj* axes_complement =
+    KEEP(rray_axes_complement(v_axes, axes_size, dimensionality));
+  const int* v_axes_complement = r_int_cbegin(axes_complement);
+  const r_ssize axes_complement_size = r_length(axes_complement);
+
+  // Splitting 4x3x2 on axis 3 gives 1x1x2 split dimensions
+  r_obj* out_dimensions = KEEP(rray_set_axes_dimension(
+    v_x_dimensions,
+    dimensionality,
+    v_axes_complement,
+    axes_complement_size,
+    1
+  ));
+  const int* v_out_dimensions = r_int_cbegin(out_dimensions);
+
+  const r_ssize out_elt_size =
+    rray_size_from_dimensions(v_out_elt_dimensions, dimensionality);
+  const r_ssize out_size =
+    rray_size_from_dimensions(v_out_dimensions, dimensionality);
+
+  const enum r_type type = r_typeof(x);
+
+  r_obj* out = KEEP(r_alloc_list(out_size));
+
+  for (r_ssize i = 0; i &lt; out_size; ++i) {
+    r_obj* out_elt = r_alloc_vector(type, out_elt_size);
+    r_list_poke(out, i, out_elt);
+    r_attrib_poke_dim(out_elt, out_elt_dimensions);
+  }
+
+  struct rray_strided_iterator2_plan plan = rray_broadcast_iterator2_plan(
+    v_out_dimensions,
+    dimensionality,
+    v_out_elt_dimensions,
+    dimensionality,
+    v_x_dimensions,
+    dimensionality
+  );
+
+  switch (type) {
+  case R_TYPE_logical:
+    rray_split_lgl(x, out, &amp;plan);
+    break;
+  case R_TYPE_integer:
+    rray_split_int(x, out, &amp;plan);
+    break;
+  case R_TYPE_double:
+    rray_split_dbl(x, out, &amp;plan);
+    break;
+  case R_TYPE_complex:
+    rray_split_cpl(x, out, &amp;plan);
+    break;
+  case R_TYPE_raw:
+    rray_split_raw(x, out, &amp;plan);
+    break;
+  case R_TYPE_character:
+    rray_split_chr(x, out, &amp;plan);
+    break;
+  case R_TYPE_list:
+    rray_split_list(x, out, &amp;plan);
+    break;
+  default:
+    r_stop_unreachable();
+  }
+
+  r_obj* names = KEEP(rray_split_names(x, axes));
+
+  if (names != r_null) {
+    r_obj* const* v_names = r_list_cbegin(names);
+    r_obj* const* v_out = r_list_cbegin(out);
+
+    for (r_ssize i = 0; i &lt; out_size; ++i) {
+      r_attrib_poke_dim_names(v_out[i], v_names[i]);
+    }
+  }
+
+  FREE(8);
+  return out;
+}
+
+#define RRAY_SPLIT_ATOMIC(CTYPE, CONST_DEREF, DEREF)                           \
+  const r_ssize size = rray_strided_iterator2_plan_size(plan);                 \
+                                                                               \
+  const r_ssize out_size = r_length(out);                                      \
+                                                                               \
+  const CTYPE* v_x = CONST_DEREF(x);                                           \
+  r_obj* const* v_out = r_list_cbegin(out);                                    \
+                                                                               \
+  r_obj* shelter = KEEP(r_alloc_raw(out_size * sizeof(CTYPE*)));               \
+  CTYPE** v_v_out = (CTYPE**) r_raw_begin(shelter);                            \
+                                                                               \
+  for (r_ssize i = 0; i &lt; out_size; ++i) {                                     \
+    v_v_out[i] = DEREF(v_out[i]);                                              \
+  }                                                                            \
+                                                                               \
+  r_ssize run_start = 0;                                                       \
+  const r_ssize run_size = rray_strided_iterator2_plan_run_size(plan);         \
+                                                                               \
+  r_ssize out_start = 0;                                                       \
+  const r_ssize out_run_stride =                                               \
+    rray_strided_iterator2_plan_run_stride1(plan);                             \
+                                                                               \
+  r_ssize out_elt_start = 0;                                                   \
+  const r_ssize out_elt_run_stride =                                           \
+    rray_strided_iterator2_plan_run_stride2(plan);                             \
+                                                                               \
+  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+  rray_strided_iterator2_plan_point_init(plan, v_point);                       \
+                                                                               \
+  while (run_start != size) {                                                  \
+    const r_ssize run_end = run_start + run_size;                              \
+    r_ssize out_loc = out_start;                                               \
+    r_ssize out_elt_loc = out_elt_start;                                       \
+                                                                               \
+    if (out_run_stride == 0) {                                                 \
+      if (out_elt_run_stride == 0) {                                           \
+        for (r_ssize i = run_start; i &lt; run_end; ++i) {                        \
+          v_v_out[out_loc][out_elt_loc] = v_x[i];                              \
+        }                                                                      \
+      } else {                                                                 \
+        for (r_ssize i = run_start; i &lt; run_end; ++i) {                        \
+          v_v_out[out_loc][out_elt_loc] = v_x[i];                              \
+          out_elt_loc += out_elt_run_stride;                                   \
+        }                                                                      \
+      }                                                                        \
+    } else if (out_elt_run_stride == 0) {                                      \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_v_out[out_loc][out_elt_loc] = v_x[i];                                \
+        out_loc += out_run_stride;                                             \
+      }                                                                        \
+    } else {                                                                   \
+      for (r_ssize i = run_start; i &lt; run_end; ++i) {                          \
+        v_v_out[out_loc][out_elt_loc] = v_x[i];                                \
+        out_loc += out_run_stride;                                             \
+        out_elt_loc += out_elt_run_stride;                                     \
+      }                                                                        \
+    }                                                                          \
+                                                                               \
+    run_start = run_end;                                                       \
+    RRAY_STRIDED_ITERATOR_NEXT2(out_start, out_elt_start, v_point, plan);      \
+  }                                                                            \
+                                                                               \
+  FREE(1);
+
+#define RRAY_SPLIT_BARRIER(CONST_DEREF, POKE)                                  \
+  const r_ssize size = rray_strided_iterator2_plan_size(plan);                 \
+                                                                               \
+  r_obj* const* v_x = CONST_DEREF(x);                                          \
+  r_obj* const* v_out = r_list_cbegin(out);                                    \
+                                                                               \
+  r_ssize run_start = 0;                                                       \</pre><p class="cut">807 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+<p><strong>Designing dimensionality padding and axis insertion</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+<p><strong>Designing dimensionality padding and axis insertion</strong></p>
+<p><strong>Outlining stack implementation with internal calls</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+<p><strong>Designing dimensionality padding and axis insertion</strong></p>
+<p><strong>Outlining stack implementation with internal calls</strong></p>
+<p><strong>Designing optimized chunked array splitting</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+<p><strong>Designing dimensionality padding and axis insertion</strong></p>
+<p><strong>Outlining stack implementation with internal calls</strong></p>
+<p><strong>Designing optimized chunked array splitting</strong></p>
+<p><strong>Refining split sizes validation and unstack behavior</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+<p><strong>Designing dimensionality padding and axis insertion</strong></p>
+<p><strong>Outlining stack implementation with internal calls</strong></p>
+<p><strong>Designing optimized chunked array splitting</strong></p>
+<p><strong>Refining split sizes validation and unstack behavior</strong></p>
+<p><strong>Planning comprehensive combine-stack-unstack rewrite</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning array split redesign</strong></p>
+<p><strong>Defining split sizes semantics</strong></p>
+<p><strong>Clarifying split output and internal stack calls</strong></p>
+<p><strong>Evaluating dimensionality expansion for stack</strong></p>
+<p><strong>Designing dimensionality padding and axis insertion</strong></p>
+<p><strong>Outlining stack implementation with internal calls</strong></p>
+<p><strong>Designing optimized chunked array splitting</strong></p>
+<p><strong>Refining split sizes validation and unstack behavior</strong></p>
+<p><strong>Planning comprehensive combine-stack-unstack rewrite</strong></p>
+</details>
+<details class="tool"><summary>Bash: sed -n '1,220p' src/decl/combine-decl.h; rg -n &quot;list_max_dimensionality|dot_axis|sizes&quot; src R…</summary>
+<pre>$ sed -n '1,220p' src/decl/combine-decl.h; rg -n &quot;list_max_dimensionality|dot_axis|sizes&quot; src R tests/testthat plans | head -120; rg -n &quot;ffi_rray_split_names|ffi_rray_split&quot; src/init.c</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+static r_obj* rray_combine_names(
+  r_obj* xs,
+  r_obj* dimensions,
+  int axis,
+  int axis_dimension
+);
+static r_obj* rray_combine_axis_names(r_obj* xs, int axis, int axis_dimension);
+static void rray_combine_fill(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_lgl(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_int(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_dbl(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_cpl(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_raw(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_chr(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+static void rray_combine_fill_list(
+  r_obj* x,
+  r_obj* out,
+  r_ssize out_start,
+  const struct rray_strided_iterator2_plan* plan
+);
+plans/split-optimize.md:168:The win holds at sizes well past any cache. The single 0.81 row is another
+src/arg.h:19:  struct rray_arg* dot_axis;
+plans/n-ary.md:624:- output sizes below and above cache capacity.
+src/arg.c:222:  INIT_ARG2(dot_axis, &quot;.axis&quot;);
+src/dimensionality.h:17:int list_max_dimensionality(
+plans/combine-stack-unstack.md:581:Add `dot_axis` to `struct rray_args` in `src/arg.h` and initialize it as
+plans/combine-stack-unstack.md:599:2. Convert `.axis` with `arg_as_int()` and the new `rray_args.dot_axis` tag.
+src/combine.c:20:  const int axis = arg_as_int(ffi_axis, rray_args.dot_axis, error_call);
+src/combine.c:50:  const int out_dimensionality = list_max_dimensionality(xs, arg, error_call);
+src/combine.c:53:  check_axis(axis, out_dimensionality, rray_args.dot_axis, error_call);
+tests/testthat/test-broadcast.R:141:test_that(&quot;preserves dimension names when sizes match&quot;, {
+src/rlang/dyn-list-of.h:15:    // Contains the addresses and sizes of each element of the
+src/dimensionality.c:23:int list_max_dimensionality(
+59:extern r_obj* ffi_rray_split_names(r_obj* ffi_x, r_obj* ffi_axes);
+75:extern r_obj* ffi_rray_split(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame);
+210:  {&quot;ffi_rray_split_names&quot;, (DL_FUNC) &amp;ffi_rray_split_names, 2},
+213:  {&quot;ffi_rray_split&quot;, (DL_FUNC) &amp;ffi_rray_split, 3},</pre></details>
+<p>The main design point is now clear: stack only needs each input expanded far enough for the insertion point, which is <code>axis - 1</code> dimensions. It does not need to expand every input to the greatest input dimensionality. The existing combine engine already supplies missing trailing dimensions and broadcasting. I’m folding that simpler composition into the plan.</p>
+
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md (+1 more)</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Delete File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="hunk">*** Add File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="ins">+# Combine, split, stack, and unstack</span>
+<span class="ins">+</span>
+<span class="ins">+## Status</span>
+<span class="ins">+</span>
+<span class="ins">+This document is an implementation plan. `rray_combine()` is already present.</span>
+<span class="ins">+The remaining work adds split, stack, and unstack around it, and rewrites the</span>
+<span class="ins">+existing split API.</span>
+<span class="ins">+</span>
+<span class="ins">+The plan rewrite lives on `feature/combine-plan-rewrite`, based on `main`.</span>
+<span class="ins">+</span>
+<span class="ins">+## Goal</span>
+<span class="ins">+</span>
+<span class="ins">+Provide a parallel family of array operations:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+rray_combine(..., .axis)</span>
+<span class="ins">+rray_split(x, axis, sizes)</span>
+<span class="ins">+rray_stack(..., .axis)</span>
+<span class="ins">+rray_unstack(x, axis)</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The pairs have direct relationships:</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_split()` divides one existing axis into contiguous chunks. Combining</span>
+<span class="ins">+  those chunks on the same axis reconstructs the input.</span>
+<span class="ins">+- `rray_stack()` inserts a new singleton axis into each input, then combines</span>
+<span class="ins">+  the inputs on that axis.</span>
+<span class="ins">+- `rray_unstack()` splits one existing axis into chunks of size 1, then removes</span>
+<span class="ins">+  that singleton axis from every chunk.</span>
+<span class="ins">+</span>
+<span class="ins">+Axes are one based. Negative axes are not accepted.</span>
+<span class="ins">+</span>
+<span class="ins">+`.axis` follows `...` in combine and stack, so callers must name it. Split and</span>
+<span class="ins">+unstack take `axis` as an ordinary argument.</span>
+<span class="ins">+</span>
+<span class="ins">+## Current state</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_combine()` has been merged. Treat its behavior and implementation as the</span>
+<span class="ins">+foundation for this work, not as unfinished work to repeat.</span>
+<span class="ins">+</span>
+<span class="ins">+The merged implementation already provides:</span>
+<span class="ins">+</span>
+<span class="ins">+- broadcasting on every axis except `.axis`;</span>
+<span class="ins">+- support for differing input dimensionality through implicit trailing axes of</span>
+<span class="ins">+  dimension 1;</span>
+<span class="ins">+- common type calculation and casting;</span>
+<span class="ins">+- an internal `ptype` argument used by C callers;</span>
+<span class="ins">+- concatenation of names on the combined axis;</span>
+<span class="ins">+- broadcast name selection on every other axis;</span>
+<span class="ins">+- checked dimension sums and output sizes;</span>
+<span class="ins">+- strided writes into the final output without full broadcast copies.</span>
+<span class="ins">+</span>
+<span class="ins">+The public R function does not expose `.ptype` yet. Stack should follow the</span>
+<span class="ins">+same rule. Keep prototype selection internal and do not add `.ptype` to either</span>
+<span class="ins">+public signature in this change.</span>
+<span class="ins">+</span>
+<span class="ins">+The merged combine implementation deliberately has no lower-level prepared</span>
+<span class="ins">+entry point. Keep that boundary. Stack should compose the existing internal</span>
+<span class="ins">+`rray_combine()` entry point rather than exposing a second combine engine.</span>
+<span class="ins">+</span>
+<span class="ins">+The current `rray_split(x, axes)` accepts multiple axes and always makes chunks</span>
+<span class="ins">+of size 1. Replace that interface with the single-axis, variable-size split in</span>
+<span class="ins">+this plan. This is a breaking replacement with no deprecation period.</span>
+<span class="ins">+</span>
+<span class="ins">+## Decision summary</span>
+<span class="ins">+</span>
+<span class="ins">+- Keep the existing public `rray_combine(..., .axis)` unchanged.</span>
+<span class="ins">+- Replace `rray_split(x, axes)` with `rray_split(x, axis, sizes)`.</span>
+<span class="ins">+- Split along one axis only and retain that axis in every output.</span>
+<span class="ins">+- A length-1 `sizes` value is a uniform chunk size and must divide the selected</span>
+<span class="ins">+  axis dimension exactly.</span>
+<span class="ins">+- A longer `sizes` vector gives each chunk size directly. Its entries may be</span>
+<span class="ins">+  zero and must sum to the selected axis dimension.</span>
+<span class="ins">+- A scalar chunk size must be positive. Zero is only meaningful in the explicit</span>
+<span class="ins">+  vector form.</span>
+<span class="ins">+- Optimize the uniform `sizes = 1L` case because unstack uses it and it is the</span>
+<span class="ins">+  most common direct split.</span>
+<span class="ins">+- Implement stack as trailing singleton expansion where needed, insertion of a</span>
+<span class="ins">+  singleton axis, and a call to the existing combine engine.</span>
+<span class="ins">+- Add an internal `rray_expand_dimensionality()` helper that pads dimensions</span>
+<span class="ins">+  with trailing ones without copying data.</span>
+<span class="ins">+- Expand an input for stack only when it has fewer than `axis - 1` dimensions.</span>
+<span class="ins">+  There is no need to expand all inputs to the greatest dimensionality.</span>
+<span class="ins">+- Implement unstack as split with `sizes = 1L`, followed by removal of the</span>
+<span class="ins">+  selected singleton axis from every piece.</span>
+<span class="ins">+- Names of `...` become names on the new axis made by stack.</span>
+<span class="ins">+- Names on the removed axis become names of the list returned by unstack.</span>
+<span class="ins">+- Keep prototype control internal for combine and stack.</span>
+<span class="ins">+- Add no new lower-level R or FFI entry points.</span>
+<span class="ins">+</span>
+<span class="ins">+## Public behavior</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_combine()`</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_combine()` joins one or more arrays along an existing axis. The selected</span>
+<span class="ins">+dimensions are added. Every other axis broadcasts to a common dimension.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+[2, 3] + [4, 3] along axis 1 -&gt; [6, 3]</span>
+<span class="ins">+[2, 3] + [2, 5] along axis 2 -&gt; [2, 8]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The selected axis does not broadcast. Missing trailing axes act as dimensions</span>
+<span class="ins">+of 1, including when the missing axis is the selected axis.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+[2] + [2, 3] along axis 2 -&gt; [2, 4]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+No public behavior changes are planned for combine. Its current tests remain</span>
+<span class="ins">+part of the verification for stack and split composition.</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_split()`</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_split()` divides `x` into contiguous chunks along one existing `axis`.</span>
+<span class="ins">+Each output keeps the dimensionality of `x`. Only the selected axis dimension</span>
+<span class="ins">+changes.</span>
+<span class="ins">+</span>
+<span class="ins">+For `x` with dimensions `[6, 3]`:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+split on axis 1 with sizes 2       -&gt; three arrays of [2, 3]</span>
+<span class="ins">+split on axis 1 with sizes c(1, 5) -&gt; arrays of [1, 3] and [5, 3]</span>
+<span class="ins">+split on axis 1 with sizes c(0, 6) -&gt; arrays of [0, 3] and [6, 3]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The two forms of `sizes` have different meanings.</span>
+<span class="ins">+</span>
+<span class="ins">+#### Uniform chunk size</span>
+<span class="ins">+</span>
+<span class="ins">+A length-1 `sizes` value is the size of every chunk. It must be positive and</span>
+<span class="ins">+the selected axis dimension must be evenly divisible by it.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+axis dimension 6, sizes 1 -&gt; 6 chunks of size 1</span>
+<span class="ins">+axis dimension 6, sizes 2 -&gt; 3 chunks of size 2</span>
+<span class="ins">+axis dimension 6, sizes 6 -&gt; 1 chunk of size 6</span>
+<span class="ins">+axis dimension 6, sizes 4 -&gt; error</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+An axis dimension of 0 produces an empty list for any positive uniform chunk</span>
+<span class="ins">+size. In particular, `sizes = 1L` works without a special error.</span>
+<span class="ins">+</span>
+<span class="ins">+#### Explicit chunk sizes</span>
+<span class="ins">+</span>
+<span class="ins">+A `sizes` vector with length other than 1 gives the size of every output chunk</span>
+<span class="ins">+in order. Every entry must be nonnegative and their checked sum must equal the</span>
+<span class="ins">+selected axis dimension. Zero-size chunks are retained in the output list.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+axis dimension 6, sizes c(2, 0, 4) -&gt; chunk sizes 2, 0, and 4</span>
+<span class="ins">+axis dimension 6, sizes c(2, 3)    -&gt; error</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+`integer()` is valid only when the selected axis has dimension 0. It returns an</span>
+<span class="ins">+empty list. This is the explicit counterpart of splitting an empty axis into no</span>
+<span class="ins">+chunks.</span>
+<span class="ins">+</span>
+<span class="ins">+The output is always an unnamed list. Split has no source for names describing</span>
+<span class="ins">+the chunk boundaries. Axis names stay on the selected axis inside each chunk.</span>
+<span class="ins">+</span>
+<span class="ins">+The central identity is:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+pieces &lt;- rray_split(x, axis, sizes)</span>
+<span class="ins">+out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+`out` should be identical to `x`, including type, dimensions, values, and</span>
+<span class="ins">+dimension names, for every valid split that produces at least one piece.</span>
+<span class="ins">+Combine requires at least one input, so an empty split of a zero-length axis</span>
+<span class="ins">+does not have a combine round trip.</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_stack()`</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_stack()` joins one or more inputs along a newly inserted axis. Old axes</span>
+<span class="ins">+broadcast according to the existing combine rules.</span>
+<span class="ins">+</span>
+<span class="ins">+For two arrays with dimensions `[2, 3]`:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+stack on axis 1 -&gt; [2, 2, 3]</span>
+<span class="ins">+stack on axis 2 -&gt; [2, 2, 3]</span>
+<span class="ins">+stack on axis 3 -&gt; [2, 3, 2]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The first two shapes happen to match because there are two inputs. Their value</span>
+<span class="ins">+layouts differ. Tests must check slices, not only dimensions.</span>
+<span class="ins">+</span>
+<span class="ins">+For greatest input dimensionality `D`, valid axes are 1 through `D + 1`.</span>
+<span class="ins">+Stacking adds exactly one axis, so the output dimensionality is `D + 1`.</span>
+<span class="ins">+</span>
+<span class="ins">+Stack broadcasts old axes because it delegates to combine:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+[2, 1, 3] and [1, 4, 3]</span>
+<span class="ins">+stack on axis 2 -&gt; [2, 2, 4, 3]</span></pre><p class="cut">638 more lines cut</p><pre class="output">Script failed
+Wall time 0.1 seconds
+Output:
+
+Script error:
+apply_patch verification failed: invalid patch: multiple operations target ~/files/r/packages/rray4/plans/combine-stack-unstack.md</pre></details>
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md (+1 more)</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Delete File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="hunk">*** Delete File: ~/files/r/packages/rray4/plans/combine.md</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.6 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Add File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="ins">+# Combine, split, stack, and unstack</span>
+<span class="ins">+</span>
+<span class="ins">+## Status</span>
+<span class="ins">+</span>
+<span class="ins">+This document is an implementation plan. `rray_combine()` is already present.</span>
+<span class="ins">+The remaining work adds split, stack, and unstack around it, and rewrites the</span>
+<span class="ins">+existing split API.</span>
+<span class="ins">+</span>
+<span class="ins">+The plan rewrite lives on `feature/combine-plan-rewrite`, based on `main`.</span>
+<span class="ins">+</span>
+<span class="ins">+## Goal</span>
+<span class="ins">+</span>
+<span class="ins">+Provide a parallel family of array operations:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+rray_combine(..., .axis)</span>
+<span class="ins">+rray_split(x, axis, sizes)</span>
+<span class="ins">+rray_stack(..., .axis)</span>
+<span class="ins">+rray_unstack(x, axis)</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The pairs have direct relationships:</span>
+<span class="ins">+</span>
+<span class="ins">+- `rray_split()` divides one existing axis into contiguous chunks. Combining</span>
+<span class="ins">+  those chunks on the same axis reconstructs the input.</span>
+<span class="ins">+- `rray_stack()` inserts a new singleton axis into each input, then combines</span>
+<span class="ins">+  the inputs on that axis.</span>
+<span class="ins">+- `rray_unstack()` splits one existing axis into chunks of size 1, then removes</span>
+<span class="ins">+  that singleton axis from every chunk.</span>
+<span class="ins">+</span>
+<span class="ins">+Axes are one based. Negative axes are not accepted.</span>
+<span class="ins">+</span>
+<span class="ins">+`.axis` follows `...` in combine and stack, so callers must name it. Split and</span>
+<span class="ins">+unstack take `axis` as an ordinary argument.</span>
+<span class="ins">+</span>
+<span class="ins">+## Current state</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_combine()` has been merged. Treat its behavior and implementation as the</span>
+<span class="ins">+foundation for this work, not as unfinished work to repeat.</span>
+<span class="ins">+</span>
+<span class="ins">+The merged implementation already provides:</span>
+<span class="ins">+</span>
+<span class="ins">+- broadcasting on every axis except `.axis`;</span>
+<span class="ins">+- support for differing input dimensionality through implicit trailing axes of</span>
+<span class="ins">+  dimension 1;</span>
+<span class="ins">+- common type calculation and casting;</span>
+<span class="ins">+- an internal `ptype` argument used by C callers;</span>
+<span class="ins">+- concatenation of names on the combined axis;</span>
+<span class="ins">+- broadcast name selection on every other axis;</span>
+<span class="ins">+- checked dimension sums and output sizes;</span>
+<span class="ins">+- strided writes into the final output without full broadcast copies.</span>
+<span class="ins">+</span>
+<span class="ins">+The public R function does not expose `.ptype` yet. Stack should follow the</span>
+<span class="ins">+same rule. Keep prototype selection internal and do not add `.ptype` to either</span>
+<span class="ins">+public signature in this change.</span>
+<span class="ins">+</span>
+<span class="ins">+The merged combine implementation deliberately has no lower-level prepared</span>
+<span class="ins">+entry point. Keep that boundary. Stack should compose the existing internal</span>
+<span class="ins">+`rray_combine()` entry point rather than exposing a second combine engine.</span>
+<span class="ins">+</span>
+<span class="ins">+The current `rray_split(x, axes)` accepts multiple axes and always makes chunks</span>
+<span class="ins">+of size 1. Replace that interface with the single-axis, variable-size split in</span>
+<span class="ins">+this plan. This is a breaking replacement with no deprecation period.</span>
+<span class="ins">+</span>
+<span class="ins">+## Decision summary</span>
+<span class="ins">+</span>
+<span class="ins">+- Keep the existing public `rray_combine(..., .axis)` unchanged.</span>
+<span class="ins">+- Replace `rray_split(x, axes)` with `rray_split(x, axis, sizes)`.</span>
+<span class="ins">+- Split along one axis only and retain that axis in every output.</span>
+<span class="ins">+- A length-1 `sizes` value is a uniform chunk size and must divide the selected</span>
+<span class="ins">+  axis dimension exactly.</span>
+<span class="ins">+- A longer `sizes` vector gives each chunk size directly. Its entries may be</span>
+<span class="ins">+  zero and must sum to the selected axis dimension.</span>
+<span class="ins">+- A scalar chunk size must be positive. Zero is only meaningful in the explicit</span>
+<span class="ins">+  vector form.</span>
+<span class="ins">+- Optimize the uniform `sizes = 1L` case because unstack uses it and it is the</span>
+<span class="ins">+  most common direct split.</span>
+<span class="ins">+- Implement stack as trailing singleton expansion where needed, insertion of a</span>
+<span class="ins">+  singleton axis, and a call to the existing combine engine.</span>
+<span class="ins">+- Add an internal `rray_expand_dimensionality()` helper that pads dimensions</span>
+<span class="ins">+  with trailing ones without copying data.</span>
+<span class="ins">+- Expand an input for stack only when it has fewer than `axis - 1` dimensions.</span>
+<span class="ins">+  There is no need to expand all inputs to the greatest dimensionality.</span>
+<span class="ins">+- Implement unstack as split with `sizes = 1L`, followed by removal of the</span>
+<span class="ins">+  selected singleton axis from every piece.</span>
+<span class="ins">+- Names of `...` become names on the new axis made by stack.</span>
+<span class="ins">+- Names on the removed axis become names of the list returned by unstack.</span>
+<span class="ins">+- Keep prototype control internal for combine and stack.</span>
+<span class="ins">+- Add no new lower-level R or FFI entry points.</span>
+<span class="ins">+</span>
+<span class="ins">+## Public behavior</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_combine()`</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_combine()` joins one or more arrays along an existing axis. The selected</span>
+<span class="ins">+dimensions are added. Every other axis broadcasts to a common dimension.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+[2, 3] + [4, 3] along axis 1 -&gt; [6, 3]</span>
+<span class="ins">+[2, 3] + [2, 5] along axis 2 -&gt; [2, 8]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The selected axis does not broadcast. Missing trailing axes act as dimensions</span>
+<span class="ins">+of 1, including when the missing axis is the selected axis.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+[2] + [2, 3] along axis 2 -&gt; [2, 4]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+No public behavior changes are planned for combine. Its current tests remain</span>
+<span class="ins">+part of the verification for stack and split composition.</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_split()`</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_split()` divides `x` into contiguous chunks along one existing `axis`.</span>
+<span class="ins">+Each output keeps the dimensionality of `x`. Only the selected axis dimension</span>
+<span class="ins">+changes.</span>
+<span class="ins">+</span>
+<span class="ins">+For `x` with dimensions `[6, 3]`:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+split on axis 1 with sizes 2       -&gt; three arrays of [2, 3]</span>
+<span class="ins">+split on axis 1 with sizes c(1, 5) -&gt; arrays of [1, 3] and [5, 3]</span>
+<span class="ins">+split on axis 1 with sizes c(0, 6) -&gt; arrays of [0, 3] and [6, 3]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The two forms of `sizes` have different meanings.</span>
+<span class="ins">+</span>
+<span class="ins">+#### Uniform chunk size</span>
+<span class="ins">+</span>
+<span class="ins">+A length-1 `sizes` value is the size of every chunk. It must be positive and</span>
+<span class="ins">+the selected axis dimension must be evenly divisible by it.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+axis dimension 6, sizes 1 -&gt; 6 chunks of size 1</span>
+<span class="ins">+axis dimension 6, sizes 2 -&gt; 3 chunks of size 2</span>
+<span class="ins">+axis dimension 6, sizes 6 -&gt; 1 chunk of size 6</span>
+<span class="ins">+axis dimension 6, sizes 4 -&gt; error</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+An axis dimension of 0 produces an empty list for any positive uniform chunk</span>
+<span class="ins">+size. In particular, `sizes = 1L` works without a special error.</span>
+<span class="ins">+</span>
+<span class="ins">+#### Explicit chunk sizes</span>
+<span class="ins">+</span>
+<span class="ins">+A `sizes` vector with length other than 1 gives the size of every output chunk</span>
+<span class="ins">+in order. Every entry must be nonnegative and their checked sum must equal the</span>
+<span class="ins">+selected axis dimension. Zero-size chunks are retained in the output list.</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+axis dimension 6, sizes c(2, 0, 4) -&gt; chunk sizes 2, 0, and 4</span>
+<span class="ins">+axis dimension 6, sizes c(2, 3)    -&gt; error</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+`integer()` is valid only when the selected axis has dimension 0. It returns an</span>
+<span class="ins">+empty list. This is the explicit counterpart of splitting an empty axis into no</span>
+<span class="ins">+chunks.</span>
+<span class="ins">+</span>
+<span class="ins">+The output is always an unnamed list. Split has no source for names describing</span>
+<span class="ins">+the chunk boundaries. Axis names stay on the selected axis inside each chunk.</span>
+<span class="ins">+</span>
+<span class="ins">+The central identity is:</span>
+<span class="ins">+</span>
+<span class="ins">+```r</span>
+<span class="ins">+pieces &lt;- rray_split(x, axis, sizes)</span>
+<span class="ins">+out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+`out` should be identical to `x`, including type, dimensions, values, and</span>
+<span class="ins">+dimension names, for every valid split that produces at least one piece.</span>
+<span class="ins">+Combine requires at least one input, so an empty split of a zero-length axis</span>
+<span class="ins">+does not have a combine round trip.</span>
+<span class="ins">+</span>
+<span class="ins">+### `rray_stack()`</span>
+<span class="ins">+</span>
+<span class="ins">+`rray_stack()` joins one or more inputs along a newly inserted axis. Old axes</span>
+<span class="ins">+broadcast according to the existing combine rules.</span>
+<span class="ins">+</span>
+<span class="ins">+For two arrays with dimensions `[2, 3]`:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+stack on axis 1 -&gt; [2, 2, 3]</span>
+<span class="ins">+stack on axis 2 -&gt; [2, 2, 3]</span>
+<span class="ins">+stack on axis 3 -&gt; [2, 3, 2]</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+The first two shapes happen to match because there are two inputs. Their value</span>
+<span class="ins">+layouts differ. Tests must check slices, not only dimensions.</span>
+<span class="ins">+</span>
+<span class="ins">+For greatest input dimensionality `D`, valid axes are 1 through `D + 1`.</span>
+<span class="ins">+Stacking adds exactly one axis, so the output dimensionality is `D + 1`.</span>
+<span class="ins">+</span>
+<span class="ins">+Stack broadcasts old axes because it delegates to combine:</span>
+<span class="ins">+</span>
+<span class="ins">+```text</span>
+<span class="ins">+[2, 1, 3] and [1, 4, 3]</span>
+<span class="ins">+stack on axis 2 -&gt; [2, 2, 4, 3]</span>
+<span class="ins">+```</span></pre><p class="cut">636 more lines cut</p><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch; git diff --stat; git diff --check; rg -n &quot;—|\.ptype|prepared|len…</summary>
+<pre>$ git status --short --branch; git diff --stat; git diff --check; rg -n &quot;—|\.ptype|prepared|length other than 1|longer `sizes`|rray_expand_dimensionality|combine\.md&quot; plans/combine-stack-unstack.md; sed -n '1,220p' plans/combine-stack-unstack.md; sed -n '220,520p' plans/combine-stack-unstack.md; sed -n '520,900p' plans/combine-stack-unstack.md</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+## feature/combine-plan-rewrite
+ M plans/combine-stack-unstack.md
+ D plans/combine.md
+ plans/combine-stack-unstack.md | 1261 +++++++++++++++++-----------------------
+ plans/combine.md               |  244 --------
+ 2 files changed, 529 insertions(+), 976 deletions(-)
+zsh:1: command not found: sizes
+53:The public R function does not expose `.ptype` yet. Stack should follow the
+54:same rule. Keep prototype selection internal and do not add `.ptype` to either
+57:The merged combine implementation deliberately has no lower-level prepared
+72:- A longer `sizes` vector gives each chunk size directly. Its entries may be
+80:- Add an internal `rray_expand_dimensionality()` helper that pads dimensions
+146:A `sizes` vector with length other than 1 gives the size of every output chunk
+210:no `.ptype` argument. The internal C entry point accepts a prototype so an
+260:The implicit trailing axis on the first prepared input broadcasts to 3. This
+270:r_obj* rray_expand_dimensionality(
+395:   `rray_expand_dimensionality()` with `.axis - 1`.
+396:7. Call `rray_insert_axes()` on each prepared input with `.axis`.
+397:8. Keep the original dots names on the prepared list.
+419:just as the current combine FFI wrapper does. There is no public `.ptype`
+422:Call the existing `rray_combine()` with the prepared views, `.axis`, and the
+423:internal prototype. Do not add a prepared combine helper to a header and do not
+543:Do not change the `rray_combine()` wrapper and do not add `.ptype` to any
+613:- `axis` with length other than 1, missing values, attributes, or a lossy cast;
+699:There is no R-facing test for `rray_expand_dimensionality()` because it is not
+768:7. Check stack's expanded wrappers, inserted wrappers, prepared list, prototype,
+821:- Public combine and stack do not expose `.ptype`.
+# Combine, split, stack, and unstack
+
+## Status
+
+This document is an implementation plan. `rray_combine()` is already present.
+The remaining work adds split, stack, and unstack around it, and rewrites the
+existing split API.
+
+The plan rewrite lives on `feature/combine-plan-rewrite`, based on `main`.
+
+## Goal
+
+Provide a parallel family of array operations:
+
+```r
+rray_combine(..., .axis)
+rray_split(x, axis, sizes)
+rray_stack(..., .axis)
+rray_unstack(x, axis)
+```
+
+The pairs have direct relationships:
+
+- `rray_split()` divides one existing axis into contiguous chunks. Combining
+  those chunks on the same axis reconstructs the input.
+- `rray_stack()` inserts a new singleton axis into each input, then combines
+  the inputs on that axis.
+- `rray_unstack()` splits one existing axis into chunks of size 1, then removes
+  that singleton axis from every chunk.
+
+Axes are one based. Negative axes are not accepted.
+
+`.axis` follows `...` in combine and stack, so callers must name it. Split and
+unstack take `axis` as an ordinary argument.
+
+## Current state
+
+`rray_combine()` has been merged. Treat its behavior and implementation as the
+foundation for this work, not as unfinished work to repeat.
+
+The merged implementation already provides:
+
+- broadcasting on every axis except `.axis`;
+- support for differing input dimensionality through implicit trailing axes of
+  dimension 1;
+- common type calculation and casting;
+- an internal `ptype` argument used by C callers;
+- concatenation of names on the combined axis;
+- broadcast name selection on every other axis;
+- checked dimension sums and output sizes;
+- strided writes into the final output without full broadcast copies.
+
+The public R function does not expose `.ptype` yet. Stack should follow the
+same rule. Keep prototype selection internal and do not add `.ptype` to either
+public signature in this change.
+
+The merged combine implementation deliberately has no lower-level prepared
+entry point. Keep that boundary. Stack should compose the existing internal
+`rray_combine()` entry point rather than exposing a second combine engine.
+
+The current `rray_split(x, axes)` accepts multiple axes and always makes chunks
+of size 1. Replace that interface with the single-axis, variable-size split in
+this plan. This is a breaking replacement with no deprecation period.
+
+## Decision summary
+
+- Keep the existing public `rray_combine(..., .axis)` unchanged.
+- Replace `rray_split(x, axes)` with `rray_split(x, axis, sizes)`.
+- Split along one axis only and retain that axis in every output.
+- A length-1 `sizes` value is a uniform chunk size and must divide the selected
+  axis dimension exactly.
+- A longer `sizes` vector gives each chunk size directly. Its entries may be
+  zero and must sum to the selected axis dimension.
+- A scalar chunk size must be positive. Zero is only meaningful in the explicit
+  vector form.
+- Optimize the uniform `sizes = 1L` case because unstack uses it and it is the
+  most common direct split.
+- Implement stack as trailing singleton expansion where needed, insertion of a
+  singleton axis, and a call to the existing combine engine.
+- Add an internal `rray_expand_dimensionality()` helper that pads dimensions
+  with trailing ones without copying data.
+- Expand an input for stack only when it has fewer than `axis - 1` dimensions.
+  There is no need to expand all inputs to the greatest dimensionality.
+- Implement unstack as split with `sizes = 1L`, followed by removal of the
+  selected singleton axis from every piece.
+- Names of `...` become names on the new axis made by stack.
+- Names on the removed axis become names of the list returned by unstack.
+- Keep prototype control internal for combine and stack.
+- Add no new lower-level R or FFI entry points.
+
+## Public behavior
+
+### `rray_combine()`
+
+`rray_combine()` joins one or more arrays along an existing axis. The selected
+dimensions are added. Every other axis broadcasts to a common dimension.
+
+```text
+[2, 3] + [4, 3] along axis 1 -&gt; [6, 3]
+[2, 3] + [2, 5] along axis 2 -&gt; [2, 8]
+```
+
+The selected axis does not broadcast. Missing trailing axes act as dimensions
+of 1, including when the missing axis is the selected axis.
+
+```text
+[2] + [2, 3] along axis 2 -&gt; [2, 4]
+```
+
+No public behavior changes are planned for combine. Its current tests remain
+part of the verification for stack and split composition.
+
+### `rray_split()`
+
+`rray_split()` divides `x` into contiguous chunks along one existing `axis`.
+Each output keeps the dimensionality of `x`. Only the selected axis dimension
+changes.
+
+For `x` with dimensions `[6, 3]`:
+
+```text
+split on axis 1 with sizes 2       -&gt; three arrays of [2, 3]
+split on axis 1 with sizes c(1, 5) -&gt; arrays of [1, 3] and [5, 3]
+split on axis 1 with sizes c(0, 6) -&gt; arrays of [0, 3] and [6, 3]
+```
+
+The two forms of `sizes` have different meanings.
+
+#### Uniform chunk size
+
+A length-1 `sizes` value is the size of every chunk. It must be positive and
+the selected axis dimension must be evenly divisible by it.
+
+```text
+axis dimension 6, sizes 1 -&gt; 6 chunks of size 1
+axis dimension 6, sizes 2 -&gt; 3 chunks of size 2
+axis dimension 6, sizes 6 -&gt; 1 chunk of size 6
+axis dimension 6, sizes 4 -&gt; error
+```
+
+An axis dimension of 0 produces an empty list for any positive uniform chunk
+size. In particular, `sizes = 1L` works without a special error.
+
+#### Explicit chunk sizes
+
+A `sizes` vector with length other than 1 gives the size of every output chunk
+in order. Every entry must be nonnegative and their checked sum must equal the
+selected axis dimension. Zero-size chunks are retained in the output list.
+
+```text
+axis dimension 6, sizes c(2, 0, 4) -&gt; chunk sizes 2, 0, and 4
+axis dimension 6, sizes c(2, 3)    -&gt; error
+```
+
+`integer()` is valid only when the selected axis has dimension 0. It returns an
+empty list. This is the explicit counterpart of splitting an empty axis into no
+chunks.
+
+The output is always an unnamed list. Split has no source for names describing
+the chunk boundaries. Axis names stay on the selected axis inside each chunk.
+
+The central identity is:
+
+```r
+pieces &lt;- rray_split(x, axis, sizes)
+out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))
+```
+
+`out` should be identical to `x`, including type, dimensions, values, and</pre><p class="cut">666 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Identifying duplicate line cause and fixing backtick usage</strong></p>
+<p><strong>Reviewing rray stack and combine behavior</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Identifying duplicate line cause and fixing backtick usage</strong></p>
+<p><strong>Reviewing rray stack and combine behavior</strong></p>
+</details>
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="hunk">@@</span>
+<span class="del">-- A longer `sizes` vector gives each chunk size directly. Its entries may be</span>
+<span class="del">-  zero and must sum to the selected axis dimension.</span>
+<span class="ins">+- A `sizes` vector with length other than 1 gives each chunk size directly. Its</span>
+<span class="ins">+  entries may be zero and must sum to the selected axis dimension.</span>
+<span class="hunk">@@</span>
+ 6. For each input whose dimensionality is less than `.axis - 1`, call
+    `rray_expand_dimensionality()` with `.axis - 1`.
+ 7. Call `rray_insert_axes()` on each prepared input with `.axis`.
+ 8. Keep the original dots names on the prepared list.
+<span class="ins">+</span>
+<span class="ins">+Build a subscript argument for each input before calling expansion or insertion</span>
+<span class="ins">+so errors still identify a named dots element or its `..n` position.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Reviewing dimension and stack checks</strong></p>
+<p><strong>Validating chunk iteration and axis handling</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Reviewing dimension and stack checks</strong></p>
+<p><strong>Validating chunk iteration and axis handling</strong></p>
+</details>
+<p>The rewrite is in place. I’m doing a final consistency pass now, with special attention to zero-length splits, name round trips, internal prototype handling, and whether the stack composition can rely entirely on the merged combine implementation.</p>
+
+<details class="tool"><summary>Bash: git diff --check; rg -n '—|–' plans/combine-stack-unstack.md || true; rg -n '^## |^### |^####…</summary>
+<pre>$ git diff --check; rg -n '—|–' plans/combine-stack-unstack.md || true; rg -n '^## |^### |^#### ' plans/combine-stack-unstack.md; rg -n '^Keep one R file|unstack \[2, 3, 4\] on axis 2' plans/combine-stack-unstack.md; git diff -- plans/combine-stack-unstack.md plans/combine.md | sed -n '1,260p'</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+3:## Status
+11:## Goal
+36:## Current state
+65:## Decision summary
+91:## Public behavior
+93:### `rray_combine()`
+113:### `rray_split()`
+129:#### Uniform chunk size
+144:#### Explicit chunk sizes
+174:### `rray_stack()`
+213:### `rray_unstack()`
+236:## Why stack only expands to `axis - 1`
+264:## Internal dimensionality expansion
+297:## Split implementation
+304:### Validation and size planning
+323:### Dimensions and allocation
+339:### Data movement
+365:### Split names
+382:## Stack implementation
+386:### Validation and preparation
+406:### Delegate to combine
+432:### Stack names
+450:## Unstack implementation
+474:## Names and round trips
+478:### Split and combine
+493:### Stack and unstack
+521:## R interface
+554:## Native files and registration
+591:## Existing split references
+609:## Errors and validation
+647:## Test plan
+649:### Combine regression tests
+655:### Split tests
+672:### Stack tests
+692:### Dimensionality expansion tests
+705:### Unstack tests
+719:### Round-trip tests
+737:## Work order
+754:## C protection audit
+778:## Verification
+813:## Done means
+220:unstack [2, 3, 4] on axis 2 -&gt; 3 arrays of [2, 4]
+523:Keep one R file per public operation:
+diff --git a/plans/combine-stack-unstack.md b/plans/combine-stack-unstack.md
+index 22c44ad..1664c97 100644
+--- a/plans/combine-stack-unstack.md
++++ b/plans/combine-stack-unstack.md
+@@ -1,207 +1,219 @@
+-# Combine, stack, and unstack
++# Combine, split, stack, and unstack
+ 
+ ## Status
+ 
+-This document is an implementation plan. It does not describe code that is
+-already present.
++This document is an implementation plan. `rray_combine()` is already present.
++The remaining work adds split, stack, and unstack around it, and rewrites the
++existing split API.
+ 
+-The target branch is `feature/combine-stack-unstack`, based on `main`.
++The plan rewrite lives on `feature/combine-plan-rewrite`, based on `main`.
+ 
+ ## Goal
+ 
+-Add three array manipulation functions:
++Provide a parallel family of array operations:
+ 
+ ```r
+ rray_combine(..., .axis)
++rray_split(x, axis, sizes)
+ rray_stack(..., .axis)
+-rray_unstack(x, .axis)
++rray_unstack(x, axis)
+ ```
+ 
+-This family replaces `rray_split()`. Remove split in the same implementation
+-change. There is no deprecation period and no private split engine left behind.
++The pairs have direct relationships:
+ 
+-They follow the main ideas of the Python Array API functions `concat()`,
+-`stack()`, and `unstack()`:
++- `rray_split()` divides one existing axis into contiguous chunks. Combining
++  those chunks on the same axis reconstructs the input.
++- `rray_stack()` inserts a new singleton axis into each input, then combines
++  the inputs on that axis.
++- `rray_unstack()` splits one existing axis into chunks of size 1, then removes
++  that singleton axis from every chunk.
+ 
+-- `rray_combine()` joins arrays along an existing axis.
+-- `rray_stack()` joins arrays along a new axis.
+-- `rray_unstack()` removes one axis and returns its slices in a list.
++Axes are one based. Negative axes are not accepted.
+ 
+-The Python references are:
++`.axis` follows `...` in combine and stack, so callers must name it. Split and
++unstack take `axis` as an ordinary argument.
+ 
+-- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.concat.html&gt;
+-- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.stack.html&gt;
+-- &lt;https://data-apis.org/array-api/2024.12/API_specification/generated/array_api.unstack.html&gt;
++## Current state
+ 
+-rray4 should differ in two deliberate ways:
++`rray_combine()` has been merged. Treat its behavior and implementation as the
++foundation for this work, not as unfinished work to repeat.
+ 
+-- Axes are one based and negative axes are not accepted.
+-- `rray_combine()` and `rray_stack()` broadcast their inputs on every axis
+-  except the axis being combined.
++The merged implementation already provides:
+ 
+-`.axis` is required. Because it follows `...`, callers must name it. This
+-matches the proposed R signatures and the package's existing axis-taking
+-functions. Python uses the first axis as the default, so this is an intentional
+-R API difference.
++- broadcasting on every axis except `.axis`;
++- support for differing input dimensionality through implicit trailing axes of
++  dimension 1;
++- common type calculation and casting;
++- an internal `ptype` argument used by C callers;
++- concatenation of names on the combined axis;
++- broadcast name selection on every other axis;
++- checked dimension sums and output sizes;
++- strided writes into the final output without full broadcast copies.
++
++The public R function does not expose `.ptype` yet. Stack should follow the
++same rule. Keep prototype selection internal and do not add `.ptype` to either
++public signature in this change.
++
++The merged combine implementation deliberately has no lower-level prepared
++entry point. Keep that boundary. Stack should compose the existing internal
++`rray_combine()` entry point rather than exposing a second combine engine.
++
++The current `rray_split(x, axes)` accepts multiple axes and always makes chunks
++of size 1. Replace that interface with the single-axis, variable-size split in
++this plan. This is a breaking replacement with no deprecation period.
+ 
+ ## Decision summary
+ 
+-- Implement broadcasting in the first version. It is well defined and fits
+-  the rest of rray4.
+-- Require callers to supply `.axis` by name. It has no default.
+-- `rray_combine()` accepts `.axis` from 1 through the greatest input
+-  dimensionality.
+-- `rray_stack()` accepts `.axis` from 1 through the common input
+-  dimensionality plus 1. For a 2D input, axes 1, 2, and 3 are all valid.
+-- `rray_unstack()` accepts arrays with dimensionality 2 or greater. rray4 has
+-  no 0D arrays, so unstacking a 1D array cannot return valid rray4 arrays.
+-- Inputs use the common rray4 type. No `.ptype` argument is added.
+-- Names on the combined axis are concatenated. Missing pieces are represented
+-  by empty strings if another input supplies names.
+-- Names of `...` become names on the new axis made by `rray_stack()`.
+-- Names on the removed axis become names of the list returned by
+-  `rray_unstack()`.
+-- `rray_stack()` should be built as cheap dimension views followed by the
+-  combine engine.
+-- `rray_unstack()` replaces `rray_split()` and owns the slice engine directly.
+-- Remove the old split API and all of its private name machinery.
++- Keep the existing public `rray_combine(..., .axis)` unchanged.
++- Replace `rray_split(x, axes)` with `rray_split(x, axis, sizes)`.
++- Split along one axis only and retain that axis in every output.
++- A length-1 `sizes` value is a uniform chunk size and must divide the selected
++  axis dimension exactly.
++- A `sizes` vector with length other than 1 gives each chunk size directly. Its
++  entries may be zero and must sum to the selected axis dimension.
++- A scalar chunk size must be positive. Zero is only meaningful in the explicit
++  vector form.
++- Optimize the uniform `sizes = 1L` case because unstack uses it and it is the
++  most common direct split.
++- Implement stack as trailing singleton expansion where needed, insertion of a
++  singleton axis, and a call to the existing combine engine.
++- Add an internal `rray_expand_dimensionality()` helper that pads dimensions
++  with trailing ones without copying data.
++- Expand an input for stack only when it has fewer than `axis - 1` dimensions.
++  There is no need to expand all inputs to the greatest dimensionality.
++- Implement unstack as split with `sizes = 1L`, followed by removal of the
++  selected singleton axis from every piece.
++- Names of `...` become names on the new axis made by stack.
++- Names on the removed axis become names of the list returned by unstack.
++- Keep prototype control internal for combine and stack.
++- Add no new lower-level R or FFI entry points.
+ 
+ ## Public behavior
+ 
+ ### `rray_combine()`
+ 
+-`rray_combine()` joins one or more arrays along `.axis`. The selected axis
+-keeps its dimension from each input, and those dimensions are added together.
+-Every other axis is broadcast to a common dimension.
+-
+-For inputs with the same dimensionality:
++`rray_combine()` joins one or more arrays along an existing axis. The selected
++dimensions are added. Every other axis broadcasts to a common dimension.
+ 
+ ```text
+ [2, 3] + [4, 3] along axis 1 -&gt; [6, 3]</pre><p class="cut">107 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Clarifying FFI entry point distinctions</strong></p>
+<p><strong>Revising FFI entry point descriptions</strong></p>
+</details>
+<details class="tool"><summary>Bash: awk 'length($0) &gt; 80 { print NR &quot;:&quot; length($0) &quot;:&quot; $0 }' plans/combine-stack-unstack.md; rg -…</summary>
+<pre>$ awk 'length($0) &gt; 80 { print NR &quot;:&quot; length($0) &quot;:&quot; $0 }' plans/combine-stack-unstack.md; rg -n 'lower-level' plans/combine-stack-unstack.md; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+790:110:Rscript -e &quot;devtools::test(filter = '^(combine|split|stack|unstack|dimensionality|insert-axes|remove-axes)$')&quot;
+57:The merged combine implementation deliberately has no lower-level prepared
+89:- Add no new lower-level R or FFI entry points.
+377:its separate FFI entry point. There should be no user-callable lower-level name
+584:Do not register dimensionality expansion or any lower-level combine, split,
+826:- No new lower-level R or FFI entry points exist.
+## feature/combine-plan-rewrite
+ M plans/combine-stack-unstack.md
+ D plans/combine.md</pre></details>
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="hunk">@@</span>
+<span class="del">-- Add no new lower-level R or FFI entry points.</span>
+<span class="ins">+- Add no lower-level R or FFI entry points beyond the wrappers for the new</span>
+<span class="ins">+  public functions.</span>
+<span class="hunk">@@</span>
+<span class="del">-- No new lower-level R or FFI entry points exist.</span>
+<span class="ins">+- No lower-level R or FFI entry points exist beyond the wrappers for the public</span>
+<span class="ins">+  functions.</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning git diff validation and dimension checks</strong></p>
+<p><strong>Verifying tensor stacking and broadcasting logic</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Planning git diff validation and dimension checks</strong></p>
+<p><strong>Verifying tensor stacking and broadcasting logic</strong></p>
+</details>
+<details class="tool"><summary>Bash: rg -n 'plans/combine\.md|combine\.md' . --glob '!plans/combine-stack-unstack.md' --glob '!*\.…</summary>
+<pre>$ rg -n 'plans/combine\.md|combine\.md' . --glob '!plans/combine-stack-unstack.md' --glob '!*\.Rd' || true; git diff --check; git status --short --branch; git diff --name-status</pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+## feature/combine-plan-rewrite
+ M plans/combine-stack-unstack.md
+ D plans/combine.md
+M	plans/combine-stack-unstack.md
+D	plans/combine.md</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Verifying diff for syntax issues</strong></p>
+</details>
+<p>Rewrote combine-stack-unstack.md on <code>feature/combine-plan-rewrite</code> and deleted <code>plans/combine.md</code>.</p>
+<p>The new plan covers:</p>
+<ul>
+<li>The four-function combine/split/stack/unstack family.</li>
+<li>Internal-only prototype handling.</li>
+<li>Scalar and explicit split-size rules, including zero-size chunks.</li>
+<li>An optimized uniform split path for <code>sizes = 1L</code>.</li>
+<li>Stack through dimensionality expansion, axis insertion, and combine.</li>
+<li>Expansion only to <code>axis - 1</code>, not the greatest dimensionality.</li>
+<li>Unstack through size-1 split followed by axis removal.</li>
+<li>Names, round trips, implementation structure, tests, benchmarks, and protection review.</li>
+</ul>
+<p><code>git diff --check</code> passes. No tests were run because only plan files changed. The changes are not committed.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>I’ll commit only the rewritten plan and deleted obsolete plan, then push <code>feature/combine-plan-rewrite</code> to <code>origin</code>.</p>
+
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git diff --check &amp;&amp; git diff --name-status</summary>
+<pre>$ git status --short --branch &amp;&amp; git diff --check &amp;&amp; git diff --name-status</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine-plan-rewrite
+ M plans/combine-stack-unstack.md
+ D plans/combine.md
+M	plans/combine-stack-unstack.md
+D	plans/combine.md</pre></details>
+<details class="tool"><summary>Bash: git add plans/combine-stack-unstack.md plans/combine.md &amp;&amp; git commit -m &quot;Rewrite the combine…</summary>
+<pre>$ git add plans/combine-stack-unstack.md plans/combine.md &amp;&amp; git commit -m &quot;Rewrite the combine, split, stack, and unstack plan&quot;</pre><pre class="output">Script completed
+Wall time 3.0 seconds
+Output:
+
+[feature/combine-plan-rewrite b52c6ec] Rewrite the combine, split, stack, and unstack plan
+ 2 files changed, 534 insertions(+), 976 deletions(-)
+ delete mode 100644 plans/combine.md</pre></details>
+<details class="tool"><summary>Bash: git push -u origin feature/combine-plan-rewrite</summary>
+<pre>$ git push -u origin feature/combine-plan-rewrite</pre><pre class="output">Script completed
+Wall time 6.1 seconds
+Output:
+
+remote: 
+remote: Create a pull request for 'feature/combine-plan-rewrite' on GitHub by visiting:        
+remote:      https://github.com/DavisVaughan/rray4/pull/new/feature/combine-plan-rewrite        
+remote: 
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/combine-plan-rewrite -&gt; feature/combine-plan-rewrite
+branch 'feature/combine-plan-rewrite' set up to track 'origin/feature/combine-plan-rewrite'.</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline --decorate</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline --decorate</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine-plan-rewrite...origin/feature/combine-plan-rewrite
+b52c6ec (HEAD -&gt; feature/combine-plan-rewrite, origin/feature/combine-plan-rewrite) Rewrite the combine, split, stack, and unstack plan</pre></details>
+<p>Committed and pushed successfully.</p>
+<ul>
+<li>Branch: <code>feature/combine-plan-rewrite</code></li>
+<li>Commit: <code>b52c6ec</code></li>
+<li>Message: <code>Rewrite the combine, split, stack, and unstack plan</code></li>
+<li>Working tree is clean and matches <code>origin</code>.</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>You don’t need rlang inject</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Updating rray_combine calls to remove injection</strong></p>
+</details>
+<p>Right. These functions already use dynamic dots, so <code>!!!</code> works directly. I’ll remove the unnecessary <code>rlang::inject()</code> calls from the plan examples.</p>
+
+<details class="tool"><summary>Bash: rg -n 'rlang::inject|!!!pieces' plans/combine-stack-unstack.md</summary>
+<pre>$ rg -n 'rlang::inject|!!!pieces' plans/combine-stack-unstack.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+167:out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))
+489:rray_combine(!!!pieces, .axis = axis)
+501:out &lt;- rlang::inject(rray_stack(!!!pieces, .axis = axis))
+726:out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))
+730:out &lt;- rlang::inject(rray_stack(!!!pieces, .axis = axis))</pre></details>
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="hunk">@@</span>
+ pieces &lt;- rray_split(x, axis, sizes)
+<span class="del">-out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))</span>
+<span class="ins">+out &lt;- rray_combine(!!!pieces, .axis = axis)</span>
+<span class="hunk">@@</span>
+ pieces &lt;- rray_unstack(x, axis)
+<span class="del">-out &lt;- rlang::inject(rray_stack(!!!pieces, .axis = axis))</span>
+<span class="ins">+out &lt;- rray_stack(!!!pieces, .axis = axis)</span>
+<span class="hunk">@@</span>
+ pieces &lt;- rray_split(x, axis, sizes)
+<span class="del">-out &lt;- rlang::inject(rray_combine(!!!pieces, .axis = axis))</span>
+<span class="ins">+out &lt;- rray_combine(!!!pieces, .axis = axis)</span>
+ expect_identical(out, x)
+ 
+ pieces &lt;- rray_unstack(x, axis)
+<span class="del">-out &lt;- rlang::inject(rray_stack(!!!pieces, .axis = axis))</span>
+<span class="ins">+out &lt;- rray_stack(!!!pieces, .axis = axis)</span>
+ expect_identical(out, x)
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: rg -n 'rlang::inject' plans/combine-stack-unstack.md || true; git diff --check; git diff --st…</summary>
+<pre>$ rg -n 'rlang::inject' plans/combine-stack-unstack.md || true; git diff --check; git diff --stat; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+ plans/combine-stack-unstack.md | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+## feature/combine-plan-rewrite...origin/feature/combine-plan-rewrite
+ M plans/combine-stack-unstack.md
+?? bench/combine.R</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Deciding on committing untracked correction file</strong></p>
+<p><strong>Evaluating authorization for follow-up commit</strong></p>
+</details>
+<details class="thinking"><summary>Thinking</summary>
+<p><strong>Deciding on committing untracked correction file</strong></p>
+<p><strong>Evaluating authorization for follow-up commit</strong></p>
+</details>
+<p>The four examples are fixed. I also found an unrelated untracked <code>bench/combine.R</code>; I’ll leave it untouched and commit only the plan correction to the existing branch.</p>
+
+<details class="tool"><summary>Bash: git add plans/combine-stack-unstack.md &amp;&amp; git commit -m &quot;Remove unnecessary inject calls from…</summary>
+<pre>$ git add plans/combine-stack-unstack.md &amp;&amp; git commit -m &quot;Remove unnecessary inject calls from the plan&quot;</pre><pre class="output">Script completed
+Wall time 4.3 seconds
+Output:
+
+[feature/combine-plan-rewrite d75e078] Remove unnecessary inject calls from the plan
+ 1 file changed, 4 insertions(+), 4 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/combine-plan-rewrite</summary>
+<pre>$ git push origin feature/combine-plan-rewrite</pre><pre class="output">Script completed
+Wall time 6.1 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   b52c6ec..d75e078  feature/combine-plan-rewrite -&gt; feature/combine-plan-rewrite</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline --decorate</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline --decorate</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine-plan-rewrite...origin/feature/combine-plan-rewrite
+?? bench/combine.R
+d75e078 (HEAD -&gt; feature/combine-plan-rewrite, origin/feature/combine-plan-rewrite) Remove unnecessary inject calls from the plan</pre></details>
+<p>Removed all unnecessary <code>rlang::inject()</code> calls and pushed commit <code>d75e078</code>.</p>
+<p>The unrelated untracked <code>bench/combine.R</code> remains untouched.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Expand dimensionality should require that dimensionality be greater than x’s (at least for now)</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Codex</p>
+<p>Agreed. I’ll make <code>rray_expand_dimensionality()</code> a strict expansion helper: the target must be greater than the input dimensionality. Stack already calls it only when expansion is required, so this tightens the contract without changing the stack design.</p>
+
+<details class="tool"><summary>Bash: rg -n 'expand|at least|no expansion|no-copy view' plans/combine-stack-unstack.md</summary>
+<pre>$ rg -n 'expand|at least|no expansion|no-copy view' plans/combine-stack-unstack.md</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+80:- Add an internal `rray_expand_dimensionality()` helper that pads dimensions
+83:  There is no need to expand all inputs to the greatest dimensionality.
+171:dimension names, for every valid split that produces at least one piece.
+172:Combine requires at least one input, so an empty split of a zero-length axis
+237:## Why stack only expands to `axis - 1`
+240:at least `axis - 1` dimensions before a new axis can be inserted at `axis`.
+248:[2]    -&gt; expand to [2, 1] -&gt; insert axis 3 -&gt; [2, 1, 1]
+271:r_obj* rray_expand_dimensionality(
+282:- require `dimensionality` to be at least the current dimensionality;
+288:- return a no-copy view even when no expansion is needed.
+396:   `rray_expand_dimensionality()` with `.axis - 1`.
+520:It cannot recover singleton dimensions that expanded or narrower input types.
+697:- no expansion for insertion axes already reachable by an input;
+703:There is no R-facing test for `rray_expand_dimensionality()` because it is not
+772:7. Check stack's expanded wrappers, inserted wrappers, prepared list, prototype,
+822:- Stack expands inputs only as far as the insertion point requires.</pre></details>
+<details class="tool"><summary>Edit plans/combine-stack-unstack.md</summary>
+<pre class="diff"><span class="hunk">*** Begin Patch</span>
+<span class="hunk">*** Update File: ~/files/r/packages/rray4/plans/combine-stack-unstack.md</span>
+<span class="hunk">@@</span>
+<span class="del">-- require `dimensionality` to be at least the current dimensionality;</span>
+<span class="ins">+- require `dimensionality` to be greater than the current dimensionality;</span>
+<span class="hunk">@@</span>
+<span class="del">-- return a no-copy view even when no expansion is needed.</span>
+<span class="ins">+- always append at least one singleton axis.</span>
+<span class="hunk">@@</span>
+<span class="del">-- no expansion for insertion axes already reachable by an input;</span>
+<span class="ins">+- stack bypasses the helper when the insertion axis is already reachable;</span>
+<span class="hunk">*** End Patch</span></pre><pre class="output">Script completed
+Wall time 0.3 seconds
+Output:
+
+{}</pre></details>
+<details class="tool"><summary>Bash: sed -n '264,300p' plans/combine-stack-unstack.md; sed -n '688,708p' plans/combine-stack-unsta…</summary>
+<pre>$ sed -n '264,300p' plans/combine-stack-unstack.md; sed -n '688,708p' plans/combine-stack-unstack.md; git diff --check; git diff -- plans/combine-stack-unstack.md; git status --short --branch</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+
+## Internal dimensionality expansion
+
+Add an internal C helper to `src/dimensionality.c` and
+`src/dimensionality.h`:
+
+```c
+r_obj* rray_expand_dimensionality(
+  r_obj* x,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+);
+```
+
+Its contract is:
+
+- normalize and validate `x` as an unclassed array;
+- require `dimensionality` to be greater than the current dimensionality;
+- require the target to stay within `RRAY_MAX_DIMENSIONALITY`;
+- return a metadata-only wrapper;
+- copy the existing dimensions and append dimensions of 1;
+- preserve existing axis names in place;
+- leave every appended axis unnamed;
+- always append at least one singleton axis.
+
+Do not add an R wrapper or an FFI registration in this change. The helper is
+implementation support for stack. If it later proves useful as a public array
+operation, it can be documented and exported separately.
+
+Stack should only call it when an input dimensionality is less than
+`axis - 1`. Inputs that already reach the insertion point go directly to
+`rray_insert_axes()`.
+
+## Split implementation
+
+Replace the current multiple-axis split engine. The new engine works one chunk
+- Leave the new axis unnamed when dots are unnamed.
+- Keep old axis names under broadcasting.
+- Reject greatest input dimensionality 64 because stack would make 65.
+- Check that input objects are not modified.
+
+### Dimensionality expansion tests
+
+Exercise the internal helper through stack:
+
+- stack bypasses the helper when the insertion axis is already reachable;
+- one and several appended singleton axes;
+- preservation of existing dimensions and names;
+- unnamed appended axes;
+- differing input dimensionality at the last valid stack axis.
+
+There is no R-facing test for `rray_expand_dimensionality()` because it is not
+public.
+
+### Unstack tests
+
+- Unstack a 2D array along both axes.
+diff --git a/plans/combine-stack-unstack.md b/plans/combine-stack-unstack.md
+index c1e0a05..ee27c62 100644
+--- a/plans/combine-stack-unstack.md
++++ b/plans/combine-stack-unstack.md
+@@ -279,13 +279,13 @@ r_obj* rray_expand_dimensionality(
+ Its contract is:
+ 
+ - normalize and validate `x` as an unclassed array;
+-- require `dimensionality` to be at least the current dimensionality;
++- require `dimensionality` to be greater than the current dimensionality;
+ - require the target to stay within `RRAY_MAX_DIMENSIONALITY`;
+ - return a metadata-only wrapper;
+ - copy the existing dimensions and append dimensions of 1;
+ - preserve existing axis names in place;
+ - leave every appended axis unnamed;
+-- return a no-copy view even when no expansion is needed.
++- always append at least one singleton axis.
+ 
+ Do not add an R wrapper or an FFI registration in this change. The helper is
+ implementation support for stack. If it later proves useful as a public array
+@@ -694,7 +694,7 @@ combine coverage.
+ 
+ Exercise the internal helper through stack:
+ 
+-- no expansion for insertion axes already reachable by an input;
++- stack bypasses the helper when the insertion axis is already reachable;
+ - one and several appended singleton axes;
+ - preservation of existing dimensions and names;
+ - unnamed appended axes;
+## feature/combine-plan-rewrite...origin/feature/combine-plan-rewrite
+ M plans/combine-stack-unstack.md
+?? bench/combine.R</pre></details>
+<p>The contract now rejects equal or smaller targets and guarantees at least one appended singleton axis. The test plan also states that stack bypasses the helper when no expansion is needed. I’ll commit and push only this plan change, leaving <code>bench/combine.R</code> untouched.</p>
+
+<details class="tool"><summary>Bash: git add plans/combine-stack-unstack.md &amp;&amp; git commit -m &quot;Require strict dimensionality expans…</summary>
+<pre>$ git add plans/combine-stack-unstack.md &amp;&amp; git commit -m &quot;Require strict dimensionality expansion&quot;</pre><pre class="output">Script completed
+Wall time 4.2 seconds
+Output:
+
+[feature/combine-plan-rewrite 4c272d2] Require strict dimensionality expansion
+ 1 file changed, 3 insertions(+), 3 deletions(-)</pre></details>
+<details class="tool"><summary>Bash: git push origin feature/combine-plan-rewrite</summary>
+<pre>$ git push origin feature/combine-plan-rewrite</pre><pre class="output">Script completed
+Wall time 6.0 seconds
+Output:
+
+To https://github.com/DavisVaughan/rray4.git
+   d75e078..4c272d2  feature/combine-plan-rewrite -&gt; feature/combine-plan-rewrite</pre></details>
+<details class="tool"><summary>Bash: git status --short --branch &amp;&amp; git log -1 --oneline --decorate</summary>
+<pre>$ git status --short --branch &amp;&amp; git log -1 --oneline --decorate</pre><pre class="output">Script completed
+Wall time 0.2 seconds
+Output:
+
+## feature/combine-plan-rewrite...origin/feature/combine-plan-rewrite
+?? bench/combine.R
+4c272d2 (HEAD -&gt; feature/combine-plan-rewrite, origin/feature/combine-plan-rewrite) Require strict dimensionality expansion</pre></details>
+<p>Updated and pushed commit <code>4c272d2</code>.</p>
+<p><code>rray_expand_dimensionality()</code> now requires a target strictly greater than the input dimensionality. Stack bypasses it when expansion is unnecessary.</p>
+<p>The unrelated <code>bench/combine.R</code> remains untouched.</p>
+
+</section>
+</main>
+</body>
+</html>

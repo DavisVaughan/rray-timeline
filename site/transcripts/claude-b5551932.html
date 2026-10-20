@@ -1,0 +1,2416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starting r_wrap() with no attributes per plans/attributes.md</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-151">rray timeline</a>
+<h1>Starting <code>r_wrap()</code> with no attributes per <code>plans/attributes.md</code></h1>
+<p class="facts">Claude · Oct 17, 2026 · 2 prompts · 15 replies · <a href="https://github.com/r-lib/rray/pull/151">#151</a></p>
+</header>
+<main>
+<p class="divider">Oct 17, 2026, 19:44 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/attributes<br />
+Implement plans/attributes.md<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Remove the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray 2&gt;&amp;1; pwd; git status; git branch -a; ls; cat plans/att…</summary>
+<pre>cd ~/files/r/packages/rray 2&gt;&amp;1; pwd; git status; git branch -a; ls; cat plans/attributes.md</pre><pre class="output">~/files/r/packages/rray
+On branch fix/wrap
+Your branch is up to date with 'origin/fix/wrap'.
+
+nothing to commit, working tree clean
+* fix/wrap
+  main
+  remotes/origin/HEAD -&gt; origin/main
+  remotes/origin/fix/wrap
+  remotes/origin/gh-pages
+  remotes/origin/main
+_pkgdown.yml
+AGENTS.md
+air.toml
+bench
+codecov.yml
+compile_commands.json
+DESCRIPTION
+docs
+LICENSE
+LICENSE.md
+man
+NAMESPACE
+panache.toml
+pkgdown
+plans
+R
+README.md
+README.Rmd
+rray.Rproj
+src
+tests
+vignettes
+# `r_wrap()` starts with no attributes
+
+Today `r_wrap(x)` copies every attribute of `x` onto the new wrapper. This
+plan makes the wrapper start with no attributes, so each caller sets exactly
+the ones it wants.
+
+The work is one pull request. It lands before `plans/view.md`, so this plan
+still uses the current `wrapper` names.
+
+---
+
+# Why
+
+## Stray attributes leak through
+
+Functions that go through `r_wrap()` keep any attribute the input happens to
+carry. Functions that allocate a new result drop them. So two reshapes of the
+same input disagree:
+
+```r
+x &lt;- array(1:4, c(2, 2))
+attr(x, &quot;foo&quot;) &lt;- 1
+names(x) &lt;- letters[1:4]
+
+attributes(rray_set_dimensions(x, c(4L, 1L)))
+#&gt; $dim: 4 1
+#&gt; $foo: 1
+#&gt; $names: &quot;a&quot; &quot;b&quot; &quot;c&quot; &quot;d&quot;
+
+attributes(rray_permute_axes(x, 2:1))
+#&gt; $dim: 2 2
+```
+
+`rray_insert_axes()` keeps `foo` and `names` the same way. `class` can't leak,
+because `check_unclassed()` rejects classed input first.
+
+After this plan, every function above returns only `dim` and, when there are
+any, `dimnames`.
+
+## Every caller only wants `dim` and `dimnames`
+
+All 9 callers of `r_wrap()` set `dim`, `dimnames`, or both, and nothing else.
+Two of them spend extra work undoing the copy: `rray_set_dimensions()` clears
+`dimnames`, and `vec_as_array()` clears `names`.
+
+## No pairlist copy
+
+`r_attrib_clone_from()` allocates a copy of the attribute pairlist on every
+call. A wrapper with no attributes skips that.
+
+## Nothing relies on the copy
+
+No test outside `test-wrapper.R` checks that a stray attribute survives, and
+no C code reads an attribute other than `dim` or `dimnames` off the result of
+`arg_as_array()`.
+
+---
+
+# Out of scope
+
+Some paths return `x` itself, so stray attributes still pass through them.
+This plan leaves them alone. A later plan can decide whether they should also
+return a view with only `dim` and `dimnames`:
+
+- `vec_as_array()` when `x` already has `dim`.
+
+- `rray_clear_titles()` and `rray_clear_axis_title()` when there are no
+  titles to clear.
+
+- `rray_cast()` when `x` and `to` have the same type, through
+  `vec_as_array()`.
+
+---
+
+# A note on order
+
+`Rf_setAttrib()` refuses to set `dimnames` on an object with no `dim`. Every
+caller that sets `dimnames` must set `dim` first. The names and titles setters
+used to get `dim` for free from the copy, so they now set it themselves from
+`r_dim(x)`.
+
+---
+
+# Checklist
+
+Work through it top to bottom. Each item is one change plus the test that
+pins it down.
+
+The test fixture used below is an array with a stray attribute and `names`:
+
+```r
+x &lt;- array(1:4, c(2L, 2L))
+attr(x, &quot;foo&quot;) &lt;- 1
+names(x) &lt;- letters[1:4]
+```
+
+Write it out in each test, since AGENTS.md wants tests to stand on their own.
+
+## 1. `r_wrap()` in `src/wrapper.c`
+
+- [ ] Delete the `r_attrib_clone_from(out, x)` line, and the comment attached
+      to it (&quot;Creates a fresh attribute pairlist! Note that we always use `x`
+      here, not `data`.&quot;). The comment goes because its code goes.
+
+- [ ] Leave every other comment in `r_wrap()` as it is. `plans/view.md`
+      deals with them.
+
+## 2. `rray_set_dimensions()` in `src/dimensions.c`
+
+- [ ] Delete `r_attrib_poke_dim_names(out, r_null)`. The wrapper has no
+      `dimnames` to clear. Keep `r_attrib_poke_dim(out, dimensions)`.
+
+- [ ] Test in `tests/testthat/test-dimensions.R`, next to &quot;drops names from a
+      named vector&quot;:
+
+      ```r
+      test_that(&quot;drops other attributes&quot;, {
+        x &lt;- array(1:4, c(2L, 2L))
+        attr(x, &quot;foo&quot;) &lt;- 1
+        names(x) &lt;- letters[1:4]
+        expect_identical(rray_set_dimensions(x, c(4L, 1L)), array(1:4, c(4L, 1L)))
+      })
+      ```
+
+## 3. `rray_expand_dimensionality()` in `src/dimensionality.c`
+
+- [ ] No code change. It already sets `dim`, then `dimnames` when `x` has
+      any.
+
+- [ ] No new test. It is internal, and its only caller is `rray_stack()`,
+      which combines the pieces into a new array. Stray attributes already
+      never reach the result of `rray_stack()`, so there is nothing new to
+      observe.
+
+## 4. `rray_insert_axes()` in `src/insert-axes.c`
+
+- [ ] No code change. It already sets `dim`, then `dimnames` when there are
+      any.
+
+- [ ] Test in `tests/testthat/test-insert-axes.R`, next to &quot;does not modify
+      the input&quot;:
+
+      ```r
+      test_that(&quot;drops other attributes&quot;, {
+        x &lt;- array(1:4, c(2L, 2L))
+        attr(x, &quot;foo&quot;) &lt;- 1
+        names(x) &lt;- letters[1:4]
+        expect_identical(rray_insert_axes(x, 1L), array(1:4, c(1L, 2L, 2L)))
+      })
+      ```
+
+## 5. `rray_remove_axes()` in `src/remove-axes.c`
+
+- [ ] No code change, for the same reason as `rray_insert_axes()`.
+
+- [ ] Test in `tests/testthat/test-remove-axes.R`, next to &quot;does not modify
+      the input&quot;. Start from a `c(1L, 2L, 2L)` array, so there is an axis to
+      remove:
+
+      ```r
+      test_that(&quot;drops other attributes&quot;, {
+        x &lt;- array(1:4, c(1L, 2L, 2L))
+        attr(x, &quot;foo&quot;) &lt;- 1
+        names(x) &lt;- letters[1:4]
+        expect_identical(rray_remove_axes(x, 1L), array(1:4, c(2L, 2L)))
+      })
+      ```</pre><p class="cut">192 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git fetch origin 2&gt;&amp;1 | tail -2; git log --oneline -3 …</summary>
+<pre>cd ~/files/r/packages/rray; git fetch origin 2&gt;&amp;1 | tail -2; git log --oneline -3 origin/main; git log --oneline origin/main..fix/wrap | head -30; ls plans; git log --oneline -3 -- plans/attributes.md</pre><pre class="output">From https://github.com/r-lib/rray
+   15c82e1..3511f69  main       -&gt; origin/main
+3511f69 Add a plan for making the ALTREP wrapper memory safe (#150)
+15c82e1 Use `...` to force `axis`/`axes` to be named (#149)
+6dea0e0 Ensure we use logical `NA` at the right times (#148)
+ab6f8a8 Test that base R keeps a wrapper's attributes when duplicating it
+d55b58c Remove the comments from the wrapper duplicate method
+aecb007 Explain why the wrapper is marked as not mutable
+23c6e25 Simplify the comment on unwrapping nested wrappers
+dc65235 Rewrite the wrapper overview comment around immutability
+4c918c8 Plan for renaming the ALTREP wrapper to a view
+699a96a Plan for starting the wrapper with no attributes
+e116229 Use compact sequences again in wrapper tests now that ALTREP inputs are shared
+d3c4869 Wrap ALTREP inputs as is instead of copying them
+20bc81f Make the ALTREP wrapper immutable so its data pointers can never dangle
+eaaad1f Rewrite the wrapper plan around an immutable wrapper
+4565791 Unwrap right before each data read instead of passing unwrapped data around
+9172a64 Add a plan for making the ALTREP wrapper memory safe
+attributes.md
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+view.md
+wrap.md
+699a96a Plan for starting the wrapper with no attributes</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git diff --stat origin/main fix/wrap | tail -20</summary>
+<pre>cd ~/files/r/packages/rray; git diff --stat origin/main fix/wrap | tail -20</pre><pre class="output">(Bash completed with no output)</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; cat src/wrapper.c; grep -n &quot;r_wrap(&quot; src/*.c</summary>
+<pre>cd ~/files/r/packages/rray; cat src/wrapper.c; grep -n &quot;r_wrap(&quot; src/*.c</pre><pre class="output">#include &quot;wrapper.h&quot;
+
+#include &lt;R_ext/Altrep.h&gt;
+
+#include &quot;clone.h&quot;
+
+#include &quot;decl/wrapper-decl.h&quot;
+
+static char* package = &quot;rray&quot;;
+
+// Wrap an R object's data in a read-only ALTREP wrapper
+//
+// Useful when ONLY modifying the attributes of the new object, and NEVER the
+// underlying data.
+//
+// The ALTREP wrapper itself is immediately marked as immutable with
+// `MARK_NOT_MUTABLE()`. This is extremely important! It ensures that R won't
+// ever ask for a writable `DATAPTR()` without first calling `Duplicate()`.
+//
+// Note that R will VERY often use `REAL()` instead of `REAL_RO()` when it only
+// needs a read-only pointer. This is due to `REAL_RO()` being a newer idea that
+// was only introduced with ALTREP, and a lot of historical code hasn't been
+// ported over. Because of that, our `DATAPTR()` ALTREP methods must return a
+// pointer even in the `writable` case, but we expect that R (and all packages)
+// hold up their side of the bargain by only actually writing to this pointer
+// when they fully own it or when there are `NO_REFERENCES()`, which won't be
+// the case since we've used `MARK_NOT_MUTABLE()`. The `NO_REFERENCES()` case is
+// relevant for `x + y + 1` where R will attempt to reuse `x + y`'s temporary
+// result since there aren't any other owners. We don't want
+// `rray_set_dimensions(x) + 1` to look reusable!
+r_obj* r_wrap(r_obj* x) {
+  R_altrep_class_t cls = wrapper_class(r_typeof(x));
+
+  // If `x` is a wrapper, unwrap it to gain access to the original data and wrap
+  // that instead. This avoids a proliferation of nested wrappers. Refcounts on
+  // `x` itself should also still be correct - each wrapper looks like an
+  // individual user of `x`.
+  r_obj* data = is_wrapper(x) ? wrapper_data(x) : x;
+
+  // Reference count on `data` is bumped when we wrap it here.
+  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+
+  // Creates a fresh attribute pairlist!
+  // Note that we always use `x` here, not `data`.
+  r_attrib_clone_from(out, x);
+
+  // The all important immutable marking of `out`, preventing any downstream C
+  // code from requesting a writable pointer without duplicating first.
+  MARK_NOT_MUTABLE(out);
+
+  FREE(1);
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// Class
+
+static R_altrep_class_t wrapper_logical_class;
+static R_altrep_class_t wrapper_integer_class;
+static R_altrep_class_t wrapper_double_class;
+static R_altrep_class_t wrapper_complex_class;
+static R_altrep_class_t wrapper_raw_class;
+static R_altrep_class_t wrapper_character_class;
+static R_altrep_class_t wrapper_list_class;
+
+static inline bool is_wrapper(r_obj* x) {
+  if (!ALTREP(x)) {
+    return false;
+  }
+
+  switch (r_typeof(x)) {
+  case R_TYPE_logical:
+    return R_altrep_inherits(x, wrapper_logical_class);
+  case R_TYPE_integer:
+    return R_altrep_inherits(x, wrapper_integer_class);
+  case R_TYPE_double:
+    return R_altrep_inherits(x, wrapper_double_class);
+  case R_TYPE_complex:
+    return R_altrep_inherits(x, wrapper_complex_class);
+  case R_TYPE_raw:
+    return R_altrep_inherits(x, wrapper_raw_class);
+  case R_TYPE_character:
+    return R_altrep_inherits(x, wrapper_character_class);
+  case R_TYPE_list:
+    return R_altrep_inherits(x, wrapper_list_class);
+  default:
+    return false;
+  }
+}
+
+static inline R_altrep_class_t wrapper_class(enum r_type type) {
+  switch (type) {
+  case R_TYPE_logical:
+    return wrapper_logical_class;
+  case R_TYPE_integer:
+    return wrapper_integer_class;
+  case R_TYPE_double:
+    return wrapper_double_class;
+  case R_TYPE_complex:
+    return wrapper_complex_class;
+  case R_TYPE_raw:
+    return wrapper_raw_class;
+  case R_TYPE_character:
+    return wrapper_character_class;
+  case R_TYPE_list:
+    return wrapper_list_class;
+  default:
+    r_abort(&quot;Can't wrap a %s.&quot;, Rf_type2char(type));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Data
+
+static inline r_obj* wrapper_data(r_obj* x) {
+  return R_altrep_data1(x);
+}
+
+// -----------------------------------------------------------------------------
+// Generic
+
+static r_obj* wrapper_serialized_state(r_obj* x) {
+  // Full serialization, lose ALTREP-ness
+  return NULL;
+}
+
+// Powers `Rf_duplicate()` and `Rf_shallow_duplicate()`
+//
+// We only need to handle the data. Base R covers the attributes for us.
+// https://github.com/wch/r-source/blob/trunk/src/main/altrep.c#L740
+static r_obj* wrapper_duplicate(r_obj* x, Rboolean deep) {
+  if (deep) {
+    return Rf_duplicate(wrapper_data(x));
+  } else {
+    return r_clone_data(wrapper_data(x));
+  }
+}
+
+static Rboolean wrapper_inspect(
+  r_obj* x,
+  int pre,
+  int deep,
+  int pvec,
+  void (*inspect_subtree)(r_obj*, int, int, int)
+) {
+  Rprintf(&quot;&lt;wrapper&gt;\n&quot;);
+  inspect_subtree(wrapper_data(x), pre, deep, pvec);
+  return TRUE;
+}
+
+static r_ssize wrapper_length(r_obj* x) {
+  return r_length(wrapper_data(x));
+}
+
+// -----------------------------------------------------------------------------
+// Dataptr
+
+static void* wrapper_logical_dataptr(r_obj* x, Rboolean writeable) {
+  return (void*) r_lgl_cbegin(wrapper_data(x));
+}
+
+static void* wrapper_integer_dataptr(r_obj* x, Rboolean writeable) {
+  return (void*) r_int_cbegin(wrapper_data(x));
+}
+
+static void* wrapper_double_dataptr(r_obj* x, Rboolean writeable) {
+  return (void*) r_dbl_cbegin(wrapper_data(x));
+}
+
+static void* wrapper_complex_dataptr(r_obj* x, Rboolean writeable) {
+  return (void*) r_cpl_cbegin(wrapper_data(x));
+}
+
+static void* wrapper_raw_dataptr(r_obj* x, Rboolean writeable) {
+  return (void*) r_raw_cbegin(wrapper_data(x));
+}
+
+static void* wrapper_character_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    r_abort(&quot;Can't request a writable dataptr to a character wrapper.&quot;);
+  } else {
+    return (void*) r_chr_cbegin(wrapper_data(x));
+  }
+}
+
+static void* wrapper_list_dataptr(r_obj* x, Rboolean writeable) {
+  if (writeable) {
+    r_abort(&quot;Can't request a writable dataptr to a list wrapper.&quot;);
+  } else {
+    return (void*) r_list_cbegin(wrapper_data(x));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Dataptr_or_null
+
+static const void* wrapper_logical_dataptr_or_null(r_obj* x) {
+  return LOGICAL_OR_NULL(wrapper_data(x));
+}</pre><p class="cut">363 more lines cut</p></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; for f in dimensionality dimensions insert-axes names r…</summary>
+<pre>cd ~/files/r/packages/rray; for f in dimensionality dimensions insert-axes names remove-axes titles utils; do echo &quot;=== $f&quot;; cat src/$f.c; done</pre><pre class="output">=== dimensionality
+#include &quot;dimensionality.h&quot;
+
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+}
+
+int rray_dimensionality(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return rray_dimensionality_from_dimensions(dimensions);
+}
+
+int rray_dimensionality_from_dimensions(r_obj* dimensions) {
+  return (int) r_length(dimensions);
+}
+
+r_obj* rray_expand_dimensionality(
+  r_obj* x,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* x_dimensions = KEEP(rray_dimensions(x, arg, error_call));
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int x_dimensionality =
+    rray_dimensionality_from_dimensions(x_dimensions);
+
+  if (dimensionality &lt;= x_dimensionality) {
+    r_stop_internal(
+      &quot;`dimensionality` (%d) must be greater than the dimensionality of %s &quot;
+      &quot;(%d).&quot;,
+      dimensionality,
+      rray_arg_format(arg),
+      x_dimensionality
+    );
+  }
+
+  check_dimensionality(dimensionality);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_x_dimensions, sizeof(int) * x_dimensionality);
+
+  for (int i = x_dimensionality; i &lt; dimensionality; ++i) {
+    v_out_dimensions[i] = 1;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_obj* x_names = r_dim_names(x);
+
+  if (x_names != r_null) {
+    r_obj* out_names = KEEP(r_alloc_list(dimensionality));
+    r_obj* const* v_x_names = r_list_cbegin(x_names);
+
+    for (int i = 0; i &lt; x_dimensionality; ++i) {
+      r_list_poke(out_names, i, v_x_names[i]);
+    }
+
+    r_attrib_poke_dim_names(out, out_names);
+    FREE(1);
+  }
+
+  FREE(4);
+  return out;
+}
+
+int list_max_dimensionality(
+  r_obj* xs,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize xs_size = r_length(xs);
+  r_obj* const* v_xs = r_list_cbegin(xs);
+
+  r_obj* xs_names = KEEP(r_names(xs));
+
+  r_ssize x_i = 0;
+  struct rray_arg* x_arg = new_subscript_arg(arg, xs_names, xs_size, &amp;x_i);
+  KEEP(x_arg-&gt;shelter);
+
+  int out = 1;
+
+  for (; x_i &lt; xs_size; ++x_i) {
+    const int x_dimensionality =
+      rray_dimensionality(v_xs[x_i], x_arg, error_call);
+
+    if (x_dimensionality &gt; out) {
+      out = x_dimensionality;
+    }
+  }
+
+  FREE(2);
+  return out;
+}
+
+void check_dimensionality(int dimensionality) {
+  if (dimensionality &lt; 1) {
+    r_stop_internal(
+      &quot;`dimensionality` (%d) must be at least 1.&quot;,
+      dimensionality
+    );
+  }
+
+  if (dimensionality &gt; RRAY_MAX_DIMENSIONALITY) {
+    r_abort(
+      &quot;rray can't support arrays with a dimensionality greater than %d. &quot;
+      &quot;A dimensionality of %d was requested.&quot;,
+      RRAY_MAX_DIMENSIONALITY,
+      dimensionality
+    );
+  }
+}
+=== dimensions
+#include &quot;dimensions.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/dimensions-decl.h&quot;
+
+r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions(ffi_x, rray_args.x, error_call);
+}
+
+r_obj* rray_dimensions(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  r_obj* out = r_dim(x);
+  FREE(1);
+  return out;
+}
+
+int rray_dimension(
+  r_obj* x,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  r_obj* dimensions = rray_dimensions(x, arg, error_call);
+  return r_int_get(dimensions, axis - 1);
+}
+
+bool rray_dimensions_are_equal(
+  const int* v_x_dimensions,
+  int x_dimensionality,
+  const int* v_y_dimensions,
+  int y_dimensionality
+) {
+  if (x_dimensionality != y_dimensionality) {
+    return false;
+  }
+
+  for (int i = 0; i &lt; x_dimensionality; ++i) {
+    if (v_x_dimensions[i] != v_y_dimensions[i]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+r_obj* ffi_rray_set_dimensions(
+  r_obj* ffi_x,
+  r_obj* ffi_dimensions,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_dimensions(ffi_x, ffi_dimensions, rray_args.x, error_call);
+}
+
+r_obj* rray_set_dimensions(
+  r_obj* x,
+  r_obj* dimensions,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+  dimensions =</pre><p class="cut">1,111 more lines cut</p></details>
+<p>Reading the plan and the code that calls <code>r_wrap()</code> before I start.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; for f in names titles; do echo &quot;=== $f&quot;; grep -n -B3 -…</summary>
+<pre>cd ~/files/r/packages/rray; for f in names titles; do echo &quot;=== $f&quot;; grep -n -B3 -A25 &quot;r_wrap(x)&quot; src/$f.c; done; echo &quot;=== dimensions&quot;; grep -n -B5 -A10 &quot;r_wrap(x)&quot; src/dimensions.c; echo &quot;=== utils&quot;; sed -n 1,45p src/utils.c</pre><pre class="output">=== names
+105-    FREE(1);
+106-  }
+107-
+108:  r_obj* out = KEEP(r_wrap(x));
+109-  r_attrib_poke_dim_names(out, names);
+110-
+111-  FREE(2);
+112-  return out;
+113-}
+114-
+115-r_obj* ffi_rray_set_axis_names(
+116-  r_obj* ffi_x,
+117-  r_obj* ffi_axis,
+118-  r_obj* ffi_names,
+119-  r_obj* ffi_frame
+120-) {
+121-  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+122-  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+123-  return rray_set_axis_names(ffi_x, axis, ffi_names, rray_args.x, error_call);
+124-}
+125-
+126-r_obj* ffi_rray_set_row_names(
+127-  r_obj* ffi_x,
+128-  r_obj* ffi_names,
+129-  r_obj* ffi_frame
+130-) {
+131-  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+132-  return rray_set_axis_names(ffi_x, 1, ffi_names, rray_args.x, error_call);
+133-}
+--
+168-  }
+169-  r_list_poke(new_names, axis - 1, names);
+170-
+171:  r_obj* out = KEEP(r_wrap(x));
+172-  r_attrib_poke_dim_names(out, new_names);
+173-
+174-  FREE(4);
+175-  return out;
+176-}
+177-
+178-static inline void check_axis_names(
+179-  r_obj* names,
+180-  int axis,
+181-  int dimension,
+182-  struct r_lazy error_call
+183-) {
+184-  if (names == r_null) {
+185-    return;
+186-  }
+187-
+188-  if (r_typeof(names) != R_TYPE_character) {
+189-    r_abort_lazy_call(
+190-      error_call,
+191-      &quot;Names for axis %d must be a character vector or `NULL`, not %s.&quot;,
+192-      axis,
+193-      r_obj_type_friendly(names)
+194-    );
+195-  }
+196-
+=== titles
+98-
+99-  r_attrib_poke_names(new_names, titles);
+100-
+101:  r_obj* out = KEEP(r_wrap(x));
+102-  r_attrib_poke_dim_names(out, new_names);
+103-
+104-  FREE(3);
+105-  return out;
+106-}
+107-
+108-r_obj* ffi_rray_set_axis_title(
+109-  r_obj* ffi_x,
+110-  r_obj* ffi_axis,
+111-  r_obj* ffi_title,
+112-  r_obj* ffi_frame
+113-) {
+114-  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+115-  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+116-  return rray_set_axis_title(ffi_x, axis, ffi_title, rray_args.x, error_call);
+117-}
+118-
+119-r_obj* rray_set_axis_title(
+120-  r_obj* x,
+121-  int axis,
+122-  r_obj* title,
+123-  struct rray_arg* arg,
+124-  struct r_lazy error_call
+125-) {
+126-  check_unclassed(x, arg, error_call);
+--
+183-  r_obj* new_names = KEEP(r_clone(names));
+184-  r_attrib_poke_names(new_names, r_null);
+185-
+186:  r_obj* out = KEEP(r_wrap(x));
+187-  r_attrib_poke_dim_names(out, new_names);
+188-
+189-  FREE(2);
+190-  return out;
+191-}
+192-
+193-static r_obj* rray_clear_axis_title(
+194-  r_obj* x,
+195-  int axis,
+196-  struct rray_arg* arg,
+197-  struct r_lazy error_call
+198-) {
+199-  r_obj* names = r_dim_names(x);
+200-  r_obj* old_titles = names == r_null ? r_null : r_names(names);
+201-
+202-  if (old_titles == r_null) {
+203-    return x;
+204-  }
+205-
+206-  r_obj* new_titles = KEEP(r_clone(old_titles));
+207-  r_chr_poke(new_titles, axis - 1, r_strs.empty);
+208-
+209-  r_obj* out = KEEP(rray_set_titles(x, new_titles, arg, error_call));
+210-
+211-  FREE(2);
+=== dimensions
+89-      x_size,
+90-      size
+91-    );
+92-  }
+93-
+94:  r_obj* out = KEEP(r_wrap(x));
+95-
+96-  r_attrib_poke_dim_names(out, r_null);
+97-  r_attrib_poke_dim(out, dimensions);
+98-
+99-  FREE(3);
+100-  return out;
+101-}
+102-
+103-r_obj* ffi_rray_dimensions_common(
+104-  r_obj* ffi_xs,
+=== utils
+#include &quot;utils.h&quot;
+
+#include &lt;limits.h&gt;
+#include &lt;math.h&gt;
+
+#include &quot;syms.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/utils-decl.h&quot;
+
+// Normalize a vector into an array
+//
+// - Turns length into `dim`
+// - Turns `names` into `dimnames`
+// - Clears `names`
+//
+// Since we are only modifying attributes,
+// we use a lightweight wrapper
+r_obj* vec_as_array(r_obj* x) {
+  if (r_dim(x) != r_null) {
+    return x;
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+
+  const r_ssize size = r_length(x);
+  r_obj* dimensions = r_int(r_ssize_as_integer(size));
+  r_attrib_poke_dim(out, dimensions);
+
+  r_obj* axis_names = r_names(x);
+  if (axis_names != r_null) {
+    KEEP(axis_names);
+    r_obj* names = KEEP(r_alloc_list(1));
+    r_list_poke(names, 0, axis_names);
+    r_attrib_poke_dim_names(out, names);
+    r_attrib_zap(out, r_syms.names);
+    FREE(2);
+  }
+
+  FREE(1);
+  return out;
+}
+
+void check_unclassed(r_obj* x, struct rray_arg* arg, struct r_lazy error_call) {
+  if (r_is_object(x)) {</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; sed -n 80,110p src/names.c; sed -n 140,172p src/names.…</summary>
+<pre>cd ~/files/r/packages/rray; sed -n 80,110p src/names.c; sed -n 140,172p src/names.c; sed -n 60,100p src/titles.c; sed -n 165,186p src/titles.c; grep -n &quot;r_syms\|syms&quot; src/utils.c; grep -n &quot;test_that&quot; tests/testthat/test-wrapper.R; grep -n &quot;drops names from a named\|does not modify the input\|doesn't touch the data\|leaves other axes untouched\|keep element names\|one dimensional array&quot; tests/testthat/*.R</pre><pre class="output">        r_obj_type_friendly(names)
+      );
+    }
+
+    r_obj* dimensions = KEEP(rray_dimensions(x, arg, error_call));
+    const int* v_dimensions = r_int_cbegin(dimensions);
+    const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+
+    if (r_length(names) != dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must have length %d to match the dimensionality of %s, &quot;
+        &quot;not length %&quot; R_PRI_SSIZE &quot;.&quot;,
+        rray_arg_format(rray_args.names),
+        dimensionality,
+        rray_arg_format(arg),
+        r_length(names)
+      );
+    }
+
+    r_obj* const* v_names = r_list_cbegin(names);
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      check_axis_names(v_names[i], i + 1, v_dimensions[i], error_call);
+    }
+
+    FREE(1);
+  }
+
+  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim_names(out, names);
+
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_set_axis_names(ffi_x, 2, ffi_names, rray_args.x, error_call);
+}
+
+r_obj* rray_set_axis_names(
+  r_obj* x,
+  int axis,
+  r_obj* names,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+
+  const int dimension = rray_dimension(x, axis, arg, error_call);
+  check_axis_names(names, axis, dimension, error_call);
+
+  r_obj* old_names = KEEP(rray_names(x, arg, error_call));
+
+  r_obj* new_names = KEEP(r_alloc_list(dimensionality));
+  if (old_names != r_null) {
+    r_obj* const* v_old_names = r_list_cbegin(old_names);
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      r_list_poke(new_names, i, v_old_names[i]);
+    }
+  }
+  r_list_poke(new_names, axis - 1, names);
+
+  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim_names(out, new_names);
+  if (titles == r_null) {
+    r_obj* out = rray_clear_titles(x);
+    FREE(1);
+    return out;
+  }
+
+  const int dimensionality = rray_dimensionality(x, arg, error_call);
+
+  if (r_typeof(titles) != R_TYPE_character) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be a character vector or `NULL`, not %s.&quot;,
+      rray_arg_format(rray_args.titles),
+      r_obj_type_friendly(titles)
+    );
+  }
+
+  if (r_length(titles) != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have length %d to match the dimensionality of %s, &quot;
+      &quot;not length %&quot; R_PRI_SSIZE &quot;.&quot;,
+      rray_arg_format(rray_args.titles),
+      dimensionality,
+      rray_arg_format(arg),
+      r_length(titles)
+    );
+  }
+
+  r_obj* old_names = r_dim_names(x);
+  r_obj* new_names = KEEP(r_alloc_list(dimensionality));
+
+  if (old_names != r_null) {
+    r_obj* const* v_old_names = r_list_cbegin(old_names);
+    for (int i = 0; i &lt; dimensionality; ++i) {
+      r_list_poke(new_names, i, v_old_names[i]);
+    }
+  }
+
+  r_attrib_poke_names(new_names, titles);
+
+    }
+  }
+
+  r_chr_poke(new_titles, axis - 1, r_chr_get(title, 0));
+
+  r_obj* out = KEEP(rray_set_titles(x, new_titles, arg, error_call));
+
+  FREE(3);
+  return out;
+}
+
+static r_obj* rray_clear_titles(r_obj* x) {
+  r_obj* names = r_dim_names(x);
+
+  if (names == r_null || r_names(names) == r_null) {
+    return x;
+  }
+
+  r_obj* new_names = KEEP(r_clone(names));
+  r_attrib_poke_names(new_names, r_null);
+
+  r_obj* out = KEEP(r_wrap(x));
+6:#include &quot;syms.h&quot;
+36:    r_attrib_zap(out, r_syms.names);
+4:test_that(&quot;wrapping produces an ALTREP wrapper&quot;, {
+14:test_that(&quot;non-wrappers are detected&quot;, {
+22:test_that(&quot;wrapper preserves length&quot;, {
+32:test_that(&quot;wrapper preserves type&quot;, {
+45:test_that(&quot;wrapper clones attributes from the original&quot;, {
+56:test_that(&quot;wrapper gets its own attribute pairlist&quot;, {
+64:test_that(&quot;modifying dim on wrapper does not affect original&quot;, {
+75:test_that(&quot;wrapper provides read access to integer data&quot;, {
+82:test_that(&quot;wrapper provides read access to double data&quot;, {
+89:test_that(&quot;wrapper provides read access to logical data&quot;, {
+96:test_that(&quot;wrapper provides read access to complex data&quot;, {
+103:test_that(&quot;wrapper provides read access to raw data&quot;, {
+110:test_that(&quot;wrapper provides read access to character data&quot;, {
+117:test_that(&quot;wrapper provides read access to list data&quot;, {
+127:test_that(&quot;wrapper starts out sharing data&quot;, {
+133:test_that(&quot;read-only access to a dimensioned wrapper shares data&quot;, {
+150:test_that(&quot;a read-only pointer stays valid after a writable request&quot;, {
+171:test_that(&quot;changing a wrapper gives a plain vector&quot;, {
+222:test_that(&quot;a second change happens in place&quot;, {
+246:test_that(&quot;a temporary wrapper is never reused as an output&quot;, {
+258:test_that(&quot;wrapping an ALTREP vector shares it&quot;, {
+266:test_that(&quot;setting an element of a character or list wrapper errors&quot;, {
+276:test_that(&quot;wrapping a wrapper does not create nested wrappers&quot;, {
+287:test_that(&quot;wrapping a wrapper uses the wrapper's attributes&quot;, {
+299:test_that(&quot;wrapping a wrapper gives independent attributes&quot;, {
+310:test_that(&quot;shallow duplicate of a wrapper is a plain vector&quot;, {
+321:test_that(&quot;duplicating a wrapper keeps the wrapper's attributes&quot;, {
+345:test_that(&quot;deep copy via c() produces a regular non-wrapper vector&quot;, {
+355:test_that(&quot;serialization round-trips wrapper to plain vector&quot;, {
+364:test_that(&quot;serialization round-trips all types&quot;, {
+383:test_that(&quot;wrapper works with zero-length vectors&quot;, {
+399:test_that(&quot;rray_set_dimensions returns a wrapper&quot;, {
+409:test_that(&quot;rray_set_dimensions wrapper shares the underlying data&quot;, {
+415:test_that(&quot;modifying reshaped array does not affect original&quot;, {
+425:test_that(&quot;wrapper preserves NAs&quot;, {
+442:test_that(&quot;subsetting a wrapper does not produce a wrapper&quot;, {
+447:test_that(&quot;subsetting a wrapper works&quot;, {
+tests/testthat/test-cast.R:98:test_that(&quot;a bare vector becomes a one dimensional array&quot;, {
+tests/testthat/test-dimensions.R:266:test_that(&quot;drops names from a named vector&quot;, {
+tests/testthat/test-insert-axes.R:100:test_that(&quot;does not modify the input&quot;, {
+tests/testthat/test-names.R:131:test_that(&quot;rray_set_names() doesn't touch the data&quot;, {
+tests/testthat/test-names.R:182:test_that(&quot;rray_set_axis_names() leaves other axes untouched&quot;, {
+tests/testthat/test-remove-axes.R:89:test_that(&quot;does not modify the input&quot;, {
+tests/testthat/test-titles.R:51:test_that(&quot;title setters keep element names and do not change the input&quot;, {</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; sed -n 40,75p tests/testthat/test-titles.R; sed -n 40,…</summary>
+<pre>cd ~/files/r/packages/rray; sed -n 40,75p tests/testthat/test-titles.R; sed -n 40,75p tests/testthat/test-wrapper.R; sed -n 125,150p tests/testthat/test-wrapper.R; sed -n 270,365p tests/testthat/test-wrapper.R; cat tests/testthat/helper-wrapper.R 2&gt;/dev/null | head -30</pre><pre class="output">  expect_match(printed, &quot;Row&quot;, fixed = TRUE)
+  expect_match(printed, &quot;Column&quot;, fixed = TRUE)
+
+  out &lt;- rray_set_axis_title(x, 2, &quot;Column&quot;)
+  expect_identical(
+    dimnames(out),
+    structure(list(NULL, NULL), names = c(&quot;&quot;, &quot;Column&quot;))
+  )
+  expect_identical(rray_axis_title(out, 1), &quot;&quot;)
+})
+
+test_that(&quot;title setters keep element names and do not change the input&quot;, {
+  x &lt;- matrix(
+    1:6,
+    2,
+    3,
+    dimnames = list(Row = c(&quot;a&quot;, &quot;b&quot;), Column = c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;))
+  )
+  original &lt;- dimnames(x)
+
+  out &lt;- rray_set_titles(x, c(&quot;First&quot;, &quot;Second&quot;))
+  expect_identical(
+    dimnames(out),
+    setNames(unname(original), c(&quot;First&quot;, &quot;Second&quot;))
+  )
+  expect_identical(dimnames(x), original)
+
+  out &lt;- rray_set_axis_title(x, 1, &quot;First&quot;)
+  expect_identical(
+    dimnames(out),
+    setNames(unname(original), c(&quot;First&quot;, &quot;Column&quot;))
+  )
+  expect_identical(dimnames(x), original)
+})
+
+test_that(&quot;title setters handle plain vectors and one-dimensional arrays&quot;, {
+})
+
+# ------------------------------------------------------------------------------
+# Attributes
+
+test_that(&quot;wrapper clones attributes from the original&quot;, {
+  x &lt;- array(
+    1:6,
+    c(2L, 3L),
+    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+  )
+  w &lt;- wrap(x)
+  expect_identical(dim(w), dim(x))
+  expect_identical(dimnames(w), dimnames(x))
+})
+
+test_that(&quot;wrapper gets its own attribute pairlist&quot;, {
+  x &lt;- c(a = 1L, b = 2L)
+  w &lt;- wrap(x)
+  names(w) &lt;- c(&quot;x&quot;, &quot;y&quot;)
+  expect_identical(names(x), c(&quot;a&quot;, &quot;b&quot;))
+  expect_identical(names(w), c(&quot;x&quot;, &quot;y&quot;))
+})
+
+test_that(&quot;modifying dim on wrapper does not affect original&quot;, {
+  x &lt;- array(1:6, c(2L, 3L))
+  w &lt;- wrap(x)
+  dim(w) &lt;- c(3L, 2L)
+  expect_identical(dim(x), c(2L, 3L))
+  expect_identical(dim(w), c(3L, 2L))
+})
+
+# ------------------------------------------------------------------------------
+# Read access
+
+test_that(&quot;wrapper provides read access to integer data&quot;, {
+# Ownership
+
+test_that(&quot;wrapper starts out sharing data&quot;, {
+  x &lt;- 1:3
+  w &lt;- wrap(x)
+  expect_wraps(w, x)
+})
+
+test_that(&quot;read-only access to a dimensioned wrapper shares data&quot;, {
+  xs &lt;- list(
+    c(TRUE, FALSE),
+    c(1L, 2L),
+    c(1.5, 2.5),
+    c(1 + 2i, 3 + 4i)
+  )
+
+  for (x in xs) {
+    dim(x) &lt;- c(1L, 2L)
+    w &lt;- wrap(x)
+
+    expect_identical(wrapper_read_access(w), TRUE)
+    expect_wraps(w, x)
+  }
+})
+
+test_that(&quot;a read-only pointer stays valid after a writable request&quot;, {
+  })
+})
+
+# ------------------------------------------------------------------------------
+# Wrapping a wrapper
+
+test_that(&quot;wrapping a wrapper does not create nested wrappers&quot;, {
+  x &lt;- 1:3
+  w1 &lt;- wrap(x)
+  w2 &lt;- wrap(w1)
+
+  expect_identical(is_wrapper(wrapper_data(w2)), FALSE)
+
+  expect_wraps(w1, x)
+  expect_wraps(w2, x)
+})
+
+test_that(&quot;wrapping a wrapper uses the wrapper's attributes&quot;, {
+  # (even though it actually wraps `x`)
+
+  x &lt;- structure(1:3, foo = &quot;bar&quot;)
+
+  w1 &lt;- structure(wrap(x), a = &quot;b&quot;)
+  expect_mapequal(attributes(w1), list(foo = &quot;bar&quot;, a = &quot;b&quot;))
+
+  w2 &lt;- wrap(w1)
+  expect_mapequal(attributes(w2), list(foo = &quot;bar&quot;, a = &quot;b&quot;))
+})
+
+test_that(&quot;wrapping a wrapper gives independent attributes&quot;, {
+  x &lt;- c(a = 1L, b = 2L, c = 3L)
+  w1 &lt;- wrap(x)
+  w2 &lt;- wrap(w1)
+  names(w1) &lt;- c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)
+  expect_identical(names(w2), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+})
+
+# ------------------------------------------------------------------------------
+# Duplication
+
+test_that(&quot;shallow duplicate of a wrapper is a plain vector&quot;, {
+  x &lt;- 1:3
+  w &lt;- wrap(x)
+  w2 &lt;- w
+  dim(w2) &lt;- c(1L, 3L)
+  expect_identical(is_wrapper(w2), FALSE)
+  expect_identical(w2, array(1:3, c(1L, 3L)))
+  expect_null(dim(w))
+  expect_wraps(w, x)
+})
+
+test_that(&quot;duplicating a wrapper keeps the wrapper's attributes&quot;, {
+  x &lt;- structure(
+    1:6,
+    dim = c(2L, 3L),
+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)),
+    foo = &quot;bar&quot;
+  )
+  w &lt;- rray_set_dimensions(x, c(3L, 2L))
+  expect_wraps(w, x)
+
+  expected &lt;- structure(1:6, foo = &quot;bar&quot;, dim = c(3L, 2L))
+
+  shallow &lt;- rlang::duplicate(w, shallow = TRUE)
+  expect_identical(is_wrapper(shallow), FALSE)
+  expect_identical(shallow, expected)
+
+  deep &lt;- rlang::duplicate(w, shallow = FALSE)
+  expect_identical(is_wrapper(deep), FALSE)
+  expect_identical(deep, expected)
+
+  expect_identical(attributes(w), attributes(expected))
+  expect_identical(attr(x, &quot;dimnames&quot;), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+})
+
+test_that(&quot;deep copy via c() produces a regular non-wrapper vector&quot;, {
+  w &lt;- wrap(1:3)
+  d &lt;- c(w)
+  expect_false(is_wrapper(d))
+  expect_identical(d, 1:3)
+})
+
+# ------------------------------------------------------------------------------
+# Serialization
+
+test_that(&quot;serialization round-trips wrapper to plain vector&quot;, {
+  w &lt;- wrap(1:5)
+  attr(w, &quot;custom&quot;) &lt;- &quot;hello&quot;
+  rt &lt;- unserialize(serialize(w, NULL))
+  expect_false(is_wrapper(rt))
+  expect_identical(as.integer(rt), 1:5)
+  expect_identical(attr(rt, &quot;custom&quot;), &quot;hello&quot;)
+})
+
+test_that(&quot;serialization round-trips all types&quot;, {
+  test_roundtrip &lt;- function(x) {
+wrap &lt;- function(x) {
+  .Call(ffi_test_wrap, x)
+}
+wrapper_data &lt;- function(x) {
+  .Call(ffi_test_wrapper_data, x)
+}</pre><p class="cut">19 more lines cut</p></details>
+<details class="tool"><summary>Question: The plan predates the test &quot;duplicating a wrapper keeps the wrapper's attributes&quot; (test-w…</summary>
+<p>The plan predates the test &quot;duplicating a wrapper keeps the wrapper's attributes&quot; (test-wrapper.R:321, from ab6f8a8). It builds its wrapper with rray_set_dimensions() on an input carrying <code>foo = &quot;bar&quot;</code>, and expects <code>foo</code> to survive. After this change <code>foo</code> no longer reaches the wrapper, so the test fails. How should I handle it?</p>
+<ul>
+<li>Drop foo (Recommended)</li>
+<li>Stop and report only</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;The plan predates the test &quot;duplicating a wrapper keeps the wrapper's attributes&quot; (test-wrapper.R:321, from ab6f8a8). It builds its wrapper with rray_set_dimensions() on an input carrying `foo = &quot;bar&quot;`, and expects `foo` to survive. After this change `foo` no longer reaches the wrapper, so the test fails. How should I handle it?&quot;=&quot;Drop foo (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git checkout -b feature/attributes origin/main 2&gt;&amp;1</summary>
+<pre>cd ~/files/r/packages/rray; git checkout -b feature/attributes origin/main 2&gt;&amp;1</pre><pre class="output">Switched to a new branch 'feature/attributes'
+branch 'feature/attributes' set up to track 'origin/main'.</pre></details>
+<p>Now the C changes.</p>
+
+<details class="tool tool-error"><summary>Bash: cd ~/files/r/packages/rray; python3 - &lt;&lt;'EOF'</summary>
+<pre>cd ~/files/r/packages/rray; python3 - &lt;&lt;'EOF'
+import re
+def sub(path, old, new, count=1):
+    s = open(path).read()
+    assert s.count(old) == count, (path, old, s.count(old))
+    s = s.replace(old, new)
+    open(path, &quot;w&quot;).write(s)
+
+sub(&quot;src/wrapper.c&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+
+  // Creates a fresh attribute pairlist!
+  // Note that we always use `x` here, not `data`.
+  r_attrib_clone_from(out, x);
+
+&quot;&quot;&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+
+&quot;&quot;&quot;)
+sub(&quot;src/dimensions.c&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+
+  r_attrib_poke_dim_names(out, r_null);
+  r_attrib_poke_dim(out, dimensions);
+&quot;&quot;&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, dimensions);
+&quot;&quot;&quot;)
+sub(&quot;src/names.c&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim_names(out, names);
+&quot;&quot;&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, r_dim(x));
+  r_attrib_poke_dim_names(out, names);
+&quot;&quot;&quot;)
+sub(&quot;src/names.c&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim_names(out, new_names);
+&quot;&quot;&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, r_dim(x));
+  r_attrib_poke_dim_names(out, new_names);
+&quot;&quot;&quot;)
+sub(&quot;src/titles.c&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim_names(out, new_names);
+&quot;&quot;&quot;, &quot;&quot;&quot;  r_obj* out = KEEP(r_wrap(x));
+  r_attrib_poke_dim(out, r_dim(x));
+  r_attrib_poke_dim_names(out, new_names);
+&quot;&quot;&quot;, count=2)
+sub(&quot;src/utils.c&quot;, &quot;&quot;&quot;    r_attrib_poke_dim_names(out, names);
+    r_attrib_zap(out, r_syms.names);
+&quot;&quot;&quot;, &quot;&quot;&quot;    r_attrib_poke_dim_names(out, names);
+&quot;&quot;&quot;)
+sub(&quot;src/utils.c&quot;, '#include &quot;syms.h&quot;\n', '')
+EOF
+grep -rn &quot;r_attrib_clone_from\|syms.h&quot; src --include=*.c --include=*.h | grep -v &quot;src/rlang/&quot;; git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/wrapper.c</summary>
+<pre class="output">38	  r_obj* data = is_wrapper(x) ? wrapper_data(x) : x;
+39	
+40	  // Reference count on `data` is bumped when we wrap it here.
+41	  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+42	  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+43	
+44	  // Creates a fresh attribute pairlist!
+45	  // Note that we always use `x` here, not `data`.
+46	  r_attrib_clone_from(out, x);
+47	
+48	  // The all important immutable marking of `out`, preventing any downstream C
+49	  // code from requesting a writable pointer without duplicating first.</pre></details>
+<details class="tool"><summary>Read src/dimensions.c</summary>
+<pre class="output">90	      size
+91	    );
+92	  }
+93	
+94	  r_obj* out = KEEP(r_wrap(x));
+95	
+96	  r_attrib_poke_dim_names(out, r_null);
+97	  r_attrib_poke_dim(out, dimensions);
+98	
+99	  FREE(3);</pre></details>
+<details class="tool"><summary>Read src/names.c</summary>
+<pre class="output">105	    FREE(1);
+106	  }
+107	
+108	  r_obj* out = KEEP(r_wrap(x));
+109	  r_attrib_poke_dim_names(out, names);
+110	
+111	  FREE(2);
+112	  return out;
+113	}
+114	
+115	r_obj* ffi_rray_set_axis_names(
+116	  r_obj* ffi_x,
+117	  r_obj* ffi_axis,
+118	  r_obj* ffi_names,
+119	  r_obj* ffi_frame
+120	) {
+121	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+122	  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+123	  return rray_set_axis_names(ffi_x, axis, ffi_names, rray_args.x, error_call);
+124	}
+125	
+126	r_obj* ffi_rray_set_row_names(
+127	  r_obj* ffi_x,
+128	  r_obj* ffi_names,
+129	  r_obj* ffi_frame
+130	) {
+131	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+132	  return rray_set_axis_names(ffi_x, 1, ffi_names, rray_args.x, error_call);
+133	}
+134	
+135	r_obj* ffi_rray_set_column_names(
+136	  r_obj* ffi_x,
+137	  r_obj* ffi_names,
+138	  r_obj* ffi_frame
+139	) {
+140	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+141	  return rray_set_axis_names(ffi_x, 2, ffi_names, rray_args.x, error_call);
+142	}
+143	
+144	r_obj* rray_set_axis_names(
+145	  r_obj* x,
+146	  int axis,
+147	  r_obj* names,
+148	  struct rray_arg* arg,
+149	  struct r_lazy error_call
+150	) {
+151	  check_unclassed(x, arg, error_call);
+152	  x = KEEP(arg_as_array(x, arg, error_call));
+153	
+154	  const int dimensionality = rray_dimensionality(x, arg, error_call);
+155	  check_axis(axis, dimensionality, rray_args.axis, error_call);
+156	
+157	  const int dimension = rray_dimension(x, axis, arg, error_call);
+158	  check_axis_names(names, axis, dimension, error_call);
+159	
+160	  r_obj* old_names = KEEP(rray_names(x, arg, error_call));
+161	
+162	  r_obj* new_names = KEEP(r_alloc_list(dimensionality));
+163	  if (old_names != r_null) {
+164	    r_obj* const* v_old_names = r_list_cbegin(old_names);
+165	    for (int i = 0; i &lt; dimensionality; ++i) {
+166	      r_list_poke(new_names, i, v_old_names[i]);
+167	    }
+168	  }
+169	  r_list_poke(new_names, axis - 1, names);
+170	
+171	  r_obj* out = KEEP(r_wrap(x));
+172	  r_attrib_poke_dim_names(out, new_names);
+173	
+174	  FREE(4);</pre></details>
+<details class="tool"><summary>Read src/titles.c</summary>
+<pre class="output">98	
+99	  r_attrib_poke_names(new_names, titles);
+100	
+101	  r_obj* out = KEEP(r_wrap(x));
+102	  r_attrib_poke_dim_names(out, new_names);
+103	
+104	  FREE(3);
+105	  return out;
+106	}
+107	
+108	r_obj* ffi_rray_set_axis_title(
+109	  r_obj* ffi_x,
+110	  r_obj* ffi_axis,
+111	  r_obj* ffi_title,
+112	  r_obj* ffi_frame
+113	) {
+114	  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+115	  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+116	  return rray_set_axis_title(ffi_x, axis, ffi_title, rray_args.x, error_call);
+117	}
+118	
+119	r_obj* rray_set_axis_title(
+120	  r_obj* x,
+121	  int axis,
+122	  r_obj* title,
+123	  struct rray_arg* arg,
+124	  struct r_lazy error_call
+125	) {
+126	  check_unclassed(x, arg, error_call);
+127	  x = KEEP(arg_as_array(x, arg, error_call));
+128	
+129	  const int dimensionality = rray_dimensionality(x, arg, error_call);
+130	  check_axis(axis, dimensionality, rray_args.axis, error_call);
+131	
+132	  if (title == r_null) {
+133	    r_obj* out = rray_clear_axis_title(x, axis, arg, error_call);
+134	    FREE(1);
+135	    return out;
+136	  }
+137	
+138	  if (r_typeof(title) != R_TYPE_character) {
+139	    r_abort_lazy_call(
+140	      error_call,
+141	      &quot;%s must be a character vector or `NULL`, not %s.&quot;,
+142	      rray_arg_format(rray_args.title),
+143	      r_obj_type_friendly(title)
+144	    );
+145	  }
+146	
+147	  if (r_length(title) != 1) {
+148	    r_abort_lazy_call(
+149	      error_call,
+150	      &quot;%s must have length 1, not length %&quot; R_PRI_SSIZE &quot;.&quot;,
+151	      rray_arg_format(rray_args.title),
+152	      r_length(title)
+153	    );
+154	  }
+155	
+156	  r_obj* names = r_dim_names(x);
+157	  r_obj* old_titles = names == r_null ? r_null : r_names(names);
+158	
+159	  r_obj* new_titles = KEEP(r_alloc_character(dimensionality));
+160	
+161	  if (old_titles != r_null) {
+162	    r_obj* const* v_old_titles = r_chr_cbegin(old_titles);
+163	    for (int i = 0; i &lt; dimensionality; ++i) {
+164	      r_chr_poke(new_titles, i, v_old_titles[i]);
+165	    }
+166	  }
+167	
+168	  r_chr_poke(new_titles, axis - 1, r_chr_get(title, 0));
+169	
+170	  r_obj* out = KEEP(rray_set_titles(x, new_titles, arg, error_call));
+171	
+172	  FREE(3);
+173	  return out;
+174	}
+175	
+176	static r_obj* rray_clear_titles(r_obj* x) {
+177	  r_obj* names = r_dim_names(x);
+178	
+179	  if (names == r_null || r_names(names) == r_null) {
+180	    return x;
+181	  }
+182	
+183	  r_obj* new_names = KEEP(r_clone(names));
+184	  r_attrib_poke_names(new_names, r_null);
+185	
+186	  r_obj* out = KEEP(r_wrap(x));
+187	  r_attrib_poke_dim_names(out, new_names);
+188	
+189	  FREE(2);</pre></details>
+<details class="tool"><summary>Read src/utils.c</summary>
+<pre class="output">1	#include &quot;utils.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	#include &lt;math.h&gt;
+5	
+6	#include &quot;syms.h&quot;
+7	#include &quot;wrapper.h&quot;
+8	
+9	#include &quot;decl/utils-decl.h&quot;
+10	
+11	// Normalize a vector into an array
+12	//
+13	// - Turns length into `dim`
+14	// - Turns `names` into `dimnames`
+15	// - Clears `names`
+16	//
+17	// Since we are only modifying attributes,
+18	// we use a lightweight wrapper
+19	r_obj* vec_as_array(r_obj* x) {
+20	  if (r_dim(x) != r_null) {
+21	    return x;
+22	  }
+23	
+24	  r_obj* out = KEEP(r_wrap(x));
+25	
+26	  const r_ssize size = r_length(x);
+27	  r_obj* dimensions = r_int(r_ssize_as_integer(size));
+28	  r_attrib_poke_dim(out, dimensions);
+29	
+30	  r_obj* axis_names = r_names(x);
+31	  if (axis_names != r_null) {
+32	    KEEP(axis_names);
+33	    r_obj* names = KEEP(r_alloc_list(1));
+34	    r_list_poke(names, 0, axis_names);
+35	    r_attrib_poke_dim_names(out, names);
+36	    r_attrib_zap(out, r_syms.names);
+37	    FREE(2);
+38	  }
+39	
+40	  FREE(1);
+41	  return out;
+42	}</pre></details>
+<details class="tool"><summary>Edit src/wrapper.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));</span>
+<span class="del">-</span>
+<span class="del">-  // Creates a fresh attribute pairlist!</span>
+<span class="del">-  // Note that we always use `x` here, not `data`.</span>
+<span class="del">-  r_attrib_clone_from(out, x);</span>
+<span class="del">-</span>
+<span class="ins">+  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray/src/wrapper.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="del">-</span>
+<span class="del">-  r_attrib_poke_dim_names(out, r_null);</span>
+<span class="del">-  r_attrib_poke_dim(out, dimensions);</span>
+<span class="ins">+  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="ins">+  r_attrib_poke_dim(out, dimensions);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/dimensions.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/names.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="del">-  r_attrib_poke_dim_names(out, names);</span>
+<span class="ins">+  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="ins">+  r_attrib_poke_dim(out, r_dim(x));</span>
+<span class="ins">+  r_attrib_poke_dim_names(out, names);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/names.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/names.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="del">-  r_attrib_poke_dim_names(out, new_names);</span>
+<span class="ins">+  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="ins">+  r_attrib_poke_dim(out, r_dim(x));</span>
+<span class="ins">+  r_attrib_poke_dim_names(out, new_names);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/names.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/titles.c</summary>
+<pre class="diff"><span class="del">-  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="del">-  r_attrib_poke_dim_names(out, new_names);</span>
+<span class="ins">+  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="ins">+  r_attrib_poke_dim(out, r_dim(x));</span>
+<span class="ins">+  r_attrib_poke_dim_names(out, new_names);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/titles.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/utils.c</summary>
+<pre class="diff"><span class="del">-    r_attrib_poke_dim_names(out, names);</span>
+<span class="del">-    r_attrib_zap(out, r_syms.names);</span>
+<span class="ins">+    r_attrib_poke_dim_names(out, names);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/utils.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/utils.c</summary>
+<pre class="diff"><span class="del">-#include &quot;syms.h&quot;</span>
+<span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;wrapper.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/utils.c has been updated successfully.</pre></details>
+<p>Now the tests.</p>
+
+<details class="tool"><summary>Read tests/testthat/test-dimensions.R</summary>
+<pre class="output">262	  out &lt;- rray_set_dimensions(x, c(3L, 2L))
+263	  expect_null(dimnames(out))
+264	})
+265	
+266	test_that(&quot;drops names from a named vector&quot;, {
+267	  x &lt;- c(a = 1L, b = 2L)
+268	  out &lt;- rray_set_dimensions(x, c(1L, 2L))
+269	  expect_null(dimnames(out))
+270	})
+271	
+272	test_that(&quot;errors when size would change&quot;, {
+273	  expect_snapshot(rray_set_dimensions(1:6, c(6L, 2L)), error = TRUE)
+274	})
+275	</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-insert-axes.R</summary>
+<pre class="output">98	})
+99	
+100	test_that(&quot;does not modify the input&quot;, {
+101	  x &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;a&quot;, &quot;b&quot;))
+102	  expected &lt;- x
+103	  rray_insert_axes(x, 2L)
+104	
+105	  expect_identical(x, expected)
+106	})
+107	
+108	test_that(&quot;axes are coerced to integer&quot;, {
+109	  x &lt;- array(1:3, 3L)</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-remove-axes.R</summary>
+<pre class="output">87	})
+88	
+89	test_that(&quot;does not modify the input&quot;, {
+90	  x &lt;- array(1L, c(1L, 1L), dimnames = list(&quot;a&quot;, &quot;b&quot;))
+91	  expected &lt;- x
+92	  rray_remove_axes(x, 2L)
+93	
+94	  expect_identical(x, expected)
+95	})
+96	
+97	test_that(&quot;axes are coerced to integer&quot;, {
+98	  x &lt;- array(1:3, c(3L, 1L))</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-names.R</summary>
+<pre class="output">128	  expect_null(dimnames(out))
+129	})
+130	
+131	test_that(&quot;rray_set_names() doesn't touch the data&quot;, {
+132	  x &lt;- array(1:6, c(2, 3))
+133	  out &lt;- rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+134	  expect_identical(unname(out), x)
+135	})
+136	
+137	test_that(&quot;rray_set_names() works with zero-size axes&quot;, {
+138	  x &lt;- array(integer(), c(0, 3))
+139	  # A zero-length character vector is normalized to `NULL` by R itself
+140	  out &lt;- rray_set_names(x, list(character(), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+141	  expect_identical(dimnames(out), list(NULL, c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+142	})
+143	
+144	test_that(&quot;rray_set_names() errors if `names` isn't a list or `NULL`&quot;, {
+145	  x &lt;- array(1:6, c(2, 3))
+146	  expect_snapshot(rray_set_names(x, c(&quot;r1&quot;, &quot;r2&quot;)), error = TRUE)
+147	})
+148	
+149	test_that(&quot;rray_set_names() errors if length doesn't match dimensionality&quot;, {
+150	  x &lt;- array(1:6, c(2, 3))
+151	  expect_snapshot(rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;))), error = TRUE)
+152	  expect_snapshot(
+153	    rray_set_names(x, list(c(&quot;r1&quot;, &quot;r2&quot;), NULL, NULL)),
+154	    error = TRUE
+155	  )
+156	})
+157	
+158	test_that(&quot;rray_set_names() errors if an axis' names aren't character&quot;, {
+159	  x &lt;- array(1:6, c(2, 3))
+160	  expect_snapshot(rray_set_names(x, list(1:2, NULL)), error = TRUE)
+161	})
+162	
+163	test_that(&quot;rray_set_names() errors if an axis' names are the wrong length&quot;, {
+164	  x &lt;- array(1:6, c(2, 3))
+165	  expect_snapshot(rray_set_names(x, list(&quot;r1&quot;, NULL)), error = TRUE)
+166	})
+167	
+168	test_that(&quot;rray_set_names() errors on classed input&quot;, {
+169	  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+170	  expect_snapshot(rray_set_names(x, NULL), error = TRUE)
+171	})
+172	
+173	# ------------------------------------------------------------------------------
+174	# rray_set_axis_names()
+175	
+176	test_that(&quot;rray_set_axis_names() sets names for a single axis&quot;, {
+177	  x &lt;- array(1:6, c(2, 3))
+178	  out &lt;- rray_set_axis_names(x, 1, c(&quot;r1&quot;, &quot;r2&quot;))
+179	  expect_identical(dimnames(out), list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))
+180	})
+181	
+182	test_that(&quot;rray_set_axis_names() leaves other axes untouched&quot;, {
+183	  x &lt;- array(
+184	    1:6,
+185	    c(2, 3),
+186	    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+187	  )
+188	  out &lt;- rray_set_axis_names(x, 1, c(&quot;a&quot;, &quot;b&quot;))
+189	  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))
+190	})
+191	
+192	test_that(&quot;rray_set_axis_names() with `NULL` clears just that axis&quot;, {
+193	  x &lt;- array(
+194	    1:6,
+195	    c(2, 3),
+196	    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+197	  )</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-cast.R</summary>
+<pre class="output">96	})
+97	
+98	test_that(&quot;a bare vector becomes a one dimensional array&quot;, {
+99	  expect_identical(
+100	    rray_cast(c(a = 1L, b = 2L), double()),
+101	    array(c(1, 2), 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))
+102	  )
+103	})
+104	
+105	test_that(&quot;dimensions and names are kept&quot;, {
+106	  x &lt;- array(1:6, c(1L, 2L, 3L), dimnames = list(&quot;a&quot;, c(&quot;b&quot;, &quot;c&quot;), NULL))
+107	  out &lt;- rray_cast(x, double())</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-dimensions.R</summary>
+<pre class="diff"><span class="del">-  out &lt;- rray_set_dimensions(x, c(1L, 2L))</span>
+<span class="del">-  expect_null(dimnames(out))</span>
+<span class="del">-})</span>
+<span class="ins">+  out &lt;- rray_set_dimensions(x, c(1L, 2L))</span>
+<span class="ins">+  expect_null(dimnames(out))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;drops other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  names(x) &lt;- letters[1:4]</span>
+<span class="ins">+  expect_identical(rray_set_dimensions(x, c(4L, 1L)), array(1:4, c(4L, 1L)))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-dimensions.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-insert-axes.R</summary>
+<pre class="diff"><span class="del">-  rray_insert_axes(x, 2L)</span>
+<span class="del">-</span>
+<span class="del">-  expect_identical(x, expected)</span>
+<span class="del">-})</span>
+<span class="ins">+  rray_insert_axes(x, 2L)</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(x, expected)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;drops other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  names(x) &lt;- letters[1:4]</span>
+<span class="ins">+  expect_identical(rray_insert_axes(x, 1L), array(1:4, c(1L, 2L, 2L)))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-insert-axes.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-remove-axes.R</summary>
+<pre class="diff"><span class="del">-  rray_remove_axes(x, 2L)</span>
+<span class="del">-</span>
+<span class="del">-  expect_identical(x, expected)</span>
+<span class="del">-})</span>
+<span class="ins">+  rray_remove_axes(x, 2L)</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(x, expected)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;drops other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(1L, 2L, 2L))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  names(x) &lt;- letters[1:4]</span>
+<span class="ins">+  expect_identical(rray_remove_axes(x, 1L), array(1:4, c(2L, 2L)))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-remove-axes.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-names.R</summary>
+<pre class="diff"><span class="del">-  expect_identical(unname(out), x)</span>
+<span class="del">-})</span>
+<span class="ins">+  expect_identical(unname(out), x)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rray_set_names() drops other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  names(x) &lt;- letters[1:4]</span>
+<span class="ins">+</span>
+<span class="ins">+  names &lt;- list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;))</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_set_names(x, names),</span>
+<span class="ins">+    array(1:4, c(2L, 2L), dimnames = names)</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(rray_set_names(x, NULL), array(1:4, c(2L, 2L)))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-names.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-names.R</summary>
+<pre class="diff"><span class="del">-  out &lt;- rray_set_axis_names(x, 1, c(&quot;a&quot;, &quot;b&quot;))</span>
+<span class="del">-  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))</span>
+<span class="del">-})</span>
+<span class="ins">+  out &lt;- rray_set_axis_names(x, 1, c(&quot;a&quot;, &quot;b&quot;))</span>
+<span class="ins">+  expect_identical(dimnames(out), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;)))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;rray_set_axis_names() drops other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  names(x) &lt;- letters[1:4]</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_set_axis_names(x, 1L, c(&quot;a&quot;, &quot;b&quot;)),</span>
+<span class="ins">+    array(1:4, c(2L, 2L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-names.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-cast.R</summary>
+<pre class="diff"><span class="del">-    array(c(1, 2), 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    array(c(1, 2), 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;a bare vector drops other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- structure(c(a = 1L, b = 2L), foo = 1)</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_cast(x, integer()),</span>
+<span class="ins">+    array(1:2, 2L, dimnames = list(c(&quot;a&quot;, &quot;b&quot;)))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-cast.R has been updated successfully.</pre></details>
+<p>Titles test (steps 8 and 9):</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-titles.R</summary>
+<pre class="diff"><span class="del">-    setNames(unname(original), c(&quot;First&quot;, &quot;Column&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-  expect_identical(dimnames(x), original)</span>
+<span class="del">-})</span>
+<span class="ins">+    setNames(unname(original), c(&quot;First&quot;, &quot;Column&quot;))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(dimnames(x), original)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;title setters drop other attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  names(x) &lt;- letters[1:4]</span>
+<span class="ins">+</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_set_titles(x, c(&quot;a&quot;, &quot;b&quot;)),</span>
+<span class="ins">+    array(1:4, c(2L, 2L), dimnames = list(a = NULL, b = NULL))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_set_axis_title(x, 1L, &quot;a&quot;),</span>
+<span class="ins">+    array(1:4, c(2L, 2L), dimnames = list(a = NULL, NULL))</span>
+<span class="ins">+  )</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L), dimnames = list(a = c(&quot;r1&quot;, &quot;r2&quot;), b = NULL))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    rray_set_titles(x, NULL),</span>
+<span class="ins">+    array(1:4, c(2L, 2L), dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), NULL))</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-titles.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-wrapper.R</summary>
+<pre class="output">40	})
+41	
+42	# ------------------------------------------------------------------------------
+43	# Attributes
+44	
+45	test_that(&quot;wrapper clones attributes from the original&quot;, {
+46	  x &lt;- array(
+47	    1:6,
+48	    c(2L, 3L),
+49	    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))
+50	  )
+51	  w &lt;- wrap(x)
+52	  expect_identical(dim(w), dim(x))
+53	  expect_identical(dimnames(w), dimnames(x))
+54	})
+55	
+56	test_that(&quot;wrapper gets its own attribute pairlist&quot;, {
+57	  x &lt;- c(a = 1L, b = 2L)
+58	  w &lt;- wrap(x)
+59	  names(w) &lt;- c(&quot;x&quot;, &quot;y&quot;)
+60	  expect_identical(names(x), c(&quot;a&quot;, &quot;b&quot;))
+61	  expect_identical(names(w), c(&quot;x&quot;, &quot;y&quot;))
+62	})
+63	
+64	test_that(&quot;modifying dim on wrapper does not affect original&quot;, {
+65	  x &lt;- array(1:6, c(2L, 3L))
+66	  w &lt;- wrap(x)
+67	  dim(w) &lt;- c(3L, 2L)
+68	  expect_identical(dim(x), c(2L, 3L))
+69	  expect_identical(dim(w), c(3L, 2L))</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-wrapper.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;wrapper clones attributes from the original&quot;, {</span>
+<span class="del">-  x &lt;- array(</span>
+<span class="del">-    1:6,</span>
+<span class="del">-    c(2L, 3L),</span>
+<span class="del">-    dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;c1&quot;, &quot;c2&quot;, &quot;c3&quot;))</span>
+<span class="del">-  )</span>
+<span class="del">-  w &lt;- wrap(x)</span>
+<span class="del">-  expect_identical(dim(w), dim(x))</span>
+<span class="del">-  expect_identical(dimnames(w), dimnames(x))</span>
+<span class="del">-})</span>
+<span class="del">-</span>
+<span class="del">-test_that(&quot;wrapper gets its own attribute pairlist&quot;, {</span>
+<span class="del">-  x &lt;- c(a = 1L, b = 2L)</span>
+<span class="del">-  w &lt;- wrap(x)</span>
+<span class="del">-  names(w) &lt;- c(&quot;x&quot;, &quot;y&quot;)</span>
+<span class="del">-  expect_identical(names(x), c(&quot;a&quot;, &quot;b&quot;))</span>
+<span class="del">-  expect_identical(names(w), c(&quot;x&quot;, &quot;y&quot;))</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;wrapper starts with no attributes&quot;, {</span>
+<span class="ins">+  x &lt;- array(1:4, c(2L, 2L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))</span>
+<span class="ins">+  attr(x, &quot;foo&quot;) &lt;- 1</span>
+<span class="ins">+  w &lt;- wrap(x)</span>
+<span class="ins">+  expect_null(attributes(w))</span>
+<span class="ins">+  expect_wraps(w, x)</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-wrapper.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-wrapper.R</summary>
+<pre class="output">118	  w &lt;- wrap(x)
+119	  expect_wraps(w, x)
+120	})
+121	
+122	test_that(&quot;read-only access to a dimensioned wrapper shares data&quot;, {
+123	  xs &lt;- list(
+124	    c(TRUE, FALSE),
+125	    c(1L, 2L),
+126	    c(1.5, 2.5),
+127	    c(1 + 2i, 3 + 4i)
+128	  )
+129	
+130	  for (x in xs) {
+131	    dim(x) &lt;- c(1L, 2L)
+132	    w &lt;- wrap(x)
+133	
+134	    expect_identical(wrapper_read_access(w), TRUE)
+135	    expect_wraps(w, x)
+136	  }
+137	})</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-wrapper.R</summary>
+<pre class="diff"><span class="del">-  for (x in xs) {</span>
+<span class="del">-    dim(x) &lt;- c(1L, 2L)</span>
+<span class="del">-    w &lt;- wrap(x)</span>
+<span class="del">-</span>
+<span class="del">-    expect_identical</span>
+<span class="ins">+  for (x in xs) {</span>
+<span class="ins">+    w &lt;- rray_set_dimensions(x, c(1L, 2L))</span>
+<span class="ins">+</span>
+<span class="ins">+    expect_identical</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-wrapper.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-wrapper.R</summary>
+<pre class="output">262	# Wrapping a wrapper
+263	
+264	test_that(&quot;wrapping a wrapper does not create nested wrappers&quot;, {
+265	  x &lt;- 1:3
+266	  w1 &lt;- wrap(x)
+267	  w2 &lt;- wrap(w1)
+268	
+269	  expect_identical(is_wrapper(wrapper_data(w2)), FALSE)
+270	
+271	  expect_wraps(w1, x)
+272	  expect_wraps(w2, x)
+273	})
+274	
+275	test_that(&quot;wrapping a wrapper uses the wrapper's attributes&quot;, {
+276	  # (even though it actually wraps `x`)
+277	
+278	  x &lt;- structure(1:3, foo = &quot;bar&quot;)
+279	
+280	  w1 &lt;- structure(wrap(x), a = &quot;b&quot;)
+281	  expect_mapequal(attributes(w1), list(foo = &quot;bar&quot;, a = &quot;b&quot;))
+282	
+283	  w2 &lt;- wrap(w1)
+284	  expect_mapequal(attributes(w2), list(foo = &quot;bar&quot;, a = &quot;b&quot;))
+285	})
+286	
+287	test_that(&quot;wrapping a wrapper gives independent attributes&quot;, {
+288	  x &lt;- c(a = 1L, b = 2L, c = 3L)
+289	  w1 &lt;- wrap(x)
+290	  w2 &lt;- wrap(w1)
+291	  names(w1) &lt;- c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)
+292	  expect_identical(names(w2), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+293	})
+294	
+295	# ------------------------------------------------------------------------------
+296	# Duplication
+297	
+298	test_that(&quot;shallow duplicate of a wrapper is a plain vector&quot;, {
+299	  x &lt;- 1:3
+300	  w &lt;- wrap(x)
+301	  w2 &lt;- w
+302	  dim(w2) &lt;- c(1L, 3L)
+303	  expect_identical(is_wrapper(w2), FALSE)
+304	  expect_identical(w2, array(1:3, c(1L, 3L)))
+305	  expect_null(dim(w))
+306	  expect_wraps(w, x)
+307	})
+308	
+309	test_that(&quot;duplicating a wrapper keeps the wrapper's attributes&quot;, {
+310	  x &lt;- structure(
+311	    1:6,
+312	    dim = c(2L, 3L),
+313	    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)),
+314	    foo = &quot;bar&quot;
+315	  )
+316	  w &lt;- rray_set_dimensions(x, c(3L, 2L))
+317	  expect_wraps(w, x)
+318	
+319	  expected &lt;- structure(1:6, foo = &quot;bar&quot;, dim = c(3L, 2L))
+320	
+321	  shallow &lt;- rlang::duplicate(w, shallow = TRUE)
+322	  expect_identical(is_wrapper(shallow), FALSE)
+323	  expect_identical(shallow, expected)
+324	
+325	  deep &lt;- rlang::duplicate(w, shallow = FALSE)
+326	  expect_identical(is_wrapper(deep), FALSE)
+327	  expect_identical(deep, expected)
+328	
+329	  expect_identical(attributes(w), attributes(expected))
+330	  expect_identical(attr(x, &quot;dimnames&quot;), list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)))
+331	})
+332	
+333	test_that(&quot;deep copy via c() produces a regular non-wrapper vector&quot;, {
+334	  w &lt;- wrap(1:3)
+335	  d &lt;- c(w)
+336	  expect_false(is_wrapper(d))
+337	  expect_identical(d, 1:3)
+338	})
+339	
+340	# ------------------------------------------------------------------------------
+341	# Serialization
+342	
+343	test_that(&quot;serialization round-trips wrapper to plain vector&quot;, {
+344	  w &lt;- wrap(1:5)
+345	  attr(w, &quot;custom&quot;) &lt;- &quot;hello&quot;
+346	  rt &lt;- unserialize(serialize(w, NULL))
+347	  expect_false(is_wrapper(rt))
+348	  expect_identical(as.integer(rt), 1:5)
+349	  expect_identical(attr(rt, &quot;custom&quot;), &quot;hello&quot;)
+350	})
+351	</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-wrapper.R</summary>
+<pre class="diff"><span class="del">-test_that(&quot;wrapping a wrapper uses the wrapper's attributes&quot;, {</span>
+<span class="del">-  # (even though it actually wraps `x`)</span>
+<span class="del">-</span>
+<span class="del">-  x &lt;- structure(1:3, foo = &quot;bar&quot;)</span>
+<span class="del">-</span>
+<span class="del">-  w1 &lt;- structure(wrap(x), a = &quot;b&quot;)</span>
+<span class="del">-  expect_mapequal(attributes(w1), list(foo = &quot;bar&quot;, a = &quot;b&quot;))</span>
+<span class="del">-</span>
+<span class="del">-  w2 &lt;- wrap(w1)</span>
+<span class="del">-  expect_mapequal(attributes(w2), list(foo = &quot;bar&quot;, a = &quot;b&quot;))</span>
+<span class="del">-})</span>
+<span class="del">-</span>
+<span class="del">-test_that(&quot;wrapping a wrapper gives independent attributes&quot;, {</span>
+<span class="del">-  x &lt;- c(a = 1L, b = 2L, c = 3L)</span>
+<span class="del">-  w1 &lt;- wrap(x)</span>
+<span class="del">-  w2 &lt;- wrap(w1)</span>
+<span class="del">-  names(w1) &lt;- c(&quot;x&quot;, &quot;y&quot;, &quot;z&quot;)</span>
+<span class="del">-  expect_identical(names(w2), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))</span>
+<span class="del">-})</span>
+<span class="ins">+test_that(&quot;wrapping a wrapper drops its attributes&quot;, {</span>
+<span class="ins">+  x &lt;- 1:4</span>
+<span class="ins">+  w1 &lt;- rray_set_dimensions(x, c(2L, 2L))</span>
+<span class="ins">+  w2 &lt;- wrap(w1)</span>
+<span class="ins">+  expect_null(attributes(w2))</span>
+<span class="ins">+  expect_identical(dim(w1), c(2L, 2L))</span>
+<span class="ins">+  expect_wraps(w2, x)</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-wrapper.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-wrapper.R</summary>
+<pre class="diff"><span class="del">-  x &lt;- structure(</span>
+<span class="del">-    1:6,</span>
+<span class="del">-    dim = c(2L, 3L),</span>
+<span class="del">-    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;)),</span>
+<span class="del">-    foo = &quot;bar&quot;</span>
+<span class="del">-  )</span>
+<span class="del">-  w &lt;- rray_set_dimensions(x, c(3L, 2L))</span>
+<span class="del">-  expect_wraps(w, x)</span>
+<span class="del">-</span>
+<span class="del">-  expected &lt;- structure(1:6, foo = &quot;bar&quot;, dim = c(3L, 2L))</span>
+<span class="ins">+  x &lt;- structure(</span>
+<span class="ins">+    1:6,</span>
+<span class="ins">+    dim = c(2L, 3L),</span>
+<span class="ins">+    dimnames = list(c(&quot;a&quot;, &quot;b&quot;), c(&quot;c&quot;, &quot;d&quot;, &quot;e&quot;))</span>
+<span class="ins">+  )</span>
+<span class="ins">+  w &lt;- rray_set_dimensions(x, c(3L, 2L))</span>
+<span class="ins">+  expect_wraps(w, x)</span>
+<span class="ins">+</span>
+<span class="ins">+  expected &lt;- array(1:6, c(3L, 2L))</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-wrapper.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-wrapper.R</summary>
+<pre class="diff"><span class="del">-  w &lt;- wrap(1:5)</span>
+<span class="del">-  attr(w, &quot;custom&quot;) &lt;- &quot;hello&quot;</span>
+<span class="del">-  rt &lt;- unserialize(serialize(w, NULL))</span>
+<span class="del">-  expect_false(is_wrapper(rt))</span>
+<span class="del">-  expect_identical(as.integer(rt), 1:5)</span>
+<span class="del">-  expect_identical(attr(rt, &quot;custom&quot;), &quot;hello&quot;)</span>
+<span class="ins">+  w &lt;- rray_set_dimensions(1:5, 5L)</span>
+<span class="ins">+  expect_identical(is_wrapper(w), TRUE)</span>
+<span class="ins">+  rt &lt;- unserialize(serialize(w, NULL))</span>
+<span class="ins">+  expect_identical(is_wrapper(rt), FALSE)</span>
+<span class="ins">+  expect_identical(as.integer(rt), 1:5)</span>
+<span class="ins">+  expect_identical(dim(rt), 5L)</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-wrapper.R has been updated successfully.</pre></details>
+<p>Formatting and running the full test suite.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git…</summary>
+<pre>cd ~/files/r/packages/rray; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git status --short &amp;&amp; Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -25</pre><pre class="output"> M src/dimensions.c
+ M src/names.c
+ M src/titles.c
+ M src/utils.c
+ M src/wrapper.c
+ M tests/testthat/test-cast.R
+ M tests/testthat/test-dimensions.R
+ M tests/testthat/test-insert-axes.R
+ M tests/testthat/test-names.R
+ M tests/testthat/test-remove-axes.R
+ M tests/testthat/test-titles.R
+ M tests/testthat/test-wrapper.R
+ℹ Testing rray
+SKIP: 'test-reduce-mean.R:187:3' ------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-mean.R:197:3' ------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-mean.R:210:3' ------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:491:3' -------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:498:3' -------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:506:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 7683 ]</pre></details>
+<p>All green. Checking that the new tests actually fail without the C change:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git stash push -q -- src &amp;&amp; Rscript -e &quot;devtools::test…</summary>
+<pre>cd ~/files/r/packages/rray; git stash push -q -- src &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(cast|dimensions|insert-axes|remove-axes|names|titles|wrapper)$')&quot; 2&gt;&amp;1 | grep -E &quot;^(Failure|Error|\[ FAIL)|── (Failure|Error)&quot; | head -30; git stash pop -q &amp;&amp; git status --short src</pre><pre class="output"> M src/dimensions.c
+ M src/names.c
+ M src/titles.c
+ M src/utils.c
+ M src/wrapper.c</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git stash push -q -- src &amp;&amp; Rscript -e &quot;devtools::test…</summary>
+<pre>cd ~/files/r/packages/rray; git stash push -q -- src &amp;&amp; Rscript -e &quot;devtools::test(filter = '^(cast|dimensions|insert-axes|remove-axes|names|titles|wrapper)$')&quot; 2&gt;&amp;1 | grep -E &quot;FAIL|Failure \(&quot; | head -30; git stash pop -q &amp;&amp; git status --short src</pre><pre class="output">FAILURE: 'test-cast.R:107:3' ----------------------
+FAILURE: 'test-dimensions.R:276:3' ----------------
+FAILURE: 'test-insert-axes.R:112:3' ---------------
+FAILURE: 'test-names.R:143:3' ---------------------
+FAILURE: 'test-names.R:147:3' ---------------------
+FAILURE: 'test-names.R:209:3' ---------------------
+FAILURE: 'test-remove-axes.R:101:3' ---------------
+FAILURE: 'test-titles.R:80:3' ---------------------
+FAILURE: 'test-titles.R:84:3' ---------------------
+FAILURE: 'test-titles.R:91:3' ---------------------
+ M src/dimensions.c
+ M src/names.c
+ M src/titles.c
+ M src/utils.c
+ M src/wrapper.c</pre></details>
+<p>The wrapper tests didn't show up in that list, so I'm checking them on their own:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git stash push -q -- src &amp;&amp; Rscript -e &quot;devtools::test…</summary>
+<pre>cd ~/files/r/packages/rray; git stash push -q -- src &amp;&amp; Rscript -e &quot;devtools::test(filter = 'wrapper')&quot; 2&gt;&amp;1 | grep -E &quot;FAIL|Failure|Error&quot; | head; git stash pop -q &amp;&amp; git status --short src</pre><pre class="output">FAILURE: 'test-wrapper.R:49:3' --------------------
+FAILURE: 'test-wrapper.R:279:3' -------------------
+[ FAIL 2 | WARN 0 | SKIP 0 | PASS 2367 ]
+ M src/dimensions.c
+ M src/names.c
+ M src/titles.c
+ M src/utils.c
+ M src/wrapper.c</pre></details>
+<p>Protection pass over the new <code>r_attrib_poke_dim(out, r_dim(x))</code> lines:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; grep -n &quot;x = KEEP(arg_as_array\|^r_obj\* rray_set\|^st…</summary>
+<pre>cd ~/files/r/packages/rray; grep -n &quot;x = KEEP(arg_as_array\|^r_obj\* rray_set\|^static r_obj\* rray_clear_titles\|rray_clear_titles(x)&quot; src/names.c src/titles.c; git diff src</pre><pre class="output">src/names.c:18:  x = KEEP(arg_as_array(x, arg, error_call));
+src/names.c:47:  x = KEEP(arg_as_array(x, arg, error_call));
+src/names.c:65:r_obj* rray_set_names(
+src/names.c:72:  x = KEEP(arg_as_array(x, arg, error_call));
+src/names.c:145:r_obj* rray_set_axis_names(
+src/names.c:153:  x = KEEP(arg_as_array(x, arg, error_call));
+src/titles.c:51:r_obj* rray_set_titles(
+src/titles.c:58:  x = KEEP(arg_as_array(x, arg, error_call));
+src/titles.c:61:    r_obj* out = rray_clear_titles(x);
+src/titles.c:120:r_obj* rray_set_axis_title(
+src/titles.c:128:  x = KEEP(arg_as_array(x, arg, error_call));
+src/titles.c:177:static r_obj* rray_clear_titles(r_obj* x) {
+diff --git a/src/dimensions.c b/src/dimensions.c
+index 535c2c3..ee903b3 100644
+--- a/src/dimensions.c
++++ b/src/dimensions.c
+@@ -92,8 +92,6 @@ r_obj* rray_set_dimensions(
+   }
+ 
+   r_obj* out = KEEP(r_wrap(x));
+-
+-  r_attrib_poke_dim_names(out, r_null);
+   r_attrib_poke_dim(out, dimensions);
+ 
+   FREE(3);
+diff --git a/src/names.c b/src/names.c
+index 9efe10e..4b8a75d 100644
+--- a/src/names.c
++++ b/src/names.c
+@@ -106,6 +106,7 @@ r_obj* rray_set_names(
+   }
+ 
+   r_obj* out = KEEP(r_wrap(x));
++  r_attrib_poke_dim(out, r_dim(x));
+   r_attrib_poke_dim_names(out, names);
+ 
+   FREE(2);
+@@ -169,6 +170,7 @@ r_obj* rray_set_axis_names(
+   r_list_poke(new_names, axis - 1, names);
+ 
+   r_obj* out = KEEP(r_wrap(x));
++  r_attrib_poke_dim(out, r_dim(x));
+   r_attrib_poke_dim_names(out, new_names);
+ 
+   FREE(4);
+diff --git a/src/titles.c b/src/titles.c
+index 611144b..76ac302 100644
+--- a/src/titles.c
++++ b/src/titles.c
+@@ -99,6 +99,7 @@ r_obj* rray_set_titles(
+   r_attrib_poke_names(new_names, titles);
+ 
+   r_obj* out = KEEP(r_wrap(x));
++  r_attrib_poke_dim(out, r_dim(x));
+   r_attrib_poke_dim_names(out, new_names);
+ 
+   FREE(3);
+@@ -184,6 +185,7 @@ static r_obj* rray_clear_titles(r_obj* x) {
+   r_attrib_poke_names(new_names, r_null);
+ 
+   r_obj* out = KEEP(r_wrap(x));
++  r_attrib_poke_dim(out, r_dim(x));
+   r_attrib_poke_dim_names(out, new_names);
+ 
+   FREE(2);
+diff --git a/src/utils.c b/src/utils.c
+index ccfc12e..6f53959 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -3,7 +3,6 @@
+ #include &lt;limits.h&gt;
+ #include &lt;math.h&gt;
+ 
+-#include &quot;syms.h&quot;
+ #include &quot;wrapper.h&quot;
+ 
+ #include &quot;decl/utils-decl.h&quot;
+@@ -33,7 +32,6 @@ r_obj* vec_as_array(r_obj* x) {
+     r_obj* names = KEEP(r_alloc_list(1));
+     r_list_poke(names, 0, axis_names);
+     r_attrib_poke_dim_names(out, names);
+-    r_attrib_zap(out, r_syms.names);
+     FREE(2);
+   }
+ 
+diff --git a/src/wrapper.c b/src/wrapper.c
+index ecaf36c..b89a9c6 100644
+--- a/src/wrapper.c
++++ b/src/wrapper.c
+@@ -41,10 +41,6 @@ r_obj* r_wrap(r_obj* x) {
+   // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+   r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+ 
+-  // Creates a fresh attribute pairlist!
+-  // Note that we always use `x` here, not `data`.
+-  r_attrib_clone_from(out, x);
+-
+   // The all important immutable marking of `out`, preventing any downstream C
+   // code from requesting a writable pointer without duplicating first.
+   MARK_NOT_MUTABLE(out);</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Protection checks out across all four setters—<code>x</code> is properly protected, <code>out</code> is kept, and <code>Rf_setAttrib()</code> protects its own args. Now checking whether <code>r_syms.names</code> is dead.</p>
+</details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; grep -rn &quot;r_syms\.\|syms.h&quot; src --include=*.c --includ…</summary>
+<pre>cd ~/files/r/packages/rray; grep -rn &quot;r_syms\.\|syms.h&quot; src --include=*.c --include=*.h | grep -v &quot;src/rlang/&quot;; cat src/syms.h</pre><pre class="output">(eval):1: no matches found: --include=*.c
+#ifndef RRAY_SYMS_H
+#define RRAY_SYMS_H
+
+#include &quot;rlang.h&quot;
+
+struct rray_syms {
+  r_obj* to;
+  r_obj* arg;
+  r_obj* x_arg;
+  r_obj* y_arg;
+  r_obj* to_arg;
+  r_obj* dot_arg;
+  r_obj* dot_to_arg;
+  r_obj* dot_ptype_arg;
+  r_obj* call;
+  r_obj* dot_call;
+};
+
+extern struct rray_syms rray_syms;
+
+#endif</pre></details>
+<p><code>r_syms.names</code> is rlang's own symbol, and <code>utils.c</code> uses nothing from <code>syms.h</code>, so dropping that include is right. Removing the plan and running <code>R CMD check</code>:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git rm -q plans/attributes.md &amp;&amp; grep -rn &quot;attributes.…</summary>
+<pre>cd ~/files/r/packages/rray; git rm -q plans/attributes.md &amp;&amp; grep -rn &quot;attributes.md&quot; plans README* AGENTS.md 2&gt;/dev/null; Rscript -e &quot;devtools::check()&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">plans/view.md:3:After `plans/wrap.md` and `plans/attributes.md`, `r_wrap(x)` returns an
+plans/view.md:19:The work is one pull request. It lands after `plans/attributes.md`, and
+  Running ‘testthat.R’ [29s/29s]
+ [29s/30s] OK
+* checking for unstated dependencies in vignettes ... OK
+* checking package vignettes ... OK
+* checking re-building of vignette outputs ... OK
+* checking for non-standard things in the check directory ... OK
+* checking for detritus in the temp directory ... OK
+* DONE
+
+Status: OK
+
+── R CMD check results ──────────────────────────────────── rray 0.0.0.9000 ────
+Duration: 1m 14.8s
+
+0 errors ✔ | 0 warnings ✔ | 0 notes ✔</pre></details>
+<p><code>R CMD check</code> is clean. <code>plans/view.md</code> still mentions <code>plans/attributes.md</code> as an ordering note. I left that alone, since it is your plan text. Committing and pushing:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git add -A &amp;&amp; git commit -q -m &quot;Start the wrapper with…</summary>
+<pre>cd ~/files/r/packages/rray; git add -A &amp;&amp; git commit -q -m &quot;Start the wrapper with no attributes so callers set only dim and dimnames&quot; &amp;&amp; git log --format='%an | %s%n%b' -1 &amp;&amp; git push -u origin feature/attributes 2&gt;&amp;1 | tail -3</pre><pre class="output">Davis Vaughan | Start the wrapper with no attributes so callers set only dim and dimnames
+
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/attributes -&gt; feature/attributes
+branch 'feature/attributes' set up to track 'origin/feature/attributes'.</pre></details>
+<p>I've implemented <code>plans/attributes.md</code>, deleted the plan, and committed and pushed everything to <code>feature/attributes</code>. All tests pass (7683, 0 failures) and <code>devtools::check()</code> finished with 0 errors, warnings or notes.</p>
+<p><code>r_wrap()</code> now returns a wrapper with no attributes, so each caller sets only <code>dim</code> and <code>dimnames</code>. Stray attributes like <code>foo</code> or <code>names</code> no longer leak through the reshape, names and titles functions.</p>
+<p><strong>Branch.</strong> I created <code>feature/attributes</code> from <code>origin/main</code>, not <code>fix/wrap</code>. Their file trees are identical because #150 already merged <code>fix/wrap</code>. My session setup named <code>feature/titles</code> as the branch to use, but I followed your request.</p>
+<p><strong>C changes</strong></p>
+<ul>
+<li>
+<p><code>src/wrapper.c</code>: removed the <code>r_attrib_clone_from()</code> call and its comment.</p>
+</li>
+<li>
+<p><code>src/dimensions.c</code> and <code>src/utils.c</code>: removed the calls that cleared <code>dimnames</code> and <code>names</code>, since the wrapper no longer has them. I also dropped the <code>syms.h</code> include from <code>utils.c</code>, because nothing there uses it any more.</p>
+</li>
+<li>
+<p><code>src/names.c</code> and <code>src/titles.c</code>: added <code>r_attrib_poke_dim(out, r_dim(x))</code> before setting <code>dimnames</code> in the four setters (<code>rray_set_names()</code>, <code>rray_set_axis_names()</code>, <code>rray_set_titles()</code>, <code>rray_clear_titles()</code>).</p>
+</li>
+</ul>
+<p><strong>Tests</strong></p>
+<ul>
+<li>
+<p>I added every test the plan listed and rewrote the <code>test-wrapper.R</code> tests as it described.</p>
+</li>
+<li>
+<p>I fixed &quot;duplicating a wrapper keeps the wrapper's attributes&quot; the way you chose: I removed <code>foo</code> from the input and the expected result. It still checks that base R copies the wrapper's own attributes when duplicating it.</p>
+</li>
+<li>
+<p>In the serialization test I also changed <code>expect_false()</code> to <code>expect_identical(..., FALSE)</code>, to match the new <code>TRUE</code> check next to it.</p>
+</li>
+<li>
+<p>To make sure the new tests actually test something, I ran them against the old C code: every one failed there, and all pass now.</p>
+</li>
+</ul>
+<p><strong>Checks.</strong> I ran <code>clang-format</code> and <code>air format</code>, and did the separate protection pass. In each setter <code>x</code> is protected when <code>r_dim(x)</code> is read, and <code>out</code> is protected. I added no comments.</p>
+<p>One thing for you: <code>plans/view.md</code> still mentions <code>plans/attributes.md</code> in two ordering notes. I left that text alone because it's your plan.</p>
+
+</section>
+<p class="divider">Oct 17, 2026, 22:26 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p class="command"><code>/pr-finish</code></p>
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git branch --show-current; git status --porcelain; gh …</summary>
+<pre>cd ~/files/r/packages/rray; git branch --show-current; git status --porcelain; gh pr view --json number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner; git rev-parse HEAD</pre><pre class="output">feature/attributes
+{&quot;baseRefName&quot;:&quot;main&quot;,&quot;headRefName&quot;:&quot;feature/attributes&quot;,&quot;headRefOid&quot;:&quot;9a1a6971a641bb3ef460f89acd2307eb8695a681&quot;,&quot;headRepositoryOwner&quot;:{&quot;id&quot;:&quot;MDEyOk9yZ2FuaXphdGlvbjIyNjE4NzE2&quot;,&quot;login&quot;:&quot;r-lib&quot;},&quot;number&quot;:151,&quot;state&quot;:&quot;MERGED&quot;}
+9a1a6971a641bb3ef460f89acd2307eb8695a681</pre></details>
+<p>All checks pass. Cleaning up:</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp;…</summary>
+<pre>cd ~/files/r/packages/rray; git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/attributes &amp;&amp; git fetch --prune origin &amp;&amp; git log --oneline -1</pre><pre class="output">Switched to branch 'main'
+Your branch is behind 'origin/main' by 1 commit, and can be fast-forwarded.
+  (use &quot;git pull&quot; to update your local branch)
+From https://github.com/r-lib/rray
+ * branch            main       -&gt; FETCH_HEAD
+   3511f69..e08c0d9  main       -&gt; origin/main
+Updating 15c82e1..e08c0d9
+Fast-forward
+ plans/view.md                             | 348 ++++++++++++++++++++++
+ plans/wrap.md                             | 470 ++++++++++++++++++++++++++++++
+ src/decl/wrapper-decl.h                   |   2 +-
+ src/dimensions.c                          |   2 -
+ src/init.c                                |  14 +-
+ src/names.c                               |   2 +
+ src/titles.c                              |   2 +
+ src/utils.c                               |   2 -
+ src/wrapper.c                             | 226 ++++++++------
+ tests/testthat/_snaps/wrapper.md          |  13 +
+ tests/testthat/helper-wrapper-mutations.R | 315 ++++++++++++++++++++
+ tests/testthat/helper-wrapper.R           |  23 +-
+ tests/testthat/test-cast.R                |   8 +
+ tests/testthat/test-dimensions.R          |   7 +
+ tests/testthat/test-insert-axes.R         |   7 +
+ tests/testthat/test-names.R               |  23 ++
+ tests/testthat/test-remove-axes.R         |   7 +
+ tests/testthat/test-titles.R              |  22 ++
+ tests/testthat/test-wrapper-mutations.R   |  39 +++
+ tests/testthat/test-wrapper.R             | 191 +++++++-----
+ 20 files changed, 1535 insertions(+), 188 deletions(-)
+ create mode 100644 plans/view.md
+ create mode 100644 plans/wrap.md
+ create mode 100644 tests/testthat/_snaps/wrapper.md
+ create mode 100644 tests/testthat/helper-wrapper-mutations.R
+ create mode 100644 tests/testthat/test-wrapper-mutations.R
+Deleted branch feature/attributes (was 9a1a697).
+From https://github.com/r-lib/rray
+ - [deleted]         (none)     -&gt; origin/feature/attributes
+ - [deleted]         (none)     -&gt; origin/fix/wrap
+   ac8c93d..c94caec  gh-pages   -&gt; origin/gh-pages
+e08c0d9 Start the wrapper with no attributes so callers set only dim and dimnames (#151)</pre></details>
+<p>PR #151 is merged, and the local cleanup is done.</p>
+<ul>
+<li>
+<p><strong>Checks:</strong> all passed. The branch had no uncommitted changes, and its last commit (<code>9a1a697</code>) matched the PR's.</p>
+</li>
+<li>
+<p><strong>Checkout:</strong> switched to <code>main</code>.</p>
+</li>
+<li>
+<p><strong>Pull:</strong> <code>main</code> fast-forwarded to <code>e08c0d9</code> (the squash merge of #151).</p>
+</li>
+<li>
+<p><strong>Delete:</strong> removed the local branch <code>feature/attributes</code>.</p>
+</li>
+<li>
+<p><strong>Prune:</strong> removed the stale remote-tracking refs <code>origin/feature/attributes</code> and <code>origin/fix/wrap</code>.</p>
+</li>
+</ul>
+<p>Your local <code>fix/wrap</code> branch still exists. It is outside this skill's scope, so I left it.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Clean up wrap too</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git rev-parse fix/wrap; git diff --stat 3511f69 fix/wr…</summary>
+<pre>cd ~/files/r/packages/rray; git rev-parse fix/wrap; git diff --stat 3511f69 fix/wrap; git log --oneline -1 3511f69</pre><pre class="output">ab6f8a878890c310eb0fc8208a0cfa2fe7b51e42
+3511f69 Add a plan for making the ALTREP wrapper memory safe (#150)</pre></details>
+<p><code>fix/wrap</code> has exactly the same files as its squash merge on <code>main</code> (#150), so nothing is lost by deleting it.</p>
+
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray; git branch -D fix/wrap &amp;&amp; git branch</summary>
+<pre>cd ~/files/r/packages/rray; git branch -D fix/wrap &amp;&amp; git branch</pre><pre class="output">Deleted branch fix/wrap (was ab6f8a8).
+* main</pre></details>
+<p>I deleted the local <code>fix/wrap</code> branch (it was at <code>ab6f8a8</code>). Before deleting it, I checked that its files were exactly the same as its squash merge into <code>main</code> (#150, <code>3511f69</code>), so nothing was lost.</p>
+<p><code>main</code> is now the only local branch. The remote <code>fix/wrap</code> branch was already deleted on GitHub, and its local reference went away in the earlier prune.</p>
+
+</section>
+</main>
+</body>
+</html>

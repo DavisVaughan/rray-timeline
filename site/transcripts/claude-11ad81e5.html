@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prototyping slice buffer reuse for a planned rray_map()</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../">rray timeline</a>
+<h1>Prototyping slice buffer reuse for a planned <code>rray_map()</code></h1>
+<p class="facts">Claude · Sep 30, 2026 · 3 prompts · 6 replies · didn't ship</p>
+</header>
+<main>
+<p class="divider">Sep 30, 2026, 00:55 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I’m thinking about a plan for rray_map(x, f, axes)</p>
+<p>For each subset along axes, we’d apply f</p>
+<p>Do you think it would be possible to reuse 1 allocation for the slice of x we call f on if we check it for NO_REFERENCES after each iteration and fill it in place it there aren’t any?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;ALLOC_LOOP_VAR&quot; eval.c | head; grep -n &quot;^v…</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; grep -n &quot;ALLOC_LOOP_VAR&quot; eval.c | head; grep -n &quot;^void attribute_hidden R_CleanupEnvir\|^static void cleanupEnvDots\|R_CleanupEnvir(SEXP&quot; eval.c | head</pre><pre class="output">2696:#define ALLOC_LOOP_VAR(v, val_type, vpi) do {			\
+2849:		ALLOC_LOOP_VAR(v, val_type, vpi);
+2853:		ALLOC_LOOP_VAR(v, val_type, vpi);
+2857:		ALLOC_LOOP_VAR(v, val_type, vpi);
+2861:		ALLOC_LOOP_VAR(v, val_type, vpi);
+2865:		ALLOC_LOOP_VAR(v, val_type, vpi);
+2869:		ALLOC_LOOP_VAR(v, val_type, vpi);
+2126:static R_INLINE void R_CleanupEnvir(SEXP rho, SEXP val)
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/r-svn/src/main &amp;&amp; sed -n 2690,2715p eval.c; sed -n 2100,2170p eval.c</summary>
+<pre>cd ~/files/r/r-svn/src/main &amp;&amp; sed -n 2690,2715p eval.c; sed -n 2100,2170p eval.c</pre><pre class="output">    ((isLanguage(body) &amp;&amp; CAR(body) == R_BraceSymbol) ? 1 : 0)
+
+/* Allocate space for the loop variable value the first time through
+   (when v == R_NilValue) and when the value may have been assigned to
+   another variable. This should be safe and avoid allocation in many
+   cases. */
+#define ALLOC_LOOP_VAR(v, val_type, vpi) do {			\
+	if (v == R_NilValue || MAYBE_SHARED(v) ||		\
+	    ATTRIB(v) != R_NilValue || (v) != CAR(cell)) {	\
+	    REPROTECT(v = allocVector(val_type, 1), vpi);	\
+	    INCREMENT_NAMED(v);					\
+	}							\
+    } while(0)
+
+attribute_hidden SEXP do_if(SEXP call, SEXP op, SEXP args, SEXP rho)
+{
+    SEXP Cond, Stmt=R_NilValue;
+    int vis=0;
+
+    PROTECT(Cond = eval(CAR(args), rho));
+    if (asLogicalNoNA(Cond, call))
+	Stmt = CADR(args);
+    else {
+	if (length(args) &gt; 2)
+	    Stmt = CADDR(args);
+	else
+	SETCAR(d, R_NilValue);
+    }
+}
+
+static R_INLINE void cleanupEnvVector(SEXP v)
+{
+    /* This is mainly for handling results of list(...) stored as a
+       local variable. It would be cheaper to just use
+       DECREMENT_REFCNT. It might also make sense to max out at len =
+       10 or so, and to avoid ALTREP objects. */
+
+    /* FIXME: Disabled for now since a BUILTIN that saves its (NR)
+       list can cause problems. .External.graphics does this for
+       recording. Probably the best option is to not have the args go
+       down as NR. Most of these are fixed now, but this stilll seems
+       to wake things up, so hold off for now. */
+    return;
+
+    // avoid ODS compiler warning.
+ #ifdef FALSE
+    R_xlen_t len = XLENGTH(v);
+    for (R_xlen_t i = 0; i &lt; len; i++)
+	SET_VECTOR_ELT(v, i, R_NilValue);
+#endif
+}
+
+static R_INLINE void R_CleanupEnvir(SEXP rho, SEXP val)
+{
+    if (val != rho) {
+	/* release the bindings and promises in rho if rho is no
+	   longer accessible from R */
+	int refs = REFCNT(rho);
+	if (refs &gt; 0)
+	    refs -= countCycleRefs(rho, val);
+	if (refs == 0) {
+	    for (SEXP b = FRAME(rho);
+		 b != R_NilValue &amp;&amp; REFCNT(b) == 1;
+		 b = CDR(b)) {
+		if (BNDCELL_TAG(b)) continue;
+		SEXP v = CAR(b);
+		if (REFCNT(v) == 1 &amp;&amp; v != val) {
+		    switch(TYPEOF(v)) {
+		    case PROMSXP:
+			clearPromise(v);
+			break;
+		    case DOTSXP:
+			cleanupEnvDots(v);
+			break;
+		    case VECSXP: /* mainly for list(...) */
+			cleanupEnvVector(v);
+			break;
+		    }
+		}
+		SETCAR(b, R_NilValue);
+	    }
+	    SET_ENCLOS(rho, R_EmptyEnv);
+	}
+    }
+}
+
+/* this needs more work -- PUSHCALLARG_RC needed in more places */
+//#define NO_CALL_FRAME_ARGS_NR
+
+static void unpromiseArgs(SEXP pargs)
+{
+    /* This assumes pargs will no longer be referenced. We could
+       double check the refcounts on pargs as a sanity check. */
+    for (; pargs != R_NilValue; pargs = CDR(pargs)) {
+	SEXP v = CAR(pargs);
+	if (TYPEOF(v) == PROMSXP &amp;&amp; REFCNT(v) == 1)
+	    clearPromise(v);
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray4/src/rlang &amp;&amp; grep -rn &quot;MAYBE_SHARED\|MAYBE_REFERENCED\…</summary>
+<pre>cd ~/files/r/packages/rray4/src/rlang &amp;&amp; grep -rn &quot;MAYBE_SHARED\|MAYBE_REFERENCED\|NO_REFERENCES\|REFCNT&quot; . | head</pre><pre class="output">obj.h:38:    return MAYBE_REFERENCED(x);</pre></details>
+<details class="tool"><summary>Bash: sed -n 28,45p ~/files/r/packages/rray4/src/rlang/obj.h</summary>
+<pre>sed -n 28,45p ~/files/r/packages/rray4/src/rlang/obj.h</pre><pre class="output">#define r_unpreserve(X)                                                        \
+    (R_ReleaseObject(_r_placeholder = X),                                      \
+     (_r_unpreserve) (_r_placeholder),                                         \
+     (void) NULL)
+
+static inline void r_mark_shared(r_obj* x) {
+    MARK_NOT_MUTABLE(x);
+}
+static inline bool r_is_shared(r_obj* x) {
+    return MAYBE_REFERENCED(x);
+}
+
+static inline void _r_preserve_global(r_obj* x) {
+    (_r_preserve)(x);
+    r_mark_shared(x);
+}</pre></details>
+<p>Yes, it's possible, and R does the same thing in its own <code>for</code> loops. There are two catches: the check has to be &quot;more than one reference&quot;, not <code>NO_REFERENCES</code>, and the savings may be small.</p>
+<h2>R already does this</h2>
+<p><code>do_for()</code> in <code>src/main/eval.c:2696</code> reuses the loop variable's storage between iterations:</p>
+<pre><code class="language-c">#define ALLOC_LOOP_VAR(v, val_type, vpi) do {
+	if (v == R_NilValue || MAYBE_SHARED(v) ||
+	    ATTRIB(v) != R_NilValue || (v) != CAR(cell)) {
+	    REPROTECT(v = allocVector(val_type, 1), vpi);
+	    ...
+</code></pre>
+<p>So R allocates a new value only when the old one might be shared. Otherwise it writes the next element into the same storage.</p>
+<h2>Use <code>MAYBE_SHARED()</code>, not <code>NO_REFERENCES()</code></h2>
+<p>To call <code>f</code>, the slice has to be reachable from somewhere: a binding like <code>.x</code> in an environment you evaluate <code>f(.x)</code> in, or a cell of the call object. That link counts as one reference. So after every iteration the reference count is at least 1, <code>NO_REFERENCES()</code> never passes, and you would never reuse the buffer.</p>
+<p>The right test is <code>MAYBE_SHARED()</code> (reference count above 1), meaning &quot;someone besides me holds it&quot;. That's exactly what <code>do_for()</code> checks.</p>
+<p>rlang's <code>r_is_shared()</code> won't work here. It's <code>MAYBE_REFERENCED()</code>, the same strict test as <code>NO_REFERENCES()</code>, just negated. You'd call <code>MAYBE_SHARED()</code> directly. It's part of the public API.</p>
+<h2>When the count drops back</h2>
+<p>The count only drops back if R releases <code>f</code>'s environment after the call. <code>R_CleanupEnvir()</code> (<code>eval.c:2126</code>) does this when a closure returns and nothing has captured its environment. It clears the bindings and promises (the lazy argument wrappers) that point at the slice. Some cases:</p>
+<ul>
+<li>
+<p><strong><code>f</code> is an ordinary closure that doesn't keep the slice:</strong> the count returns to 1, and you reuse the buffer.</p>
+</li>
+<li>
+<p><strong><code>f</code> is <code>identity</code>, or returns the slice inside a list:</strong> storing the result adds a reference, so you allocate. Do the check after storing <code>f</code>'s result in the output, not before.</p>
+</li>
+<li>
+<p><strong><code>f</code> builds a closure, e.g. <code>function(x) function() x</code>:</strong> the environment is captured, so it is never cleaned up. The count stays high and you allocate.</p>
+</li>
+<li>
+<p><strong><code>f</code> modifies <code>x</code>:</strong> its argument is shared at that point, so R copies it on modify first. Your buffer is untouched.</p>
+</li>
+</ul>
+<h2>The risk</h2>
+<p>A count that's too high is harmless: you just allocate. A count that's too low is dangerous, because you'd overwrite data someone is still holding.</p>
+<p>That can happen when something holds the slice in a place R doesn't count references for. The main example is a builtin that saves its argument list; the FIXME in <code>cleanupEnvVector()</code> mentions <code>.External.graphics</code> doing exactly this. It's rare, and R itself accepts the same risk in <code>do_for()</code>. But <code>do_for()</code> only does it for attribute-free length-1 vectors, while you'd be doing it for arbitrary user functions on larger arrays.</p>
+<p>Two details:</p>
+<ul>
+<li>
+<p><strong>Attributes:</strong> Only overwrite the data. The slice's <code>dim</code> and <code>dimnames</code> are the same on every iteration, so set them once. If <code>f</code> keeps <code>dim(x)</code>, only that attribute vector is shared, not the slice.</p>
+</li>
+<li>
+<p><strong>Type:</strong> The buffer must keep the same type and length on every iteration. It does, since every slice of <code>x</code> has the same shape.</p>
+</li>
+</ul>
+<h2>Is it worth it?</h2>
+<p>Probably only a little. Each iteration already pays for an R closure call (building an environment, a promise, and running the body). Allocating a small slice likely costs less than that call. The saving grows with slice size, but so does the time <code>f</code> spends on the slice.</p>
+<p>I'd build the simple version first, where each iteration allocates, and benchmark it. Try many small slices with a cheap <code>f</code> like <code>sum</code>, and a few large slices. Add the reuse only if allocation shows up in the profile. If you add it, the change is small: one <code>MAYBE_SHARED()</code> check after storing the result, then either allocate a new slice or keep the old one.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Build this as a POC in a throwaway folder and benchmark with and without reuse</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: mkdir -p /tmp/rray-map-poc &amp;&amp; cd /tmp/rray-map-poc &amp;&amp; R --version | head -1 &amp;&amp; Rscript -e 'ca…</summary>
+<pre>mkdir -p /tmp/rray-map-poc &amp;&amp; cd /tmp/rray-map-poc &amp;&amp; R --version | head -1 &amp;&amp; Rscript -e 'cat(requireNamespace(&quot;bench&quot;), &quot;\n&quot;)'</pre><pre class="output">R version 4.6.0 alpha (2026-04-08 r89818)
+Loading required namespace: bench
+TRUE
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Write /tmp/rray-map-poc/map.c</summary>
+<pre>#include &lt;R.h&gt;
+#include &lt;Rinternals.h&gt;
+#include &lt;string.h&gt;
+
+SEXP poc_map(SEXP x, SEXP f, SEXP reuse) {
+  const R_xlen_t n_row = Rf_nrows(x);
+  const R_xlen_t n_col = Rf_ncols(x);
+  const bool c_reuse = Rf_asLogical(reuse);
+  const double* v_x = REAL_RO(x);
+
+  SEXP out = PROTECT(Rf_allocVector(VECSXP, n_col));
+
+  SEXP env = PROTECT(R_NewEnv(R_GlobalEnv, FALSE, 0));
+  SEXP x_sym = Rf_install(&quot;.x&quot;);
+  SEXP f_sym = Rf_install(&quot;.f&quot;);
+  Rf_defineVar(f_sym, f, env);
+
+  SEXP call = PROTECT(Rf_lang2(f_sym, x_sym));
+
+  SEXP slice = R_NilValue;
+  PROTECT_INDEX slice_pi;
+  PROTECT_WITH_INDEX(slice, &amp;slice_pi);
+
+  R_xlen_t n_alloc = 0;
+
+  for (R_xlen_t j = 0; j &lt; n_col; ++j) {
+    if (slice == R_NilValue || !c_reuse || MAYBE_SHARED(slice)) {
+      REPROTECT(slice = Rf_allocVector(REALSXP, n_row), slice_pi);
+      Rf_defineVar(x_sym, slice, env);
+      ++n_alloc;
+    }
+
+    memcpy(REAL(slice), v_x + j * n_row, n_row * sizeof(double));
+
+    SET_VECTOR_ELT(out, j, Rf_eval(call, env));
+  }
+
+  SEXP result = PROTECT(Rf_allocVector(VECSXP, 2));
+  SET_VECTOR_ELT(result, 0, out);
+  SET_VECTOR_ELT(result, 1, Rf_ScalarReal((double) n_alloc));
+
+  UNPROTECT(5);
+  return result;
+}</pre><pre class="output">File created successfully at: /tmp/rray-map-poc/map.c (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write /tmp/rray-map-poc/check.R</summary>
+<pre>dyn.load(&quot;/tmp/rray-map-poc/map.so&quot;)
+
+map &lt;- function(x, f, reuse) .Call(&quot;poc_map&quot;, x, f, reuse)
+
+x &lt;- matrix(as.double(1:50), nrow = 5)
+expected &lt;- lapply(seq_len(ncol(x)), \(j) x[, j])
+
+fs &lt;- list(
+  builtin_sum = sum,
+  closure_sum = function(x) sum(x),
+  identity = identity,
+  wrap_list = function(x) list(x),
+  capture = function(x) function() x,
+  modify = function(x) {
+    x[1] &lt;- -1
+    x
+  },
+  assign_global = function(x) {
+    kept &lt;&lt;- x
+    sum(x)
+  },
+  keep_dim = function(x) {
+    attr(x, &quot;foo&quot;) &lt;- 1
+    x
+  }
+)
+
+materialize &lt;- function(res) {
+  lapply(res, \(r) if (is.function(r)) r() else r)
+}
+
+for (name in names(fs)) {
+  f &lt;- fs[[name]]
+  a &lt;- map(x, f, FALSE)
+  b &lt;- map(x, f, TRUE)
+  cat(sprintf(
+    &quot;%-14s allocs (no reuse / reuse): %3d / %3d   identical: %s\n&quot;,
+    name,
+    a[[2]],
+    b[[2]],
+    identical(materialize(a[[1]]), materialize(b[[1]]))
+  ))
+}
+
+res &lt;- map(x, identity, TRUE)[[1]]
+cat(&quot;identity slices intact:&quot;, identical(res, expected), &quot;\n&quot;)
+
+map(x, fs$assign_global, TRUE)
+cat(&quot;global binding holds last slice:&quot;, identical(kept, x[, 10]), &quot;\n&quot;)</pre><pre class="output">File created successfully at: /tmp/rray-map-poc/check.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; R CMD SHLIB map.c 2&gt;&amp;1 | tail -2 &amp;&amp; Rscript check.R</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; R CMD SHLIB map.c 2&gt;&amp;1 | tail -2 &amp;&amp; Rscript check.R</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG   -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c map.c -o map.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o map.so map.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R
+builtin_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+closure_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity       allocs (no reuse / reuse):  10 /  10   identical: TRUE
+wrap_list      allocs (no reuse / reuse):  10 /  10   identical: TRUE
+capture        allocs (no reuse / reuse):  10 /   1   identical: TRUE
+modify         allocs (no reuse / reuse):  10 /   1   identical: TRUE
+assign_global  allocs (no reuse / reuse):  10 /  10   identical: TRUE
+keep_dim       allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity slices intact: TRUE 
+[[1]]
+[[1]][[1]]
+[1] 15
+
+[[1]][[2]]
+[1] 40
+
+[[1]][[3]]
+[1] 65
+
+[[1]][[4]]
+[1] 90
+
+[[1]][[5]]
+[1] 115
+
+[[1]][[6]]
+[1] 140
+
+[[1]][[7]]
+[1] 165
+
+[[1]][[8]]
+[1] 190
+
+[[1]][[9]]
+[1] 215
+
+[[1]][[10]]
+[1] 240
+
+
+[[2]]
+[1] 10
+
+global binding holds last slice: TRUE
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The <code>capture</code> row looks suspicious—it reused the buffer instead of holding the slice, likely due to lazy evaluation holding <code>.x</code> rather than the value. I'll add a forced variant and check it against real expected values.</p>
+</details>
+<details class="tool tool-error"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; python3 - &lt;&lt;'EOF'</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; python3 - &lt;&lt;'EOF'
+p = &quot;check.R&quot;
+s = open(p).read()
+s = s.replace(&quot;&quot;&quot;  capture = function(x) function() x,
+&quot;&quot;&quot;, &quot;&quot;&quot;  capture = function(x) function() x,
+  capture_forced = function(x) {
+    force(x)
+    function() x
+  },
+&quot;&quot;&quot;)
+s = s.replace(&quot;&quot;&quot;map(x, fs$assign_global, TRUE)
+&quot;&quot;&quot;, &quot;&quot;&quot;invisible(map(x, fs$assign_global, TRUE))
+&quot;&quot;&quot;)
+s += &quot;&quot;&quot;
+got &lt;- materialize(map(x, fs$capture, TRUE)[[1]])
+cat(&quot;lazy capture sees every slice:&quot;, identical(got, expected), &quot;\\n&quot;)
+got &lt;- materialize(map(x, fs$capture_forced, TRUE)[[1]])
+cat(&quot;forced capture sees every slice:&quot;, identical(got, expected), &quot;\\n&quot;)
+&quot;&quot;&quot;
+open(p, &quot;w&quot;).write(s)
+EOF
+Rscript check.R</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/check.R</summary>
+<pre class="diff"><span class="del">-  capture = function(x) function() x,</span>
+<span class="ins">+  capture = function(x) function() x,</span>
+<span class="ins">+  capture_forced = function(x) {</span>
+<span class="ins">+    force(x)</span>
+<span class="ins">+    function() x</span>
+<span class="ins">+  },</span></pre><pre class="output">The file /tmp/rray-map-poc/check.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/check.R</summary>
+<pre class="diff"><span class="del">-map(x, fs$assign_global, TRUE)</span>
+<span class="del">-cat(&quot;global binding holds last slice:&quot;, identical(kept, x[, 10]), &quot;\n&quot;)</span>
+<span class="ins">+invisible(map(x, fs$assign_global, TRUE))</span>
+<span class="ins">+cat(&quot;global binding holds last slice:&quot;, identical(kept, x[, 10]), &quot;\n&quot;)</span>
+<span class="ins">+</span>
+<span class="ins">+got &lt;- materialize(map(x, fs$capture, TRUE)[[1]])</span>
+<span class="ins">+cat(&quot;lazy capture sees every slice:&quot;, identical(got, expected), &quot;\n&quot;)</span>
+<span class="ins">+</span>
+<span class="ins">+got &lt;- materialize(map(x, fs$capture_forced, TRUE)[[1]])</span>
+<span class="ins">+cat(&quot;forced capture sees every slice:&quot;, identical(got, expected), &quot;\n&quot;)</span></pre><pre class="output">The file /tmp/rray-map-poc/check.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; Rscript check.R</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; Rscript check.R</pre><pre class="output">builtin_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+closure_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity       allocs (no reuse / reuse):  10 /  10   identical: TRUE
+wrap_list      allocs (no reuse / reuse):  10 /  10   identical: TRUE
+capture        allocs (no reuse / reuse):  10 /   1   identical: TRUE
+capture_forced allocs (no reuse / reuse):  10 /  10   identical: TRUE
+modify         allocs (no reuse / reuse):  10 /   1   identical: TRUE
+assign_global  allocs (no reuse / reuse):  10 /  10   identical: TRUE
+keep_dim       allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity slices intact: TRUE 
+global binding holds last slice: TRUE 
+lazy capture sees every slice: FALSE 
+forced capture sees every slice: TRUE
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Reuse checks pass, but I found an unrelated bug: binding the slice to <code>.x</code> before calling <code>f(.x)</code> causes a lazy closure to only see the last slice. I'll fix this by inlining the slice value directly in the call, then run the benchmark.</p>
+</details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/map.c</summary>
+<pre class="diff"><span class="del">-  SEXP env = PROTECT(R_NewEnv(R_GlobalEnv, FALSE, 0));</span>
+<span class="del">-  SEXP x_sym = Rf_install(&quot;.x&quot;);</span>
+<span class="del">-  SEXP f_sym = Rf_install(&quot;.f&quot;);</span>
+<span class="del">-  Rf_defineVar(f_sym, f, env);</span>
+<span class="del">-</span>
+<span class="del">-  SEXP call = PROTECT(Rf_lang2(f_sym, x_sym));</span>
+<span class="ins">+  SEXP env = PROTECT(R_NewEnv(R_GlobalEnv, FALSE, 0));</span>
+<span class="ins">+  SEXP f_sym = Rf_install(&quot;.f&quot;);</span>
+<span class="ins">+  Rf_defineVar(f_sym, f, env);</span>
+<span class="ins">+</span>
+<span class="ins">+  SEXP call = PROTECT(Rf_lang2(f_sym, R_NilValue));</span></pre><pre class="output">The file /tmp/rray-map-poc/map.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/map.c</summary>
+<pre class="diff"><span class="del">-      Rf_defineVar(x_sym, slice, env);</span>
+<span class="ins">+      SETCADR(call, slice);</span></pre><pre class="output">The file /tmp/rray-map-poc/map.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; R CMD SHLIB map.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; Rscript check.R</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; R CMD SHLIB map.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; Rscript check.R</pre><pre class="output">builtin_sum    allocs (no reuse / reuse):  10 /  10   identical: TRUE
+closure_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity       allocs (no reuse / reuse):  10 /  10   identical: TRUE
+wrap_list      allocs (no reuse / reuse):  10 /  10   identical: TRUE
+capture        allocs (no reuse / reuse):  10 /  10   identical: TRUE
+capture_forced allocs (no reuse / reuse):  10 /  10   identical: TRUE
+modify         allocs (no reuse / reuse):  10 /   1   identical: TRUE
+assign_global  allocs (no reuse / reuse):  10 /  10   identical: TRUE
+keep_dim       allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity slices intact: TRUE 
+global binding holds last slice: TRUE 
+lazy capture sees every slice: TRUE 
+forced capture sees every slice: TRUE
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Value-in-call fixes the lazy capture bug. It costs something, though: builtins like <code>sum</code> now never reuse, because R marks self-evaluating constants as permanently shared. Now the benchmark.</p>
+
+<details class="tool"><summary>Write /tmp/rray-map-poc/bench.R</summary>
+<pre>dyn.load(&quot;/tmp/rray-map-poc/map.so&quot;)
+
+map &lt;- function(x, f, reuse) .Call(&quot;poc_map&quot;, x, f, reuse)[[1]]
+
+closure_first &lt;- function(x) x[[1L]]
+closure_sum &lt;- function(x) sum(x)
+
+shapes &lt;- list(
+  c(5, 200000),
+  c(100, 10000),
+  c(1000, 1000),
+  c(10000, 100),
+  c(100000, 10)
+)
+
+fs &lt;- list(
+  closure_first = closure_first,
+  closure_sum = closure_sum,
+  builtin_sum = sum
+)
+
+rows &lt;- list()
+
+for (shape in shapes) {
+  x &lt;- matrix(runif(prod(shape)), nrow = shape[[1]])
+
+  for (name in names(fs)) {
+    f &lt;- fs[[name]]
+
+    res &lt;- bench::mark(
+      no_reuse = map(x, f, FALSE),
+      reuse = map(x, f, TRUE),
+      min_iterations = 20,
+      filter_gc = FALSE
+    )
+
+    rows[[length(rows) + 1L]] &lt;- data.frame(
+      rows_per_slice = shape[[1]],
+      slices = shape[[2]],
+      f = name,
+      no_reuse_ms = as.numeric(res$median[[1]]) * 1000,
+      reuse_ms = as.numeric(res$median[[2]]) * 1000,
+      no_reuse_mem = format(res$mem_alloc[[1]]),
+      reuse_mem = format(res$mem_alloc[[2]]),
+      no_reuse_gc = res$n_gc[[1]] / res$n_itr[[1]],
+      reuse_gc = res$n_gc[[2]] / res$n_itr[[2]]
+    )
+  }
+}
+
+out &lt;- do.call(rbind, rows)
+out$speedup &lt;- out$no_reuse_ms / out$reuse_ms
+out$no_reuse_ms &lt;- round(out$no_reuse_ms, 2)
+out$reuse_ms &lt;- round(out$reuse_ms, 2)
+out$speedup &lt;- round(out$speedup, 2)
+out$no_reuse_gc &lt;- round(out$no_reuse_gc, 2)
+out$reuse_gc &lt;- round(out$reuse_gc, 2)
+
+print(out, row.names = FALSE)</pre><pre class="output">File created successfully at: /tmp/rray-map-poc/bench.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; Rscript bench.R 2&gt;&amp;1 | grep -v &quot;^Warning\|gc\b.*filter&quot;</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; Rscript bench.R 2&gt;&amp;1 | grep -v &quot;^Warning\|gc\b.*filter&quot;</pre><pre class="output"> rows_per_slice slices             f no_reuse_ms reuse_ms no_reuse_mem
+          5e+00  2e+05 closure_first       38.93    38.96       1.53MB
+          5e+00  2e+05   closure_sum       59.90    55.18       1.53MB
+          5e+00  2e+05   builtin_sum       26.48    26.94       1.53MB
+          1e+02  1e+04 closure_first        2.30     1.48       8.16MB
+          1e+02  1e+04   closure_sum        4.41     3.57       8.16MB
+          1e+02  1e+04   builtin_sum        3.06     3.06       8.16MB
+          1e+03  1e+03 closure_first        0.68     0.25       7.68MB
+          1e+03  1e+03   closure_sum        2.12     1.73       7.68MB
+          1e+03  1e+03   builtin_sum        1.99     2.00       7.68MB
+          1e+04  1e+02 closure_first        0.45     0.14       7.63MB
+          1e+04  1e+02   closure_sum        1.94     1.59       7.63MB
+          1e+04  1e+02   builtin_sum        1.93     1.91       7.63MB
+          1e+05  1e+01 closure_first        0.43     0.16       7.63MB
+          1e+05  1e+01   closure_sum        1.90     1.57       7.63MB
+          1e+05  1e+01   builtin_sum        1.90     1.90       7.63MB
+ reuse_mem no_reuse_gc reuse_gc speedup
+    1.53MB        2.75     2.70    1.00
+    1.53MB        3.40     3.25    1.09
+    1.53MB        1.75     1.90    0.98
+      79KB        0.23     0.05    1.55
+      79KB        0.20     0.07    1.24
+    8.16MB        0.21     0.22    1.00
+    15.7KB        0.20     0.00    2.71
+    15.7KB        0.16     0.01    1.22
+    7.68MB        0.16     0.16    0.99
+      79KB        0.17     0.00    3.12
+      79KB        0.16     0.00    1.22
+    7.63MB        0.17     0.16    1.01
+     781KB        0.22     0.02    2.67
+     781KB        0.22     0.02    1.21
+    7.63MB        0.22     0.23    1.00
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Reuse gives a real speedup once slices reach about 100 elements or more, and nothing for tiny slices. The catch is that it only works when <code>f</code> is a closure (a function written in R). Builtins like <code>sum</code> never get reused.</p>
+<p>The POC is in <code>/tmp/rray-map-poc/</code>: <code>map.c</code> is the C loop, <code>check.R</code> tests correctness, <code>bench.R</code> runs the benchmark. To keep it small, it maps over the columns of a double matrix. The reuse test is <code>MAYBE_SHARED()</code> on the slice, checked after <code>f</code>'s result is stored.</p>
+<h2>Correctness</h2>
+<p>The reuse version matched the always-allocate version for every <code>f</code> I tried:</p>
+<ul>
+<li>
+<p><strong>Reused the buffer:</strong> <code>function(x) sum(x)</code>; functions that modify <code>x</code> (R copies before modifying); and functions that set attributes on <code>x</code>.</p>
+</li>
+<li>
+<p><strong>Allocated a new slice:</strong> <code>identity</code>, <code>function(x) list(x)</code>, a closure that captures <code>x</code>, and <code>kept &lt;&lt;- x</code>. All earlier slices stayed intact.</p>
+</li>
+</ul>
+<p>One bug turned up that affects both versions. My first draft bound the slice to <code>.x</code> in an environment and called <code>f(.x)</code>. With <code>f &lt;- function(x) function() x</code>, <code>x</code> is never evaluated, so every returned closure looked up <code>.x</code> later and saw only the last slice. The fix is to put the slice value directly into the call.</p>
+<p>That fix is what breaks reuse for builtins. R evaluates the constant argument before calling <code>sum</code>, and evaluating a constant marks it as permanently shared. So <code>rray_map(x, sum)</code> allocates every time. That's still safe, just slower. With the <code>.x</code> binding, builtins did reuse, but the capture bug came with it.</p>
+<h2>Benchmark</h2>
+<p>Median times, with a new slice every time versus reusing one:</p>
+<table>
+<thead>
+<tr>
+<th align="right">Slice length</th>
+<th align="right">Slices</th>
+<th><code>f</code></th>
+<th align="right">New slice (ms)</th>
+<th align="right">Reuse (ms)</th>
+<th align="right">Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td align="right">5</td>
+<td align="right">200,000</td>
+<td><code>function(x) x[[1]]</code></td>
+<td align="right">38.9</td>
+<td align="right">39.0</td>
+<td align="right">1.00</td>
+</tr>
+<tr>
+<td align="right">5</td>
+<td align="right">200,000</td>
+<td><code>function(x) sum(x)</code></td>
+<td align="right">59.9</td>
+<td align="right">55.2</td>
+<td align="right">1.09</td>
+</tr>
+<tr>
+<td align="right">100</td>
+<td align="right">10,000</td>
+<td><code>function(x) x[[1]]</code></td>
+<td align="right">2.30</td>
+<td align="right">1.48</td>
+<td align="right">1.55</td>
+</tr>
+<tr>
+<td align="right">100</td>
+<td align="right">10,000</td>
+<td><code>function(x) sum(x)</code></td>
+<td align="right">4.41</td>
+<td align="right">3.57</td>
+<td align="right">1.24</td>
+</tr>
+<tr>
+<td align="right">1,000</td>
+<td align="right">1,000</td>
+<td><code>function(x) x[[1]]</code></td>
+<td align="right">0.68</td>
+<td align="right">0.25</td>
+<td align="right">2.71</td>
+</tr>
+<tr>
+<td align="right">1,000</td>
+<td align="right">1,000</td>
+<td><code>function(x) sum(x)</code></td>
+<td align="right">2.12</td>
+<td align="right">1.73</td>
+<td align="right">1.22</td>
+</tr>
+<tr>
+<td align="right">10,000</td>
+<td align="right">100</td>
+<td><code>function(x) x[[1]]</code></td>
+<td align="right">0.45</td>
+<td align="right">0.14</td>
+<td align="right">3.12</td>
+</tr>
+<tr>
+<td align="right">10,000</td>
+<td align="right">100</td>
+<td><code>function(x) sum(x)</code></td>
+<td align="right">1.94</td>
+<td align="right">1.59</td>
+<td align="right">1.22</td>
+</tr>
+<tr>
+<td align="right">100,000</td>
+<td align="right">10</td>
+<td><code>function(x) x[[1]]</code></td>
+<td align="right">0.43</td>
+<td align="right">0.16</td>
+<td align="right">2.67</td>
+</tr>
+<tr>
+<td align="right">100,000</td>
+<td align="right">10</td>
+<td><code>function(x) sum(x)</code></td>
+<td align="right">1.90</td>
+<td align="right">1.57</td>
+<td align="right">1.21</td>
+</tr>
+<tr>
+<td align="right">any</td>
+<td align="right">any</td>
+<td><code>sum</code> (builtin)</td>
+<td align="right">same</td>
+<td align="right">same</td>
+<td align="right">1.00</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>
+<p><strong>Tiny slices:</strong> no gain. Calling <code>f</code> costs far more than allocating a 5-element vector, which R serves quickly from its pool of small vectors.</p>
+</li>
+<li>
+<p><strong>Slices of 100 or more:</strong> about 1.2x when <code>f</code> reads the whole slice, up to about 3x when <code>f</code> barely touches it. GC runs mostly disappear. For 1,000 by 1,000, memory allocated drops from 7.7 MB to 16 KB.</p>
+</li>
+<li>
+<p><strong>Small-slice memory numbers:</strong> ignore them. <code>bench</code> doesn't track R's small-vector allocations, so those rows understate the allocation.</p>
+</li>
+</ul>
+<h2>My take</h2>
+<p>It's worth doing, since it's a single <code>MAYBE_SHARED()</code> check. The open design question is builtins. <code>sum</code> and <code>mean</code>-style builtins are probably the most common <code>f</code> for <code>rray_map()</code>. Getting reuse for them means going back to the <code>.x</code> binding, plus a separate fix for the lazy capture bug (for example, making a fresh environment whenever a closure has kept the old one). I haven't tried that.</p>
+<p>Nothing is committed, and nothing in the rray4 repo was touched.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Could we track the set of important builtins and do pointer comparison of f against them and assume it’s safe to override if we see them</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<p>Before answering, I'll test a variant that doesn't need a list at all. Builtins evaluate their arguments right away, so the lazy capture bug can't happen with them. That means builtins could use the <code>.x</code> binding and closures the value in the call.</p>
+
+<details class="tool"><summary>Read /tmp/rray-map-poc/map.c</summary>
+<pre class="output">1	#include &lt;R.h&gt;
+2	#include &lt;Rinternals.h&gt;
+3	#include &lt;string.h&gt;
+4	
+5	SEXP poc_map(SEXP x, SEXP f, SEXP reuse) {
+6	  const R_xlen_t n_row = Rf_nrows(x);
+7	  const R_xlen_t n_col = Rf_ncols(x);
+8	  const bool c_reuse = Rf_asLogical(reuse);
+9	  const double* v_x = REAL_RO(x);
+10	
+11	  SEXP out = PROTECT(Rf_allocVector(VECSXP, n_col));
+12	
+13	  SEXP env = PROTECT(R_NewEnv(R_GlobalEnv, FALSE, 0));
+14	  SEXP f_sym = Rf_install(&quot;.f&quot;);
+15	  Rf_defineVar(f_sym, f, env);
+16	
+17	  SEXP call = PROTECT(Rf_lang2(f_sym, R_NilValue));
+18	
+19	  SEXP slice = R_NilValue;
+20	  PROTECT_INDEX slice_pi;
+21	  PROTECT_WITH_INDEX(slice, &amp;slice_pi);
+22	
+23	  R_xlen_t n_alloc = 0;
+24	
+25	  for (R_xlen_t j = 0; j &lt; n_col; ++j) {
+26	    if (slice == R_NilValue || !c_reuse || MAYBE_SHARED(slice)) {
+27	      REPROTECT(slice = Rf_allocVector(REALSXP, n_row), slice_pi);
+28	      SETCADR(call, slice);
+29	      ++n_alloc;
+30	    }
+31	
+32	    memcpy(REAL(slice), v_x + j * n_row, n_row * sizeof(double));
+33	
+34	    SET_VECTOR_ELT(out, j, Rf_eval(call, env));
+35	  }
+36	
+37	  SEXP result = PROTECT(Rf_allocVector(VECSXP, 2));
+38	  SET_VECTOR_ELT(result, 0, out);
+39	  SET_VECTOR_ELT(result, 1, Rf_ScalarReal((double) n_alloc));
+40	
+41	  UNPROTECT(5);
+42	  return result;
+43	}
+44	</pre></details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/map.c</summary>
+<pre class="diff"><span class="del">-  SEXP call = PROTECT(Rf_lang2(f_sym, R_NilValue));</span>
+<span class="ins">+  const bool by_symbol = TYPEOF(f) == BUILTINSXP;</span>
+<span class="ins">+  SEXP x_sym = Rf_install(&quot;.x&quot;);</span>
+<span class="ins">+</span>
+<span class="ins">+  SEXP call = PROTECT(Rf_lang2(f_sym, by_symbol ? x_sym : R_NilValue));</span></pre><pre class="output">The file /tmp/rray-map-poc/map.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/map.c</summary>
+<pre class="diff"><span class="del">-      SETCADR(call, slice);</span>
+<span class="ins">+      if (by_symbol) {</span>
+<span class="ins">+        Rf_defineVar(x_sym, slice, env);</span>
+<span class="ins">+      } else {</span>
+<span class="ins">+        SETCADR(call, slice);</span>
+<span class="ins">+      }</span></pre><pre class="output">The file /tmp/rray-map-poc/map.c has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit /tmp/rray-map-poc/check.R</summary>
+<pre class="diff"><span class="del">-  builtin_sum = sum,</span>
+<span class="ins">+  builtin_sum = sum,</span>
+<span class="ins">+  builtin_range = range,</span>
+<span class="ins">+  builtin_invisible = invisible,</span>
+<span class="ins">+  builtin_paren = `(`,</span>
+<span class="ins">+  builtin_c = c,</span>
+<span class="ins">+  builtin_list = list,</span>
+<span class="ins">+  builtin_unclass = unclass,</span>
+<span class="ins">+  builtin_dispatch = length,</span></pre><pre class="output">The file /tmp/rray-map-poc/check.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; R CMD SHLIB map.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; Rscript check.R &amp;&amp; Rscript -e 'l…</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; R CMD SHLIB map.c &gt;/dev/null 2&gt;&amp;1 &amp;&amp; Rscript check.R &amp;&amp; Rscript -e 'length.poc &lt;- function(x) function() x; x &lt;- structure(matrix(as.double(1:6), 2), class = &quot;poc&quot;); dyn.load(&quot;/tmp/rray-map-poc/map.so&quot;); print(TYPEOF &lt;- typeof(length))' </pre><pre class="output">builtin_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+builtin_range  allocs (no reuse / reuse):  10 /   1   identical: TRUE
+builtin_invisible allocs (no reuse / reuse):  10 /  10   identical: TRUE
+builtin_paren  allocs (no reuse / reuse):  10 /  10   identical: TRUE
+builtin_c      allocs (no reuse / reuse):  10 /   1   identical: TRUE
+builtin_list   allocs (no reuse / reuse):  10 /  10   identical: TRUE
+builtin_unclass allocs (no reuse / reuse):  10 /  10   identical: TRUE
+builtin_dispatch allocs (no reuse / reuse):  10 /   1   identical: TRUE
+closure_sum    allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity       allocs (no reuse / reuse):  10 /  10   identical: TRUE
+wrap_list      allocs (no reuse / reuse):  10 /  10   identical: TRUE
+capture        allocs (no reuse / reuse):  10 /  10   identical: TRUE
+capture_forced allocs (no reuse / reuse):  10 /  10   identical: TRUE
+modify         allocs (no reuse / reuse):  10 /   1   identical: TRUE
+assign_global  allocs (no reuse / reuse):  10 /  10   identical: TRUE
+keep_dim       allocs (no reuse / reuse):  10 /   1   identical: TRUE
+identity slices intact: TRUE 
+global binding holds last slice: TRUE 
+lazy capture sees every slice: TRUE 
+forced capture sees every slice: TRUE 
+[1] &quot;builtin&quot;
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Every builtin case matches, and the builtins that hand back <code>x</code> itself (<code>invisible</code>, <code>(</code>, <code>list</code>, <code>unclass</code>) correctly get a new slice. Quick benchmark for <code>sum</code>:</p>
+
+<details class="tool"><summary>Bash: cd /tmp/rray-map-poc &amp;&amp; Rscript bench.R 2&gt;&amp;1 | grep -A0 &quot;builtin_sum\|rows_per&quot; | head -20</summary>
+<pre>cd /tmp/rray-map-poc &amp;&amp; Rscript bench.R 2&gt;&amp;1 | grep -A0 &quot;builtin_sum\|rows_per&quot; | head -20</pre><pre class="output"> rows_per_slice slices             f no_reuse_ms reuse_ms no_reuse_mem
+          5e+00  2e+05   builtin_sum       29.21    26.25       1.53MB
+          1e+02  1e+04   builtin_sum        3.15     2.34       8.16MB
+          1e+03  1e+03   builtin_sum        2.00     1.63       7.68MB
+          1e+04  1e+02   builtin_sum        1.91     1.57       7.63MB
+          1e+05  1e+01   builtin_sum        1.89     1.56       7.63MB
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>It would work, but you don't need the list. A simpler rule is safer and covers every builtin: pick the calling style from the type of <code>f</code>, and keep the <code>MAYBE_SHARED()</code> check for everything.</p>
+<h2>The rule</h2>
+<ul>
+<li>
+<p><strong><code>f</code> is a builtin:</strong> bind the slice to <code>.x</code> and call <code>f(.x)</code>. Builtins evaluate their arguments right away, so the lazy capture bug can't happen. And since the slice is never evaluated as a constant, it isn't marked as permanently shared.</p>
+</li>
+<li>
+<p><strong>Anything else:</strong> put the slice value directly in the call, as before.</p>
+</li>
+</ul>
+<p>In the POC this is a check on <code>TYPEOF(f) == BUILTINSXP</code> plus an <code>if</code> around how the slice is set.</p>
+<h2>Why not skip the check for a list of builtins</h2>
+<p>Some builtins return their argument itself instead of a new value, and the refcount check is what catches them. I added these to <code>check.R</code>:</p>
+<table>
+<thead>
+<tr>
+<th><code>f</code></th>
+<th align="right">New slices with reuse on (of 10)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sum</code>, <code>range</code>, <code>c</code>, <code>length</code></td>
+<td align="right">1</td>
+</tr>
+<tr>
+<td><code>invisible</code>, <code>`(`</code>, <code>list</code>, <code>unclass</code></td>
+<td align="right">10</td>
+</tr>
+</tbody>
+</table>
+<p>The second row are builtins that hand back <code>x</code> (or a list holding it). Overwriting the buffer after them would silently corrupt earlier results. A list of builtins deemed safe would need to know exactly which ones do this. It would also have to account for internal S3 dispatch, where <code>sum()</code> on a classed slice calls an R method that could keep the slice. The refcount check already handles all of this.</p>
+<p>All the earlier correctness cases still pass, including both capture cases.</p>
+<h2>Result for <code>sum</code></h2>
+<table>
+<thead>
+<tr>
+<th align="right">Slice length</th>
+<th align="right">Slices</th>
+<th align="right">New slice (ms)</th>
+<th align="right">Reuse (ms)</th>
+<th align="right">Speedup</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td align="right">5</td>
+<td align="right">200,000</td>
+<td align="right">29.2</td>
+<td align="right">26.3</td>
+<td align="right">1.11</td>
+</tr>
+<tr>
+<td align="right">100</td>
+<td align="right">10,000</td>
+<td align="right">3.15</td>
+<td align="right">2.34</td>
+<td align="right">1.35</td>
+</tr>
+<tr>
+<td align="right">1,000</td>
+<td align="right">1,000</td>
+<td align="right">2.00</td>
+<td align="right">1.63</td>
+<td align="right">1.23</td>
+</tr>
+<tr>
+<td align="right">10,000</td>
+<td align="right">100</td>
+<td align="right">1.91</td>
+<td align="right">1.57</td>
+<td align="right">1.22</td>
+</tr>
+<tr>
+<td align="right">100,000</td>
+<td align="right">10</td>
+<td align="right">1.89</td>
+<td align="right">1.56</td>
+<td align="right">1.21</td>
+</tr>
+</tbody>
+</table>
+<p>That's in line with <code>function(x) sum(x)</code> from the first run.</p>
+<p>I only tested unclassed double slices. If rray slices can carry a class, the dispatch case needs its own test. The updated files are still in <code>/tmp/rray-map-poc/</code>, and nothing in rray4 was touched.</p>
+
+</section>
+</main>
+</body>
+</html>

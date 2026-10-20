@@ -1,0 +1,1298 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building rray_slice() axis locations inside the subscript loop</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-90">rray timeline</a>
+<h1>Building <code>rray_slice()</code> axis locations inside the subscript loop</h1>
+<p class="facts">Claude · Sep 26, 2026 · 3 prompts · 5 replies · <a href="https://github.com/r-lib/rray/pull/90">#90</a></p>
+</header>
+<main>
+<p class="divider">Sep 26, 2026, 22:32 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>I am now convinced we can do all of the as slice subscript loop + v v locations fill loop in one go</p>
+<p>We don’t need a long contiguous locations vector. Just make one per non TRUE subscript</p>
+<p>Turn rray slice fill locations into as locations and make it return index for the int branch but allocate and fill a locations vector for the others</p>
+<p>Shouldn’t need locations size at all</p>
+<p>Should all get much simpler</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls src &amp;&amp; cat src/slice.c src/slice.h src/decl/slice-decl.h 2&gt;/dev/null</summary>
+<pre>ls src &amp;&amp; cat src/slice.c src/slice.h src/decl/slice-decl.h 2&gt;/dev/null</pre><pre class="output">arg.c
+arg.h
+arg.o
+arithmetic-add.c
+arithmetic-add.h
+arithmetic-add.o
+arithmetic-divide.c
+arithmetic-divide.h
+arithmetic-divide.o
+arithmetic-exponentiate.c
+arithmetic-exponentiate.h
+arithmetic-exponentiate.o
+arithmetic-multiply.c
+arithmetic-multiply.h
+arithmetic-multiply.o
+arithmetic-subtract.c
+arithmetic-subtract.h
+arithmetic-subtract.o
+arithmetic.c
+arithmetic.h
+arithmetic.o
+axes.c
+axes.h
+axes.o
+binary.h
+broadcast-names.c
+broadcast-names.h
+broadcast-names.o
+broadcast.c
+broadcast.h
+broadcast.o
+cast-common.c
+cast-common.h
+cast-common.o
+cast.c
+cast.h
+cast.o
+clone.c
+clone.h
+clone.o
+combine.c
+combine.h
+combine.o
+compare.c
+compare.h
+compare.o
+decl
+dimensionality.c
+dimensionality.h
+dimensionality.o
+dimensions.c
+dimensions.h
+dimensions.o
+equal.c
+equal.h
+equal.o
+extract-assign.c
+extract-assign.h
+extract-assign.o
+extract-subscript.c
+extract-subscript.h
+extract-subscript.o
+extract.c
+extract.h
+extract.o
+extremum.c
+extremum.h
+extremum.o
+index.c
+index.h
+index.o
+init.c
+init.o
+insert-axes.c
+insert-axes.h
+insert-axes.o
+Makevars
+missing.h
+move-axes.c
+move-axes.h
+move-axes.o
+names.c
+names.h
+names.o
+permute-axes.c
+permute-axes.h
+permute-axes.o
+point-iterator.h
+ptype-common.c
+ptype-common.h
+ptype-common.o
+ptype.c
+ptype.h
+ptype.o
+reduce-logical.c
+reduce-logical.h
+reduce-logical.o
+reduce-mean.c
+reduce-mean.h
+reduce-mean.o
+reduce-names.c
+reduce-names.h
+reduce-names.o
+reduce-product.c
+reduce-product.h
+reduce-product.o
+reduce-sum.c
+reduce-sum.h
+reduce-sum.o
+reduce.c
+reduce.h
+reduce.o
+remove-axes.c
+remove-axes.h
+remove-axes.o
+rep.c
+rep.h
+rep.o
+rlang
+rlang.c
+rlang.o
+rray4.so
+size.c
+size.h
+size.o
+slice-subscript.c
+slice-subscript.h
+slice-subscript.o
+slice.c
+slice.h
+slice.o
+split.c
+split.h
+split.o
+stack.c
+stack.h
+stack.o
+strided-iterator.h
+strides.c
+strides.h
+strides.o
+subscript.c
+subscript.h
+subscript.o
+syms.c
+syms.h
+syms.o
+type.c
+type.h
+type.o
+typeof2.c
+typeof2.h
+typeof2.o
+unstack.c
+unstack.h
+unstack.o
+utils.c
+utils.h
+utils.o
+wrapper.c
+wrapper.h
+wrapper.o
+#include &quot;slice.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;missing.h&quot;
+#include &quot;size.h&quot;
+#include &quot;slice-subscript.h&quot;
+#include &quot;strides.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/slice-decl.h&quot;
+
+r_obj* ffi_rray_slice(r_obj* ffi_x, r_obj* ffi_indices, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_slice(
+    ffi_x,
+    ffi_indices,
+    rray_args.x,
+    rray_args.empty,
+    error_call
+  );
+}
+
+r_obj* rray_slice(
+  r_obj* x,
+  r_obj* indices,
+  struct rray_arg* x_arg,
+  struct rray_arg* indices_arg,
+  struct r_lazy error_call
+) {
+  int n_prot = 0;
+
+  check_unclassed(x, x_arg, error_call);
+  x = KEEP_N(arg_as_array(x, x_arg, error_call), &amp;n_prot);
+
+  r_obj* x_dimensions = r_dim(x);
+  const int* v_x_dimensions = r_int_cbegin(x_dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(x_dimensions);
+  check_dimensionality(dimensionality);</pre><p class="cut">702 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat src/slice-subscript.h src/slice-subscript.c &amp;&amp; grep -n &quot;rray_subscript\b\|struct rray_sub…</summary>
+<pre>cat src/slice-subscript.h src/slice-subscript.c &amp;&amp; grep -n &quot;rray_subscript\b\|struct rray_subscript {&quot; -A12 src/subscript.h | head -60 &amp;&amp; git log --oneline -12</pre><pre class="output">#ifndef RRAY_SLICE_SUBSCRIPT_H
+#define RRAY_SLICE_SUBSCRIPT_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;arg.h&quot;
+#include &quot;subscript.h&quot;
+
+struct rray_subscript rray_as_slice_subscript(
+  r_obj* index,
+  int dimension,
+  r_obj* names,
+  struct rray_arg* index_arg,
+  struct r_lazy error_call
+);
+
+#endif
+#include &quot;slice-subscript.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/slice-subscript-decl.h&quot;
+
+r_obj* ffi_rray_as_slice_subscript(
+  r_obj* ffi_i,
+  r_obj* ffi_dimension,
+  r_obj* ffi_names,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+
+  const int dimension =
+    arg_as_int(ffi_dimension, rray_args.dimension, error_call);
+
+  const struct rray_subscript subscript = rray_as_slice_subscript(
+    ffi_i,
+    dimension,
+    ffi_names,
+    rray_args.i,
+    error_call
+  );
+  KEEP(subscript.index);
+
+  r_obj* out = rray_subscript_as_list(subscript);
+
+  FREE(1);
+  return out;
+}
+
+struct rray_subscript rray_as_slice_subscript(
+  r_obj* index,
+  int dimension,
+  r_obj* names,
+  struct rray_arg* index_arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(index, index_arg, error_call);
+
+  r_obj* index_dimensions = r_dim(index);
+
+  if (index_dimensions != r_null) {
+    const int index_dimensionality =
+      rray_dimensionality_from_dimensions(index_dimensions);
+
+    if (index_dimensionality != 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must be a vector or a 1D array, not an array with a &quot;
+        &quot;dimensionality of %d.&quot;,
+        rray_arg_format(index_arg),
+        index_dimensionality
+      );
+    }
+  }
+
+  switch (r_typeof(index)) {
+  case R_TYPE_null:
+    return (struct rray_subscript){
+      .index = r_globals.empty_int,
+      .kind = RRAY_SUBSCRIPT_KIND_locations_int,
+      .size = 0
+    };
+  case R_TYPE_logical:
+    return rray_as_subscript_mask(index, dimension, index_arg, error_call);
+  case R_TYPE_integer:
+  case R_TYPE_double:
+    return rray_as_subscript_locations(index, dimension, index_arg, error_call);
+  case R_TYPE_character:
+    return rray_as_subscript_names(index, names, index_arg, error_call);
+  default:
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be logical, integer, double, character, or `NULL`, not %s.&quot;,
+      rray_arg_format(index_arg),
+      r_obj_type_friendly(index)
+    );
+  }
+}
+
+static struct rray_subscript rray_as_subscript_names(
+  r_obj* index,
+  r_obj* names,
+  struct rray_arg* index_arg,
+  struct r_lazy error_call
+) {
+  if (names == r_null) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Character %s can't select from an axis without names.&quot;,
+      rray_arg_format(index_arg)
+    );
+  }
+
+  const r_ssize size = r_length(index);
+  r_obj* const* v_index = r_chr_cbegin(index);
+
+  r_obj* out = KEEP(Rf_match(names, index, 0));
+  int* v_out = r_int_begin(out);
+
+  for (r_ssize i = 0; i &lt; size; ++i) {
+    r_obj* elt = v_index[i];
+
+    if (elt == r_globals.na_str) {
+      v_out[i] = r_globals.na_int;
+      continue;
+    }
+    if (elt == r_strs.empty) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain the empty string.&quot;,
+        rray_arg_format(index_arg)
+      );
+    }
+    if (v_out[i] == 0) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must only contain names of the axis, not \&quot;%s\&quot;.&quot;,
+        rray_arg_format(index_arg),
+        r_str_c_string(elt)
+      );
+    }
+  }
+
+  const struct rray_subscript subscript =
+    {.index = out, .kind = RRAY_SUBSCRIPT_KIND_locations_int, .size = size};
+
+  FREE(1);
+  return subscript;
+}
+16:struct rray_subscript {
+17-  r_obj* index;
+18-  enum rray_subscript_kind kind;
+19-  r_ssize size;
+20-};
+21-
+22-struct rray_subscript_summary {
+23-  double min;
+24-  double max;
+25-  r_ssize zeros;
+26-  bool any_missing;
+27-  bool any_fractional;
+28-};
+--
+30:struct rray_subscript rray_as_subscript_locations(
+31-  r_obj* index,
+32-  r_ssize size,
+33-  struct rray_arg* index_arg,
+34-  struct r_lazy error_call
+35-);
+36-
+37:struct rray_subscript rray_as_subscript_mask(
+38-  r_obj* index,
+39-  r_ssize size,
+40-  struct rray_arg* index_arg,
+41-  struct r_lazy error_call
+42-);
+43-
+44-r_ssize rray_mask_size(r_obj* mask, r_ssize size);
+45-
+46-struct rray_subscript_summary rray_subscript_summarise(
+47-  r_obj* index,
+48-  r_ssize start,
+49-  r_ssize size
+--
+57:r_obj* rray_subscript_as_list(struct rray_subscript subscript);
+58-
+59-#endif
+bf81bfa Use location pointers to identify whole slice axes
+1b95e95 Use integer locations in slice loops
+faf07c0 Nest the missing check under each side of the identity branch in `rray_slice()`
+64bc8ef Write every location in `rray_slice_locations_as_offsets()` with a ternary
+ed0bf5f Name missing `rray_slice()` locations `&quot;&quot;` rather than `NA`, like vctrs
+0fbcb63 Detect missing `rray_slice()` locations across all axes in one pass
+00a207d Split out missing detection and pass identity to `rray_slice_axis_names()`
+2ea30a8 Rename the `rray_slice_axis` `offsets` field to `v_offsets`
+6eab171 Fill each `rray_slice()` axis entirely inside its identity branch
+b0b01a5 Tidy the identity axis loop in `rray_slice()`
+0528834 Use `r_is_true()` to detect identity axes in `rray_slice()`
+fe852c3 Read `rray_slice()` axis names through a possibly `NULL` `v_x_names`</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;define RRAY_MAX_DIMENSIONALITY&quot; src/ &amp;&amp; grep -rn &quot;fill_locations\|locations_size\|v…</summary>
+<pre>grep -rn &quot;define RRAY_MAX_DIMENSIONALITY&quot; src/ &amp;&amp; grep -rn &quot;fill_locations\|locations_size\|v_subscripts&quot; src/ R/ tests/ plans/ 2&gt;/dev/null | grep -v &quot;^src/slice.c\|^src/decl/slice-decl.h&quot;</pre><pre class="output">src/dimensionality.h:8:#define RRAY_MAX_DIMENSIONALITY 64</pre></details>
+<p>Now the rewrite of the axis loop and the fill function.</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+p = &quot;src/slice.c&quot;
+s = open(p).read()
+
+old_start = s.index(&quot;  struct rray_subscript v_subscripts[RRAY_MAX_DIMENSIONALITY];\n&quot;)
+old_end = s.index(&quot;  r_obj* names = KEEP_N(\n&quot;)
+new = '''  r_obj* dimensions = KEEP_N(r_alloc_integer(dimensionality), &amp;n_prot);
+  int* v_dimensions = r_int_begin(dimensions);
+
+  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];
+
+  r_ssize axis = 0;
+  struct rray_arg* index_arg =
+    new_subscript_arg(indices_arg, r_null, dimensionality, &amp;axis);
+  KEEP_N(index_arg-&gt;shelter, &amp;n_prot);
+
+  for (; axis &lt; dimensionality; ++axis) {
+    r_obj* index = v_indices[axis];
+    r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[axis];
+
+    const struct rray_subscript subscript = rray_as_slice_subscript(
+      index,
+      v_x_dimensions[axis],
+      x_axis_names,
+      index_arg,
+      error_call
+    );
+    KEEP_N(subscript.index, &amp;n_prot);
+
+    v_dimensions[axis] = r_ssize_as_integer(subscript.size);
+
+    if (r_is_true(index)) {
+      v_v_locations[axis] = NULL;
+    } else {
+      r_obj* locations = KEEP_N(rray_slice_as_locations(subscript), &amp;n_prot);
+      v_v_locations[axis] = r_int_cbegin(locations);
+    }
+  }
+
+  const r_ssize size =
+    rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+
+  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+  rray_fill_strides_from_dimensions(
+    v_x_dimensions,
+    dimensionality,
+    v_x_strides
+  );
+
+'''
+s = s[:old_start] + new + s[old_end:]
+
+fs = s.index(&quot;static void rray_slice_fill_locations(&quot;)
+fe = s.index(&quot;static r_obj* rray_slice_names(&quot;)
+newf = '''static r_obj* rray_slice_as_locations(struct rray_subscript subscript) {
+  switch (subscript.kind) {
+  case RRAY_SUBSCRIPT_KIND_locations_int:
+    return subscript.index;
+  case RRAY_SUBSCRIPT_KIND_locations_dbl: {
+    const double* v_index = r_dbl_cbegin(subscript.index);
+
+    r_obj* out = KEEP(r_alloc_integer(subscript.size));
+    int* v_out = r_int_begin(out);
+
+    for (r_ssize i = 0; i &lt; subscript.size; ++i) {
+      const double location = v_index[i];
+      v_out[i] =
+        rray_dbl_is_missing(location) ? r_globals.na_int : (int) location;
+    }
+
+    FREE(1);
+    return out;
+  }
+  case RRAY_SUBSCRIPT_KIND_mask: {
+    const int* v_index = r_lgl_cbegin(subscript.index);
+    const r_ssize index_step = r_length(subscript.index) == 1 ? 0 : 1;
+
+    r_obj* out = KEEP(r_alloc_integer(subscript.size));
+    int* v_out = r_int_begin(out);
+
+    r_ssize i = 0;
+
+    for (r_ssize location = 0; i &lt; subscript.size; ++location) {
+      const int elt = v_index[location * index_step];
+
+      if (elt == 0) {
+        continue;
+      }
+
+      v_out[i] = elt == r_globals.na_lgl ? r_globals.na_int : (int) location + 1;
+      ++i;
+    }
+
+    FREE(1);
+    return out;
+  }
+  case RRAY_SUBSCRIPT_KIND_points_int:
+  case RRAY_SUBSCRIPT_KIND_points_dbl:
+    r_stop_unreachable();
+  }
+
+  r_stop_unreachable();
+}
+
+'''
+s = s[:fs] + newf + s[fe:]
+open(p, &quot;w&quot;).write(s)
+
+d = &quot;src/decl/slice-decl.h&quot;
+t = open(d).read()
+t = t.replace('''static void rray_slice_fill_locations(
+  struct rray_subscript subscript,
+  int* v_locations
+);''', '''static r_obj* rray_slice_as_locations(struct rray_subscript subscript);''')
+open(d, &quot;w&quot;).write(t)
+EOF
+sed -n 25,110p src/slice.c</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script. rray4 requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/slice.c</summary>
+<pre class="output">60	  struct rray_subscript v_subscripts[RRAY_MAX_DIMENSIONALITY];
+61	
+62	  r_obj* dimensions = KEEP_N(r_alloc_integer(dimensionality), &amp;n_prot);
+63	  int* v_dimensions = r_int_begin(dimensions);
+64	
+65	  r_ssize axis = 0;
+66	  struct rray_arg* index_arg =
+67	    new_subscript_arg(indices_arg, r_null, dimensionality, &amp;axis);
+68	  KEEP_N(index_arg-&gt;shelter, &amp;n_prot);
+69	
+70	  for (; axis &lt; dimensionality; ++axis) {
+71	    r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[axis];
+72	
+73	    const struct rray_subscript subscript = rray_as_slice_subscript(
+74	      v_indices[axis],
+75	      v_x_dimensions[axis],
+76	      x_axis_names,
+77	      index_arg,
+78	      error_call
+79	    );
+80	    KEEP_N(subscript.index, &amp;n_prot);
+81	
+82	    v_subscripts[axis] = subscript;
+83	    v_dimensions[axis] = r_ssize_as_integer(subscript.size);
+84	  }
+85	
+86	  const r_ssize size =
+87	    rray_size_from_dimensions_checked(v_dimensions, dimensionality, error_call);
+88	
+89	  r_ssize v_x_strides[RRAY_MAX_DIMENSIONALITY];
+90	  rray_fill_strides_from_dimensions(
+91	    v_x_dimensions,
+92	    dimensionality,
+93	    v_x_strides
+94	  );
+95	
+96	  r_ssize locations_size = 0;
+97	
+98	  for (int i = 0; i &lt; dimensionality; ++i) {
+99	    if (
+100	      !r_is_true(v_indices[i]) &amp;&amp;
+101	      v_subscripts[i].kind != RRAY_SUBSCRIPT_KIND_locations_int
+102	    ) {
+103	      locations_size += v_dimensions[i];
+104	    }
+105	  }
+106	
+107	  r_obj* locations = KEEP_N(r_alloc_integer(locations_size), &amp;n_prot);
+108	  int* v_locations = r_int_begin(locations);
+109	
+110	  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];
+111	
+112	  for (int i = 0; i &lt; dimensionality; ++i) {
+113	    if (r_is_true(v_indices[i])) {
+114	      v_v_locations[i] = NULL;
+115	    } else if (v_subscripts[i].kind == RRAY_SUBSCRIPT_KIND_locations_int) {
+116	      v_v_locations[i] = r_int_cbegin(v_subscripts[i].index);
+117	    } else {
+118	      v_v_locations[i] = v_locations;
+119	      rray_slice_fill_locations(v_subscripts[i], v_locations);
+120	      if (v_dimensions[i] != 0) {
+121	        v_locations += v_dimensions[i];
+122	      }
+123	    }
+124	  }
+125	
+126	  r_obj* names = KEEP_N(
+127	    rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),
+128	    &amp;n_prot
+129	  );
+130	
+131	  const bool any_missing = rray_slice_locations_any_missing(
+132	    v_v_locations,
+133	    v_dimensions,
+134	    dimensionality
+135	  );
+136	
+137	  r_obj* out;
+138	
+139	  switch (r_typeof(x)) {
+140	  case R_TYPE_logical:
+141	    out = rray_slice_lgl(
+142	      x,
+143	      v_v_locations,
+144	      v_x_strides,
+145	      v_dimensions,
+146	      dimensionality,
+147	      size,
+148	      any_missing
+149	    );
+150	    break;
+151	  case R_TYPE_integer:
+152	    out = rray_slice_int(
+153	      x,
+154	      v_v_locations,
+155	      v_x_strides,
+156	      v_dimensions,
+157	      dimensionality,
+158	      size,
+159	      any_missing
+160	    );
+161	    break;
+162	  case R_TYPE_double:
+163	    out = rray_slice_dbl(
+164	      x,
+165	      v_v_locations,
+166	      v_x_strides,
+167	      v_dimensions,
+168	      dimensionality,
+169	      size,
+170	      any_missing
+171	    );
+172	    break;
+173	  case R_TYPE_complex:
+174	    out = rray_slice_cpl(
+175	      x,
+176	      v_v_locations,
+177	      v_x_strides,
+178	      v_dimensions,
+179	      dimensionality,
+180	      size,
+181	      any_missing
+182	    );
+183	    break;
+184	  case R_TYPE_raw:
+185	    out = rray_slice_raw(
+186	      x,
+187	      v_v_locations,
+188	      v_x_strides,
+189	      v_dimensions,</pre></details>
+<details class="tool"><summary>Read src/decl/slice-decl.h</summary>
+<pre class="output">1	static void rray_slice_fill_locations(
+2	  struct rray_subscript subscript,
+3	  int* v_locations
+4	);
+5	</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-  struct rray_subscript v_subscripts[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* dimensions = KEEP_N(r_alloc_integer(dimensionality), &amp;n_prot);</span>
+<span class="del">-  int* v_dimensions = r_int_begin(dimensions);</span>
+<span class="del">-</span>
+<span class="del">-  r_ssize axis = 0;</span>
+<span class="del">-  struct rray_arg* index_arg =</span>
+<span class="del">-    new_subscript_arg(indices_arg, r_null, dimensionality, &amp;axis);</span>
+<span class="del">-  KEEP_N(index_arg-&gt;shelter, &amp;n_prot);</span>
+<span class="del">-</span>
+<span class="del">-  for (; axis &lt; dimensionality; ++axis) {</span>
+<span class="del">-    r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[axis];</span>
+<span class="del">-</span>
+<span class="del">-    const struct rray_subscript subscript = rray_as_slice_subscript(</span>
+<span class="del">-      v_indices[axis],</span>
+<span class="del">-      v_x_dimensions[axis],</span>
+<span class="del">-      x_axis_names,</span>
+<span class="del">-      index_arg,</span>
+<span class="del">-      error_call</span>
+<span class="del">-    );</span>
+<span class="del">-    KEEP_N(subscript.index, &amp;n_prot);</span>
+<span class="del">-</span>
+<span class="del">-    v_subscripts[axis] = subscript;</span>
+<span class="del">-    v_dimensions[axis] = r_ssize_as_integer(subscript.size);</span>
+<span class="del">-  }</span>
+<span class="ins">+  r_obj* dimensions = KEEP_N(r_alloc_integer(dimensionality), &amp;n_prot);</span>
+<span class="ins">+  int* v_dimensions = r_int_begin(dimensions);</span>
+<span class="ins">+</span>
+<span class="ins">+  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="ins">+</span>
+<span class="ins">+  r_ssize axis = 0;</span>
+<span class="ins">+  struct rray_arg* index_arg =</span>
+<span class="ins">+    new_subscript_arg(indices_arg, r_null, dimensionality, &amp;axis);</span>
+<span class="ins">+  KEEP_N(index_arg-&gt;shelter, &amp;n_prot);</span>
+<span class="ins">+</span>
+<span class="ins">+  for (; axis &lt; dimensionality; ++axis) {</span>
+<span class="ins">+    r_obj* index = v_indices[axis];</span>
+<span class="ins">+    r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[axis];</span>
+<span class="ins">+</span>
+<span class="ins">+    const struct rray_subscript subscript = rray_as_slice_subscript(</span>
+<span class="ins">+      index,</span>
+<span class="ins">+      v_x_dimensions[axis],</span>
+<span class="ins">+      x_axis_names,</span>
+<span class="ins">+      index_arg,</span>
+<span class="ins">+      error_call</span>
+<span class="ins">+    );</span>
+<span class="ins">+    KEEP_N(subscript.index, &amp;n_prot);</span>
+<span class="ins">+</span>
+<span class="ins">+    v_dimensions[axis] = r_ssize_as_integer(subscript.size);</span>
+<span class="ins">+</span>
+<span class="ins">+    if (r_is_true(index)) {</span>
+<span class="ins">+      v_v_locations[axis] = NULL;</span>
+<span class="ins">+    } else {</span>
+<span class="ins">+      r_obj* locations = KEEP_N(rray_slice_as_locations(subscript), &amp;n_prot);</span>
+<span class="ins">+      v_v_locations[axis] = r_int_cbegin(locations);</span>
+<span class="ins">+    }</span>
+<span class="ins">+  }</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-  r_ssize locations_size = 0;</span>
+<span class="del">-</span>
+<span class="del">-  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-    if (</span>
+<span class="del">-      !r_is_true(v_indices[i]) &amp;&amp;</span>
+<span class="del">-      v_subscripts[i].kind != RRAY_SUBSCRIPT_KIND_locations_int</span>
+<span class="del">-    ) {</span>
+<span class="del">-      locations_size += v_dimensions[i];</span>
+<span class="del">-    }</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* locations = KEEP_N(r_alloc_integer(locations_size), &amp;n_prot);</span>
+<span class="del">-  int* v_locations = r_int_begin(locations);</span>
+<span class="del">-</span>
+<span class="del">-  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];</span>
+<span class="del">-</span>
+<span class="del">-  for (int i = 0; i &lt; dimensionality; ++i) {</span>
+<span class="del">-    if (r_is_true(v_indices[i])) {</span>
+<span class="del">-      v_v_locations[i] = NULL;</span>
+<span class="del">-    } else if (v_subscripts[i].kind == RRAY_SUBSCRIPT_KIND_locations_int) {</span>
+<span class="del">-      v_v_locations[i] = r_int_cbegin(v_subscripts[i].index);</span>
+<span class="del">-    } else {</span>
+<span class="del">-      v_v_locations[i] = v_locations;</span>
+<span class="del">-      rray_slice_fill_locations(v_subscripts[i], v_locations);</span>
+<span class="del">-      if (v_dimensions[i] != 0) {</span>
+<span class="del">-        v_locations += v_dimensions[i];</span>
+<span class="del">-      }</span>
+<span class="del">-    }</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="ins">+</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/slice.c</summary>
+<pre class="diff"><span class="del">-static void rray_slice_fill_locations(</span>
+<span class="del">-  struct rray_subscript subscript,</span>
+<span class="del">-  int* v_locations</span>
+<span class="del">-) {</span>
+<span class="del">-  switch (subscript.kind) {</span>
+<span class="del">-  case RRAY_SUBSCRIPT_KIND_locations_dbl: {</span>
+<span class="del">-    const double* v_index = r_dbl_cbegin(subscript.index);</span>
+<span class="del">-</span>
+<span class="del">-    for (r_ssize i = 0; i &lt; subscript.size; ++i) {</span>
+<span class="del">-      const double location = v_index[i];</span>
+<span class="del">-      v_locations[i] =</span>
+<span class="del">-        rray_dbl_is_missing(location) ? r_globals.na_int : (int) location;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    break;</span>
+<span class="del">-  }</span>
+<span class="del">-  case RRAY_SUBSCRIPT_KIND_mask: {</span>
+<span class="del">-    const int* v_index = r_lgl_cbegin(subscript.index);</span>
+<span class="del">-    const r_ssize index_step = r_length(subscript.index) == 1 ? 0 : 1;</span>
+<span class="del">-</span>
+<span class="del">-    r_ssize i = 0;</span>
+<span class="del">-</span>
+<span class="del">-    for (r_ssize location = 0; i &lt; subscript.size; ++location) {</span>
+<span class="del">-      const int elt = v_index[location * index_step];</span>
+<span class="del">-</span>
+<span class="del">-      if (elt == 0) {</span>
+<span class="del">-        continue;</span>
+<span class="del">-      }</span>
+<span class="del">-</span>
+<span class="del">-      v_locations[i] =</span>
+<span class="del">-        elt == r_globals.na_lgl ? r_globals.na_int : (int) location + 1;</span>
+<span class="del">-      ++i;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    break;</span>
+<span class="del">-  }</span>
+<span class="del">-  case RRAY_SUBSCRIPT_KIND_locations_int:</span>
+<span class="del">-  case RRAY_SUBSCRIPT_KIND_points_int:</span>
+<span class="del">-  case RRAY_SUBSCRIPT_KIND_points_dbl:</span>
+<span class="del">-    r_stop_unreachable();</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="ins">+static r_obj* rray_slice_as_locations(struct rray_subscript subscript) {</span>
+<span class="ins">+  switch (subscript.kind) {</span>
+<span class="ins">+  case RRAY_SUBSCRIPT_KIND_locations_int:</span>
+<span class="ins">+    return subscript.index;</span>
+<span class="ins">+  case RRAY_SUBSCRIPT_KIND_locations_dbl: {</span>
+<span class="ins">+    const double* v_index = r_dbl_cbegin(subscript.index);</span>
+<span class="ins">+</span>
+<span class="ins">+    r_obj* out = KEEP(r_alloc_integer(subscript.size));</span>
+<span class="ins">+    int* v_out = r_int_begin(out);</span>
+<span class="ins">+</span>
+<span class="ins">+    for (r_ssize i = 0; i &lt; subscript.size; ++i) {</span>
+<span class="ins">+      const double location = v_index[i];</span>
+<span class="ins">+      v_out[i] =</span>
+<span class="ins">+        rray_dbl_is_missing(location) ? r_globals.na_int : (int) location;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    FREE(1);</span>
+<span class="ins">+    return out;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  case RRAY_SUBSCRIPT_KIND_mask: {</span>
+<span class="ins">+    const int* v_index = r_lgl_cbegin(subscript.index);</span>
+<span class="ins">+    const r_ssize index_step = r_length(subscript.index) == 1 ? 0 : 1;</span>
+<span class="ins">+</span>
+<span class="ins">+    r_obj* out = KEEP(r_alloc_integer(subscript.size));</span>
+<span class="ins">+    int* v_out = r_int_begin(out);</span>
+<span class="ins">+</span>
+<span class="ins">+    r_ssize i = 0;</span>
+<span class="ins">+</span>
+<span class="ins">+    for (r_ssize location = 0; i &lt; subscript.size; ++location) {</span>
+<span class="ins">+      const int elt = v_index[location * index_step];</span>
+<span class="ins">+</span>
+<span class="ins">+      if (elt == 0) {</span>
+<span class="ins">+        continue;</span>
+<span class="ins">+      }</span>
+<span class="ins">+</span>
+<span class="ins">+      v_out[i] = elt == r_globals.na_lgl ? r_globals.na_int : (int) location + 1;</span>
+<span class="ins">+      ++i;</span>
+<span class="ins">+    }</span>
+<span class="ins">+</span>
+<span class="ins">+    FREE(1);</span>
+<span class="ins">+    return out;</span>
+<span class="ins">+  }</span>
+<span class="ins">+  case RRAY_SUBSCRIPT_KIND_points_int:</span>
+<span class="ins">+  case RRAY_SUBSCRIPT_KIND_points_dbl:</span>
+<span class="ins">+    r_stop_unreachable();</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  r_stop_unreachable();</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/slice.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/decl/slice-decl.h</summary>
+<pre class="diff"><span class="del">-static void rray_slice_fill_locations(</span>
+<span class="del">-  struct rray_subscript subscript,</span>
+<span class="del">-  int* v_locations</span>
+<span class="del">-);</span>
+<span class="ins">+static r_obj* rray_slice_as_locations(struct rray_subscript subscript);</span></pre><pre class="output">The file ~/files/r/packages/rray4/src/decl/slice-decl.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; grep -rn -B3 &quot;^  r_stop_unreachable();$…</summary>
+<pre>clang-format -i src/*.c src/*.h &amp;&amp; git diff --stat &amp;&amp; grep -rn -B3 &quot;^  r_stop_unreachable();$&quot; src/*.c | grep -A3 &quot;^src/[a-z-]*.c-[0-9]*-  }$&quot; | head -20</pre><pre class="output"> src/decl/slice-decl.h |  5 +---
+ src/slice.c           | 71 ++++++++++++++++++++-------------------------------
+ 2 files changed, 29 insertions(+), 47 deletions(-)
+src/arithmetic-add.c-103-  }
+src/arithmetic-add.c-104-
+src/arithmetic-add.c:105:  r_stop_unreachable();
+src/arithmetic-divide.c-106-    }
+src/arithmetic-divide.c-107-  }
+src/arithmetic-divide.c-108-
+src/arithmetic-divide.c:109:  r_stop_unreachable();
+src/arithmetic-multiply.c-108-    }
+src/arithmetic-multiply.c-109-  }
+src/arithmetic-multiply.c-110-
+src/arithmetic-multiply.c:111:  r_stop_unreachable();
+src/arithmetic-exponentiate.c-101-    }
+src/arithmetic-exponentiate.c-102-  }
+src/arithmetic-exponentiate.c-103-
+src/arithmetic-exponentiate.c:104:  r_stop_unreachable();
+src/arithmetic-subtract.c-108-    }
+src/arithmetic-subtract.c-109-  }
+src/arithmetic-subtract.c-110-
+src/arithmetic-subtract.c:111:  r_stop_unreachable();
+src/cast.c-117-    stop_scalar_input(x, x_arg, error_call);</pre></details>
+<p>The trailing <code>r_stop_unreachable()</code> after the switch matches the existing pattern. Now the tests.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = '^slice')&quot; 2&gt;&amp;1 | tail -15</summary>
+<pre>Rscript -e &quot;devtools::test(filter = '^slice')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">ℹ Testing rray4
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 86 ]</pre></details>
+<details class="tool"><summary>Bash: git diff</summary>
+<pre>git diff</pre><pre class="output">diff --git a/src/decl/slice-decl.h b/src/decl/slice-decl.h
+index ee811ac..c193e3e 100644
+--- a/src/decl/slice-decl.h
++++ b/src/decl/slice-decl.h
+@@ -1,7 +1,4 @@
+-static void rray_slice_fill_locations(
+-  struct rray_subscript subscript,
+-  int* v_locations
+-);
++static r_obj* rray_slice_as_locations(struct rray_subscript subscript);
+ 
+ static r_obj* rray_slice_names(
+   r_obj* const* v_x_names,
+diff --git a/src/slice.c b/src/slice.c
+index d392bae..036ff93 100644
+--- a/src/slice.c
++++ b/src/slice.c
+@@ -57,21 +57,22 @@ r_obj* rray_slice(
+     r_abort_lazy_call(error_call, &quot;All elements of `...` must be unnamed.&quot;);
+   }
+ 
+-  struct rray_subscript v_subscripts[RRAY_MAX_DIMENSIONALITY];
+-
+   r_obj* dimensions = KEEP_N(r_alloc_integer(dimensionality), &amp;n_prot);
+   int* v_dimensions = r_int_begin(dimensions);
+ 
++  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];
++
+   r_ssize axis = 0;
+   struct rray_arg* index_arg =
+     new_subscript_arg(indices_arg, r_null, dimensionality, &amp;axis);
+   KEEP_N(index_arg-&gt;shelter, &amp;n_prot);
+ 
+   for (; axis &lt; dimensionality; ++axis) {
++    r_obj* index = v_indices[axis];
+     r_obj* x_axis_names = v_x_names == NULL ? r_null : v_x_names[axis];
+ 
+     const struct rray_subscript subscript = rray_as_slice_subscript(
+-      v_indices[axis],
++      index,
+       v_x_dimensions[axis],
+       x_axis_names,
+       index_arg,
+@@ -79,8 +80,14 @@ r_obj* rray_slice(
+     );
+     KEEP_N(subscript.index, &amp;n_prot);
+ 
+-    v_subscripts[axis] = subscript;
+     v_dimensions[axis] = r_ssize_as_integer(subscript.size);
++
++    if (r_is_true(index)) {
++      v_v_locations[axis] = NULL;
++    } else {
++      r_obj* locations = KEEP_N(rray_slice_as_locations(subscript), &amp;n_prot);
++      v_v_locations[axis] = r_int_cbegin(locations);
++    }
+   }
+ 
+   const r_ssize size =
+@@ -93,36 +100,6 @@ r_obj* rray_slice(
+     v_x_strides
+   );
+ 
+-  r_ssize locations_size = 0;
+-
+-  for (int i = 0; i &lt; dimensionality; ++i) {
+-    if (
+-      !r_is_true(v_indices[i]) &amp;&amp;
+-      v_subscripts[i].kind != RRAY_SUBSCRIPT_KIND_locations_int
+-    ) {
+-      locations_size += v_dimensions[i];
+-    }
+-  }
+-
+-  r_obj* locations = KEEP_N(r_alloc_integer(locations_size), &amp;n_prot);
+-  int* v_locations = r_int_begin(locations);
+-
+-  const int* v_v_locations[RRAY_MAX_DIMENSIONALITY];
+-
+-  for (int i = 0; i &lt; dimensionality; ++i) {
+-    if (r_is_true(v_indices[i])) {
+-      v_v_locations[i] = NULL;
+-    } else if (v_subscripts[i].kind == RRAY_SUBSCRIPT_KIND_locations_int) {
+-      v_v_locations[i] = r_int_cbegin(v_subscripts[i].index);
+-    } else {
+-      v_v_locations[i] = v_locations;
+-      rray_slice_fill_locations(v_subscripts[i], v_locations);
+-      if (v_dimensions[i] != 0) {
+-        v_locations += v_dimensions[i];
+-      }
+-    }
+-  }
+-
+   r_obj* names = KEEP_N(
+     rray_slice_names(v_x_names, v_dimensions, dimensionality, v_v_locations),
+     &amp;n_prot
+@@ -229,26 +206,32 @@ r_obj* rray_slice(
+   return out;
+ }
+ 
+-static void rray_slice_fill_locations(
+-  struct rray_subscript subscript,
+-  int* v_locations
+-) {
++static r_obj* rray_slice_as_locations(struct rray_subscript subscript) {
+   switch (subscript.kind) {
++  case RRAY_SUBSCRIPT_KIND_locations_int:
++    return subscript.index;
+   case RRAY_SUBSCRIPT_KIND_locations_dbl: {
+     const double* v_index = r_dbl_cbegin(subscript.index);
+ 
++    r_obj* out = KEEP(r_alloc_integer(subscript.size));
++    int* v_out = r_int_begin(out);
++
+     for (r_ssize i = 0; i &lt; subscript.size; ++i) {
+       const double location = v_index[i];
+-      v_locations[i] =
++      v_out[i] =
+         rray_dbl_is_missing(location) ? r_globals.na_int : (int) location;
+     }
+ 
+-    break;
++    FREE(1);
++    return out;
+   }
+   case RRAY_SUBSCRIPT_KIND_mask: {
+     const int* v_index = r_lgl_cbegin(subscript.index);
+     const r_ssize index_step = r_length(subscript.index) == 1 ? 0 : 1;
+ 
++    r_obj* out = KEEP(r_alloc_integer(subscript.size));
++    int* v_out = r_int_begin(out);
++
+     r_ssize i = 0;
+ 
+     for (r_ssize location = 0; i &lt; subscript.size; ++location) {
+@@ -258,18 +241,20 @@ static void rray_slice_fill_locations(
+         continue;
+       }
+ 
+-      v_locations[i] =
++      v_out[i] =
+         elt == r_globals.na_lgl ? r_globals.na_int : (int) location + 1;
+       ++i;
+     }
+ 
+-    break;
++    FREE(1);
++    return out;
+   }
+-  case RRAY_SUBSCRIPT_KIND_locations_int:
+   case RRAY_SUBSCRIPT_KIND_points_int:
+   case RRAY_SUBSCRIPT_KIND_points_dbl:
+     r_stop_unreachable();
+   }
++
++  r_stop_unreachable();
+ }
+ 
+ static r_obj* rray_slice_names(</pre></details>
+<p>I rewrote it the way you described. The axis loop now builds each axis's locations as it goes, so <code>locations_size</code>, the shared locations vector, and the second pass over the axes are all gone. The slice tests pass (86), and <code>clang-format</code> has been run.</p>
+<p>What changed in <code>src/slice.c</code>:</p>
+<ul>
+<li>
+<p><strong>New helper.</strong> <code>rray_slice_fill_locations()</code> is now <code>rray_slice_as_locations(subscript)</code>, which returns an <code>r_obj*</code>:</p>
+<ul>
+<li>An integer subscript returns <code>subscript.index</code> as is.</li>
+<li>A double or logical subscript gets its own new integer vector, filled with the same code as before.</li>
+</ul>
+</li>
+<li>
+<p><strong>One loop.</strong> Each axis converts its subscript, sets <code>v_dimensions[axis]</code>, then fills in <code>v_v_locations[axis]</code>: <code>NULL</code> for a <code>TRUE</code> axis, otherwise it keeps the result of <code>rray_slice_as_locations()</code> and points at its data.</p>
+</li>
+<li>
+<p><strong>Removed.</strong> <code>v_subscripts</code>, <code>locations_size</code>, the shared <code>locations</code> vector, and the <code>if (v_dimensions[i] != 0)</code> pointer-advance guard.</p>
+</li>
+</ul>
+<p>Net result: 29 lines added, 47 removed.</p>
+<p>I checked the protection by reading the diff:</p>
+<ul>
+<li>
+<p><strong>The subscript.</strong> <code>subscript.index</code> is kept before <code>rray_slice_as_locations()</code> allocates anything.</p>
+</li>
+<li>
+<p><strong>Each locations vector.</strong> It is kept as soon as it is returned, so every <code>v_v_locations</code> pointer points into a protected vector.</p>
+</li>
+<li>
+<p><strong>Protect count.</strong> Each axis now keeps up to two objects, so at most 128 plus a few. For integer axes, the second keep holds the same object as the first, which does no harm.</p>
+</li>
+</ul>
+<p>Nothing is committed.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add src/slice.c src/decl/slice-decl.h &amp;&amp; git commit -q -m &quot;Build each slice axis's locati…</summary>
+<pre>git add src/slice.c src/decl/slice-decl.h &amp;&amp; git commit -q -m &quot;Build each slice axis's locations inside the subscript loop&quot; &amp;&amp; git push -u origin feature/slice 2&gt;&amp;1 | tail -3 &amp;&amp; git log --oneline -1</pre><pre class="output">To https://github.com/DavisVaughan/rray4.git
+   bf81bfa..5eabbe9  feature/slice -&gt; feature/slice
+branch 'feature/slice' set up to track 'origin/feature/slice'.
+5eabbe9 Build each slice axis's locations inside the subscript loop</pre></details>
+<p>The change is committed and pushed to <code>origin/feature/slice</code> as <code>5eabbe9</code> with the message &quot;Build each slice axis's locations inside the subscript loop&quot;. Following your project rules, the message has no attribution trailer.</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Does subscript.index need keepn if it doesn’t outlive the loop?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: grep -n &quot;\.index = \|return (struct rray_subscript)\|kind = &quot; src/subscript.c src/slice-subsc…</summary>
+<pre>grep -n &quot;\.index = \|return (struct rray_subscript)\|kind = &quot; src/subscript.c src/slice-subscript.c</pre><pre class="output">src/slice-subscript.c:62:    return (struct rray_subscript){
+src/slice-subscript.c:63:      .index = r_globals.empty_int,
+src/slice-subscript.c:64:      .kind = RRAY_SUBSCRIPT_KIND_locations_int,
+src/slice-subscript.c:129:    {.index = out, .kind = RRAY_SUBSCRIPT_KIND_locations_int, .size = size};
+src/subscript.c:61:  return (struct rray_subscript){
+src/subscript.c:62:    .index = index,
+src/subscript.c:63:    .kind = r_typeof(index) == R_TYPE_integer
+src/subscript.c:115:    .index = out,
+src/subscript.c:116:    .kind = RRAY_SUBSCRIPT_KIND_mask,
+src/subscript.c:149:      {.index = out, .kind = RRAY_SUBSCRIPT_KIND_locations_int, .size = size};
+src/subscript.c:172:      {.index = out, .kind = RRAY_SUBSCRIPT_KIND_locations_dbl, .size = size};
+src/subscript.c:202:  return (struct rray_subscript){
+src/subscript.c:203:    .index = index,
+src/subscript.c:204:    .kind = RRAY_SUBSCRIPT_KIND_mask,</pre></details>
+<details class="tool"><summary>Bash: sed -n 95,210p src/subscript.c</summary>
+<pre>sed -n 95,210p src/subscript.c</pre><pre class="output">    break;
+  }
+  case R_TYPE_double: {
+    const double* v_index = r_dbl_cbegin(index);
+
+    for (r_ssize i = 0; i &lt; index_size; ++i) {
+      const double elt = v_index[i];
+
+      if (elt != 0) {
+        v_out[-(r_ssize) elt - 1] = 0;
+      }
+    }
+
+    break;
+  }
+  default:
+    r_stop_unreachable();
+  }
+
+  const struct rray_subscript subscript = {
+    .index = out,
+    .kind = RRAY_SUBSCRIPT_KIND_mask,
+    .size = rray_mask_size(out, size)
+  };
+
+  FREE(1);
+  return subscript;
+}
+
+static struct rray_subscript rray_as_subscript_nonzero(
+  r_obj* index,
+  r_ssize size
+) {
+  const r_ssize index_size = r_length(index);
+
+  switch (r_typeof(index)) {
+  case R_TYPE_integer: {
+    const int* v_index = r_int_cbegin(index);
+
+    r_obj* out = KEEP(r_alloc_integer(size));
+    int* v_out = r_int_begin(out);
+
+    r_ssize j = 0;
+
+    for (r_ssize i = 0; i &lt; index_size; ++i) {
+      const int elt = v_index[i];
+
+      if (elt != 0) {
+        v_out[j] = elt;
+        ++j;
+      }
+    }
+
+    const struct rray_subscript subscript =
+      {.index = out, .kind = RRAY_SUBSCRIPT_KIND_locations_int, .size = size};
+
+    FREE(1);
+    return subscript;
+  }
+  case R_TYPE_double: {
+    const double* v_index = r_dbl_cbegin(index);
+
+    r_obj* out = KEEP(r_alloc_double(size));
+    double* v_out = r_dbl_begin(out);
+
+    r_ssize j = 0;
+
+    for (r_ssize i = 0; i &lt; index_size; ++i) {
+      const double elt = v_index[i];
+
+      if (elt != 0) {
+        v_out[j] = elt;
+        ++j;
+      }
+    }
+
+    const struct rray_subscript subscript =
+      {.index = out, .kind = RRAY_SUBSCRIPT_KIND_locations_dbl, .size = size};
+
+    FREE(1);
+    return subscript;
+  }
+  default:
+    r_stop_unreachable();
+  }
+}
+
+struct rray_subscript rray_as_subscript_mask(
+  r_obj* index,
+  r_ssize size,
+  struct rray_arg* index_arg,
+  struct r_lazy error_call
+) {
+  // Check for size 1 or size `size`. Note we don't expand a single `TRUE`, we
+  // have native support for that.
+  const r_ssize index_size = r_length(index);
+
+  if (index_size != 1 &amp;&amp; index_size != size) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;Logical %s must be size 1 or %&quot; R_PRI_SSIZE &quot;, not %&quot; R_PRI_SSIZE &quot;.&quot;,
+      rray_arg_format(index_arg),
+      size,
+      index_size
+    );
+  }
+
+  return (struct rray_subscript){
+    .index = index,
+    .kind = RRAY_SUBSCRIPT_KIND_mask,
+    .size = rray_mask_size(index, size)
+  };
+}
+
+// Computes number of used values in `x`. Includes both `TRUE` and `NA` logical
+// values!</pre></details>
+<p>It doesn't need to last past the loop, but it does need protection for one call.</p>
+<p><code>subscript.index</code> isn't always the user's input. <code>rray_as_subscript_locations()</code> can return a new vector, for example:</p>
+<ul>
+<li>
+<p><strong>Negative locations</strong> become a new logical mask (<code>src/subscript.c:115</code>).</p>
+</li>
+<li>
+<p><strong>Zeros</strong> are dropped into a new double vector (<code>src/subscript.c:172</code>).</p>
+</li>
+</ul>
+<p>That new vector is only referenced from the C stack. <code>rray_slice_as_locations()</code> then allocates <code>out</code> while reading it, so it has to be protected during that call. After the call it isn't needed: the double and mask cases have copied it into <code>out</code>, and the integer case returns it as <code>locations</code>, which gets kept anyway.</p>
+<p>So <code>KEEP_N()</code> is more than it needs. Its only cost is that the protect stack grows by one extra entry per axis until the end of <code>rray_slice()</code>. A tighter version protects it just around the call:</p>
+<pre><code class="language-c">    v_dimensions[axis] = r_ssize_as_integer(subscript.size);
+
+    if (r_is_true(index)) {
+      v_v_locations[axis] = NULL;
+      continue;
+    }
+
+    KEEP(subscript.index);
+    r_obj* locations = rray_slice_as_locations(subscript);
+    FREE(1);
+
+    KEEP_N(locations, &amp;n_prot);
+    v_v_locations[axis] = r_int_cbegin(locations);
+</code></pre>
+<p>This is safe:</p>
+<ul>
+<li>
+<p>Nothing allocates between <code>FREE(1)</code> and <code>KEEP_N()</code>.</p>
+</li>
+<li>
+<p>Nothing allocates between <code>rray_as_slice_subscript()</code> returning and the <code>KEEP()</code>, since <code>r_ssize_as_integer()</code> and <code>r_is_true()</code> don't allocate.</p>
+</li>
+<li>
+<p>On a <code>TRUE</code> axis, the index is the user's own <code>TRUE</code>, which the <code>indices</code> list already protects.</p>
+</li>
+</ul>
+<p>The downside is the <code>FREE(1)</code> / <code>KEEP_N()</code> pair, which reads a little oddly. Do you want me to switch to this?</p>
+
+</section>
+</main>
+</body>
+</html>

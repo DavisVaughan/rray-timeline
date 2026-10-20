@@ -1,0 +1,2342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Planning multi-axis rray_rep() with times and axes</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-95">rray timeline</a>
+<h1>Planning multi-axis <code>rray_rep()</code> with <code>times</code> and <code>axes</code></h1>
+<p class="facts">Claude · Sep 28, 2026 · 4 prompts · 10 replies · <a href="https://github.com/r-lib/rray/pull/95">#95</a></p>
+</header>
+<main>
+<p class="divider">Sep 28, 2026, 07:01 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>The roll.md plan has helped me realize that rray rep should probably be times+axes, where times can be length 1 or length N axes. What do you think?</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: ls plans/ &amp;&amp; cat plans/roll.md &amp;&amp; ls R/ src/ | grep -i rep; cat R/rep.R 2&gt;/dev/null</summary>
+<pre>ls plans/ &amp;&amp; cat plans/roll.md &amp;&amp; ls R/ src/ | grep -i rep; cat R/rep.R 2&gt;/dev/null</pre><pre class="output">extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+roll.md
+slice.md
+# Rolling plan
+
+## Recommendation
+
+Add two functions:
+
+```r
+rray_roll(x, ..., n, axes)
+rray_roll_each(x, ..., n, axis)
+```
+
+Both move elements along an axis. An element pushed off one end comes back on
+the other.
+
+- `rray_roll()` rolls one or more axes, with one shift per axis. Every lane
+  through an axis moves by the same amount, so each output position has exactly
+  one source position, and names roll with the data.
+
+- `rray_roll_each()` rolls one axis, with one shift per lane. Lanes can move by
+  different amounts, so an output position can come from different source
+  positions in different lanes. Names on the rolled axis are always dropped.
+
+The split mirrors pairs the package already has:
+
+| Every lane moves together | Each lane moves on its own |
+|---|---|
+| `rray_slice_axis()` | `rray_index_axis()` |
+| `rray_rep()` | `rray_rep_each()` |
+| `rray_roll()` | `rray_roll_each()` |
+
+The function decides what happens to names. The size or values of `n` never do.
+A caller who wants names kept calls `rray_roll()`.
+
+## Terms
+
+- **Lane.** One run of elements along the rolled axis, with every other
+  coordinate held fixed. For a matrix and `axis = 2`, each row is a lane. For
+  dimensions `(A, B, C)` and `axis = 2`, there are `A * C` lanes, each of
+  length `B`.
+
+- **Lane dimensions.** The dimensions of `x` with the rolled axis set to 1. For
+  `(A, B, C)` and `axis = 2`, they are `(A, 1, C)`. There is one lane per
+  element of an array with these dimensions.
+
+- **Shift.** The value of `n` for one lane or one axis. It can be negative,
+  zero, or larger than the dimension.
+
+## Shared rules
+
+### Direction
+
+A positive shift moves elements toward higher positions, as in NumPy:
+
+```r
+rray_roll(1:5, n = 2, axes = 1)
+# [1] 4 5 1 2 3
+```
+
+A negative shift moves them toward lower positions:
+
+```r
+rray_roll(1:5, n = -1, axes = 1)
+# [1] 2 3 4 5 1
+```
+
+### Wrapping
+
+A shift is reduced modulo the dimension `d` of the rolled axis, into `[0, d)`:
+
+```text
+k = n mod d
+out[..., j, ...] = x[..., (j - k) mod d, ...]
+```
+
+So a shift of `7` on a dimension of `5` is a shift of `2`, and a shift of `-1`
+is a shift of `4`:
+
+```r
+rray_roll(1:5, n = 7, axes = 1)
+# [1] 4 5 1 2 3
+```
+
+A shift of `0`, or any multiple of `d`, leaves the axis unchanged.
+
+### Values of `n`
+
+- Integers, and anything that casts losslessly to integer. Doubles holding
+  whole numbers work and `1.5` is an error. Logicals work too, with `TRUE` as
+  `1`, the same as `axes` and `times` accept them today.
+
+- Any sign and any magnitude within the R integer range, which is
+  `-2147483647` to `2147483647`. `-2147483648` is reserved for `NA`, and a
+  double outside the range fails the cast.
+
+- No missing values.
+
+- No classed objects.
+
+### Zero dimensions
+
+When the rolled axis has dimension 0, there is nothing to move. Every shift is
+valid, and it is still validated. The result equals `x`, with the names rule of
+the function applied.
+
+### Bare vectors
+
+`x` goes through `arg_as_array()`, so a bare vector is a one-dimensional array
+and its names move to `dimnames`. The result is always an array.
+
+## `rray_roll()`
+
+```r
+rray_roll(x, ..., n, axes)
+```
+
+### Arguments
+
+- `x`: an array or bare vector.
+
+- `...`: must be empty. It forces `n` and `axes` to be named, as in
+  `rray_rep()`.
+
+- `n`: a bare integer vector of size 1 or the size of `axes`, validated the
+  same way as `axes`. A size 1 `n` is used for every axis in `axes`. Otherwise
+  `n[[i]]` is the shift for `axes[[i]]`. `n` can't have attributes, so names,
+  dimensions, and classes are all errors. Arrays of per-lane shifts belong to
+  `rray_roll_each()`.
+
+- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+  An axis can't appear twice. `integer()` is allowed and rolls nothing.
+
+The result has the type, dimensions, and dimensionality of `x`.
+
+### Worked examples
+
+#### One dimension
+
+```r
+rray_roll(1:5, n = 2, axes = 1)
+# [1] 4 5 1 2 3
+
+rray_roll(1:5, n = -1, axes = 1)
+# [1] 2 3 4 5 1
+
+rray_roll(1:5, n = 7, axes = 1)
+# [1] 4 5 1 2 3
+
+rray_roll(1:5, n = 0, axes = 1)
+# [1] 1 2 3 4 5
+```
+
+Each result is a one-dimensional array with dimensions `5`.
+
+#### A matrix
+
+```r
+x &lt;- matrix(
+  1:6,
+  nrow = 2,
+  dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+)
+
+x
+#    a b c
+# r1 1 3 5
+# r2 2 4 6
+```
+
+Roll the columns:
+
+```r
+rray_roll(x, n = 1, axes = 2)
+#    c a b
+# r1 5 1 3
+# r2 6 2 4
+
+rray_roll(x, n = -1, axes = 2)
+#    b c a
+# r1 3 5 1
+# r2 4 6 2
+```
+
+Roll the rows:
+
+```r
+rray_roll(x, n = 1, axes = 1)
+#    a b c
+# r2 2 4 6
+# r1 1 3 5
+```
+
+Roll both at once. A size 1 `n` is used for every axis:</pre><p class="cut">1,092 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n -i &quot;rep&quot; plans/roll.md | head -50; ls R | grep -i rep; grep -rn &quot;rray_rep&quot; R/*.R | he…</summary>
+<pre>grep -n -i &quot;rep&quot; plans/roll.md | head -50; ls R | grep -i rep; grep -rn &quot;rray_rep&quot; R/*.R | head; </pre><pre class="output">28:| `rray_rep()` | `rray_rep_each()` |
+121:  `rray_rep()`.
+274:NumPy adds up shifts on a repeated axis. rray4 treats a repeated axis as a
+705:  following `src/rep.c`, which holds `rray_rep()` and `rray_rep_each()`.
+714:- `_pkgdown.yml`: a new `Rolling` section after `Repeating`, containing
+783:`src/rep.c`, in a new `stop_roll_n_size()`.
+823:reports an error about an index.
+866:`block_size` and `n_groups` use the same names and meaning as in `src/rep.c`.
+935:`rray_rep_fill_varying()`. Each core is one macro call, with
+967:The barrier version replaces the assignment with `POKE(out, out_i, ...)`.
+1033:One topic, `rray-roll`, in `R/roll.R`, shaped like `rray-rep` in `R/rep.R`:
+1103:- Errors, snapshotted: repeated axis, out of range axis, `n` size mismatch for
+1189:`shift` and `axis` broadcast against each other, and a repeated axis adds its
+1191:`rray_roll()` keeps the multi-axis form, requires `axes`, and rejects repeated
+rep.R
+R/rep.R:4:#' - `rray_rep()` repeats the entire `axis` of `x` in bulk, i.e. repeat all of
+R/rep.R:7:#' - `rray_rep_each()` repeats each individual element of the `axis` of `x`
+R/rep.R:24:#' @param times For `rray_rep()`, a single integer greater than or equal
+R/rep.R:27:#'   For `rray_rep_each()`, a vector of integers greater than or equal to
+R/rep.R:40:#' rray_rep(x, times = 2, axis = 1)
+R/rep.R:43:#' rray_rep_each(x, times = 2, axis = 1)
+R/rep.R:46:#' rray_rep(x, times = 2, axis = 2)
+R/rep.R:49:#' rray_rep_each(x, times = c(1, 2, 3), axis = 1)
+R/rep.R:52:#' rray_rep_each(x, times = c(1, 0, 2), axis = 1)
+R/rep.R:56:#' rray_names(rray_rep(y, times = 2, axis = 1))</pre></details>
+<details class="tool"><summary>Bash: cat R/rep.R; sed -n 1,140p plans/roll.md | sed -n 60,140p; sed -n 260,300p plans/roll.md; sed…</summary>
+<pre>cat R/rep.R; sed -n 1,140p plans/roll.md | sed -n 60,140p; sed -n 260,300p plans/roll.md; sed -n 1180,1200p plans/roll.md; grep -n &quot;rep\b\|rray_rep&quot; src/rep.c | head -30</pre><pre class="output">#' Repeat an array
+#'
+#' @description
+#' - `rray_rep()` repeats the entire `axis` of `x` in bulk, i.e. repeat all of
+#'   the columns 5 `times`.
+#'
+#' - `rray_rep_each()` repeats each individual element of the `axis` of `x`
+#'   separately, i.e. repeat the first column 2 `times`, the second column 3
+#'   `times`, and so on. For convenience, you can also provide a single number
+#'   to repeat each element along the `axis` the same number of times.
+#'
+#' These are the array versions of [vctrs::vec_rep()] and
+#' [vctrs::vec_rep_each()], which repeat along the size of a vector rather than
+#' along an axis.
+#'
+#' @details
+#' Names repeat alongside the data, so the repeated axis can come back with
+#' duplicate names. Every other axis keeps its names untouched.
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param times For `rray_rep()`, a single integer greater than or equal
+#'   to 0.
+#'
+#'   For `rray_rep_each()`, a vector of integers greater than or equal to
+#'   0. It is recycled to the dimension of `x` along `axis`.
+#'
+#' @param axis A single integer representing the axis to repeat along.
+#'
+#' @returns
+#' An array with the same dimensions as `x`, except along `axis`.
+#'
+#' @name rray-rep
+#' @examples
+#' x &lt;- array(1:6, c(3, 2))
+#'
+#' # All rows in bulk, twice
+#' rray_rep(x, times = 2, axis = 1)
+#'
+#' # Each row individually, twice
+#' rray_rep_each(x, times = 2, axis = 1)
+#'
+#' # Columns rather than rows
+#' rray_rep(x, times = 2, axis = 2)
+#'
+#' # A different number of repeats per row
+#' rray_rep_each(x, times = c(1, 2, 3), axis = 1)
+#'
+#' # Zeroes drop slices entirely
+#' rray_rep_each(x, times = c(1, 0, 2), axis = 1)
+#'
+#' # Names repeat with the data, duplicates and all
+#' y &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+#' rray_names(rray_rep(y, times = 2, axis = 1))
+#' rray_names(rray_rep_each(y, times = 2, axis = 1))
+NULL
+
+#' @rdname rray-rep
+#' @export
+rray_rep &lt;- function(x, ..., times, axis) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_rep, x, times, axis, environment())
+}
+
+#' @rdname rray-rep
+#' @export
+rray_rep_each &lt;- function(x, ..., times, axis) {
+  check_dots_empty0(...)
+  .Call(ffi_rray_rep_each, x, times, axis, environment())
+}
+
+```r
+rray_roll(1:5, n = -1, axes = 1)
+# [1] 2 3 4 5 1
+```
+
+### Wrapping
+
+A shift is reduced modulo the dimension `d` of the rolled axis, into `[0, d)`:
+
+```text
+k = n mod d
+out[..., j, ...] = x[..., (j - k) mod d, ...]
+```
+
+So a shift of `7` on a dimension of `5` is a shift of `2`, and a shift of `-1`
+is a shift of `4`:
+
+```r
+rray_roll(1:5, n = 7, axes = 1)
+# [1] 4 5 1 2 3
+```
+
+A shift of `0`, or any multiple of `d`, leaves the axis unchanged.
+
+### Values of `n`
+
+- Integers, and anything that casts losslessly to integer. Doubles holding
+  whole numbers work and `1.5` is an error. Logicals work too, with `TRUE` as
+  `1`, the same as `axes` and `times` accept them today.
+
+- Any sign and any magnitude within the R integer range, which is
+  `-2147483647` to `2147483647`. `-2147483648` is reserved for `NA`, and a
+  double outside the range fails the cast.
+
+- No missing values.
+
+- No classed objects.
+
+### Zero dimensions
+
+When the rolled axis has dimension 0, there is nothing to move. Every shift is
+valid, and it is still validated. The result equals `x`, with the names rule of
+the function applied.
+
+### Bare vectors
+
+`x` goes through `arg_as_array()`, so a bare vector is a one-dimensional array
+and its names move to `dimnames`. The result is always an array.
+
+## `rray_roll()`
+
+```r
+rray_roll(x, ..., n, axes)
+```
+
+### Arguments
+
+- `x`: an array or bare vector.
+
+- `...`: must be empty. It forces `n` and `axes` to be named, as in
+  `rray_rep()`.
+
+- `n`: a bare integer vector of size 1 or the size of `axes`, validated the
+  same way as `axes`. A size 1 `n` is used for every axis in `axes`. Otherwise
+  `n[[i]]` is the shift for `axes[[i]]`. `n` can't have attributes, so names,
+  dimensions, and classes are all errors. Arrays of per-lane shifts belong to
+  `rray_roll_each()`.
+
+- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+  An axis can't appear twice. `integer()` is allowed and rolls nothing.
+
+The result has the type, dimensions, and dimensionality of `x`.
+
+### Worked examples
+
+#### One dimension
+
+```r
+rray_roll(1:5, n = 2, axes = 1)
+# [1] 4 5 1 2 3
+other axis keeps its names untouched. This is the subset rule from
+`plans/implementation.md` 2.3, and is exactly what `rray_slice_axis()` does for
+the same locations.
+
+### Relationship to NumPy
+
+| NumPy | rray4 |
+|---|---|
+| `np.roll(x, 1, axis=0)` | `rray_roll(x, n = 1, axes = 1)` |
+| `np.roll(x, (1, 2), axis=(0, 1))` | `rray_roll(x, n = c(1, 2), axes = c(1, 2))` |
+| `np.roll(x, 1, axis=(0, 1))` | `rray_roll(x, n = 1, axes = c(1, 2))` |
+| `np.roll(x, (1, 2), axis=(0, 0))` | Error. Write `rray_roll(x, n = 3, axes = 1)` |
+| `np.roll(x, 1)` | Not supported. `axes` is required |
+
+NumPy adds up shifts on a repeated axis. rray4 treats a repeated axis as a
+mistake.
+
+### Errors
+
+```r
+x &lt;- matrix(1:6, nrow = 2)
+
+rray_roll(x, n = 1, axes = c(1, 1))
+# Error in `rray_roll()`:
+# ! `axes` must not contain 1 more than once.
+
+rray_roll(x, n = c(1, 2, 3), axes = c(1, 2))
+# Error in `rray_roll()`:
+# ! `n` must be size 1 or size 2 to match `axes`, not size 3.
+
+rray_roll(x, n = c(1, 2), axes = 1)
+# Error in `rray_roll()`:
+# ! `n` must be size 1, not size 2.
+
+rray_roll(x, n = NA, axes = 1)
+# Error in `rray_roll()`:
+# ! `n` must not contain missing values.
+
+rray_roll(x, n = 1.5, axes = 1)
+# Error: Can't convert from `n` &lt;double&gt; to &lt;integer&gt; due to loss of precision.
+# • Locations: 1
+
+Add `rray_roll_each()` to `R/roll.R` and `src/roll.c`, extend the topic, and
+add its tests.
+
+## Research notes
+</pre><p class="cut">45 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -n &quot;&lt;- function&quot; R/*.R | grep -v &quot;^R/zzz&quot; | grep -E &quot;axis|axes&quot;; sed -n 54,130p src/rep.…</summary>
+<pre>grep -n &quot;&lt;- function&quot; R/*.R | grep -v &quot;^R/zzz&quot; | grep -E &quot;axis|axes&quot;; sed -n 54,130p src/rep.c; Rscript -e 'devtools::load_all(quiet=TRUE); print(rray_rep(1:3, times = 2, axis = 2))' 2&gt;&amp;1 | tail -8</pre><pre class="output">R/combine.R:26:rray_combine &lt;- function(..., .axis) {
+R/insert-axes.R:66:rray_insert_axes &lt;- function(x, axes) {
+R/move-axes.R:42:rray_move_axes &lt;- function(x, ..., from, to) {
+R/names.R:54:rray_axis_names &lt;- function(x, axis) {
+R/names.R:124:rray_set_axis_names &lt;- function(x, axis, names) {
+R/permute-axes.R:35:rray_permute_axes &lt;- function(x, axes) {
+R/remove-axes.R:23:rray_remove_axes &lt;- function(x, axes) {
+R/reduce.R:69:rray_sum_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:76:rray_product_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:83:rray_mean_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:90:rray_all_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce.R:97:rray_any_along &lt;- function(x, axes, ..., na_rm = FALSE) {
+R/reduce-names.R:2:rray_reduce_names &lt;- function(x, axes) {
+R/rep.R:62:rray_rep &lt;- function(x, ..., times, axis) {
+R/rep.R:69:rray_rep_each &lt;- function(x, ..., times, axis) {
+R/unstack.R:43:rray_unstack &lt;- function(x, axis) {
+R/slice.R:119:rray_slice_axis &lt;- function(x, i, ..., axis) {
+R/slice.R:144:rray_slice_assign_axis &lt;- function(x, i, ..., axis, value) {
+R/stack.R:47:rray_stack &lt;- function(..., .axis) {
+R/split.R:43:rray_split &lt;- function(x, ..., axis, dimensions) {
+static r_obj* rray_rep_impl(
+  r_obj* x,
+  r_obj* times,
+  int axis,
+  bool each,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* dimensions = r_dim(x);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_dimensions[axis - 1];
+
+  times = KEEP(
+    arg_as_times(times, each ? axis_dimension : 1, rray_args.times, error_call)
+  );
+  const int* v_times = r_int_cbegin(times);
+  const r_ssize times_size = r_length(times);
+
+  const int out_dimension =
+    rray_rep_dimension(axis_dimension, v_times, times_size, error_call);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_dimensions, sizeof(int) * dimensionality);
+  v_out_dimensions[axis - 1] = out_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(x), out_size));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_ssize block_size = 1;
+  for (int i = 0; i &lt; axis - 1; ++i) {
+    block_size *= v_dimensions[i];
+  }
+
+  if (!each) {
+    block_size *= axis_dimension;
+  }
+
+  r_ssize n_groups = 1;
+  for (int i = axis; i &lt; dimensionality; ++i) {
+    n_groups *= v_dimensions[i];
+  }
+
+  const r_ssize n_blocks_per_group = each ? axis_dimension : 1;
+
+  if (times_size == 1) {
+    // Groups flatten away with uniform `times`
+    const int times = v_times[0];
+    const r_ssize n_blocks = n_groups * n_blocks_per_group;
+    rray_rep_fill_uniform(x, out, block_size, n_blocks, times);
+  } else {
+    rray_rep_fill_varying(
+      x,
+      out,
+      block_size,
+      n_blocks_per_group,
+      n_groups,
+      v_times
+    );
+  }
+
+  r_obj* out_names = KEEP(rray_rep_names(
+    r_dim_names(x),
+    axis,
+Error in `rray_rep()`:
+! `axis` must be less than or equal to the dimensionality of 1, not 2.
+Backtrace:
+    ▆
+ 1. ├─base::print(rray_rep(1:3, times = 2, axis = 2))
+ 2. ├─rray4::rray_rep(1:3, times = 2, axis = 2)
+ 3. └─rlang::abort(message = message, call = call)
+Execution halted</pre></details>
+<p>I think it's a good change. Multi-axis <code>rray_rep()</code> is NumPy's <code>np.tile()</code>, and it fits rray4 well.</p>
+<p><strong>Why it works:</strong></p>
+<ul>
+<li>
+<p><strong>The result is well defined.</strong> Repeating along axis 1 and then axis 2 gives the same result as the other order. So one <code>times</code> per axis has a single meaning, and there is no &quot;a repeated axis adds up&quot; question like the one NumPy has for roll.</p>
+</li>
+<li>
+<p><strong>Names still follow the current rule.</strong> Each axis in <code>axes</code> repeats its own names, and every other axis keeps its names untouched.</p>
+</li>
+<li>
+<p><strong>It makes the pairs line up exactly.</strong> After the change, both pairs have the same shape:</p>
+<table>
+<thead>
+<tr>
+<th>Every lane together</th>
+<th>Each element on its own</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rray_rep(x, ..., times, axes)</code></td>
+<td><code>rray_rep_each(x, ..., times, axis)</code></td>
+</tr>
+<tr>
+<td><code>rray_roll(x, ..., n, axes)</code></td>
+<td><code>rray_roll_each(x, ..., n, axis)</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>times</code> and <code>n</code> would follow the same rule: size 1, or the size of <code>axes</code>. Today <code>rray_rep()</code> is the one function that breaks that pattern.</p>
+</li>
+</ul>
+<p><strong>What I'd copy from the roll plan:</strong></p>
+<ul>
+<li>
+<p><code>axes</code> is required.</p>
+</li>
+<li>
+<p>Listing the same axis twice is an error.</p>
+</li>
+<li>
+<p><code>axes = integer()</code> returns <code>x</code> unchanged.</p>
+</li>
+<li>
+<p><code>times</code> is a bare integer vector, size 1 or the size of <code>axes</code>. The size error would read the same way as the roll one.</p>
+</li>
+</ul>
+<p><strong>Where I'd stop:</strong></p>
+<ul>
+<li>
+<p><strong><code>rray_rep_each()</code> keeps a single <code>axis</code>.</strong> A varying <code>times</code> across several axes would need a list of vectors, one per axis. That is a different argument shape and not worth it. NumPy's <code>np.repeat()</code> is single-axis too. The one real use for several axes is upsampling, like turning each pixel into a 2x2 block. That is two calls, which is fine.</p>
+</li>
+<li>
+<p><strong>No automatic new axes when <code>axes</code> is past the dimensionality.</strong> <code>np.tile()</code> adds axes in that case, but <code>rray_rep()</code> errors on it today. I'd keep the error, since <code>rray_insert_axes()</code> already covers that job.</p>
+</li>
+</ul>
+<p><strong>The one real design choice is the C code.</strong> The current block and group approach in <code>src/rep.c:54</code> only handles one axis. There are two options:</p>
+<ol>
+<li>
+<p><strong>Chain single-axis reps.</strong> Simple, but it allocates one intermediate array per extra axis.</p>
+</li>
+<li>
+<p><strong>Fill <code>out</code> in place in one pass.</strong> Fill along the lowest axis first. Then, for each higher axis, copy the region already filled. The result is one allocation and mostly <code>memcpy()</code>, and the current uniform fast path stays as the single-axis case.</p>
+</li>
+</ol>
+<p>I'd pick option 2, since it's no harder to follow than what's there.</p>
+<p>This renames <code>axis</code> to <code>axes</code> on an exported function. I assume that's fine before a release, but tell me if not. Do you want this as its own plan in <code>plans/rep.md</code>, or folded into the roll plan as an early step so the pairs table in <code>plans/roll.md</code> is true when roll lands?</p>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>its own plan in plans/rep.md as detailed as necessary. 2 sounds good for implementing</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat plans/roll.md</summary>
+<pre>cat plans/roll.md</pre><pre class="output"># Rolling plan
+
+## Recommendation
+
+Add two functions:
+
+```r
+rray_roll(x, ..., n, axes)
+rray_roll_each(x, ..., n, axis)
+```
+
+Both move elements along an axis. An element pushed off one end comes back on
+the other.
+
+- `rray_roll()` rolls one or more axes, with one shift per axis. Every lane
+  through an axis moves by the same amount, so each output position has exactly
+  one source position, and names roll with the data.
+
+- `rray_roll_each()` rolls one axis, with one shift per lane. Lanes can move by
+  different amounts, so an output position can come from different source
+  positions in different lanes. Names on the rolled axis are always dropped.
+
+The split mirrors pairs the package already has:
+
+| Every lane moves together | Each lane moves on its own |
+|---|---|
+| `rray_slice_axis()` | `rray_index_axis()` |
+| `rray_rep()` | `rray_rep_each()` |
+| `rray_roll()` | `rray_roll_each()` |
+
+The function decides what happens to names. The size or values of `n` never do.
+A caller who wants names kept calls `rray_roll()`.
+
+## Terms
+
+- **Lane.** One run of elements along the rolled axis, with every other
+  coordinate held fixed. For a matrix and `axis = 2`, each row is a lane. For
+  dimensions `(A, B, C)` and `axis = 2`, there are `A * C` lanes, each of
+  length `B`.
+
+- **Lane dimensions.** The dimensions of `x` with the rolled axis set to 1. For
+  `(A, B, C)` and `axis = 2`, they are `(A, 1, C)`. There is one lane per
+  element of an array with these dimensions.
+
+- **Shift.** The value of `n` for one lane or one axis. It can be negative,
+  zero, or larger than the dimension.
+
+## Shared rules
+
+### Direction
+
+A positive shift moves elements toward higher positions, as in NumPy:
+
+```r
+rray_roll(1:5, n = 2, axes = 1)
+# [1] 4 5 1 2 3
+```
+
+A negative shift moves them toward lower positions:
+
+```r
+rray_roll(1:5, n = -1, axes = 1)
+# [1] 2 3 4 5 1
+```
+
+### Wrapping
+
+A shift is reduced modulo the dimension `d` of the rolled axis, into `[0, d)`:
+
+```text
+k = n mod d
+out[..., j, ...] = x[..., (j - k) mod d, ...]
+```
+
+So a shift of `7` on a dimension of `5` is a shift of `2`, and a shift of `-1`
+is a shift of `4`:
+
+```r
+rray_roll(1:5, n = 7, axes = 1)
+# [1] 4 5 1 2 3
+```
+
+A shift of `0`, or any multiple of `d`, leaves the axis unchanged.
+
+### Values of `n`
+
+- Integers, and anything that casts losslessly to integer. Doubles holding
+  whole numbers work and `1.5` is an error. Logicals work too, with `TRUE` as
+  `1`, the same as `axes` and `times` accept them today.
+
+- Any sign and any magnitude within the R integer range, which is
+  `-2147483647` to `2147483647`. `-2147483648` is reserved for `NA`, and a
+  double outside the range fails the cast.
+
+- No missing values.
+
+- No classed objects.
+
+### Zero dimensions
+
+When the rolled axis has dimension 0, there is nothing to move. Every shift is
+valid, and it is still validated. The result equals `x`, with the names rule of
+the function applied.
+
+### Bare vectors
+
+`x` goes through `arg_as_array()`, so a bare vector is a one-dimensional array
+and its names move to `dimnames`. The result is always an array.
+
+## `rray_roll()`
+
+```r
+rray_roll(x, ..., n, axes)
+```
+
+### Arguments
+
+- `x`: an array or bare vector.
+
+- `...`: must be empty. It forces `n` and `axes` to be named, as in
+  `rray_rep()`.
+
+- `n`: a bare integer vector of size 1 or the size of `axes`, validated the
+  same way as `axes`. A size 1 `n` is used for every axis in `axes`. Otherwise
+  `n[[i]]` is the shift for `axes[[i]]`. `n` can't have attributes, so names,
+  dimensions, and classes are all errors. Arrays of per-lane shifts belong to
+  `rray_roll_each()`.
+
+- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+  An axis can't appear twice. `integer()` is allowed and rolls nothing.
+
+The result has the type, dimensions, and dimensionality of `x`.
+
+### Worked examples
+
+#### One dimension
+
+```r
+rray_roll(1:5, n = 2, axes = 1)
+# [1] 4 5 1 2 3
+
+rray_roll(1:5, n = -1, axes = 1)
+# [1] 2 3 4 5 1
+
+rray_roll(1:5, n = 7, axes = 1)
+# [1] 4 5 1 2 3
+
+rray_roll(1:5, n = 0, axes = 1)
+# [1] 1 2 3 4 5
+```
+
+Each result is a one-dimensional array with dimensions `5`.
+
+#### A matrix
+
+```r
+x &lt;- matrix(
+  1:6,
+  nrow = 2,
+  dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+)
+
+x
+#    a b c
+# r1 1 3 5
+# r2 2 4 6
+```
+
+Roll the columns:
+
+```r
+rray_roll(x, n = 1, axes = 2)
+#    c a b
+# r1 5 1 3
+# r2 6 2 4
+
+rray_roll(x, n = -1, axes = 2)
+#    b c a
+# r1 3 5 1
+# r2 4 6 2
+```
+
+Roll the rows:
+
+```r
+rray_roll(x, n = 1, axes = 1)
+#    a b c
+# r2 2 4 6
+# r1 1 3 5
+```
+
+Roll both at once. A size 1 `n` is used for every axis:
+
+```r
+rray_roll(x, n = 1, axes = c(1, 2))
+#    c a b
+# r2 6 2 4
+# r1 5 1 3
+
+rray_roll(x, n = c(1, 1), axes = c(1, 2))</pre><p class="cut">1,008 more lines cut</p></details>
+<details class="tool"><summary>Read ~/.claude/projects/-Users-davis-files-r-packages-rray4/e5b9d04e-c38a-4e08-bee4-151c…</summary>
+<pre class="output">1	# Rolling plan
+2	
+3	## Recommendation
+4	
+5	Add two functions:
+6	
+7	```r
+8	rray_roll(x, ..., n, axes)
+9	rray_roll_each(x, ..., n, axis)
+10	```
+11	
+12	Both move elements along an axis. An element pushed off one end comes back on
+13	the other.
+14	
+15	- `rray_roll()` rolls one or more axes, with one shift per axis. Every lane
+16	  through an axis moves by the same amount, so each output position has exactly
+17	  one source position, and names roll with the data.
+18	
+19	- `rray_roll_each()` rolls one axis, with one shift per lane. Lanes can move by
+20	  different amounts, so an output position can come from different source
+21	  positions in different lanes. Names on the rolled axis are always dropped.
+22	
+23	The split mirrors pairs the package already has:
+24	
+25	| Every lane moves together | Each lane moves on its own |
+26	|---|---|
+27	| `rray_slice_axis()` | `rray_index_axis()` |
+28	| `rray_rep()` | `rray_rep_each()` |
+29	| `rray_roll()` | `rray_roll_each()` |
+30	
+31	The function decides what happens to names. The size or values of `n` never do.
+32	A caller who wants names kept calls `rray_roll()`.
+33	
+34	## Terms
+35	
+36	- **Lane.** One run of elements along the rolled axis, with every other
+37	  coordinate held fixed. For a matrix and `axis = 2`, each row is a lane. For
+38	  dimensions `(A, B, C)` and `axis = 2`, there are `A * C` lanes, each of
+39	  length `B`.
+40	
+41	- **Lane dimensions.** The dimensions of `x` with the rolled axis set to 1. For
+42	  `(A, B, C)` and `axis = 2`, they are `(A, 1, C)`. There is one lane per
+43	  element of an array with these dimensions.
+44	
+45	- **Shift.** The value of `n` for one lane or one axis. It can be negative,
+46	  zero, or larger than the dimension.
+47	
+48	## Shared rules
+49	
+50	### Direction
+51	
+52	A positive shift moves elements toward higher positions, as in NumPy:
+53	
+54	```r
+55	rray_roll(1:5, n = 2, axes = 1)
+56	# [1] 4 5 1 2 3
+57	```
+58	
+59	A negative shift moves them toward lower positions:
+60	
+61	```r
+62	rray_roll(1:5, n = -1, axes = 1)
+63	# [1] 2 3 4 5 1
+64	```
+65	
+66	### Wrapping
+67	
+68	A shift is reduced modulo the dimension `d` of the rolled axis, into `[0, d)`:
+69	
+70	```text
+71	k = n mod d
+72	out[..., j, ...] = x[..., (j - k) mod d, ...]
+73	```
+74	
+75	So a shift of `7` on a dimension of `5` is a shift of `2`, and a shift of `-1`
+76	is a shift of `4`:
+77	
+78	```r
+79	rray_roll(1:5, n = 7, axes = 1)
+80	# [1] 4 5 1 2 3
+81	```
+82	
+83	A shift of `0`, or any multiple of `d`, leaves the axis unchanged.
+84	
+85	### Values of `n`
+86	
+87	- Integers, and anything that casts losslessly to integer. Doubles holding
+88	  whole numbers work and `1.5` is an error. Logicals work too, with `TRUE` as
+89	  `1`, the same as `axes` and `times` accept them today.
+90	
+91	- Any sign and any magnitude within the R integer range, which is
+92	  `-2147483647` to `2147483647`. `-2147483648` is reserved for `NA`, and a
+93	  double outside the range fails the cast.
+94	
+95	- No missing values.
+96	
+97	- No classed objects.
+98	
+99	### Zero dimensions
+100	
+101	When the rolled axis has dimension 0, there is nothing to move. Every shift is
+102	valid, and it is still validated. The result equals `x`, with the names rule of
+103	the function applied.
+104	
+105	### Bare vectors
+106	
+107	`x` goes through `arg_as_array()`, so a bare vector is a one-dimensional array
+108	and its names move to `dimnames`. The result is always an array.
+109	
+110	## `rray_roll()`
+111	
+112	```r
+113	rray_roll(x, ..., n, axes)
+114	```
+115	
+116	### Arguments
+117	
+118	- `x`: an array or bare vector.
+119	
+120	- `...`: must be empty. It forces `n` and `axes` to be named, as in
+121	  `rray_rep()`.
+122	
+123	- `n`: a bare integer vector of size 1 or the size of `axes`, validated the
+124	  same way as `axes`. A size 1 `n` is used for every axis in `axes`. Otherwise
+125	  `n[[i]]` is the shift for `axes[[i]]`. `n` can't have attributes, so names,
+126	  dimensions, and classes are all errors. Arrays of per-lane shifts belong to
+127	  `rray_roll_each()`.
+128	
+129	- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+130	  An axis can't appear twice. `integer()` is allowed and rolls nothing.
+131	
+132	The result has the type, dimensions, and dimensionality of `x`.
+133	
+134	### Worked examples
+135	
+136	#### One dimension
+137	
+138	```r
+139	rray_roll(1:5, n = 2, axes = 1)
+140	# [1] 4 5 1 2 3
+141	
+142	rray_roll(1:5, n = -1, axes = 1)
+143	# [1] 2 3 4 5 1
+144	
+145	rray_roll(1:5, n = 7, axes = 1)
+146	# [1] 4 5 1 2 3
+147	
+148	rray_roll(1:5, n = 0, axes = 1)
+149	# [1] 1 2 3 4 5
+150	```
+151	
+152	Each result is a one-dimensional array with dimensions `5`.
+153	
+154	#### A matrix
+155	
+156	```r
+157	x &lt;- matrix(
+158	  1:6,
+159	  nrow = 2,
+160	  dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))
+161	)
+162	
+163	x
+164	#    a b c
+165	# r1 1 3 5
+166	# r2 2 4 6
+167	```
+168	
+169	Roll the columns:
+170	
+171	```r
+172	rray_roll(x, n = 1, axes = 2)
+173	#    c a b
+174	# r1 5 1 3
+175	# r2 6 2 4
+176	
+177	rray_roll(x, n = -1, axes = 2)
+178	#    b c a
+179	# r1 3 5 1
+180	# r2 4 6 2
+181	```
+182	
+183	Roll the rows:
+184	
+185	```r
+186	rray_roll(x, n = 1, axes = 1)
+187	#    a b c
+188	# r2 2 4 6
+189	# r1 1 3 5
+190	```
+191	
+192	Roll both at once. A size 1 `n` is used for every axis:
+193	
+194	```r
+195	rray_roll(x, n = 1, axes = c(1, 2))
+196	#    c a b
+197	# r2 6 2 4
+198	# r1 5 1 3
+199	
+200	rray_roll(x, n = c(1, 1), axes = c(1, 2))</pre><p class="cut">1,009 more lines cut</p></details>
+<p>Now the full rep C source, tests, and helpers.</p>
+
+<details class="tool"><summary>Bash: cat src/rep.c src/rep.h src/decl/rep-decl.h</summary>
+<pre>cat src/rep.c src/rep.h src/decl/rep-decl.h</pre><pre class="output">#include &quot;rep.h&quot;
+
+#include &lt;limits.h&gt;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/rep-decl.h&quot;
+
+r_obj* ffi_rray_rep(
+  r_obj* ffi_x,
+  r_obj* ffi_times,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_rep(ffi_x, ffi_times, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_rep(
+  r_obj* x,
+  r_obj* times,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_rep_impl(x, times, axis, false, arg, error_call);
+}
+
+r_obj* ffi_rray_rep_each(
+  r_obj* ffi_x,
+  r_obj* ffi_times,
+  r_obj* ffi_axis,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const int axis = arg_as_int(ffi_axis, rray_args.axis, error_call);
+  return rray_rep_each(ffi_x, ffi_times, axis, rray_args.x, error_call);
+}
+
+r_obj* rray_rep_each(
+  r_obj* x,
+  r_obj* times,
+  int axis,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_rep_impl(x, times, axis, true, arg, error_call);
+}
+
+static r_obj* rray_rep_impl(
+  r_obj* x,
+  r_obj* times,
+  int axis,
+  bool each,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_unclassed(x, arg, error_call);
+  x = KEEP(arg_as_array(x, arg, error_call));
+
+  r_obj* dimensions = r_dim(x);
+  const int* v_dimensions = r_int_cbegin(dimensions);
+  const int dimensionality = rray_dimensionality_from_dimensions(dimensions);
+  check_dimensionality(dimensionality);
+
+  check_axis(axis, dimensionality, rray_args.axis, error_call);
+  const int axis_dimension = v_dimensions[axis - 1];
+
+  times = KEEP(
+    arg_as_times(times, each ? axis_dimension : 1, rray_args.times, error_call)
+  );
+  const int* v_times = r_int_cbegin(times);
+  const r_ssize times_size = r_length(times);
+
+  const int out_dimension =
+    rray_rep_dimension(axis_dimension, v_times, times_size, error_call);
+
+  r_obj* out_dimensions = KEEP(r_alloc_integer(dimensionality));
+  int* v_out_dimensions = r_int_begin(out_dimensions);
+  r_memcpy(v_out_dimensions, v_dimensions, sizeof(int) * dimensionality);
+  v_out_dimensions[axis - 1] = out_dimension;
+
+  const r_ssize out_size = rray_size_from_dimensions_checked(
+    v_out_dimensions,
+    dimensionality,
+    error_call
+  );
+
+  r_obj* out = KEEP(r_alloc_vector(r_typeof(x), out_size));
+  r_attrib_poke_dim(out, out_dimensions);
+
+  r_ssize block_size = 1;
+  for (int i = 0; i &lt; axis - 1; ++i) {
+    block_size *= v_dimensions[i];
+  }
+
+  if (!each) {
+    block_size *= axis_dimension;
+  }
+
+  r_ssize n_groups = 1;
+  for (int i = axis; i &lt; dimensionality; ++i) {
+    n_groups *= v_dimensions[i];
+  }
+
+  const r_ssize n_blocks_per_group = each ? axis_dimension : 1;
+
+  if (times_size == 1) {
+    // Groups flatten away with uniform `times`
+    const int times = v_times[0];
+    const r_ssize n_blocks = n_groups * n_blocks_per_group;
+    rray_rep_fill_uniform(x, out, block_size, n_blocks, times);
+  } else {
+    rray_rep_fill_varying(
+      x,
+      out,
+      block_size,
+      n_blocks_per_group,
+      n_groups,
+      v_times
+    );
+  }
+
+  r_obj* out_names = KEEP(rray_rep_names(
+    r_dim_names(x),
+    axis,
+    out_dimension,
+    each,
+    v_times,
+    times_size
+  ));
+  if (out_names != r_null) {
+    r_attrib_poke_dim_names(out, out_names);
+  }
+
+  FREE(5);
+  return out;
+}
+
+static r_obj* arg_as_times(
+  r_obj* times,
+  r_ssize size,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  times = KEEP(arg_as_non_negative_bare_integer(times, arg, error_call));
+
+  const r_ssize times_size = r_length(times);
+
+  if (times_size != 1 &amp;&amp; times_size != size) {
+    stop_times_size(times_size, size, arg, error_call);
+  }
+
+  FREE(1);
+  return times;
+}
+
+static r_no_return void stop_times_size(
+  r_ssize times_size,
+  r_ssize size,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  if (size == 1) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be size 1, not size %&quot; R_PRI_SSIZE &quot;.&quot;,
+      rray_arg_format(arg),
+      times_size
+    );
+  } else {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must be size 1 or the `axis` dimension of %&quot; R_PRI_SSIZE &quot;, &quot;
+      &quot;not size %&quot; R_PRI_SSIZE &quot;.&quot;,
+      rray_arg_format(arg),
+      size,
+      times_size
+    );
+  }
+}
+
+static int rray_rep_dimension(
+  int axis_dimension,
+  const int* v_times,
+  r_ssize times_size,
+  struct r_lazy error_call
+) {
+  if (times_size == 1) {
+    // Single `times`. Multiply by `axis`'s `dimension` regardless of
+    // rep / rep-each.
+    const int times = v_times[0];
+
+    if (times != 0 &amp;&amp; axis_dimension &gt; INT_MAX / times) {
+      stop_dimension_too_large(error_call);
+    }</pre><p class="cut">652 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat tests/testthat/test-rep.R; ls tests/testthat | grep -i rep; cat tests/testthat/_snaps/rep…</summary>
+<pre>cat tests/testthat/test-rep.R; ls tests/testthat | grep -i rep; cat tests/testthat/_snaps/rep.md 2&gt;/dev/null | head -150</pre><pre class="output"># ------------------------------------------------------------------------------
+# rray_rep()
+
+test_that(&quot;`rray_rep()` repeats the axis, `rray_rep_each()` repeats slices&quot;, {
+  x &lt;- array(1:3, 3)
+
+  expect_identical(
+    rray_rep(x, times = 2, axis = 1),
+    array(c(1L, 2L, 3L, 1L, 2L, 3L), 6)
+  )
+  expect_identical(
+    rray_rep_each(x, times = 2, axis = 1),
+    array(c(1L, 1L, 2L, 2L, 3L, 3L), 6)
+  )
+})
+
+test_that(&quot;repeats along every axis&quot;, {
+  x &lt;- array(1:24, c(2, 3, 4))
+
+  expect_identical(
+    rray_rep(x, times = 2, axis = 1),
+    x[c(1:2, 1:2), , , drop = FALSE]
+  )
+  expect_identical(
+    rray_rep(x, times = 2, axis = 2),
+    x[, c(1:3, 1:3), , drop = FALSE]
+  )
+  expect_identical(
+    rray_rep(x, times = 2, axis = 3),
+    x[,, c(1:4, 1:4), drop = FALSE]
+  )
+})
+
+test_that(&quot;works with bare vectors&quot;, {
+  expect_identical(rray_rep(1:3, times = 2, axis = 1), array(c(1:3, 1:3), 6))
+})
+
+test_that(&quot;works with 1D arrays&quot;, {
+  expect_identical(
+    rray_rep(array(1:3), times = 2, axis = 1),
+    array(c(1:3, 1:3), 6)
+  )
+})
+
+test_that(&quot;works with every type&quot;, {
+  inputs &lt;- list(
+    c(TRUE, NA, FALSE),
+    c(1L, NA, 3L),
+    c(1.5, NA, 3.5),
+    c(1 + 1i, NA, 3 + 3i),
+    as.raw(1:3),
+    c(&quot;a&quot;, NA, &quot;c&quot;),
+    list(1, &quot;a&quot;, NULL)
+  )
+
+  for (input in inputs) {
+    x &lt;- array(input, c(3, 2))
+    expect_identical(
+      rray_rep(x, times = 2, axis = 1),
+      expected_rep(x, 2, 1, FALSE)
+    )
+    expect_identical(
+      rray_rep(x, times = 2, axis = 2),
+      expected_rep(x, 2, 2, FALSE)
+    )
+  }
+})
+
+test_that(&quot;`times = 0` gives a zero dimension&quot;, {
+  x &lt;- array(1:6, c(3, 2))
+
+  expect_identical(rray_rep(x, times = 0, axis = 1), array(integer(), c(0, 2)))
+  expect_identical(rray_rep(x, times = 0, axis = 2), array(integer(), c(3, 0)))
+})
+
+test_that(&quot;`times = 1` returns the input&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+  expect_identical(rray_rep(x, times = 1, axis = 1), x)
+  expect_identical(rray_rep(x, times = 1, axis = 2), x)
+})
+
+test_that(&quot;works with a zero dimension axis&quot;, {
+  x &lt;- array(integer(), c(0, 2))
+  expect_identical(rray_rep(x, times = 3, axis = 1), x)
+})
+
+test_that(&quot;`times` can be a double&quot;, {
+  x &lt;- array(1:6, c(3, 2))
+  expect_identical(
+    rray_rep(x, times = 2, axis = 1),
+    rray_rep(x, times = 2L, axis = 1)
+  )
+})
+
+test_that(&quot;names on the repeated axis repeat, and can be duplicated&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axis = 1)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;, &quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;))
+  )
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axis = 2)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;, &quot;x&quot;, &quot;y&quot;))
+  )
+})
+
+test_that(&quot;partial and missing dimension names are handled&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL))
+  expect_identical(
+    dimnames(rray_rep(x, times = 2, axis = 2)),
+    list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), NULL)
+  )
+
+  expect_null(dimnames(rray_rep(array(1:6, c(3, 2)), times = 2, axis = 1)))
+})
+
+test_that(&quot;`x` is not modified&quot;, {
+  x &lt;- array(1:6, c(3, 2), dimnames = list(c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;), c(&quot;x&quot;, &quot;y&quot;)))
+  before &lt;- x
+
+  out &lt;- rray_rep(x, times = 2, axis = 1)
+  out[[1]] &lt;- 100L
+  dimnames(out) &lt;- NULL
+
+  expect_identical(x, before)
+})
+
+test_that(&quot;matches a reference implementation&quot;, {
+  shapes &lt;- list(5L, c(3L, 2L), c(2L, 3L), c(1L, 6L, 2L), c(2L, 3L, 4L))
+
+  for (dimensions in shapes) {
+    x &lt;- array(seq_len(prod(dimensions)), dimensions)
+
+    named &lt;- x
+    dimnames(named) &lt;- lapply(dimensions, \(dimension) {
+      paste0(&quot;n&quot;, seq_len(dimension))
+    })
+
+    for (axis in seq_along(dimensions)) {
+      for (times in 0:3) {
+        expect_identical(
+          rray_rep(x, times = times, axis = axis),
+          expected_rep(x, times, axis, FALSE)
+        )
+        expect_identical(
+          rray_rep(named, times = times, axis = axis),
+          expected_rep(named, times, axis, FALSE)
+        )
+      }
+    }
+  }
+})
+
+test_that(&quot;`times` and `axis` must be named&quot;, {
+  x &lt;- array(1:6, c(3, 2))
+
+  expect_snapshot(error = TRUE, {
+    rray_rep(x, 2, 1)
+    rray_rep(x, 2, axis = 1)
+  })
+})
+
+test_that(&quot;`axis` is validated&quot;, {
+  x &lt;- array(1:6, c(3, 2))
+  expect_snapshot(rray_rep(x, times = 2, axis = 0), error = TRUE)
+  expect_snapshot(rray_rep(x, times = 2, axis = 3), error = TRUE)
+  expect_snapshot(rray_rep(x, times = 2, axis = c(1, 2)), error = TRUE)
+  expect_snapshot(rray_rep(x, times = 2, axis = NA_integer_), error = TRUE)
+})
+
+test_that(&quot;`times` is validated&quot;, {
+  x &lt;- array(1:6, c(3, 2))
+  expect_snapshot(rray_rep(x, times = NA_integer_, axis = 1), error = TRUE)
+  expect_snapshot(rray_rep(x, times = -1, axis = 1), error = TRUE)
+  expect_snapshot(rray_rep(x, times = 1.5, axis = 1), error = TRUE)
+  expect_snapshot(
+    rray_rep(x, times = structure(1L, names = &quot;a&quot;), axis = 1),
+    error = TRUE
+  )
+  expect_snapshot(rray_rep(x, times = c(1, 2), axis = 1), error = TRUE)
+  expect_snapshot(rray_rep(x, times = integer(), axis = 1), error = TRUE)
+})
+
+test_that(&quot;errors if the repeated dimension is too large&quot;, {
+  x &lt;- array(1:2, 2)
+  expect_snapshot(
+    rray_rep(x, times = .Machine$integer.max, axis = 1),
+    error = TRUE
+  )
+})
+
+test_that(&quot;errors on invalid input&quot;, {
+  expect_snapshot(rray_rep(NULL, times = 2, axis = 1), error = TRUE)
+
+  x &lt;- structure(array(1:4, c(2, 2)), class = &quot;foo&quot;)
+  expect_snapshot(rray_rep(x, times = 2, axis = 1), error = TRUE)
+})
+
+# ------------------------------------------------------------------------------</pre><p class="cut">362 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: grep -rn &quot;arg_as_axes_unsorted\|arg_as_bare_integer\|arg_as_times\|rray_rep\b\|rray_rep(\|rra…</summary>
+<pre>grep -rn &quot;arg_as_axes_unsorted\|arg_as_bare_integer\|arg_as_times\|rray_rep\b\|rray_rep(\|rray_rep_each(&quot; src/*.c src/*.h R/*.R | grep -v &quot;^src/rep.c&quot;; grep -rn &quot;rray_rep&quot; tests/testthat/*.R | grep -v test-rep.R | head; grep -rn &quot;rep&quot; _pkgdown.yml NEWS.md 2&gt;/dev/null</pre><pre class="output">Exit code 2
+src/axes.c:12:  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+src/axes.c:69:r_obj* arg_as_axes_unsorted(
+src/axes.c:77:  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+src/axes.c:140:  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+src/insert-axes.c:27:  axes = KEEP(arg_as_bare_integer(axes, rray_args.axes, error_call));
+src/init.c:152:extern r_obj* ffi_rray_rep(
+src/init.c:158:extern r_obj* ffi_rray_rep_each(
+src/init.c:324:  {&quot;ffi_rray_rep&quot;, (DL_FUNC) &amp;ffi_rray_rep, 4},
+src/move-axes.c:28:    arg_as_axes_unsorted(from, dimensionality, rray_args.from, error_call)
+src/move-axes.c:30:  to = KEEP(arg_as_axes_unsorted(to, dimensionality, rray_args.to, error_call));
+src/utils.c:75:r_obj* arg_as_bare_integer(
+src/utils.c:98:  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+src/utils.c:120:  x = KEEP(arg_as_bare_integer(x, arg, error_call));
+src/axes.h:15:r_obj* arg_as_axes_unsorted(
+src/rep.h:8:r_obj* rray_rep(
+src/rep.h:16:r_obj* rray_rep_each(
+src/utils.h:49:r_obj* arg_as_bare_integer(
+R/rep.R:4:#' - `rray_rep()` repeats the entire `axis` of `x` in bulk, i.e. repeat all of
+R/rep.R:7:#' - `rray_rep_each()` repeats each individual element of the `axis` of `x`
+R/rep.R:24:#' @param times For `rray_rep()`, a single integer greater than or equal
+R/rep.R:27:#'   For `rray_rep_each()`, a vector of integers greater than or equal to
+R/rep.R:40:#' rray_rep(x, times = 2, axis = 1)
+R/rep.R:43:#' rray_rep_each(x, times = 2, axis = 1)
+R/rep.R:46:#' rray_rep(x, times = 2, axis = 2)
+R/rep.R:49:#' rray_rep_each(x, times = c(1, 2, 3), axis = 1)
+R/rep.R:52:#' rray_rep_each(x, times = c(1, 0, 2), axis = 1)
+R/rep.R:56:#' rray_names(rray_rep(y, times = 2, axis = 1))
+R/rep.R:57:#' rray_names(rray_rep_each(y, times = 2, axis = 1))
+R/rep.R:62:rray_rep &lt;- function(x, ..., times, axis) {
+R/rep.R:64:  .Call(ffi_rray_rep, x, times, axis, environment())
+_pkgdown.yml:46:  - rray-rep</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,200p src/axes.c; sed -n 60,140p src/utils.c; cat tests/testthat/helper-rep.R; grep -…</summary>
+<pre>sed -n 1,200p src/axes.c; sed -n 60,140p src/utils.c; cat tests/testthat/helper-rep.R; grep -rln &quot;rray_rep&quot; --include=*.md --include=*.Rmd --include=*.R . | grep -v &quot;^./R/rep.R\|test-rep\|helper-rep&quot;</pre><pre class="output">#include &quot;axes.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;utils.h&quot;
+
+r_obj* arg_as_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+  check_axes(axes, dimensionality, arg, error_call);
+  FREE(1);
+  return axes;
+}
+
+void check_axes(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  const r_ssize axes_size = r_length(axes);
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (i &gt; 0 &amp;&amp; axis &lt;= v_axes[i - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must be in strictly increasing order.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+  }
+}
+
+r_obj* arg_as_axes_unsorted(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+
+  const r_ssize axes_size = r_length(axes);
+
+  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (r_ssize i = 0; i &lt; axes_size; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (v_seen[axis - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain %d more than once.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    v_seen[axis - 1] = true;
+  }
+
+  FREE(1);
+  return axes;
+}
+
+r_obj* arg_as_axes_permutation(
+  r_obj* axes,
+  int dimensionality,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  check_dimensionality(dimensionality);
+
+  axes = KEEP(arg_as_bare_integer(axes, arg, error_call));
+
+  const r_ssize axes_size = r_length(axes);
+
+  if (axes_size != dimensionality) {
+    r_abort_lazy_call(
+      error_call,
+      &quot;%s must have length %d to match the dimensionality of the array, &quot;
+      &quot;not length %&quot; R_PRIdXLEN_T &quot;.&quot;,
+      rray_arg_format(arg),
+      dimensionality,
+      axes_size
+    );
+  }
+
+  bool v_seen[RRAY_MAX_DIMENSIONALITY] = {false};
+
+  const int* v_axes = r_int_cbegin(axes);
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int axis = v_axes[i];
+
+    if (axis == r_globals.na_int) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain missing values.&quot;,
+        rray_arg_format(arg)
+      );
+    }
+
+    if (axis &lt; 1) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values greater than or equal to 1, not %d.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    if (axis &gt; dimensionality) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must contain values less than or equal to the &quot;
+        &quot;dimensionality of %d, not %d.&quot;,
+        rray_arg_format(arg),
+        dimensionality,
+        axis
+      );
+    }
+
+    if (v_seen[axis - 1]) {
+      r_abort_lazy_call(
+        error_call,
+        &quot;%s must not contain axis %d more than once.&quot;,
+        rray_arg_format(arg),
+        axis
+      );
+    }
+
+    v_seen[axis - 1] = true;
+  }</pre><p class="cut">96 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rln &quot;rray_rep&quot; . --exclude-dir=.git | grep -v &quot;R/rep.R\|test-rep\|helper-rep\|src/rep\|…</summary>
+<pre>grep -rln &quot;rray_rep&quot; . --exclude-dir=.git | grep -v &quot;R/rep.R\|test-rep\|helper-rep\|src/rep\|src/init.c\|_snaps/rep&quot;; grep -n &quot;rray_rep&quot; plans/*.md | grep -v &quot;plans/roll.md&quot;; grep -n &quot;times\b&quot; src/arg.c src/arg.h | head; grep -n &quot;stop_dimension_too_large\|too large&quot; src/*.c | head; ls NEWS.md 2&gt;/dev/null &amp;&amp; head -20 NEWS.md; git log --oneline -5 -- R/rep.R</pre><pre class="output">NAMESPACE
+man/rray-rep.Rd
+plans/roll.md
+plans/slice.md
+src/decl/rep-decl.h
+plans/slice.md:161:a second subscript. This matches `rray_rep()` and `rray_split()`.
+src/arg.h:27:  struct rray_arg* times;
+src/arg.c:230:  INIT_ARG(times);
+src/combine.c:72:        &quot;The combined dimension on `.axis` is too large.&quot;
+src/rep.c:199:      stop_dimension_too_large(error_call);
+src/rep.c:211:        stop_dimension_too_large(error_call);
+src/rep.c:221:static r_no_return void stop_dimension_too_large(struct r_lazy error_call) {
+src/rep.c:224:    &quot;The dimension implied by `times` is too large for R.&quot;
+src/size.c:65:    &quot;Size (%g) computed from dimensions `%s` is too large.&quot;,
+032a90f Add `rray_rep()` and `rray_rep_each()` (#82)</pre></details>
+<details class="tool"><summary>Bash: sed -n 150,170p plans/slice.md; sed -n 30,80p src/size.c; ls plans; head -30 plans/index.md</summary>
+<pre>sed -n 150,170p plans/slice.md; sed -n 30,80p src/size.c; ls plans; head -30 plans/index.md</pre><pre class="output">name.
+
+## `rray_slice_axis()`
+
+```r
+rray_slice_axis(x, i, ..., axis)
+rray_slice_assign_axis(x, i, ..., axis, value)
+```
+
+The dots are empty and must stay empty. They force `axis` and `value` to be
+supplied by name, so a call always says which axis it means and never reads as
+a second subscript. This matches `rray_rep()` and `rray_split()`.
+
+```r
+rray_slice_axis(x, c(3, 1), axis = 2)
+rray_slice_assign_axis(x, c(3, 1), axis = 2, value = 0L)
+```
+
+`rray_slice_axis()` has exactly the same subscript semantics as supplying `i`
+at the matching position in `rray_slice()`. The same normalized subscript is
+used for every lane through the selected axis. Only the selected axis
+// Sometimes dimensions are built from pieces rather than being pulled from an
+// existing array, and must be checked for overflow
+r_ssize rray_size_from_dimensions_checked(
+  const int* v_dimensions,
+  int dimensionality,
+  struct r_lazy error_call
+) {
+  r_ssize out = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    const int dimension = v_dimensions[i];
+
+    if (dimension != 0 &amp;&amp; out &gt; R_SSIZE_MAX / dimension) {
+      stop_size_too_large(v_dimensions, dimensionality, error_call);
+    }
+
+    out *= dimension;
+  }
+
+  return out;
+}
+
+static r_no_return void stop_size_too_large(
+  const int* v_dimensions,
+  int dimensionality,
+  struct r_lazy error_call
+) {
+  double size = 1;
+
+  for (int i = 0; i &lt; dimensionality; ++i) {
+    size *= v_dimensions[i];
+  }
+
+  r_abort_lazy_call(
+    error_call,
+    &quot;Size (%g) computed from dimensions `%s` is too large.&quot;,
+    size,
+    format_error_dimensions(v_dimensions, dimensionality)
+  );
+}
+
+static const char* format_error_dimensions(
+  const int* v_dimensions,
+  int dimensionality
+) {
+  // 11 characters for the widest `int` and 2 for its `, ` separator, then 3
+  // more for the `(`, the `)`, and the null terminator
+  const size_t size = (size_t) dimensionality * 13 + 3;
+  char* out = R_alloc(size, sizeof(char));
+
+  size_t loc = 0;
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+roll.md
+slice.md
+# Integer coordinate indexing plan
+
+## Recommendation
+
+Add one fully specified coordinate function and one directional one-axis
+specialization:
+
+```r
+rray_index(x, ...)
+rray_index_assign(x, ..., value)
+
+rray_index_axis(x, i, ..., axis)
+rray_index_assign_axis(x, i, ..., axis, value)
+```
+
+`rray_index()` requires exactly one integer coordinate array for every source
+axis. The arrays broadcast to common dimensions and are read pointwise. The
+common dimensions are the result dimensions.
+
+`rray_index_axis()` accepts one integer array for the selected source axis and
+supplies identity coordinates for every other axis. `i` must broadcast to the
+dimensions of `x` outside `axis`. The result has the same dimensionality as
+`x`, every unselected axis keeps its source dimension, and only the selected
+axis can change.
+
+Every source coordinate is explicit. Different partial indexing behaviors are
+represented by shaping full coordinate arrays in different ways.
+
+The complete family is:</pre></details>
+<details class="tool"><summary>Bash: grep -rn &quot;RRAY_MAX_DIMENSIONALITY&quot; src/*.h | head -3; grep -n &quot;axes\|INIT_ARG&quot; src/arg.c | he…</summary>
+<pre>grep -rn &quot;RRAY_MAX_DIMENSIONALITY&quot; src/*.h | head -3; grep -n &quot;axes\|INIT_ARG&quot; src/arg.c | head -40; Rscript -e '
+devtools::load_all(quiet=TRUE)
+x &lt;- matrix(1:4, 2, dimnames=list(c(&quot;r1&quot;,&quot;r2&quot;), c(&quot;a&quot;,&quot;b&quot;)))
+print(dimnames(rray_rep(x, times=0, axis=1)))
+y &lt;- x; dimnames(y) &lt;- list(rows = c(&quot;r1&quot;,&quot;r2&quot;), cols = c(&quot;a&quot;,&quot;b&quot;))
+print(dimnames(rray_rep(y, times=2, axis=1)))
+print(dimnames(rray_rep(y, times=2, axis=2)))
+print(rray_slice_axis(x, c(1,2,1,2), axis = 1))
+print(identical(rray_slice_axis(x, c(1,2,1,2), axis = 1), rray_rep(x, times=2, axis=1)))
+'</pre><pre class="output">src/binary.h:41:  r_ssize v_point[RRAY_MAX_DIMENSIONALITY];                                    \
+src/dimensionality.h:8:#define RRAY_MAX_DIMENSIONALITY 64
+src/point-iterator.h:15:  int v_point[RRAY_MAX_DIMENSIONALITY];
+206:#define INIT_ARG(ARG)                                                          \
+211:#define INIT_ARG2(ARG, STR)                                                    \
+217:  INIT_ARG2(empty, &quot;&quot;);
+218:  INIT_ARG(x);
+219:  INIT_ARG(y);
+220:  INIT_ARG(i);
+221:  INIT_ARG(names);
+222:  INIT_ARG(axis);
+223:  INIT_ARG2(dot_axis, &quot;.axis&quot;);
+224:  INIT_ARG(axes);
+225:  INIT_ARG(from);
+226:  INIT_ARG(to);
+227:  INIT_ARG(dimensions);
+228:  INIT_ARG2(dot_dimensions, &quot;.dimensions&quot;);
+229:  INIT_ARG(dimension);
+230:  INIT_ARG(times);
+231:  INIT_ARG(value);
+[[1]]
+NULL
+
+[[2]]
+[1] &quot;a&quot; &quot;b&quot;
+
+[[1]]
+[1] &quot;r1&quot; &quot;r2&quot; &quot;r1&quot; &quot;r2&quot;
+
+[[2]]
+[1] &quot;a&quot; &quot;b&quot;
+
+[[1]]
+[1] &quot;r1&quot; &quot;r2&quot;
+
+[[2]]
+[1] &quot;a&quot; &quot;b&quot; &quot;a&quot; &quot;b&quot;
+
+   a b
+r1 1 3
+r2 2 4
+r1 1 3
+r2 2 4
+[1] TRUE</pre></details>
+<details class="tool"><summary>Bash: grep -n -i &quot;names(dimnames\|dimnames names\|named dimnames\|names on the dimnames\|dimnames. …</summary>
+<pre>grep -n -i &quot;names(dimnames\|dimnames names\|named dimnames\|names on the dimnames\|dimnames. names&quot; plans/*.md | head; Rscript -e '
+devtools::load_all(quiet=TRUE)
+y &lt;- matrix(1:4, 2, dimnames = list(rows = c(&quot;r1&quot;,&quot;r2&quot;), cols = c(&quot;a&quot;,&quot;b&quot;)))
+print(names(dimnames(rray_slice_axis(y, c(1,1), axis = 1))))
+print(names(dimnames(rray_roll &lt;- NULL)))
+print(names(dimnames(rray_permute_axes(y, c(2,1)))))
+'</pre><pre class="output">NULL
+NULL
+NULL</pre></details>
+<p>Still gathering facts for <code>plans/rep.md</code>. Next I'll produce the worked-example output with base R, then write the plan.</p>
+
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; Rscript -e '</summary>
+<pre>cd /tmp &amp;&amp; Rscript -e '
+tile &lt;- function(x, times, axes) { times &lt;- rep_len(times, length(axes)); idx &lt;- lapply(dim(x), seq_len); for (i in seq_along(axes)) { a &lt;- axes[[i]]; idx[[a]] &lt;- rep(seq_len(dim(x)[[a]]), times[[i]]) }; do.call(`[`, c(list(x), idx, list(drop = FALSE))) }
+x &lt;- matrix(1:4, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;)))
+print(x)
+print(tile(x, 2, c(1, 2)))
+print(tile(x, c(2, 3), c(1, 2)))
+print(tile(x, c(3, 2), c(2, 1)))
+print(tile(x, c(2, 0), c(1, 2)))
+y &lt;- array(1:8, c(2, 2, 2))
+out &lt;- tile(y, 2, c(1, 3)); print(dim(out)); print(out[,,1]); print(out[,,3])
+'</pre><pre class="output">   a b
+r1 1 3
+r2 2 4
+   a b a b
+r1 1 3 1 3
+r2 2 4 2 4
+r1 1 3 1 3
+r2 2 4 2 4
+   a b a b a b
+r1 1 3 1 3 1 3
+r2 2 4 2 4 2 4
+r1 1 3 1 3 1 3
+r2 2 4 2 4 2 4
+   a b a b a b
+r1 1 3 1 3 1 3
+r2 2 4 2 4 2 4
+r1 1 3 1 3 1 3
+r2 2 4 2 4 2 4
+  
+r1
+r2
+r1
+r2
+[1] 4 2 4
+     [,1] [,2]
+[1,]    1    3
+[2,]    2    4
+[3,]    1    3
+[4,]    2    4
+     [,1] [,2]
+[1,]    1    3
+[2,]    2    4
+[3,]    1    3
+[4,]    2    4
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<details class="tool"><summary>Bash: cd /tmp &amp;&amp; Rscript -e '</summary>
+<pre>cd /tmp &amp;&amp; Rscript -e '
+tile &lt;- function(x, times, axes) { idx &lt;- lapply(dim(x), seq_len); for (i in seq_along(axes)) { a &lt;- axes[[i]]; idx[[a]] &lt;- rep(seq_len(dim(x)[[a]]), times[[i]]) }; do.call(`[`, c(list(x), idx, list(drop = FALSE))) }
+sim &lt;- function(x, times, axes) {
+  d &lt;- dim(x); D &lt;- length(d); o &lt;- d; o[axes] &lt;- d[axes] * times
+  out &lt;- rep(NA_integer_, prod(o)); if (!length(out)) return(array(out, o))
+  a &lt;- if (length(axes)) axes[[1]] else D; t &lt;- if (length(axes)) times[[1]] else 1L
+  block &lt;- prod(d[seq_len(a)]); nb &lt;- prod(d[-seq_len(a)]); oi &lt;- 0
+  for (b in seq_len(nb) - 1) for (r in seq_len(t)) { out[oi + seq_len(block)] &lt;- x[b * block + seq_len(block)]; oi &lt;- oi + block }
+  cur &lt;- d; cur[a] &lt;- o[a]
+  for (k in seq_along(axes)[-1]) {
+    a &lt;- axes[[k]]; t &lt;- times[[k]]; if (t == 1) next
+    block &lt;- prod(cur[seq_len(a)]); ng &lt;- prod(cur[-seq_len(a)])
+    for (g in rev(seq_len(ng) - 1)) { src &lt;- g * block; dst &lt;- g * block * t
+      for (r in rev(seq_len(t) - 1)) { if (dst + r * block == src) next; out[dst + r * block + seq_len(block)] &lt;- out[src + seq_len(block)] } }
+    cur[a] &lt;- o[a]
+  }
+  array(out, o)
+}
+set.seed(1); ok &lt;- TRUE
+for (i in 1:3000) { D &lt;- sample(1:4, 1); d &lt;- sample(0:3, D, TRUE); x &lt;- array(seq_len(prod(d)), d)
+  k &lt;- sample(0:D, 1); axes &lt;- sample(D, k); times &lt;- sample(0:3, k, TRUE)
+  e &lt;- tile(x, times, axes); s &lt;- sim(x, as.integer(times), axes); dimnames(e) &lt;- NULL
+  if (!identical(e, s)) { ok &lt;- FALSE; print(list(d, axes, times)); break } }
+print(ok)'</pre><pre class="output">[1] TRUE
+Shell cwd was reset to ~/files/r/packages/rray4</pre></details>
+<p>Algorithm checks out: a base R simulation of the in-place fill matched base R subsetting on 3000 random cases. Writing the plan now.</p>
+
+<details class="tool"><summary>Write plans/rep.md</summary>
+<pre># Multi-axis repeat plan
+
+## Recommendation
+
+Change `rray_rep()` to repeat one or more axes, with one `times` per axis:
+
+```r
+rray_rep(x, ..., times, axes)
+rray_rep_each(x, ..., times, axis)
+```
+
+`rray_rep_each()` does not change.
+
+- `rray_rep()` repeats whole axes. `times` is size 1, used for every axis in
+  `axes`, or the size of `axes`, with `times[[i]]` used for `axes[[i]]`. This
+  is NumPy's `np.tile()` with explicit axes.
+
+- `rray_rep_each()` repeats each position along one axis. `times` is size 1 or
+  the dimension of `axis`.
+
+This makes the rep pair match the roll pair in `plans/roll.md` exactly:
+
+| Every lane together | Each position on its own |
+|---|---|
+| `rray_rep(x, ..., times, axes)` | `rray_rep_each(x, ..., times, axis)` |
+| `rray_roll(x, ..., n, axes)` | `rray_roll_each(x, ..., n, axis)` |
+
+The left column takes `axes` and one value per axis. The right column takes one
+`axis` and one value per position or lane.
+
+This is a breaking change to an exported function. `axis` is renamed to `axes`,
+with no deprecation path. An old call such as `rray_rep(x, times = 2, axis = 1)`
+now fails in `check_dots_empty0()`, since `axis` lands in the dots.
+
+## Why multiple axes are well defined
+
+Repeating along axis 1 and then axis 2 gives the same result as the other order.
+Every output position has exactly one source position:
+
+```text
+out[i1, ..., iD] = x[i1 mod d1, ..., iD mod dD]    (zero-based)
+```
+
+So one `times` per axis has a single meaning, the names rule stays the same,
+and there is no ordering question.
+
+## `rray_rep()`
+
+### Arguments
+
+- `x`: an array or bare vector.
+
+- `...`: must be empty. It forces `times` and `axes` to be named.
+
+- `times`: a bare integer vector of values greater than or equal to 0, size 1
+  or the size of `axes`. Validated with `arg_as_non_negative_bare_integer()`, as
+  today.
+
+- `axes`: a bare integer vector of axes. Required, with no default. Any order.
+  An axis can't appear twice. `integer()` is allowed and repeats nothing.
+  Validated with `arg_as_axes_unsorted()`, like `from` and `to` in
+  `rray_move_axes()` and `axes` in `rray_roll()`.
+
+The result has the type and dimensionality of `x`. Each axis in `axes` has its
+dimension multiplied by its `times`. Every other axis keeps its dimension.
+
+### Worked examples
+
+```r
+x &lt;- matrix(1:4, nrow = 2, dimnames = list(c(&quot;r1&quot;, &quot;r2&quot;), c(&quot;a&quot;, &quot;b&quot;)))
+
+x
+#    a b
+# r1 1 3
+# r2 2 4
+```
+
+One axis, as today:
+
+```r
+rray_rep(x, times = 2, axes = 2)
+#    a b a b
+# r1 1 3 1 3
+# r2 2 4 2 4
+```
+
+Both axes with a size 1 `times`:
+
+```r
+rray_rep(x, times = 2, axes = c(1, 2))
+#    a b a b
+# r1 1 3 1 3
+# r2 2 4 2 4
+# r1 1 3 1 3
+# r2 2 4 2 4
+```
+
+One `times` per axis. `times` pairs with `axes` in the order given, so these two
+are identical:
+
+```r
+rray_rep(x, times = c(2, 3), axes = c(1, 2))
+rray_rep(x, times = c(3, 2), axes = c(2, 1))
+#    a b a b a b
+# r1 1 3 1 3 1 3
+# r2 2 4 2 4 2 4
+# r1 1 3 1 3 1 3
+# r2 2 4 2 4 2 4
+```
+
+A `times` of 0 gives a zero dimension on that axis. The other axes still
+repeat:
+
+```r
+out &lt;- rray_rep(x, times = c(2, 0), axes = c(1, 2))
+
+dim(out)
+# [1] 4 0
+
+rray_names(out)
+# [[1]]
+# [1] &quot;r1&quot; &quot;r2&quot; &quot;r1&quot; &quot;r2&quot;
+#
+# [[2]]
+# NULL
+```
+
+Three dimensions, repeating the first and last axes:
+
+```r
+y &lt;- array(1:8, c(2, 2, 2))
+
+out &lt;- rray_rep(y, times = 2, axes = c(1, 3))
+
+dim(out)
+# [1] 4 2 4
+
+out[, , 1]
+#      [,1] [,2]
+# [1,]    1    3
+# [2,]    2    4
+# [3,]    1    3
+# [4,]    2    4
+
+out[, , 3]
+#      [,1] [,2]
+# [1,]    1    3
+# [2,]    2    4
+# [3,]    1    3
+# [4,]    2    4
+```
+
+Nothing repeats. Each of these gives a new array identical to `x`, names
+included:
+
+```r
+rray_rep(x, times = 1, axes = c(1, 2))
+rray_rep(x, times = 2, axes = integer())
+rray_rep(x, times = integer(), axes = integer())
+```
+
+### Names
+
+Each axis in `axes` repeats its own names `times` times, duplicates and all.
+Every other axis keeps its names untouched. This is today's rule applied once
+per axis, and is exactly what `rray_slice_axis()` does with the same locations.
+
+As today, names on the `dimnames` list itself are not kept. `rray_slice_axis()`
+drops them too, so that is a separate question for all of rray4.
+
+### Relationship to NumPy
+
+| NumPy | rray4 |
+|---|---|
+| `np.tile(x, (2, 1))` | `rray_rep(x, times = 2, axes = 1)` |
+| `np.tile(x, (2, 3))` | `rray_rep(x, times = c(2, 3), axes = c(1, 2))` |
+| `np.tile(x, 2)` on a matrix | `rray_rep(x, times = 2, axes = 2)` |
+| `np.tile(x, (2, 1, 1))` on a matrix | Not supported. Use `rray_insert_axes()` first |
+
+`np.tile()` lines `reps` up with the trailing axes, and adds new leading axes
+when `reps` is longer than the dimensionality. rray4 names every axis
+explicitly and never adds axes.
+
+### Errors
+
+```r
+x &lt;- matrix(1:6, nrow = 2)
+
+rray_rep(x, times = 2, axes = c(1, 1))
+# Error in `rray_rep()`:
+# ! `axes` must not contain 1 more than once.
+
+rray_rep(x, times = 2, axes = 3)
+# Error in `rray_rep()`:
+# ! `axes` must contain values less than or equal to the dimensionality of 2,
+#   not 3.
+
+rray_rep(x, times = c(1, 2, 3), axes = c(1, 2))
+# Error in `rray_rep()`:
+# ! `times` must be size 1 or size 2 to match `axes`, not size 3.</pre><p class="cut">510 more lines cut</p><pre class="output">File created successfully at: ~/files/r/packages/rray4/plans/rep.md (file state is current in your context — no need to Read it back)</pre></details>
+<p>Let me verify the size error wording I quoted in the plan.</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;computed from dimensions&quot; tests/testthat/_snaps/*.md | head -3</summary>
+<pre>grep -rn &quot;computed from dimensions&quot; tests/testthat/_snaps/*.md | head -3</pre><pre class="output">tests/testthat/_snaps/index.md:15:      ! Size (1.84467e+19) computed from dimensions `(16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16)` is too large.</pre></details>
+<p>Wording matches. Opening the plan in your editor.</p>
+
+<details class="tool"><summary>Bash: echo &quot;VISUAL=$VISUAL EDITOR=$EDITOR&quot;; for e in positron code zed; do command -v $e; done</summary>
+<pre>echo &quot;VISUAL=$VISUAL EDITOR=$EDITOR&quot;; for e in positron code zed; do command -v $e; done</pre><pre class="output">VISUAL= EDITOR=
+/usr/local/bin/positron
+/usr/local/bin/code
+/usr/local/bin/zed</pre></details>
+<details class="tool"><summary>Bash: positron ~/files/r/packages/rray4/plans/rep.md</summary>
+<pre>positron ~/files/r/packages/rray4/plans/rep.md</pre><pre class="output">(Bash completed with no output)</pre></details>
+<p>I wrote the plan to <code>plans/rep.md</code> and opened it in Positron. It is not committed. I'm on <code>feature/roll</code>, so the file sits there untracked for now.</p>
+<p><strong>The design:</strong></p>
+<ul>
+<li>
+<p><strong>Two steps to fill the result.</strong> The first axis in <code>axes</code> is repeated straight from <code>x</code> using the existing fill code, so single-axis <code>rray_rep()</code> stays exactly as fast as today. Every other axis is then repeated in place inside <code>out</code>. It works group by group, last group first, so a write never lands on data that hasn't been read yet.</p>
+</li>
+<li>
+<p><strong>Checked against base R.</strong> I wrote a base R simulation of both steps. It matched base R subsetting on 3000 random arrays, including zero dimensions, unsorted axes, and <code>times</code> from 0 to 3. The plan also explains why the copies never overlap, so <code>r_memcpy()</code> is valid.</p>
+</li>
+<li>
+<p><strong><code>rray_rep_each()</code> behaves exactly as before</strong>, but its C code no longer shares <code>rray_rep_impl()</code> with <code>rray_rep()</code>. Each function gets its own helpers, and the fill and dimension helpers they both use go at the bottom of <code>src/rep.c</code>.</p>
+</li>
+<li>
+<p><strong>Validation matches <code>rray_roll()</code>.</strong> <code>axes</code> goes through <code>arg_as_axes_unsorted()</code>. The only new error text is the <code>times</code> size error that mentions <code>axes</code>, and it reads the same as the roll one.</p>
+</li>
+</ul>
+<p>A few things I'd like you to decide before I finalize it:</p>
+<ol>
+<li>
+<p><strong>Renaming with no deprecation.</strong> <code>axis</code> becomes <code>axes</code>, and an old call fails with the &quot;<code>...</code> must be empty&quot; error. I assumed that's fine since there's been no release. Is it?</p>
+</li>
+<li>
+<p><strong><code>r_memcpy()</code> versus loops.</strong> The new in-place step uses <code>r_memcpy()</code> for atomic types. The existing <code>rray_rep_fill_uniform()</code> copies element by element in a loop. I could leave that as is, or switch it to <code>r_memcpy()</code> too so the two match. Which do you want?</p>
+</li>
+<li>
+<p><strong><code>rray_rep_each()</code> keeps a single <code>axis</code>.</strong> The plan writes this down as decided, with the reasons (a varying <code>times</code> across axes would need a list, and NumPy's <code>np.repeat()</code> is single-axis too). Do you agree?</p>
+</li>
+<li>
+<p><strong>Branch and order.</strong> The plan has this as one pull request on its own branch from <code>main</code>, merged before the first roll pull request. Should I create that branch now and move <code>plans/rep.md</code> onto it? If so, what should it be called?</p>
+</li>
+</ol>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>2 honestly i think using a loop everywhere is fine</p>
+<p>3 yes</p>
+<p>4 feature/rep-axes branched off main</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-```c</span>
+<span class="del">-CTYPE* v_out = DEREF(out);</span>
+<span class="del">-</span>
+<span class="del">-for (r_ssize group = n_groups - 1; group &gt;= 0; --group) {</span>
+<span class="del">-  const CTYPE* v_source = v_out + group * block_size;</span>
+<span class="del">-  CTYPE* v_group = v_out + group * group_size;</span>
+<span class="del">-</span>
+<span class="del">-  for (int time = 0; time &lt; times; ++time) {</span>
+<span class="del">-    CTYPE* v_target = v_group + time * block_size;</span>
+<span class="del">-</span>
+<span class="del">-    if (v_target == v_source) {</span>
+<span class="del">-      continue;</span>
+<span class="del">-    }</span>
+<span class="del">-</span>
+<span class="del">-    r_memcpy(v_target, v_source, block_size * sizeof(CTYPE));</span>
+<span class="del">-  }</span>
+<span class="del">-}</span>
+<span class="del">-```</span>
+<span class="del">-</span>
+<span class="del">-Then set the current dimension of `axis` to its output dimension. Skip any axis</span>
+<span class="del">-with `times` of 1.</span>
+<span class="del">-</span>
+<span class="del">-Why this is safe:</span>
+<span class="del">-</span>
+<span class="del">-- Group `g` only writes at or after `g * group_size`. Every group still to be</span>
+<span class="del">-  read sits before `g * block_size`, which is at most that. So a write never</span>
+<span class="del">-  hits unread data.</span>
+<span class="del">-</span>
+<span class="del">-- For `g &gt;= 1` and `times &gt;= 2`, the target region starts at</span>
+<span class="del">-  `g * block_size * times`, which is at least `(g + 1) * block_size`. So target</span>
+<span class="del">-  and source never overlap and `r_memcpy()` is valid.</span>
+<span class="del">-</span>
+<span class="del">-- For `g == 0`, the first target is the source itself, which is skipped. The</span>
+<span class="del">-  rest start at `block_size` or later and don't overlap it.</span>
+<span class="ins">+```c</span>
+<span class="ins">+CTYPE* v_out = DEREF(out);</span>
+<span class="ins">+</span>
+<span class="ins">+for (r_ssize group = n_groups - 1; group &gt;= 0; --group) {</span>
+<span class="ins">+  const CTYPE* v_source = v_out + group * block_size;</span>
+<span class="ins">+  CTYPE* v_group = v_out + group * group_size;</span>
+<span class="ins">+</span>
+<span class="ins">+  for (int time = 0; time &lt; times; ++time) {</span>
+<span class="ins">+    CTYPE* v_target = v_group + time * block_size;</span>
+<span class="ins">+</span>
+<span class="ins">+    for (r_ssize i = 0; i &lt; block_size; ++i) {</span>
+<span class="ins">+      v_target[i] = v_source[i];</span>
+<span class="ins">+    }</span>
+<span class="ins">+  }</span>
+<span class="ins">+}</span>
+<span class="ins">+```</span>
+<span class="ins">+</span>
+<span class="ins">+Then set the current dimension of `axis` to its output dimension. Skip any axis</span>
+<span class="ins">+with `times` of 1.</span>
+<span class="ins">+</span>
+<span class="ins">+Why this is safe:</span>
+<span class="ins">+</span>
+<span class="ins">+- Group `g` only writes at or after `g * group_size`. Every group still to be</span>
+<span class="ins">+  read sits before `g * block_size`, which is at most that. So a write never</span>
+<span class="ins">+  hits unread data.</span>
+<span class="ins">+</span>
+<span class="ins">+- For `g &gt;= 1` and `times &gt;= 2`, the target region starts at</span>
+<span class="ins">+  `g * block_size * times`, which is at least `(g + 1) * block_size`. So target</span>
+<span class="ins">+  and source never overlap.</span>
+<span class="ins">+</span>
+<span class="ins">+- For `g == 0`, the first target is the source itself, so that copy writes</span>
+<span class="ins">+  each element onto itself, which is harmless. The rest start at `block_size`</span>
+<span class="ins">+  or later and don't overlap it.</span>
+<span class="ins">+</span>
+<span class="ins">+A target that only partly overlapped its source would corrupt the copy. The two</span>
+<span class="ins">+points above rule that out.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit plans/rep.md</summary>
+<pre class="diff"><span class="del">-`rray_rep_expand()` switches on `r_typeof(out)` to seven cores, like</span>
+<span class="del">-`rray_rep_fill_uniform()`. Each core is one macro call:</span>
+<span class="del">-</span>
+<span class="del">-- `RRAY_REP_EXPAND_ATOMIC(CTYPE, DEREF)` for logical, integer, double, complex,</span>
+<span class="del">-  and raw, using `r_memcpy()` as above.</span>
+<span class="del">-</span>
+<span class="del">-- `RRAY_REP_EXPAND_BARRIER(CONST_DEREF, POKE)` for character and list. It reads</span>
+<span class="del">-  from `CONST_DEREF(out)` and writes element by element with `POKE()`, with the</span>
+<span class="del">-  same skip for the source itself.</span>
+<span class="ins">+`rray_rep_expand()` switches on `r_typeof(out)` to seven cores, like</span>
+<span class="ins">+`rray_rep_fill_uniform()`. Each core is one macro call:</span>
+<span class="ins">+</span>
+<span class="ins">+- `RRAY_REP_EXPAND_ATOMIC(CTYPE, DEREF)` for logical, integer, double, complex,</span>
+<span class="ins">+  and raw, with the loop above.</span>
+<span class="ins">+</span>
+<span class="ins">+- `RRAY_REP_EXPAND_BARRIER(CONST_DEREF, POKE)` for character and list. It reads</span>
+<span class="ins">+  from `CONST_DEREF(out)` and writes with `POKE()` at the matching offset.</span>
+<span class="ins">+</span>
+<span class="ins">+Both copy element by element in a loop, like every other fill in `src/rep.c`.</span>
+<span class="ins">+No `r_memcpy()`.</span></pre><pre class="output">The file ~/files/r/packages/rray4/plans/rep.md has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git fetch origin main 2&gt;&amp;1 | tail -1; git rev-parse main origin/main</summary>
+<pre>git status --short &amp;&amp; git fetch origin main 2&gt;&amp;1 | tail -1; git rev-parse main origin/main</pre><pre class="output">?? plans/rep.md
+ * branch            main       -&gt; FETCH_HEAD
+ce3af974e0be3fb2dcd8e6088b0420fa4e8fb2cc
+ce3af974e0be3fb2dcd8e6088b0420fa4e8fb2cc</pre></details>
+<p>Local <code>main</code> matches <code>origin/main</code>. Creating the branch. The untracked plan file comes along with it.</p>
+
+<details class="tool"><summary>Bash: git switch -c feature/rep-axes main &amp;&amp; git status --short</summary>
+<pre>git switch -c feature/rep-axes main &amp;&amp; git status --short</pre><pre class="output">Switched to a new branch 'feature/rep-axes'
+?? plans/rep.md</pre></details>
+<p>I've updated the plan and created <code>feature/rep-axes</code> from <code>main</code>. <code>plans/rep.md</code> is on the new branch, untracked and not committed.</p>
+<p><strong>What changed in the plan:</strong></p>
+<ul>
+<li>
+<p><strong>Loops everywhere.</strong> The in-place step now copies element by element in a loop, like every other fill in <code>src/rep.c</code>, with no <code>r_memcpy()</code>. The one copy where source and target are the same block now writes each element onto itself, which is harmless, so the skip check is gone.</p>
+</li>
+<li>
+<p><strong>The safety argument is still in the plan.</strong> Even with a loop, a target that only partly overlapped its source would corrupt the copy. The plan explains why that can't happen.</p>
+</li>
+<li>
+<p><strong><code>rray_rep_each()</code> keeps a single <code>axis</code></strong>, as you agreed.</p>
+</li>
+</ul>
+<p>Two things to know:</p>
+<ul>
+<li>
+<p><strong>You didn't answer question 1.</strong> I've left the plan assuming <code>axis</code> can be renamed to <code>axes</code> with no deprecation. Tell me if you want one.</p>
+</li>
+<li>
+<p><strong>The plan mentions a file this branch doesn't have.</strong> It refers to <code>plans/roll.md</code> and to <code>rray_roll()</code> for the pairs table and the matching error wording. <code>plans/roll.md</code> only exists on <code>feature/roll</code>. That's fine if you're reading the two plans side by side, but the reference won't resolve on this branch by itself.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Commit and push to the new branch then switch back</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git add plans/rep.md &amp;&amp; git commit -q -m 'Add a plan for multi-axis `rray_rep()`' &amp;&amp; git log …</summary>
+<pre>git add plans/rep.md &amp;&amp; git commit -q -m 'Add a plan for multi-axis `rray_rep()`' &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/rep-axes 2&gt;&amp;1 | tail -3 &amp;&amp; git switch feature/roll &amp;&amp; git status --short</pre><pre class="output">f84f694 Add a plan for multi-axis `rray_rep()`
+To https://github.com/DavisVaughan/rray4.git
+ * [new branch]      feature/rep-axes -&gt; feature/rep-axes
+branch 'feature/rep-axes' set up to track 'origin/feature/rep-axes'.
+Switched to branch 'feature/roll'
+Your branch is up to date with 'origin/feature/roll'.</pre></details>
+<p>I committed the plan as <code>f84f694</code>, &quot;Add a plan for multi-axis <code>rray_rep()</code>&quot;, and pushed it to <code>origin/feature/rep-axes</code>. You're back on <code>feature/roll</code>, and its working tree is clean.</p>
+
+</section>
+</main>
+</body>
+</html>

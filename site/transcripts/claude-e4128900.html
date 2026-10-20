@@ -1,0 +1,2910 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renaming the ALTREP wrapper to a view per plans/view.md</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-152">rray timeline</a>
+<h1>Renaming the ALTREP wrapper to a view per <code>plans/view.md</code></h1>
+<p class="facts">Claude · Oct 17, 2026 · 1 prompt · 17 replies · <a href="https://github.com/r-lib/rray/pull/152">#152</a></p>
+</header>
+<main>
+<p class="divider">Oct 17, 2026, 22:28 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/view<br />
+Implement plans/view.md<br />
+Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Remove the plan when done<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git status &amp;&amp; git branch -a &amp;&amp; ls plans &amp;&amp; cat plans/view.md</summary>
+<pre>git status &amp;&amp; git branch -a &amp;&amp; ls plans &amp;&amp; cat plans/view.md</pre><pre class="output">On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+* main
+  remotes/origin/HEAD -&gt; origin/main
+  remotes/origin/gh-pages
+  remotes/origin/main
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+view.md
+wrap.md
+# Rename the ALTREP wrapper to a view
+
+After `plans/wrap.md` and `plans/attributes.md`, `r_wrap(x)` returns an
+object that:
+
+- shares the data of `x` and never copies it,
+
+- is read only, since R always copies it before changing it,
+
+- starts with no attributes, so the caller sets its own.
+
+That is a read-only view, and &quot;view&quot; says so better than &quot;wrapper&quot; does. Base
+R's own wrapper classes behave differently: they copy their data on the first
+write and become the owner. Ours never does.
+
+This plan renames everything. It is a pure rename: no behavior changes, apart
+from the wording of a few internal error messages.
+
+The work is one pull request. It lands after `plans/attributes.md`, and
+assumes the tests that plan adds and renames are in place.
+
+---
+
+# Goal
+
+After this plan, this command:
+
+```sh
+git grep -n -i wrap -- ':!src/rlang' ':!plans'
+```
+
+prints only these lines, which have nothing to do with the ALTREP class:
+
+- `AGENTS.md`: &quot;FFI wrappers&quot; (3 lines), &quot;rlang's C library wrappers&quot;,
+  &quot;rlang's wrappers around `PROTECT()`&quot;, &quot;Wrap roxygen comments&quot;.
+
+- `src/arg.c`, `src/arg.h`, `src/decl/arg-decl.h`, `src/if-else.c`:
+  `new_wrapper_arg()` and `wrapper_arg_fill()`. These match vctrs, and stay.
+
+- `src/int-128.h`: &quot;wraps&quot; and &quot;wrapped&quot;, about integer overflow.
+
+- `tests/testthat/test-roll.R`: &quot;shifts wrap around the dimension&quot;.
+
+`plans/` keeps the old word, since the earlier plans are a record of how we
+got here.
+
+---
+
+# Names
+
+## Files
+
+Use `git mv` for each, so history follows the file.
+
+| Old | New |
+| --- | --- |
+| `src/wrapper.c` | `src/view.c` |
+| `src/wrapper.h` | `src/view.h` |
+| `src/decl/wrapper-decl.h` | `src/decl/view-decl.h` |
+| `tests/testthat/helper-wrapper.R` | `tests/testthat/helper-view.R` |
+| `tests/testthat/helper-wrapper-mutations.R` | `tests/testthat/helper-view-mutations.R` |
+| `tests/testthat/test-wrapper.R` | `tests/testthat/test-view.R` |
+| `tests/testthat/test-wrapper-mutations.R` | `tests/testthat/test-view-mutations.R` |
+| `tests/testthat/_snaps/wrapper.md` | deleted, regenerated as `_snaps/view.md` |
+
+Also delete `src/wrapper.o` if it exists, so a stale object file never gets
+linked. It is ignored by git.
+
+## C: the entry point and include guard
+
+| Old | New |
+| --- | --- |
+| `r_wrap()` | `r_view()` |
+| `RRAY_WRAPPER_H` | `RRAY_VIEW_H` |
+| `#include &quot;wrapper.h&quot;` | `#include &quot;view.h&quot;` |
+| `#include &quot;decl/wrapper-decl.h&quot;` | `#include &quot;decl/view-decl.h&quot;` |
+
+## C: internal helpers
+
+| Old | New |
+| --- | --- |
+| `is_wrapper()` | `is_view()` |
+| `wrapper_class()` | `view_class()` |
+| `wrapper_data()` | `view_data()` |
+
+## C: class variables and ALTREP class names
+
+For each `{type}` in `logical`, `integer`, `double`, `complex`, `raw`,
+`character` and `list`:
+
+| Old | New |
+| --- | --- |
+| `wrapper_{type}_class` | `view_{type}_class` |
+| `&quot;wrapper_{type}&quot;` (the name passed to `R_make_alt*_class()`) | `&quot;view_{type}&quot;` |
+
+The class name shows up in `.Internal(inspect())` and nowhere else. Views
+are never serialized as ALTREP (`Serialized_state` returns `NULL`), so no
+saved file refers to the old names.
+
+## C: ALTREP methods
+
+| Old | New |
+| --- | --- |
+| `wrapper_serialized_state()` | `view_serialized_state()` |
+| `wrapper_duplicate()` | `view_duplicate()` |
+| `wrapper_inspect()` | `view_inspect()` |
+| `wrapper_length()` | `view_length()` |
+
+And for each `{type}` that has the method:
+
+| Old | New |
+| --- | --- |
+| `wrapper_{type}_dataptr()` | `view_{type}_dataptr()` |
+| `wrapper_{type}_dataptr_or_null()` | `view_{type}_dataptr_or_null()` |
+| `wrapper_{type}_elt()` | `view_{type}_elt()` |
+| `wrapper_{type}_get_region()` | `view_{type}_get_region()` |
+| `wrapper_character_set_elt()` | `view_character_set_elt()` |
+| `wrapper_list_set_elt()` | `view_list_set_elt()` |
+
+## C: initializers
+
+| Old | New |
+| --- | --- |
+| `init_wrapper_{type}()` | `init_view_{type}()` |
+| `r_init_wrapper()` | `r_init_view()` |
+
+## C: test helpers
+
+| Old | New |
+| --- | --- |
+| `ffi_test_wrap()` | `ffi_test_view()` |
+| `ffi_test_wrapper_data()` | `ffi_test_view_data()` |
+| `ffi_test_is_wrapper()` | `ffi_test_is_view()` |
+| `ffi_test_wrapper_read_access()` | `ffi_test_view_read_access()` |
+| `ffi_test_wrapper_pointer_is_stable()` | `ffi_test_view_pointer_is_stable()` |
+| `ffi_test_wrapper_set_elt()` | `ffi_test_view_set_elt()` |
+
+`ffi_test_is_altrep()` keeps its name.
+
+## C: messages
+
+| Old | New |
+| --- | --- |
+| `Can't wrap a %s.` | `Can't create a view of a %s.` |
+| `Can't request a writable dataptr to a character wrapper.` | `Can't request a writable dataptr to a character view.` |
+| `Can't request a writable dataptr to a list wrapper.` | `Can't request a writable dataptr to a list view.` |
+| `Can't set an element of a character wrapper.` | `Can't set an element of a character view.` |
+| `Can't set an element of a list wrapper.` | `Can't set an element of a list view.` |
+| `` `x` must be a wrapper. `` (2 places) | `` `x` must be a view. `` |
+| `&lt;wrapper&gt;\n` in `view_inspect()` | `&lt;view&gt;\n` |
+
+## R test helpers
+
+| Old | New |
+| --- | --- |
+| `wrap()` | `view()` |
+| `wrapper_data()` | `view_data()` |
+| `is_wrapper()` | `is_view()` |
+| `wrapper_read_access()` | `view_read_access()` |
+| `wrapper_pointer_is_stable()` | `view_pointer_is_stable()` |
+| `wrapper_set_elt()` | `view_set_elt()` |
+| `expect_wraps(w, x)` | `expect_view_of(v, x)` |
+
+`is_altrep()` keeps its name.
+
+Local variables follow: `w` becomes `v`, `w1` and `w2` become `v1` and `v2`,
+in all four test and helper files. That includes the argument of every case
+function in `helper-view-mutations.R`, for example
+`plus = function(v) v + 1`.
+
+## R test descriptions
+
+`test-view.R`:
+
+| Old | New |
+| --- | --- |
+| wrapping produces an ALTREP wrapper | view() produces an ALTREP view |
+| non-wrappers are detected | non-views are detected |
+| wrapper preserves length | view preserves length |
+| wrapper preserves type | view preserves type |
+| wrapper starts with no attributes | view starts with no attributes |
+| modifying dim on wrapper does not affect original | modifying dim on a view does not affect the original |
+| wrapper provides read access to {type} data (7 tests) | view provides read access to {type} data |</pre><p class="cut">165 more lines cut</p></details>
+<details class="tool"><summary>Bash: git grep -n -i wrap -- ':!src/rlang' ':!plans' | grep -v '^src/wrapper.c' | grep -v '^tests/t…</summary>
+<pre>git grep -n -i wrap -- ':!src/rlang' ':!plans' | grep -v '^src/wrapper.c' | grep -v '^tests/testthat/.*wrapper'; echo ---; ls src/*.o 2&gt;/dev/null | head; ls tests/testthat | grep -i wrap</pre><pre class="output">AGENTS.md:102:- FFI wrappers: `ffi_rray_{name}()` — thin SEXP-to-C bridges. Go above internal functions in the `.c` file.
+AGENTS.md:106:- FFI wrapper parameters are also prefixed, i.e. `ffi_rray_axis_names(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame)`. This frees up the unprefixed name for the converted C value.
+AGENTS.md:107:- Headers only declare internal C functions, not FFI wrappers.
+AGENTS.md:110:- Always prefer rlang's C library wrappers over raw R API (e.g., `r_globals.na_int` over `NA_INTEGER`, `r_length()` over `Rf_length()`).
+AGENTS.md:112:- Any `r_obj*` returned by a C function that allocates must be protected with `KEEP()` / `FREE()` (rlang's wrappers around `PROTECT()` / `UNPROTECT()`) if used after any further allocation could occur.
+AGENTS.md:176:- Wrap roxygen comments at 80 characters.
+src/arg.c:86:struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg) {
+src/arg.c:88:    {.parent = parent, .fill = &amp;wrapper_arg_fill, .data = (void*) arg};
+src/arg.c:92:static r_ssize wrapper_arg_fill(void* data, char* buf, r_ssize remaining) {
+src/arg.c:208:  ARG = new_wrapper_arg(NULL, #ARG);                                           \
+src/arg.c:213:  ARG = new_wrapper_arg(NULL, STR);                                            \
+src/arg.h:44:struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+src/decl/arg-decl.h:10:static r_ssize wrapper_arg_fill(void* data, char* buf, r_ssize remaining);
+src/decl/wrapper-decl.h:1:static inline bool is_wrapper(r_obj* x);
+src/decl/wrapper-decl.h:2:static inline R_altrep_class_t wrapper_class(enum r_type type);
+src/decl/wrapper-decl.h:3:static inline r_obj* wrapper_data(r_obj* x);
+src/dimensionality.c:5:#include &quot;wrapper.h&quot;
+src/dimensionality.c:59:  r_obj* out = KEEP(r_wrap(x));
+src/dimensions.c:6:#include &quot;wrapper.h&quot;
+src/dimensions.c:94:  r_obj* out = KEEP(r_wrap(x));
+src/if-else.c:23:  struct rray_arg condition_arg = new_wrapper_arg(NULL, &quot;condition&quot;);
+src/if-else.c:24:  struct rray_arg true_arg = new_wrapper_arg(NULL, &quot;true&quot;);
+src/if-else.c:25:  struct rray_arg false_arg = new_wrapper_arg(NULL, &quot;false&quot;);
+src/if-else.c:26:  struct rray_arg missing_arg = new_wrapper_arg(NULL, &quot;missing&quot;);
+src/init.c:364:extern r_obj* ffi_test_wrap(r_obj* ffi_x);
+src/init.c:365:extern r_obj* ffi_test_wrapper_data(r_obj* ffi_x);
+src/init.c:366:extern r_obj* ffi_test_is_wrapper(r_obj* ffi_x);
+src/init.c:368:extern r_obj* ffi_test_wrapper_read_access(r_obj* ffi_x);
+src/init.c:369:extern r_obj* ffi_test_wrapper_pointer_is_stable(r_obj* ffi_x);
+src/init.c:370:extern r_obj* ffi_test_wrapper_set_elt(r_obj* ffi_x);
+src/init.c:483:  {&quot;ffi_test_wrap&quot;, (DL_FUNC) &amp;ffi_test_wrap, 1},
+src/init.c:484:  {&quot;ffi_test_wrapper_data&quot;, (DL_FUNC) &amp;ffi_test_wrapper_data, 1},
+src/init.c:485:  {&quot;ffi_test_is_wrapper&quot;, (DL_FUNC) &amp;ffi_test_is_wrapper, 1},
+src/init.c:487:  {&quot;ffi_test_wrapper_read_access&quot;, (DL_FUNC) &amp;ffi_test_wrapper_read_access, 1},
+src/init.c:488:  {&quot;ffi_test_wrapper_pointer_is_stable&quot;,
+src/init.c:489:   (DL_FUNC) &amp;ffi_test_wrapper_pointer_is_stable,
+src/init.c:491:  {&quot;ffi_test_wrapper_set_elt&quot;, (DL_FUNC) &amp;ffi_test_wrapper_set_elt, 1},
+src/init.c:502:extern void r_init_wrapper(DllInfo* dll);
+src/init.c:507:  r_init_wrapper(dll);
+src/insert-axes.c:7:#include &quot;wrapper.h&quot;
+src/insert-axes.c:71:  r_obj* out = KEEP(r_wrap(x));
+src/int-128.h:19://   unsigned value. The low part wraps at 2^64.
+src/int-128.h:20:// - Add -1 to `hi` when `y` is negative, then add 1 if `lo` wrapped.
+src/int-128.h:22:// For example, with `x = {lo = 1, hi = 0}` and `y = -1`, `lo` wraps to 0.
+src/names.c:7:#include &quot;wrapper.h&quot;
+src/names.c:108:  r_obj* out = KEEP(r_wrap(x));
+src/names.c:172:  r_obj* out = KEEP(r_wrap(x));
+src/remove-axes.c:7:#include &quot;wrapper.h&quot;
+src/remove-axes.c:82:  r_obj* out = KEEP(r_wrap(x));
+src/titles.c:7:#include &quot;wrapper.h&quot;
+src/titles.c:101:  r_obj* out = KEEP(r_wrap(x));
+src/titles.c:187:  r_obj* out = KEEP(r_wrap(x));
+src/utils.c:6:#include &quot;wrapper.h&quot;
+src/utils.c:17:// we use a lightweight wrapper
+src/utils.c:23:  r_obj* out = KEEP(r_wrap(x));
+src/wrapper.h:1:#ifndef RRAY_WRAPPER_H
+src/wrapper.h:2:#define RRAY_WRAPPER_H
+src/wrapper.h:6:r_obj* r_wrap(r_obj* x);
+tests/testthat/test-roll.R:11:test_that(&quot;shifts wrap around the dimension&quot;, {
+---
+src/arg.o
+src/arithmetic-add.o
+src/arithmetic-divide.o
+src/arithmetic-exponentiate.o
+src/arithmetic-multiply.o
+src/arithmetic-subtract.o
+src/arithmetic.o
+src/axes.o
+src/broadcast-names.o
+src/broadcast.o
+helper-wrapper-mutations.R
+helper-wrapper.R
+test-wrapper-mutations.R
+test-wrapper.R</pre></details>
+<p>Matches the plan. Now the main files.</p>
+
+<details class="tool"><summary>Bash: cat -n src/wrapper.c src/wrapper.h src/decl/wrapper-decl.h</summary>
+<pre>cat -n src/wrapper.c src/wrapper.h src/decl/wrapper-decl.h</pre><pre class="output">     1	#include &quot;wrapper.h&quot;
+     2	
+     3	#include &lt;R_ext/Altrep.h&gt;
+     4	
+     5	#include &quot;clone.h&quot;
+     6	
+     7	#include &quot;decl/wrapper-decl.h&quot;
+     8	
+     9	static char* package = &quot;rray&quot;;
+    10	
+    11	// Wrap an R object's data in a read-only ALTREP wrapper
+    12	//
+    13	// Useful when ONLY modifying the attributes of the new object, and NEVER the
+    14	// underlying data.
+    15	//
+    16	// The ALTREP wrapper itself is immediately marked as immutable with
+    17	// `MARK_NOT_MUTABLE()`. This is extremely important! It ensures that R won't
+    18	// ever ask for a writable `DATAPTR()` without first calling `Duplicate()`.
+    19	//
+    20	// Note that R will VERY often use `REAL()` instead of `REAL_RO()` when it only
+    21	// needs a read-only pointer. This is due to `REAL_RO()` being a newer idea that
+    22	// was only introduced with ALTREP, and a lot of historical code hasn't been
+    23	// ported over. Because of that, our `DATAPTR()` ALTREP methods must return a
+    24	// pointer even in the `writable` case, but we expect that R (and all packages)
+    25	// hold up their side of the bargain by only actually writing to this pointer
+    26	// when they fully own it or when there are `NO_REFERENCES()`, which won't be
+    27	// the case since we've used `MARK_NOT_MUTABLE()`. The `NO_REFERENCES()` case is
+    28	// relevant for `x + y + 1` where R will attempt to reuse `x + y`'s temporary
+    29	// result since there aren't any other owners. We don't want
+    30	// `rray_set_dimensions(x) + 1` to look reusable!
+    31	r_obj* r_wrap(r_obj* x) {
+    32	  R_altrep_class_t cls = wrapper_class(r_typeof(x));
+    33	
+    34	  // If `x` is a wrapper, unwrap it to gain access to the original data and wrap
+    35	  // that instead. This avoids a proliferation of nested wrappers. Refcounts on
+    36	  // `x` itself should also still be correct - each wrapper looks like an
+    37	  // individual user of `x`.
+    38	  r_obj* data = is_wrapper(x) ? wrapper_data(x) : x;
+    39	
+    40	  // Reference count on `data` is bumped when we wrap it here.
+    41	  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+    42	  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+    43	
+    44	  // The all important immutable marking of `out`, preventing any downstream C
+    45	  // code from requesting a writable pointer without duplicating first.
+    46	  MARK_NOT_MUTABLE(out);
+    47	
+    48	  FREE(1);
+    49	  return out;
+    50	}
+    51	
+    52	// -----------------------------------------------------------------------------
+    53	// Class
+    54	
+    55	static R_altrep_class_t wrapper_logical_class;
+    56	static R_altrep_class_t wrapper_integer_class;
+    57	static R_altrep_class_t wrapper_double_class;
+    58	static R_altrep_class_t wrapper_complex_class;
+    59	static R_altrep_class_t wrapper_raw_class;
+    60	static R_altrep_class_t wrapper_character_class;
+    61	static R_altrep_class_t wrapper_list_class;
+    62	
+    63	static inline bool is_wrapper(r_obj* x) {
+    64	  if (!ALTREP(x)) {
+    65	    return false;
+    66	  }
+    67	
+    68	  switch (r_typeof(x)) {
+    69	  case R_TYPE_logical:
+    70	    return R_altrep_inherits(x, wrapper_logical_class);
+    71	  case R_TYPE_integer:
+    72	    return R_altrep_inherits(x, wrapper_integer_class);
+    73	  case R_TYPE_double:
+    74	    return R_altrep_inherits(x, wrapper_double_class);
+    75	  case R_TYPE_complex:
+    76	    return R_altrep_inherits(x, wrapper_complex_class);
+    77	  case R_TYPE_raw:
+    78	    return R_altrep_inherits(x, wrapper_raw_class);
+    79	  case R_TYPE_character:
+    80	    return R_altrep_inherits(x, wrapper_character_class);
+    81	  case R_TYPE_list:
+    82	    return R_altrep_inherits(x, wrapper_list_class);
+    83	  default:
+    84	    return false;
+    85	  }
+    86	}
+    87	
+    88	static inline R_altrep_class_t wrapper_class(enum r_type type) {
+    89	  switch (type) {
+    90	  case R_TYPE_logical:
+    91	    return wrapper_logical_class;
+    92	  case R_TYPE_integer:
+    93	    return wrapper_integer_class;
+    94	  case R_TYPE_double:
+    95	    return wrapper_double_class;
+    96	  case R_TYPE_complex:
+    97	    return wrapper_complex_class;
+    98	  case R_TYPE_raw:
+    99	    return wrapper_raw_class;
+   100	  case R_TYPE_character:
+   101	    return wrapper_character_class;
+   102	  case R_TYPE_list:
+   103	    return wrapper_list_class;
+   104	  default:
+   105	    r_abort(&quot;Can't wrap a %s.&quot;, Rf_type2char(type));
+   106	  }
+   107	}
+   108	
+   109	// -----------------------------------------------------------------------------
+   110	// Data
+   111	
+   112	static inline r_obj* wrapper_data(r_obj* x) {
+   113	  return R_altrep_data1(x);
+   114	}
+   115	
+   116	// -----------------------------------------------------------------------------
+   117	// Generic
+   118	
+   119	static r_obj* wrapper_serialized_state(r_obj* x) {
+   120	  // Full serialization, lose ALTREP-ness
+   121	  return NULL;
+   122	}
+   123	
+   124	// Powers `Rf_duplicate()` and `Rf_shallow_duplicate()`
+   125	//
+   126	// We only need to handle the data. Base R covers the attributes for us.
+   127	// https://github.com/wch/r-source/blob/trunk/src/main/altrep.c#L740
+   128	static r_obj* wrapper_duplicate(r_obj* x, Rboolean deep) {
+   129	  if (deep) {
+   130	    return Rf_duplicate(wrapper_data(x));
+   131	  } else {
+   132	    return r_clone_data(wrapper_data(x));
+   133	  }
+   134	}
+   135	
+   136	static Rboolean wrapper_inspect(
+   137	  r_obj* x,
+   138	  int pre,
+   139	  int deep,
+   140	  int pvec,
+   141	  void (*inspect_subtree)(r_obj*, int, int, int)
+   142	) {
+   143	  Rprintf(&quot;&lt;wrapper&gt;\n&quot;);
+   144	  inspect_subtree(wrapper_data(x), pre, deep, pvec);
+   145	  return TRUE;
+   146	}
+   147	
+   148	static r_ssize wrapper_length(r_obj* x) {
+   149	  return r_length(wrapper_data(x));
+   150	}
+   151	
+   152	// -----------------------------------------------------------------------------
+   153	// Dataptr
+   154	
+   155	static void* wrapper_logical_dataptr(r_obj* x, Rboolean writeable) {
+   156	  return (void*) r_lgl_cbegin(wrapper_data(x));
+   157	}
+   158	
+   159	static void* wrapper_integer_dataptr(r_obj* x, Rboolean writeable) {
+   160	  return (void*) r_int_cbegin(wrapper_data(x));
+   161	}
+   162	
+   163	static void* wrapper_double_dataptr(r_obj* x, Rboolean writeable) {
+   164	  return (void*) r_dbl_cbegin(wrapper_data(x));
+   165	}
+   166	
+   167	static void* wrapper_complex_dataptr(r_obj* x, Rboolean writeable) {
+   168	  return (void*) r_cpl_cbegin(wrapper_data(x));
+   169	}
+   170	
+   171	static void* wrapper_raw_dataptr(r_obj* x, Rboolean writeable) {
+   172	  return (void*) r_raw_cbegin(wrapper_data(x));
+   173	}
+   174	
+   175	static void* wrapper_character_dataptr(r_obj* x, Rboolean writeable) {
+   176	  if (writeable) {
+   177	    r_abort(&quot;Can't request a writable dataptr to a character wrapper.&quot;);
+   178	  } else {
+   179	    return (void*) r_chr_cbegin(wrapper_data(x));
+   180	  }
+   181	}
+   182	
+   183	static void* wrapper_list_dataptr(r_obj* x, Rboolean writeable) {
+   184	  if (writeable) {
+   185	    r_abort(&quot;Can't request a writable dataptr to a list wrapper.&quot;);
+   186	  } else {
+   187	    return (void*) r_list_cbegin(wrapper_data(x));
+   188	  }
+   189	}
+   190	
+   191	// -----------------------------------------------------------------------------
+   192	// Dataptr_or_null
+   193	
+   194	static const void* wrapper_logical_dataptr_or_null(r_obj* x) {
+   195	  return LOGICAL_OR_NULL(wrapper_data(x));
+   196	}
+   197	
+   198	static const void* wrapper_integer_dataptr_or_null(r_obj* x) {
+   199	  return INTEGER_OR_NULL(wrapper_data(x));
+   200	}</pre><p class="cut">359 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat -n tests/testthat/helper-wrapper.R tests/testthat/helper-wrapper-mutations.R tests/testth…</summary>
+<pre>cat -n tests/testthat/helper-wrapper.R tests/testthat/helper-wrapper-mutations.R tests/testthat/test-wrapper-mutations.R tests/testthat/_snaps/wrapper.md</pre><pre class="output">     1	wrap &lt;- function(x) {
+     2	  .Call(ffi_test_wrap, x)
+     3	}
+     4	wrapper_data &lt;- function(x) {
+     5	  .Call(ffi_test_wrapper_data, x)
+     6	}
+     7	is_wrapper &lt;- function(x) {
+     8	  .Call(ffi_test_is_wrapper, x)
+     9	}
+    10	is_altrep &lt;- function(x) {
+    11	  .Call(ffi_test_is_altrep, x)
+    12	}
+    13	wrapper_read_access &lt;- function(x) {
+    14	  .Call(ffi_test_wrapper_read_access, x)
+    15	}
+    16	wrapper_pointer_is_stable &lt;- function(x) {
+    17	  .Call(ffi_test_wrapper_pointer_is_stable, x)
+    18	}
+    19	wrapper_set_elt &lt;- function(x) {
+    20	  .Call(ffi_test_wrapper_set_elt, x)
+    21	}
+    22	
+    23	expect_wraps &lt;- function(w, x) {
+    24	  expect_identical(obj_address(wrapper_data(w)), obj_address(x))
+    25	}
+     1	mutation_vector &lt;- function(type) {
+     2	  switch(
+     3	    type,
+     4	    logical = rep(c(TRUE, FALSE, NA, TRUE), 25L),
+     5	    integer = 1:100 + 0L,
+     6	    double = as.double(1:100) + 0.5,
+     7	    complex = complex(real = 1:100, imaginary = 100:1),
+     8	    raw = as.raw(1:100),
+     9	    character = paste0(&quot;s&quot;, 1:100),
+    10	    list = as.list(1:100 + 0L),
+    11	    altrep_integer = 1:100,
+    12	    altrep_character = as.character(1:100)
+    13	  )
+    14	}
+    15	
+    16	mutation_cases &lt;- function(type) {
+    17	  cases &lt;- switch(
+    18	    type,
+    19	    logical = mutation_cases_logical(),
+    20	    integer = mutation_cases_numeric(),
+    21	    double = mutation_cases_numeric(),
+    22	    complex = mutation_cases_complex(),
+    23	    raw = mutation_cases_raw(),
+    24	    character = mutation_cases_character(),
+    25	    list = mutation_cases_list(),
+    26	    altrep_integer = mutation_cases_numeric(),
+    27	    altrep_character = mutation_cases_character()
+    28	  )
+    29	
+    30	  cases &lt;- c(cases, mutation_cases_any())
+    31	
+    32	  if (type != &quot;raw&quot;) {
+    33	    cases &lt;- c(cases, mutation_cases_missing())
+    34	  }
+    35	
+    36	  cases
+    37	}
+    38	
+    39	expect_no_mutation &lt;- function(type) {
+    40	  cases &lt;- mutation_cases(type)
+    41	
+    42	  for (name in names(cases)) {
+    43	    f &lt;- cases[[name]]
+    44	
+    45	    x &lt;- mutation_vector(type)
+    46	    x_before &lt;- unserialize(serialize(x, NULL))
+    47	
+    48	    w &lt;- rray_set_dimensions(x, c(10L, 10L))
+    49	    plain &lt;- unserialize(serialize(w, NULL))
+    50	
+    51	    expect_identical(f(w), f(plain), info = name)
+    52	    expect_identical(x, x_before, info = name)
+    53	    expect_identical(w, plain, info = name)
+    54	    expect_identical(
+    55	      obj_address(wrapper_data(w)),
+    56	      obj_address(x),
+    57	      info = name
+    58	    )
+    59	  }
+    60	}
+    61	
+    62	mutation_cases_any &lt;- function() {
+    63	  list(
+    64	    print = function(w) utils::capture.output(print(w)),
+    65	    format = function(w) format(w),
+    66	    str = function(w) utils::capture.output(utils::str(w)),
+    67	    summary = function(w) summary(w),
+    68	    head = function(w) utils::head(w),
+    69	    identical = function(w) identical(w, w),
+    70	    all_equal = function(w) all.equal(w, w),
+    71	    dput = function(w) utils::capture.output(dput(w)),
+    72	    serialize = function(w) unserialize(serialize(w, NULL)),
+    73	    rds = function(w) {
+    74	      path &lt;- tempfile()
+    75	      on.exit(unlink(path))
+    76	      saveRDS(w, path)
+    77	      readRDS(path)
+    78	    },
+    79	    subset = function(w) w[1:5, 2],
+    80	    subset2 = function(w) w[[3]],
+    81	    split = function(w) split(w, rep(1:2, 50L)),
+    82	    match = function(w) match(w[1:3], w),
+    83	    in_op = function(w) w[1:3] %in% w,
+    84	    rev = function(w) rev(w),
+    85	    as_list = function(w) as.list(w),
+    86	    lapply = function(w) lapply(1:3, function(i) w[[i]]),
+    87	    do_call_c = function(w) do.call(c, list(w, w)),
+    88	    assign_elt = function(w) {
+    89	      y &lt;- w
+    90	      y[1] &lt;- y[2]
+    91	      y
+    92	    },
+    93	    assign_elt2 = function(w) {
+    94	      y &lt;- w
+    95	      y[[2]] &lt;- y[[3]]
+    96	      y
+    97	    },
+    98	    assign_all = function(w) {
+    99	      y &lt;- w
+   100	      y[] &lt;- y[1]
+   101	      y
+   102	    },
+   103	    assign_dim = function(w) {
+   104	      y &lt;- w
+   105	      dim(y) &lt;- c(20L, 5L)
+   106	      y
+   107	    },
+   108	    assign_dim_null = function(w) {
+   109	      y &lt;- w
+   110	      dim(y) &lt;- NULL
+   111	      y
+   112	    },
+   113	    assign_dimnames = function(w) {
+   114	      y &lt;- w
+   115	      dimnames(y) &lt;- list(letters[1:10], LETTERS[1:10])
+   116	      y
+   117	    },
+   118	    assign_attr = function(w) {
+   119	      y &lt;- w
+   120	      attr(y, &quot;foo&quot;) &lt;- 1
+   121	      y
+   122	    },
+   123	    assign_class = function(w) {
+   124	      y &lt;- w
+   125	      class(y) &lt;- &quot;foo&quot;
+   126	      unclass(y)
+   127	    },
+   128	    assign_diag = function(w) {
+   129	      y &lt;- w
+   130	      diag(y) &lt;- y[1]
+   131	      y
+   132	    },
+   133	    single_binding = function(w) {
+   134	      local({
+   135	        y &lt;- rray_set_dimensions(w, 100L)
+   136	        y[1] &lt;- y[2]
+   137	        y
+   138	      })
+   139	    },
+   140	    rray = function(w) {
+   141	      rray_slice(rray_reverse(w, axes = 1L), 1:3, 1:2)
+   142	    }
+   143	  )
+   144	}
+   145	
+   146	mutation_cases_missing &lt;- function() {
+   147	  list(
+   148	    assign_is_na = function(w) {
+   149	      y &lt;- w
+   150	      is.na(y) &lt;- 3
+   151	      y
+   152	    }
+   153	  )
+   154	}
+   155	
+   156	mutation_cases_numeric &lt;- function() {
+   157	  list(
+   158	    plus = function(w) w + 1,
+   159	    plus_rev = function(w) 1 + w,
+   160	    times_self = function(w) w * w,
+   161	    negate = function(w) -w,
+   162	    power = function(w) w^2,
+   163	    modulo = function(w) w %% 3,
+   164	    int_divide = function(w) w %/% 3,
+   165	    equal = function(w) w == 1,
+   166	    temporary = function(w) (w + 0) + 1,
+   167	    abs = function(w) abs(w),
+   168	    sqrt = function(w) sqrt(abs(w)),
+   169	    exp = function(w) exp(w / 1000),
+   170	    round = function(w) round(w),
+   171	    floor = function(w) floor(w),
+   172	    sum = function(w) sum(w),
+   173	    mean = function(w) mean(w),
+   174	    range = function(w) range(w),
+   175	    var = function(w) stats::var(as.vector(w)),</pre><p class="cut">192 more lines cut</p></details>
+<details class="tool"><summary>Bash: cat -n tests/testthat/test-wrapper.R</summary>
+<pre>cat -n tests/testthat/test-wrapper.R</pre><pre class="output">     1	# ------------------------------------------------------------------------------
+     2	# wrap() basics
+     3	
+     4	test_that(&quot;wrapping produces an ALTREP wrapper&quot;, {
+     5	  expect_true(is_wrapper(wrap(1L)))
+     6	  expect_true(is_wrapper(wrap(1)))
+     7	  expect_true(is_wrapper(wrap(&quot;a&quot;)))
+     8	  expect_true(is_wrapper(wrap(TRUE)))
+     9	  expect_true(is_wrapper(wrap(1i)))
+    10	  expect_true(is_wrapper(wrap(as.raw(1))))
+    11	  expect_true(is_wrapper(wrap(list(1))))
+    12	})
+    13	
+    14	test_that(&quot;non-wrappers are detected&quot;, {
+    15	  expect_false(is_wrapper(1L))
+    16	  expect_false(is_wrapper(1))
+    17	  expect_false(is_wrapper(&quot;a&quot;))
+    18	  expect_false(is_wrapper(TRUE))
+    19	  expect_false(is_wrapper(NULL))
+    20	})
+    21	
+    22	test_that(&quot;wrapper preserves length&quot;, {
+    23	  expect_length(wrap(1:5), 5L)
+    24	  expect_length(wrap(c(1.5, 2.5, 3.5)), 3L)
+    25	  expect_length(wrap(c(&quot;a&quot;, &quot;b&quot;)), 2L)
+    26	  expect_length(wrap(c(TRUE, FALSE, TRUE)), 3L)
+    27	  expect_length(wrap(complex(3)), 3L)
+    28	  expect_length(wrap(raw(4)), 4L)
+    29	  expect_length(wrap(list(1, 2)), 2L)
+    30	})
+    31	
+    32	test_that(&quot;wrapper preserves type&quot;, {
+    33	  expect_type(wrap(1L), &quot;integer&quot;)
+    34	  expect_type(wrap(1), &quot;double&quot;)
+    35	  expect_type(wrap(&quot;a&quot;), &quot;character&quot;)
+    36	  expect_type(wrap(TRUE), &quot;logical&quot;)
+    37	  expect_type(wrap(1i), &quot;complex&quot;)
+    38	  expect_type(wrap(as.raw(1)), &quot;raw&quot;)
+    39	  expect_type(wrap(list(1)), &quot;list&quot;)
+    40	})
+    41	
+    42	# ------------------------------------------------------------------------------
+    43	# Attributes
+    44	
+    45	test_that(&quot;wrapper starts with no attributes&quot;, {
+    46	  x &lt;- array(1:4, c(2L, 2L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+    47	  attr(x, &quot;foo&quot;) &lt;- 1
+    48	  w &lt;- wrap(x)
+    49	  expect_null(attributes(w))
+    50	  expect_wraps(w, x)
+    51	})
+    52	
+    53	test_that(&quot;modifying dim on wrapper does not affect original&quot;, {
+    54	  x &lt;- array(1:6, c(2L, 3L))
+    55	  w &lt;- wrap(x)
+    56	  dim(w) &lt;- c(3L, 2L)
+    57	  expect_identical(dim(x), c(2L, 3L))
+    58	  expect_identical(dim(w), c(3L, 2L))
+    59	})
+    60	
+    61	# ------------------------------------------------------------------------------
+    62	# Read access
+    63	
+    64	test_that(&quot;wrapper provides read access to integer data&quot;, {
+    65	  x &lt;- 1:5
+    66	  w &lt;- wrap(x)
+    67	  expect_identical(w[1], 1L)
+    68	  expect_identical(w[2:4], 2:4)
+    69	})
+    70	
+    71	test_that(&quot;wrapper provides read access to double data&quot;, {
+    72	  x &lt;- c(1.5, 2.5, 3.5)
+    73	  w &lt;- wrap(x)
+    74	  expect_identical(w[1], 1.5)
+    75	  expect_identical(w[3], 3.5)
+    76	})
+    77	
+    78	test_that(&quot;wrapper provides read access to logical data&quot;, {
+    79	  x &lt;- c(TRUE, FALSE, NA)
+    80	  w &lt;- wrap(x)
+    81	  expect_identical(w[1], TRUE)
+    82	  expect_identical(w[2:3], c(FALSE, NA))
+    83	})
+    84	
+    85	test_that(&quot;wrapper provides read access to complex data&quot;, {
+    86	  x &lt;- c(1 + 2i, 3 + 4i)
+    87	  w &lt;- wrap(x)
+    88	  expect_identical(w[1], 1 + 2i)
+    89	  expect_identical(w[2], 3 + 4i)
+    90	})
+    91	
+    92	test_that(&quot;wrapper provides read access to raw data&quot;, {
+    93	  x &lt;- as.raw(1:3)
+    94	  w &lt;- wrap(x)
+    95	  expect_identical(w[1], as.raw(1))
+    96	  expect_identical(w[2:3], as.raw(c(2, 3)))
+    97	})
+    98	
+    99	test_that(&quot;wrapper provides read access to character data&quot;, {
+   100	  x &lt;- c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)
+   101	  w &lt;- wrap(x)
+   102	  expect_identical(w[1], &quot;a&quot;)
+   103	  expect_identical(w[3], &quot;c&quot;)
+   104	})
+   105	
+   106	test_that(&quot;wrapper provides read access to list data&quot;, {
+   107	  x &lt;- list(&quot;a&quot;, 1L, TRUE)
+   108	  w &lt;- wrap(x)
+   109	  expect_identical(w[[1]], &quot;a&quot;)
+   110	  expect_identical(w[2:3], list(1L, TRUE))
+   111	})
+   112	
+   113	# ------------------------------------------------------------------------------
+   114	# Ownership
+   115	
+   116	test_that(&quot;wrapper starts out sharing data&quot;, {
+   117	  x &lt;- 1:3
+   118	  w &lt;- wrap(x)
+   119	  expect_wraps(w, x)
+   120	})
+   121	
+   122	test_that(&quot;read-only access to a dimensioned wrapper shares data&quot;, {
+   123	  xs &lt;- list(
+   124	    c(TRUE, FALSE),
+   125	    c(1L, 2L),
+   126	    c(1.5, 2.5),
+   127	    c(1 + 2i, 3 + 4i)
+   128	  )
+   129	
+   130	  for (x in xs) {
+   131	    w &lt;- rray_set_dimensions(x, c(1L, 2L))
+   132	
+   133	    expect_identical(wrapper_read_access(w), TRUE)
+   134	    expect_wraps(w, x)
+   135	  }
+   136	})
+   137	
+   138	test_that(&quot;a read-only pointer stays valid after a writable request&quot;, {
+   139	  xs &lt;- list(
+   140	    c(TRUE, FALSE),
+   141	    c(1L, 2L),
+   142	    c(1.5, 2.5),
+   143	    c(1 + 2i, 3 + 4i),
+   144	    as.raw(c(1, 2)),
+   145	    c(&quot;a&quot;, &quot;b&quot;),
+   146	    list(1, &quot;a&quot;)
+   147	  )
+   148	
+   149	  for (x in xs) {
+   150	    x_before &lt;- unserialize(serialize(x, NULL))
+   151	    w &lt;- wrap(x)
+   152	
+   153	    expect_identical(wrapper_pointer_is_stable(w), TRUE)
+   154	    expect_wraps(w, x)
+   155	    expect_identical(x, x_before)
+   156	  }
+   157	})
+   158	
+   159	test_that(&quot;changing a wrapper gives a plain vector&quot;, {
+   160	  x &lt;- 1:3
+   161	  w &lt;- wrap(x)
+   162	  w[1] &lt;- 99L
+   163	  expect_identical(is_wrapper(w), FALSE)
+   164	  expect_identical(w[1], 99L)
+   165	  expect_identical(x, 1:3)
+   166	
+   167	  x &lt;- c(1, 2, 3)
+   168	  w &lt;- wrap(x)
+   169	  w[1] &lt;- 99
+   170	  expect_identical(is_wrapper(w), FALSE)
+   171	  expect_identical(w[1], 99)
+   172	  expect_identical(x, c(1, 2, 3))
+   173	
+   174	  x &lt;- c(TRUE, FALSE, TRUE)
+   175	  w &lt;- wrap(x)
+   176	  w[1] &lt;- FALSE
+   177	  expect_identical(is_wrapper(w), FALSE)
+   178	  expect_identical(w[1], FALSE)
+   179	  expect_identical(x, c(TRUE, FALSE, TRUE))
+   180	
+   181	  x &lt;- c(1 + 0i, 2 + 0i)
+   182	  w &lt;- wrap(x)
+   183	  w[1] &lt;- 99 + 0i
+   184	  expect_identical(is_wrapper(w), FALSE)
+   185	  expect_identical(w[1], 99 + 0i)
+   186	  expect_identical(x, c(1 + 0i, 2 + 0i))
+   187	
+   188	  x &lt;- as.raw(1:3)
+   189	  w &lt;- wrap(x)
+   190	  w[1] &lt;- as.raw(99)
+   191	  expect_identical(is_wrapper(w), FALSE)
+   192	  expect_identical(w[1], as.raw(99))
+   193	  expect_identical(x, as.raw(1:3))
+   194	
+   195	  x &lt;- c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)
+   196	  w &lt;- wrap(x)
+   197	  w[1] &lt;- &quot;z&quot;
+   198	  expect_identical(is_wrapper(w), FALSE)
+   199	  expect_identical(w[1], &quot;z&quot;)
+   200	  expect_identical(x, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))</pre><p class="cut">238 more lines cut</p></details>
+<details class="tool"><summary>Question: The Comments section of plans/view.md doesn't match src/wrapper.c anymore (#151 rewrote t…</summary>
+<p>The Comments section of plans/view.md doesn't match src/wrapper.c anymore (#151 rewrote them). The header above r_wrap() now explains MARK_NOT_MUTABLE() and the <code>x + y + 1</code> reuse case, the unwrap comment ends at &quot;individual user of <code>x</code>.&quot;, and wrapper_duplicate() only has the accurate &quot;Powers <code>Rf_duplicate()</code>...&quot; comment (the two lines the plan names to delete are gone). These all still describe current behavior. What should I do with them?</p>
+<ul>
+<li>Reword, keep all (Recommended)</li>
+<li>Delete the named blocks</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;The Comments section of plans/view.md doesn't match src/wrapper.c anymore (#151 rewrote them). The header above r_wrap() now explains MARK_NOT_MUTABLE() and the `x + y + 1` reuse case, the unwrap comment ends at &quot;individual user of `x`.&quot;, and wrapper_duplicate() only has the accurate &quot;Powers `Rf_duplicate()`...&quot; comment (the two lines the plan names to delete are gone). These all still describe current behavior. What should I do with them?&quot;=&quot;Reword, keep all (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/view &amp;&amp; Rscript -e &quot;devtools::test(reporter = 'summary')&quot; 2&gt;&amp;1 | tail…</summary>
+<pre>git checkout -b feature/view &amp;&amp; Rscript -e &quot;devtools::test(reporter = 'summary')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">Switched to a new branch 'feature/view'
+
+══ Skipped ═════════════════════════════════════════════════════════════════════
+1. integer means past 2^32 elements fall back to an int128 total ('test-reduce-mean.R:187:3') - Reason: Not testing long vectors
+
+2. integer means past 2^32 elements are exact for negative totals ('test-reduce-mean.R:197:3') - Reason: Not testing long vectors
+
+3. integer means past 2^32 elements fall back with NA ('test-reduce-mean.R:210:3') - Reason: Not testing long vectors
+
+4. errors when a logical sum has too many `TRUE` values ('test-reduce-sum.R:491:3') - Reason: Not testing long vectors
+
+5. integer sums past 2^32 elements fall back and error on overflow ('test-reduce-sum.R:498:3') - Reason: Not testing long vectors
+
+6. integer sums past 2^32 elements fall back with NA ('test-reduce-sum.R:506:3') - Reason: Not testing long vectors
+
+══ DONE ════════════════════════════════════════════════════════════════════════</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;r &lt;- as.data.frame(devtools::test(reporter = 'silent')); cat(sum(r\$nb), sum(r\$f…</summary>
+<pre>Rscript -e &quot;r &lt;- as.data.frame(devtools::test(reporter = 'silent')); cat(sum(r\$nb), sum(r\$failed), sum(r\$skipped), nrow(r), '\n')&quot; 2&gt;&amp;1 | tail -2</pre><pre class="output">ℹ Testing rray
+7689 0 6 1280</pre></details>
+<p>Baseline: 7689 expectations, 1280 tests. Now the moves and C renames.</p>
+
+<details class="tool"><summary>Bash: git mv src/wrapper.c src/view.c &amp;&amp; git mv src/wrapper.h src/view.h &amp;&amp; git mv src/decl/wrapper…</summary>
+<pre>git mv src/wrapper.c src/view.c &amp;&amp; git mv src/wrapper.h src/view.h &amp;&amp; git mv src/decl/wrapper-decl.h src/decl/view-decl.h &amp;&amp; cd tests/testthat &amp;&amp; git mv helper-wrapper.R helper-view.R &amp;&amp; git mv helper-wrapper-mutations.R helper-view-mutations.R &amp;&amp; git mv test-wrapper.R test-view.R &amp;&amp; git mv test-wrapper-mutations.R test-view-mutations.R &amp;&amp; git rm -q _snaps/wrapper.md &amp;&amp; cd ../.. &amp;&amp; rm -f src/wrapper.o &amp;&amp; git status --short</pre><pre class="output">R  src/decl/wrapper-decl.h -&gt; src/decl/view-decl.h
+R  src/wrapper.c -&gt; src/view.c
+R  src/wrapper.h -&gt; src/view.h
+D  tests/testthat/_snaps/wrapper.md
+R  tests/testthat/helper-wrapper-mutations.R -&gt; tests/testthat/helper-view-mutations.R
+R  tests/testthat/helper-wrapper.R -&gt; tests/testthat/helper-view.R
+R  tests/testthat/test-wrapper-mutations.R -&gt; tests/testthat/test-view-mutations.R
+R  tests/testthat/test-wrapper.R -&gt; tests/testthat/test-view.R</pre></details>
+<details class="tool tool-error"><summary>Bash: sed -i '' -E \</summary>
+<pre>sed -i '' -E \
+  -e 's/wrapper_/view_/g' \
+  -e 's/\bis_wrapper\b/is_view/g; s/[[:&lt;:]]is_wrapper[[:&gt;:]]/is_view/g' \
+  -e 's/[[:&lt;:]]r_init_wrapper[[:&gt;:]]/r_init_view/g' \
+  -e 's/[[:&lt;:]]ffi_test_is_wrapper[[:&gt;:]]/ffi_test_is_view/g' \
+  -e 's/[[:&lt;:]]ffi_test_wrap[[:&gt;:]]/ffi_test_view/g' \
+  -e 's/[[:&lt;:]]r_wrap[[:&gt;:]]/r_view/g' \
+  -e 's/RRAY_WRAPPER_H/RRAY_VIEW_H/g' \
+  -e 's/#include &quot;wrapper.h&quot;/#include &quot;view.h&quot;/; s/#include &quot;decl\/wrapper-decl.h&quot;/#include &quot;decl\/view-decl.h&quot;/' \
+  src/view.c src/view.h src/decl/view-decl.h src/init.c &amp;&amp; git grep -n -i wrap -- src/view.c src/view.h src/decl/view-decl.h src/init.c</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a sed in-place edit. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read src/view.c</summary>
+<pre class="output">1	#include &quot;wrapper.h&quot;
+2	
+3	#include &lt;R_ext/Altrep.h&gt;
+4	
+5	#include &quot;clone.h&quot;</pre></details>
+<details class="tool"><summary>Read src/view.h</summary>
+<pre class="output">1	#ifndef RRAY_WRAPPER_H
+2	#define RRAY_WRAPPER_H
+3	
+4	#include &quot;rlang.h&quot;
+5	
+6	r_obj* r_wrap(r_obj* x);
+7	
+8	#endif
+9	</pre></details>
+<details class="tool"><summary>Read src/decl/view-decl.h</summary>
+<pre class="output">1	static inline bool is_wrapper(r_obj* x);
+2	static inline R_altrep_class_t wrapper_class(enum r_type type);
+3	static inline r_obj* wrapper_data(r_obj* x);
+4	</pre></details>
+<details class="tool"><summary>Write src/view.h</summary>
+<pre>#ifndef RRAY_VIEW_H
+#define RRAY_VIEW_H
+
+#include &quot;rlang.h&quot;
+
+r_obj* r_view(r_obj* x);
+
+#endif</pre><pre class="output">The file ~/files/r/packages/rray/src/view.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write src/decl/view-decl.h</summary>
+<pre>static inline bool is_view(r_obj* x);
+static inline R_altrep_class_t view_class(enum r_type type);
+static inline r_obj* view_data(r_obj* x);</pre><pre class="output">The file ~/files/r/packages/rray/src/decl/view-decl.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-wrapper_</span>
+<span class="ins">+view_</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-is_wrapper(</span>
+<span class="ins">+is_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated. All occurrences were successfully replaced.</pre></details>
+<p>Expected mid-edit. Now the remaining spots in view.c by hand.</p>
+
+<details class="tool"><summary>Read src/view.c</summary>
+<pre class="output">1	#include &quot;wrapper.h&quot;
+2	
+3	#include &lt;R_ext/Altrep.h&gt;
+4	
+5	#include &quot;clone.h&quot;
+6	
+7	#include &quot;decl/wrapper-decl.h&quot;
+8	
+9	static char* package = &quot;rray&quot;;
+10	
+11	// Wrap an R object's data in a read-only ALTREP wrapper
+12	//
+13	// Useful when ONLY modifying the attributes of the new object, and NEVER the
+14	// underlying data.
+15	//
+16	// The ALTREP wrapper itself is immediately marked as immutable with
+17	// `MARK_NOT_MUTABLE()`. This is extremely important! It ensures that R won't
+18	// ever ask for a writable `DATAPTR()` without first calling `Duplicate()`.
+19	//
+20	// Note that R will VERY often use `REAL()` instead of `REAL_RO()` when it only
+21	// needs a read-only pointer. This is due to `REAL_RO()` being a newer idea that
+22	// was only introduced with ALTREP, and a lot of historical code hasn't been
+23	// ported over. Because of that, our `DATAPTR()` ALTREP methods must return a
+24	// pointer even in the `writable` case, but we expect that R (and all packages)
+25	// hold up their side of the bargain by only actually writing to this pointer
+26	// when they fully own it or when there are `NO_REFERENCES()`, which won't be
+27	// the case since we've used `MARK_NOT_MUTABLE()`. The `NO_REFERENCES()` case is
+28	// relevant for `x + y + 1` where R will attempt to reuse `x + y`'s temporary
+29	// result since there aren't any other owners. We don't want
+30	// `rray_set_dimensions(x) + 1` to look reusable!
+31	r_obj* r_wrap(r_obj* x) {
+32	  R_altrep_class_t cls = view_class(r_typeof(x));
+33	
+34	  // If `x` is a wrapper, unwrap it to gain access to the original data and wrap
+35	  // that instead. This avoids a proliferation of nested wrappers. Refcounts on
+36	  // `x` itself should also still be correct - each wrapper looks like an
+37	  // individual user of `x`.
+38	  r_obj* data = is_view(x) ? view_data(x) : x;
+39	
+40	  // Reference count on `data` is bumped when we wrap it here.
+41	  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
+42	  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
+43	
+44	  // The all important immutable marking of `out`, preventing any downstream C
+45	  // code from requesting a writable pointer without duplicating first.
+46	  MARK_NOT_MUTABLE(out);
+47	
+48	  FREE(1);
+49	  return out;
+50	}</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="del">-</span>
+<span class="del">-#include &lt;R_ext/Altrep.h&gt;</span>
+<span class="del">-</span>
+<span class="del">-#include &quot;clone.h&quot;</span>
+<span class="del">-</span>
+<span class="del">-#include &quot;decl/wrapper-decl.h&quot;</span>
+<span class="del">-</span>
+<span class="del">-static char* package = &quot;rray&quot;;</span>
+<span class="del">-</span>
+<span class="del">-// Wrap an R object's data in a read-only ALTREP wrapper</span>
+<span class="del">-//</span>
+<span class="del">-// Useful when ONLY modifying the attributes of the new object, and NEVER the</span>
+<span class="del">-// underlying data.</span>
+<span class="del">-//</span>
+<span class="del">-// The ALTREP wrapper itself is immediately</span>
+<span class="ins">+#include &quot;view.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &lt;R_ext/Altrep.h&gt;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &quot;clone.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+#include &quot;decl/view-decl.h&quot;</span>
+<span class="ins">+</span>
+<span class="ins">+static char* package = &quot;rray&quot;;</span>
+<span class="ins">+</span>
+<span class="ins">+// Create a read-only ALTREP view of an R object's data</span>
+<span class="ins">+//</span>
+<span class="ins">+// Useful when ONLY modifying the attributes of the new object, and NEVER the</span>
+<span class="ins">+// underlying data.</span>
+<span class="ins">+//</span>
+<span class="ins">+// The ALTREP view itself is immediately</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-r_obj* r_wrap(r_obj* x) {</span>
+<span class="del">-  R_altrep_class_t cls = view_class(r_typeof(x));</span>
+<span class="del">-</span>
+<span class="del">-  // If `x` is a wrapper, unwrap it to gain access to the original data and wrap</span>
+<span class="del">-  // that instead. This avoids a proliferation of nested wrappers. Refcounts on</span>
+<span class="del">-  // `x` itself should also still be correct - each wrapper looks like an</span>
+<span class="del">-  // individual user of `x`.</span>
+<span class="del">-  r_obj* data = is_view(x) ? view_data(x) : x;</span>
+<span class="del">-</span>
+<span class="del">-  // Reference count on `data` is bumped when we wrap it here.</span>
+<span class="ins">+r_obj* r_view(r_obj* x) {</span>
+<span class="ins">+  R_altrep_class_t cls = view_class(r_typeof(x));</span>
+<span class="ins">+</span>
+<span class="ins">+  // If `x` is a view, take its original data and view that instead. This</span>
+<span class="ins">+  // avoids a proliferation of nested views. Refcounts on `x` itself should also</span>
+<span class="ins">+  // still be correct - each view looks like an individual user of `x`.</span>
+<span class="ins">+  r_obj* data = is_view(x) ? view_data(x) : x;</span>
+<span class="ins">+</span>
+<span class="ins">+  // Reference count on `data` is bumped when we create the view here.</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Bash: grep -n -i 'wrap' src/view.c</summary>
+<pre>grep -n -i 'wrap' src/view.c</pre><pre class="output">104:    r_abort(&quot;Can't wrap a %s.&quot;, Rf_type2char(type));
+142:  Rprintf(&quot;&lt;wrapper&gt;\n&quot;);
+176:    r_abort(&quot;Can't request a writable dataptr to a character wrapper.&quot;);
+184:    r_abort(&quot;Can't request a writable dataptr to a list wrapper.&quot;);
+306:  r_abort(&quot;Can't set an element of a character wrapper.&quot;);
+310:  r_abort(&quot;Can't set an element of a list wrapper.&quot;);
+316:r_obj* ffi_test_wrap(r_obj* ffi_x) {
+317:  return r_wrap(ffi_x);
+322:    r_abort(&quot;`x` must be a wrapper.&quot;);
+337:    r_abort(&quot;`x` must be a wrapper.&quot;);
+539:void r_init_wrapper(DllInfo* dll) {</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-Can't wrap a %s.</span>
+<span class="ins">+Can't create a view of a %s.</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-&lt;wrapper&gt;\n</span>
+<span class="ins">+&lt;view&gt;\n</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">- wrapper.&quot;);</span>
+<span class="ins">+ view.&quot;);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-r_obj* ffi_test_wrap(r_obj* ffi_x) {</span>
+<span class="del">-  return r_wrap(ffi_x);</span>
+<span class="ins">+r_obj* ffi_test_view(r_obj* ffi_x) {</span>
+<span class="ins">+  return r_view(ffi_x);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/view.c</summary>
+<pre class="diff"><span class="del">-void r_init_wrapper(DllInfo* dll) {</span>
+<span class="ins">+void r_init_view(DllInfo* dll) {</span></pre><pre class="output">The file ~/files/r/packages/rray/src/view.c has been updated successfully.</pre></details>
+<p>Now <code>init.c</code> and the eight callers.</p>
+
+<details class="tool"><summary>Read src/init.c</summary>
+<pre class="output">360	extern r_obj* ffi_rray_and(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+361	extern r_obj* ffi_rray_or(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+362	extern r_obj* ffi_rray_xor(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+363	
+364	extern r_obj* ffi_test_wrap(r_obj* ffi_x);
+365	extern r_obj* ffi_test_wrapper_data(r_obj* ffi_x);
+366	extern r_obj* ffi_test_is_wrapper(r_obj* ffi_x);
+367	extern r_obj* ffi_test_is_altrep(r_obj* ffi_x);
+368	extern r_obj* ffi_test_wrapper_read_access(r_obj* ffi_x);
+369	extern r_obj* ffi_test_wrapper_pointer_is_stable(r_obj* ffi_x);
+370	extern r_obj* ffi_test_wrapper_set_elt(r_obj* ffi_x);
+371	extern r_obj* ffi_test_rray_sum_forced_fallback(
+372	  r_obj* ffi_x,
+373	  r_obj* ffi_axes,
+374	  r_obj* ffi_na_rm,
+375	  r_obj* ffi_frame
+376	);
+377	extern r_obj* ffi_test_rray_mean_forced_fallback(
+378	  r_obj* ffi_x,
+379	  r_obj* ffi_axes,
+380	  r_obj* ffi_na_rm,
+381	  r_obj* ffi_frame
+382	);
+383	
+384	// Defined below
+385	r_obj* ffi_rray_init_library(r_obj* ffi_ns);
+386	
+387	static const R_CallMethodDef CallEntries[] = {
+388	  {&quot;ffi_rray_broadcast&quot;, (DL_FUNC) &amp;ffi_rray_broadcast, 3},
+389	  {&quot;ffi_rray_broadcast_common&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_common, 3},
+390	  {&quot;ffi_rray_if_else&quot;, (DL_FUNC) &amp;ffi_rray_if_else, 6},
+391	  {&quot;ffi_rray_index&quot;, (DL_FUNC) &amp;ffi_rray_index, 3},
+392	  {&quot;ffi_rray_as_index_array&quot;, (DL_FUNC) &amp;ffi_rray_as_index_array, 3},
+393	  {&quot;ffi_rray_extract&quot;, (DL_FUNC) &amp;ffi_rray_extract, 3},
+394	  {&quot;ffi_rray_extract_assign&quot;, (DL_FUNC) &amp;ffi_rray_extract_assign, 4},
+395	  {&quot;ffi_rray_as_extract_subscript&quot;,
+396	   (DL_FUNC) &amp;ffi_rray_as_extract_subscript,
+397	   3},
+398	  {&quot;ffi_rray_slice&quot;, (DL_FUNC) &amp;ffi_rray_slice, 3},
+399	  {&quot;ffi_rray_slice_assign&quot;, (DL_FUNC) &amp;ffi_rray_slice_assign, 4},
+400	  {&quot;ffi_rray_slice_axis&quot;, (DL_FUNC) &amp;ffi_rray_slice_axis, 4},
+401	  {&quot;ffi_rray_slice_rows&quot;, (DL_FUNC) &amp;ffi_rray_slice_rows, 3},
+402	  {&quot;ffi_rray_slice_columns&quot;, (DL_FUNC) &amp;ffi_rray_slice_columns, 3},
+403	  {&quot;ffi_rray_slice_assign_axis&quot;, (DL_FUNC) &amp;ffi_rray_slice_assign_axis, 5},
+404	  {&quot;ffi_rray_slice_assign_rows&quot;, (DL_FUNC) &amp;ffi_rray_slice_assign_rows, 4},
+405	  {&quot;ffi_rray_slice_assign_columns&quot;,
+406	   (DL_FUNC) &amp;ffi_rray_slice_assign_columns,
+407	   4},
+408	  {&quot;ffi_rray_as_slice_subscript&quot;, (DL_FUNC) &amp;ffi_rray_as_slice_subscript, 4},
+409	  {&quot;ffi_rray_size&quot;, (DL_FUNC) &amp;ffi_rray_size, 2},
+410	  {&quot;ffi_rray_dimensions&quot;, (DL_FUNC) &amp;ffi_rray_dimensions, 2},
+411	  {&quot;ffi_rray_dimensions_common&quot;, (DL_FUNC) &amp;ffi_rray_dimensions_common, 3},
+412	  {&quot;ffi_rray_dimensionality&quot;, (DL_FUNC) &amp;ffi_rray_dimensionality, 2},
+413	  {&quot;ffi_rray_names&quot;, (DL_FUNC) &amp;ffi_rray_names, 2},
+414	  {&quot;ffi_rray_titles&quot;, (DL_FUNC) &amp;ffi_rray_titles, 2},
+415	  {&quot;ffi_rray_axis_title&quot;, (DL_FUNC) &amp;ffi_rray_axis_title, 3},
+416	  {&quot;ffi_rray_set_titles&quot;, (DL_FUNC) &amp;ffi_rray_set_titles, 3},
+417	  {&quot;ffi_rray_set_axis_title&quot;, (DL_FUNC) &amp;ffi_rray_set_axis_title, 4},
+418	  {&quot;ffi_rray_axis_names&quot;, (DL_FUNC) &amp;ffi_rray_axis_names, 3},
+419	  {&quot;ffi_rray_row_names&quot;, (DL_FUNC) &amp;ffi_rray_row_names, 2},
+420	  {&quot;ffi_rray_column_names&quot;, (DL_FUNC) &amp;ffi_rray_column_names, 2},
+421	  {&quot;ffi_rray_set_names&quot;, (DL_FUNC) &amp;ffi_rray_set_names, 3},
+422	  {&quot;ffi_rray_set_axis_names&quot;, (DL_FUNC) &amp;ffi_rray_set_axis_names, 4},
+423	  {&quot;ffi_rray_set_row_names&quot;, (DL_FUNC) &amp;ffi_rray_set_row_names, 3},
+424	  {&quot;ffi_rray_set_column_names&quot;, (DL_FUNC) &amp;ffi_rray_set_column_names, 3},
+425	  {&quot;ffi_rray_broadcast_names&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names, 2},
+426	  {&quot;ffi_rray_broadcast_names2&quot;, (DL_FUNC) &amp;ffi_rray_broadcast_names2, 3},
+427	  {&quot;ffi_rray_broadcast_names_common&quot;,
+428	   (DL_FUNC) &amp;ffi_rray_broadcast_names_common,
+429	   2},
+430	  {&quot;ffi_rray_reduce_names&quot;, (DL_FUNC) &amp;ffi_rray_reduce_names, 2},
+431	  {&quot;ffi_rray_set_dimensions&quot;, (DL_FUNC) &amp;ffi_rray_set_dimensions, 3},
+432	  {&quot;ffi_rray_combine&quot;, (DL_FUNC) &amp;ffi_rray_combine, 3},
+433	  {&quot;ffi_rray_split&quot;, (DL_FUNC) &amp;ffi_rray_split, 4},
+434	  {&quot;ffi_rray_stack&quot;, (DL_FUNC) &amp;ffi_rray_stack, 3},
+435	  {&quot;ffi_rray_unstack&quot;, (DL_FUNC) &amp;ffi_rray_unstack, 3},
+436	  {&quot;ffi_rray_rep&quot;, (DL_FUNC) &amp;ffi_rray_rep, 4},
+437	  {&quot;ffi_rray_rep_each&quot;, (DL_FUNC) &amp;ffi_rray_rep_each, 4},
+438	  {&quot;ffi_rray_roll&quot;, (DL_FUNC) &amp;ffi_rray_roll, 4},
+439	  {&quot;ffi_rray_roll_each&quot;, (DL_FUNC) &amp;ffi_rray_roll_each, 4},
+440	  {&quot;ffi_rray_reverse&quot;, (DL_FUNC) &amp;ffi_rray_reverse, 3},
+441	  {&quot;ffi_rray_remove_axes&quot;, (DL_FUNC) &amp;ffi_rray_remove_axes, 3},
+442	  {&quot;ffi_rray_insert_axes&quot;, (DL_FUNC) &amp;ffi_rray_insert_axes, 3},
+443	  {&quot;ffi_rray_permute_axes&quot;, (DL_FUNC) &amp;ffi_rray_permute_axes, 3},
+444	  {&quot;ffi_rray_move_axes&quot;, (DL_FUNC) &amp;ffi_rray_move_axes, 4},
+445	  {&quot;ffi_rray_sum&quot;, (DL_FUNC) &amp;ffi_rray_sum, 4},
+446	  {&quot;ffi_rray_prod&quot;, (DL_FUNC) &amp;ffi_rray_prod, 4},
+447	  {&quot;ffi_rray_mean&quot;, (DL_FUNC) &amp;ffi_rray_mean, 4},
+448	  {&quot;ffi_rray_all&quot;, (DL_FUNC) &amp;ffi_rray_all, 4},
+449	  {&quot;ffi_rray_any&quot;, (DL_FUNC) &amp;ffi_rray_any, 4},
+450	  {&quot;ffi_rray_max&quot;, (DL_FUNC) &amp;ffi_rray_max, 4},
+451	  {&quot;ffi_rray_min&quot;, (DL_FUNC) &amp;ffi_rray_min, 4},
+452	  {&quot;ffi_rray_locate_max&quot;, (DL_FUNC) &amp;ffi_rray_locate_max, 4},
+453	  {&quot;ffi_rray_locate_min&quot;, (DL_FUNC) &amp;ffi_rray_locate_min, 4},
+454	  {&quot;ffi_rray_cumulative_all&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_all, 3},
+455	  {&quot;ffi_rray_cumulative_any&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_any, 3},
+456	  {&quot;ffi_rray_cumulative_max&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_max, 3},
+457	  {&quot;ffi_rray_cumulative_min&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_min, 3},
+458	  {&quot;ffi_rray_cumulative_prod&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_prod, 3},
+459	  {&quot;ffi_rray_cumulative_sum&quot;, (DL_FUNC) &amp;ffi_rray_cumulative_sum, 3},
+460	  {&quot;ffi_rray_ptype&quot;, (DL_FUNC) &amp;ffi_rray_ptype, 2},
+461	  {&quot;ffi_rray_ptype2&quot;, (DL_FUNC) &amp;ffi_rray_ptype2, 3},
+462	  {&quot;ffi_rray_ptype_common&quot;, (DL_FUNC) &amp;ffi_rray_ptype_common, 3},
+463	  {&quot;ffi_rray_cast&quot;, (DL_FUNC) &amp;ffi_rray_cast, 3},
+464	  {&quot;ffi_rray_cast_common&quot;, (DL_FUNC) &amp;ffi_rray_cast_common, 3},
+465	  {&quot;ffi_rray_add&quot;, (DL_FUNC) &amp;ffi_rray_add, 3},
+466	  {&quot;ffi_rray_divide&quot;, (DL_FUNC) &amp;ffi_rray_divide, 3},
+467	  {&quot;ffi_rray_exponentiate&quot;, (DL_FUNC) &amp;ffi_rray_exponentiate, 3},
+468	  {&quot;ffi_rray_multiply&quot;, (DL_FUNC) &amp;ffi_rray_multiply, 3},
+469	  {&quot;ffi_rray_subtract&quot;, (DL_FUNC) &amp;ffi_rray_subtract, 3},
+470	  {&quot;ffi_rray_pmax&quot;, (DL_FUNC) &amp;ffi_rray_pmax, 4},
+471	  {&quot;ffi_rray_pmin&quot;, (DL_FUNC) &amp;ffi_rray_pmin, 4},
+472	  {&quot;ffi_rray_equal&quot;, (DL_FUNC) &amp;ffi_rray_equal, 3},
+473	  {&quot;ffi_rray_not_equal&quot;, (DL_FUNC) &amp;ffi_rray_not_equal, 3},
+474	  {&quot;ffi_rray_greater_than&quot;, (DL_FUNC) &amp;ffi_rray_greater_than, 3},
+475	  {&quot;ffi_rray_greater_than_or_equal&quot;,
+476	   (DL_FUNC) &amp;ffi_rray_greater_than_or_equal,
+477	   3},
+478	  {&quot;ffi_rray_less_than&quot;, (DL_FUNC) &amp;ffi_rray_less_than, 3},
+479	  {&quot;ffi_rray_less_than_or_equal&quot;, (DL_FUNC) &amp;ffi_rray_less_than_or_equal, 3},
+480	  {&quot;ffi_rray_and&quot;, (DL_FUNC) &amp;ffi_rray_and, 3},
+481	  {&quot;ffi_rray_or&quot;, (DL_FUNC) &amp;ffi_rray_or, 3},
+482	  {&quot;ffi_rray_xor&quot;, (DL_FUNC) &amp;ffi_rray_xor, 3},
+483	  {&quot;ffi_test_wrap&quot;, (DL_FUNC) &amp;ffi_test_wrap, 1},
+484	  {&quot;ffi_test_wrapper_data&quot;, (DL_FUNC) &amp;ffi_test_wrapper_data, 1},
+485	  {&quot;ffi_test_is_wrapper&quot;, (DL_FUNC) &amp;ffi_test_is_wrapper, 1},
+486	  {&quot;ffi_test_is_altrep&quot;, (DL_FUNC) &amp;ffi_test_is_altrep, 1},
+487	  {&quot;ffi_test_wrapper_read_access&quot;, (DL_FUNC) &amp;ffi_test_wrapper_read_access, 1},
+488	  {&quot;ffi_test_wrapper_pointer_is_stable&quot;,
+489	   (DL_FUNC) &amp;ffi_test_wrapper_pointer_is_stable,
+490	   1},
+491	  {&quot;ffi_test_wrapper_set_elt&quot;, (DL_FUNC) &amp;ffi_test_wrapper_set_elt, 1},
+492	  {&quot;ffi_test_rray_sum_forced_fallback&quot;,
+493	   (DL_FUNC) &amp;ffi_test_rray_sum_forced_fallback,
+494	   4},
+495	  {&quot;ffi_test_rray_mean_forced_fallback&quot;,
+496	   (DL_FUNC) &amp;ffi_test_rray_mean_forced_fallback,
+497	   4},
+498	  {&quot;ffi_rray_init_library&quot;, (DL_FUNC) &amp;ffi_rray_init_library, 1},
+499	  {NULL, NULL, 0}
+500	};
+501	
+502	extern void r_init_wrapper(DllInfo* dll);
+503	
+504	void R_init_rray(DllInfo* dll) {
+505	  R_registerRoutines(dll, NULL, CallEntries, NULL, NULL);
+506	  R_useDynamicSymbols(dll, FALSE);
+507	  r_init_wrapper(dll);
+508	}
+509	</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-ffi_test_wrapper_</span>
+<span class="ins">+ffi_test_view_</span></pre><pre class="output">The file ~/files/r/packages/rray/src/init.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-ffi_test_is_wrapper</span>
+<span class="ins">+ffi_test_is_view</span></pre><pre class="output">The file ~/files/r/packages/rray/src/init.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-ffi_test_wrap</span>
+<span class="ins">+ffi_test_view</span></pre><pre class="output">The file ~/files/r/packages/rray/src/init.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/init.c</summary>
+<pre class="diff"><span class="del">-r_init_wrapper</span>
+<span class="ins">+r_init_view</span></pre><pre class="output">The file ~/files/r/packages/rray/src/init.c has been updated. All occurrences were successfully replaced.</pre></details>
+<p>Now the callers. Checking include ordering in each.</p>
+
+<details class="tool"><summary>Bash: for f in dimensionality dimensions insert-axes remove-axes names titles utils; do echo &quot;== $f…</summary>
+<pre>for f in dimensionality dimensions insert-axes remove-axes names titles utils; do echo &quot;== $f&quot;; sed -n '1,12p' src/$f.c; done</pre><pre class="output">== dimensionality
+#include &quot;dimensionality.h&quot;
+
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_dimensionality(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return r_int(rray_dimensionality(ffi_x, rray_args.x, error_call));
+}
+
+int rray_dimensionality(
+== dimensions
+#include &quot;dimensions.h&quot;
+
+#include &quot;dimensionality.h&quot;
+#include &quot;size.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/dimensions-decl.h&quot;
+
+r_obj* ffi_rray_dimensions(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_dimensions(ffi_x, rray_args.x, error_call);
+== insert-axes
+#include &quot;insert-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_insert_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_insert_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+== remove-axes
+#include &quot;remove-axes.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+r_obj* ffi_rray_remove_axes(r_obj* ffi_x, r_obj* ffi_axes, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  return rray_remove_axes(ffi_x, ffi_axes, rray_args.x, error_call);
+}
+== names
+#include &quot;names.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;dimensions.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/names-decl.h&quot;
+
+r_obj* ffi_rray_names(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+== titles
+#include &quot;titles.h&quot;
+
+#include &quot;axes.h&quot;
+#include &quot;dimensionality.h&quot;
+#include &quot;names.h&quot;
+#include &quot;utils.h&quot;
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/titles-decl.h&quot;
+
+r_obj* ffi_rray_titles(r_obj* ffi_x, r_obj* ffi_frame) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+== utils
+#include &quot;utils.h&quot;
+
+#include &lt;limits.h&gt;
+#include &lt;math.h&gt;
+
+#include &quot;wrapper.h&quot;
+
+#include &quot;decl/utils-decl.h&quot;
+
+// Normalize a vector into an array
+//
+// - Turns length into `dim`</pre></details>
+<details class="tool"><summary>Read src/dimensionality.c</summary>
+<pre class="output">1	#include &quot;dimensionality.h&quot;
+2	
+3	#include &quot;dimensions.h&quot;
+4	#include &quot;utils.h&quot;
+5	#include &quot;wrapper.h&quot;
+6	</pre></details>
+<details class="tool"><summary>Read src/dimensions.c</summary>
+<pre class="output">1	#include &quot;dimensions.h&quot;
+2	
+3	#include &quot;dimensionality.h&quot;
+4	#include &quot;size.h&quot;
+5	#include &quot;utils.h&quot;
+6	#include &quot;wrapper.h&quot;
+7	</pre></details>
+<details class="tool"><summary>Read src/insert-axes.c</summary>
+<pre class="output">1	#include &quot;insert-axes.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;utils.h&quot;
+7	#include &quot;wrapper.h&quot;
+8	</pre></details>
+<details class="tool"><summary>Read src/remove-axes.c</summary>
+<pre class="output">1	#include &quot;remove-axes.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;utils.h&quot;
+7	#include &quot;wrapper.h&quot;
+8	</pre></details>
+<details class="tool"><summary>Read src/names.c</summary>
+<pre class="output">1	#include &quot;names.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;dimensions.h&quot;
+6	#include &quot;utils.h&quot;
+7	#include &quot;wrapper.h&quot;
+8	</pre></details>
+<details class="tool"><summary>Read src/titles.c</summary>
+<pre class="output">1	#include &quot;titles.h&quot;
+2	
+3	#include &quot;axes.h&quot;
+4	#include &quot;dimensionality.h&quot;
+5	#include &quot;names.h&quot;
+6	#include &quot;utils.h&quot;
+7	#include &quot;wrapper.h&quot;
+8	</pre></details>
+<details class="tool"><summary>Read src/utils.c</summary>
+<pre class="output">1	#include &quot;utils.h&quot;
+2	
+3	#include &lt;limits.h&gt;
+4	#include &lt;math.h&gt;
+5	
+6	#include &quot;wrapper.h&quot;
+7	
+8	#include &quot;decl/utils-decl.h&quot;
+9	
+10	// Normalize a vector into an array
+11	//
+12	// - Turns length into `dim`
+13	// - Turns `names` into `dimnames`
+14	// - Clears `names`
+15	//
+16	// Since we are only modifying attributes,
+17	// we use a lightweight wrapper
+18	r_obj* vec_as_array(r_obj* x) {
+19	  if (r_dim(x) != r_null) {
+20	    return x;
+21	  }
+22	
+23	  r_obj* out = KEEP(r_wrap(x));
+24	
+25	  const r_ssize size = r_length(x);
+26	  r_obj* dimensions = r_int(r_ssize_as_integer(size));
+27	  r_attrib_poke_dim(out, dimensions);
+28	
+29	  r_obj* axis_names = r_names(x);
+30	  if (axis_names != r_null) {</pre></details>
+<details class="tool"><summary>Edit src/dimensionality.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/dimensionality.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/dimensionality.c</summary>
+<pre class="diff"><span class="del">-r_wrap(</span>
+<span class="ins">+r_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/dimensionality.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/dimensions.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/dimensions.c</summary>
+<pre class="diff"><span class="del">-r_wrap(</span>
+<span class="ins">+r_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/dimensions.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/insert-axes.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/insert-axes.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/insert-axes.c</summary>
+<pre class="diff"><span class="del">-r_wrap(</span>
+<span class="ins">+r_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/insert-axes.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/remove-axes.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/remove-axes.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/remove-axes.c</summary>
+<pre class="diff"><span class="del">-r_wrap(</span>
+<span class="ins">+r_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/remove-axes.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/names.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/names.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/names.c</summary>
+<pre class="diff"><span class="del">-r_wrap(</span>
+<span class="ins">+r_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/names.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/titles.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/titles.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/titles.c</summary>
+<pre class="diff"><span class="del">-r_wrap(</span>
+<span class="ins">+r_view(</span></pre><pre class="output">The file ~/files/r/packages/rray/src/titles.c has been updated. All occurrences were successfully replaced.</pre></details>
+<details class="tool"><summary>Edit src/utils.c</summary>
+<pre class="diff"><span class="del">-#include &quot;wrapper.h&quot;</span>
+<span class="ins">+#include &quot;view.h&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/utils.c has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/utils.c</summary>
+<pre class="diff"><span class="del">-// we use a lightweight wrapper</span>
+<span class="del">-r_obj* vec_as_array(r_obj* x) {</span>
+<span class="del">-  if (r_dim(x) != r_null) {</span>
+<span class="del">-    return x;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  r_obj* out = KEEP(r_wrap(x));</span>
+<span class="ins">+// we use a lightweight view</span>
+<span class="ins">+r_obj* vec_as_array(r_obj* x) {</span>
+<span class="ins">+  if (r_dim(x) != r_null) {</span>
+<span class="ins">+    return x;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  r_obj* out = KEEP(r_view(x));</span></pre><pre class="output">The file ~/files/r/packages/rray/src/utils.c has been updated successfully.</pre></details>
+<p>Now the R helpers and tests.</p>
+
+<details class="tool"><summary>Read tests/testthat/helper-view.R</summary>
+<pre class="output">1	wrap &lt;- function(x) {
+2	  .Call(ffi_test_wrap, x)
+3	}
+4	wrapper_data &lt;- function(x) {
+5	  .Call(ffi_test_wrapper_data, x)
+6	}
+7	is_wrapper &lt;- function(x) {
+8	  .Call(ffi_test_is_wrapper, x)
+9	}
+10	is_altrep &lt;- function(x) {
+11	  .Call(ffi_test_is_altrep, x)
+12	}
+13	wrapper_read_access &lt;- function(x) {
+14	  .Call(ffi_test_wrapper_read_access, x)
+15	}
+16	wrapper_pointer_is_stable &lt;- function(x) {
+17	  .Call(ffi_test_wrapper_pointer_is_stable, x)
+18	}
+19	wrapper_set_elt &lt;- function(x) {
+20	  .Call(ffi_test_wrapper_set_elt, x)
+21	}
+22	
+23	expect_wraps &lt;- function(w, x) {
+24	  expect_identical(obj_address(wrapper_data(w)), obj_address(x))
+25	}
+26	</pre></details>
+<details class="tool"><summary>Write tests/testthat/helper-view.R</summary>
+<pre>view &lt;- function(x) {
+  .Call(ffi_test_view, x)
+}
+view_data &lt;- function(x) {
+  .Call(ffi_test_view_data, x)
+}
+is_view &lt;- function(x) {
+  .Call(ffi_test_is_view, x)
+}
+is_altrep &lt;- function(x) {
+  .Call(ffi_test_is_altrep, x)
+}
+view_read_access &lt;- function(x) {
+  .Call(ffi_test_view_read_access, x)
+}
+view_pointer_is_stable &lt;- function(x) {
+  .Call(ffi_test_view_pointer_is_stable, x)
+}
+view_set_elt &lt;- function(x) {
+  .Call(ffi_test_view_set_elt, x)
+}
+
+expect_view_of &lt;- function(v, x) {
+  expect_identical(obj_address(view_data(v)), obj_address(x))
+}</pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/helper-view.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Read tests/testthat/helper-view-mutations.R</summary>
+<pre class="output">1	mutation_vector &lt;- function(type) {
+2	  switch(
+3	    type,</pre></details>
+<details class="tool"><summary>Bash: cd ~/files/r/packages/rray/tests/testthat &amp;&amp; grep -nP '\bw\b' helper-view-mutation…</summary>
+<pre>cd ~/files/r/packages/rray/tests/testthat &amp;&amp; grep -nP '\bw\b' helper-view-mutations.R | grep -vP 'function\(w\)' ; echo; grep -cP '\bv\b' helper-view-mutations.R test-view.R; grep -nP '\bw[12]?\b' test-view.R | wc -l</pre><pre class="output">48:    w &lt;- rray_set_dimensions(x, c(10L, 10L))
+49:    plain &lt;- unserialize(serialize(w, NULL))
+51:    expect_identical(f(w), f(plain), info = name)
+53:    expect_identical(w, plain, info = name)
+55:      obj_address(wrapper_data(w)),
+76:      saveRDS(w, path)
+89:      y &lt;- w
+94:      y &lt;- w
+99:      y &lt;- w
+104:      y &lt;- w
+109:      y &lt;- w
+114:      y &lt;- w
+119:      y &lt;- w
+124:      y &lt;- w
+129:      y &lt;- w
+135:        y &lt;- rray_set_dimensions(w, 100L)
+141:      rray_slice(rray_reverse(w, axes = 1L), 1:3, 1:2)
+149:      y &lt;- w
+283:      y &lt;- w
+288:      y &lt;- w
+305:      y &lt;- w
+310:      y &lt;- w
+
+helper-view-mutations.R:0
+test-view.R:0
+     118</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/5fa6488e-ece6-4ed0-9af8-b2f5e412…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/5fa6488e-ece6-4ed0-9af8-b2f5e4128900/scratchpad; mkdir -p $S; cat &gt; $S/rename.pl &lt;&lt;'EOF'
+my %desc = (
+  'wrapping produces an ALTREP wrapper' =&gt; 'view() produces an ALTREP view',
+  'non-wrappers are detected' =&gt; 'non-views are detected',
+  'wrapper preserves length' =&gt; 'view preserves length',
+  'wrapper preserves type' =&gt; 'view preserves type',
+  'wrapper starts with no attributes' =&gt; 'view starts with no attributes',
+  'modifying dim on wrapper does not affect original' =&gt; 'modifying dim on a view does not affect the original',
+  'wrapper starts out sharing data' =&gt; 'view starts out sharing data',
+  'read-only access to a dimensioned wrapper shares data' =&gt; 'read-only access to a dimensioned view shares data',
+  'changing a wrapper gives a plain vector' =&gt; 'changing a view gives a plain vector',
+  'a temporary wrapper is never reused as an output' =&gt; 'a temporary view is never reused as an output',
+  'wrapping an ALTREP vector shares it' =&gt; 'a view of an ALTREP vector shares it',
+  'setting an element of a character or list wrapper errors' =&gt; 'setting an element of a character or list view errors',
+  'wrapping a wrapper does not create nested wrappers' =&gt; 'a view of a view does not nest',
+  'wrapping a wrapper drops its attributes' =&gt; 'a view of a view drops its attributes',
+  'shallow duplicate of a wrapper is a plain vector' =&gt; 'shallow duplicate of a view is a plain vector',
+  &quot;duplicating a wrapper keeps the wrapper's attributes&quot; =&gt; &quot;duplicating a view keeps the view's attributes&quot;,
+  'deep copy via c() produces a regular non-wrapper vector' =&gt; 'deep copy via c() produces a plain vector',
+  'serialization round-trips wrapper to plain vector' =&gt; 'serialization round-trips a view to a plain vector',
+  'wrapper works with zero-length vectors' =&gt; 'view works with zero-length vectors',
+  'rray_set_dimensions returns a wrapper' =&gt; 'rray_set_dimensions returns a view',
+  'rray_set_dimensions wrapper shares the underlying data' =&gt; 'rray_set_dimensions view shares the underlying data',
+  'wrapper preserves NAs' =&gt; 'view preserves NAs',
+  'subsetting a wrapper does not produce a wrapper' =&gt; 'subsetting a view does not produce a view',
+  'subsetting a wrapper works' =&gt; 'subsetting a view works',
+  'wrappers of ALTREP integers are never mutated' =&gt; 'views of ALTREP integers are never mutated',
+  'wrappers of ALTREP characters are never mutated' =&gt; 'views of ALTREP characters are never mutated',
+);
+while (&lt;&gt;) {
+  if (/^test_that\(&quot;(.*)&quot;, \{$/) {
+    my $d = $1;
+    if (exists $desc{$d}) { $d = $desc{$d}; }
+    elsif ($d =~ /^wrapper provides read access to (\w+) data$/) { $d = &quot;view provides read access to $1 data&quot;; }
+    elsif ($d =~ /^(\w+) wrappers are never mutated$/) { $d = &quot;$1 views are never mutated&quot;; }
+    $_ = &quot;test_that(\&quot;$d\&quot;, {\n&quot;;
+  }
+  s/^# wrap\(\) basics$/# view() basics/;
+  s/^# Wrapping a wrapper$/# A view of a view/;
+  s/\bexpect_wraps\b/expect_view_of/g;
+  s/\bis_wrapper\b/is_view/g;
+  s/\bwrapper_(data|read_access|pointer_is_stable|set_elt)\b/view_$1/g;
+  s/\bwrap\(/view(/g;
+  s/\bw([12]?)\b/v$1/g;
+  print;
+}
+EOF
+cd ~/files/r/packages/rray/tests/testthat &amp;&amp; for f in helper-view-mutations test-view test-view-mutations; do perl $S/rename.pl $f.R &gt; $S/$f.R; done; for f in helper-view-mutations test-view test-view-mutations; do echo &quot;=== $f&quot;; diff $f.R $S/$f.R | grep '^&gt;' | grep -v 'function(v)' ; done; grep -n -i wrap $S/*.R</pre><pre class="output">=== helper-view-mutations
+&gt;     v &lt;- rray_set_dimensions(x, c(10L, 10L))
+&gt;     plain &lt;- unserialize(serialize(v, NULL))
+&gt;     expect_identical(f(v), f(plain), info = name)
+&gt;     expect_identical(v, plain, info = name)
+&gt;       obj_address(view_data(v)),
+&gt;       saveRDS(v, path)
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;         y &lt;- rray_set_dimensions(v, 100L)
+&gt;       rray_slice(rray_reverse(v, axes = 1L), 1:3, 1:2)
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+&gt;       y &lt;- v
+=== test-view
+&gt; # view() basics
+&gt; test_that(&quot;view() produces an ALTREP view&quot;, {
+&gt;   expect_true(is_view(view(1L)))
+&gt;   expect_true(is_view(view(1)))
+&gt;   expect_true(is_view(view(&quot;a&quot;)))
+&gt;   expect_true(is_view(view(TRUE)))
+&gt;   expect_true(is_view(view(1i)))
+&gt;   expect_true(is_view(view(as.raw(1))))
+&gt;   expect_true(is_view(view(list(1))))
+&gt; test_that(&quot;non-views are detected&quot;, {
+&gt;   expect_false(is_view(1L))
+&gt;   expect_false(is_view(1))
+&gt;   expect_false(is_view(&quot;a&quot;))
+&gt;   expect_false(is_view(TRUE))
+&gt;   expect_false(is_view(NULL))
+&gt; test_that(&quot;view preserves length&quot;, {
+&gt;   expect_length(view(1:5), 5L)
+&gt;   expect_length(view(c(1.5, 2.5, 3.5)), 3L)
+&gt;   expect_length(view(c(&quot;a&quot;, &quot;b&quot;)), 2L)
+&gt;   expect_length(view(c(TRUE, FALSE, TRUE)), 3L)
+&gt;   expect_length(view(complex(3)), 3L)
+&gt;   expect_length(view(raw(4)), 4L)
+&gt;   expect_length(view(list(1, 2)), 2L)
+&gt; test_that(&quot;view preserves type&quot;, {
+&gt;   expect_type(view(1L), &quot;integer&quot;)
+&gt;   expect_type(view(1), &quot;double&quot;)
+&gt;   expect_type(view(&quot;a&quot;), &quot;character&quot;)
+&gt;   expect_type(view(TRUE), &quot;logical&quot;)
+&gt;   expect_type(view(1i), &quot;complex&quot;)
+&gt;   expect_type(view(as.raw(1)), &quot;raw&quot;)
+&gt;   expect_type(view(list(1)), &quot;list&quot;)
+&gt; test_that(&quot;view starts with no attributes&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_null(attributes(v))
+&gt;   expect_view_of(v, x)
+&gt; test_that(&quot;modifying dim on a view does not affect the original&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   dim(v) &lt;- c(3L, 2L)
+&gt;   expect_identical(dim(v), c(3L, 2L))
+&gt; test_that(&quot;view provides read access to integer data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[1], 1L)
+&gt;   expect_identical(v[2:4], 2:4)
+&gt; test_that(&quot;view provides read access to double data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[1], 1.5)
+&gt;   expect_identical(v[3], 3.5)
+&gt; test_that(&quot;view provides read access to logical data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[1], TRUE)
+&gt;   expect_identical(v[2:3], c(FALSE, NA))
+&gt; test_that(&quot;view provides read access to complex data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[1], 1 + 2i)
+&gt;   expect_identical(v[2], 3 + 4i)
+&gt; test_that(&quot;view provides read access to raw data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[1], as.raw(1))
+&gt;   expect_identical(v[2:3], as.raw(c(2, 3)))
+&gt; test_that(&quot;view provides read access to character data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[1], &quot;a&quot;)
+&gt;   expect_identical(v[3], &quot;c&quot;)
+&gt; test_that(&quot;view provides read access to list data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(v[[1]], &quot;a&quot;)
+&gt;   expect_identical(v[2:3], list(1L, TRUE))
+&gt; test_that(&quot;view starts out sharing data&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_view_of(v, x)
+&gt; test_that(&quot;read-only access to a dimensioned view shares data&quot;, {
+&gt;     v &lt;- rray_set_dimensions(x, c(1L, 2L))
+&gt;     expect_identical(view_read_access(v), TRUE)
+&gt;     expect_view_of(v, x)
+&gt;     v &lt;- view(x)
+&gt;     expect_identical(view_pointer_is_stable(v), TRUE)
+&gt;     expect_view_of(v, x)
+&gt; test_that(&quot;changing a view gives a plain vector&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- 99L
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[1], 99L)
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- 99
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[1], 99)
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- FALSE
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[1], FALSE)
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- 99 + 0i
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[1], 99 + 0i)
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- as.raw(99)
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[1], as.raw(99))
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- &quot;z&quot;
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[1], &quot;z&quot;)
+&gt;   v &lt;- view(x)
+&gt;   v[[1]] &lt;- &quot;z&quot;
+&gt;   expect_identical(is_view(v), FALSE)
+&gt;   expect_identical(v[[1]], &quot;z&quot;)
+&gt;   v &lt;- view(x)
+&gt;   v[1] &lt;- 10L
+&gt;   address &lt;- obj_address(v)
+&gt;   v[2] &lt;- 20L
+&gt;   expect_identical(obj_address(v), address)
+&gt;   expect_identical(v, c(10L, 20L, 3L))
+&gt;   v &lt;- view(x)
+&gt; 
+&gt;   v[1] &lt;- list(10L)
+&gt;   address &lt;- obj_address(v)
+&gt;   v[2] &lt;- list(20L)
+&gt;   expect_identical(obj_address(v), address)
+&gt;   expect_identical(v, list(10L, 20L, 3L))
+&gt; test_that(&quot;a temporary view is never reused as an output&quot;, {
+&gt; test_that(&quot;a view of an ALTREP vector shares it&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   expect_identical(is_altrep(view_data(v)), TRUE)
+&gt;   expect_view_of(v, x)
+&gt;   expect_identical(v, 1:100)
+&gt; test_that(&quot;setting an element of a character or list view errors&quot;, {
+&gt;     view_set_elt(view(c(&quot;a&quot;, &quot;b&quot;)))
+&gt;     view_set_elt(view(list(1, 2)))
+&gt; # A view of a view
+&gt; test_that(&quot;a view of a view does not nest&quot;, {
+&gt;   v1 &lt;- view(x)
+&gt;   v2 &lt;- view(v1)
+&gt;   expect_identical(is_view(view_data(v2)), FALSE)
+&gt;   expect_view_of(v1, x)
+&gt;   expect_view_of(v2, x)
+&gt; test_that(&quot;a view of a view drops its attributes&quot;, {
+&gt;   v1 &lt;- rray_set_dimensions(x, c(2L, 2L))
+&gt;   v2 &lt;- view(v1)
+&gt;   expect_null(attributes(v2))
+&gt;   expect_identical(dim(v1), c(2L, 2L))
+&gt;   expect_view_of(v2, x)
+&gt; test_that(&quot;shallow duplicate of a view is a plain vector&quot;, {
+&gt;   v &lt;- view(x)
+&gt;   v2 &lt;- v
+&gt;   dim(v2) &lt;- c(1L, 3L)
+&gt;   expect_identical(is_view(v2), FALSE)
+&gt;   expect_identical(v2, array(1:3, c(1L, 3L)))
+&gt;   expect_null(dim(v))
+&gt;   expect_view_of(v, x)
+&gt; test_that(&quot;duplicating a view keeps the view's attributes&quot;, {
+&gt;   v &lt;- rray_set_dimensions(x, c(3L, 2L))
+&gt;   expect_view_of(v, x)
+&gt;   shallow &lt;- rlang::duplicate(v, shallow = TRUE)
+&gt;   expect_identical(is_view(shallow), FALSE)
+&gt;   deep &lt;- rlang::duplicate(v, shallow = FALSE)
+&gt;   expect_identical(is_view(deep), FALSE)
+&gt;   expect_identical(attributes(v), attributes(expected))
+&gt; test_that(&quot;deep copy via c() produces a plain vector&quot;, {
+&gt;   v &lt;- view(1:3)
+&gt;   d &lt;- c(v)
+&gt;   expect_false(is_view(d))
+&gt; test_that(&quot;serialization round-trips a view to a plain vector&quot;, {
+&gt;   v &lt;- rray_set_dimensions(1:5, 5L)
+&gt;   expect_identical(is_view(v), TRUE)
+&gt;   rt &lt;- unserialize(serialize(v, NULL))
+&gt;   expect_identical(is_view(rt), FALSE)
+&gt;     v &lt;- view(x)
+&gt;     rt &lt;- unserialize(serialize(v, NULL))
+&gt;     expect_false(is_view(rt))
+&gt; test_that(&quot;view works with zero-length vectors&quot;, {
+&gt;   expect_true(is_view(view(integer())))
+&gt;   expect_true(is_view(view(double())))
+&gt;   expect_true(is_view(view(character())))
+&gt;   expect_true(is_view(view(logical())))
+&gt;   expect_true(is_view(view(complex())))
+&gt;   expect_true(is_view(view(raw())))</pre><p class="cut">43 more lines cut</p></details>
+<p>The transformed output reads correctly. Writing the files through the Write tool, then diffing against the generated copies to confirm they match.</p>
+
+<details class="tool"><summary>Read tests/testthat/test-view-mutations.R</summary>
+<pre class="output">1	test_that(&quot;logical wrappers are never mutated&quot;, {
+2	  expect_no_mutation(&quot;logical&quot;)
+3	})
+4	
+5	test_that(&quot;integer wrappers are never mutated&quot;, {
+6	  expect_no_mutation(&quot;integer&quot;)
+7	})
+8	
+9	test_that(&quot;double wrappers are never mutated&quot;, {
+10	  expect_no_mutation(&quot;double&quot;)
+11	})
+12	
+13	test_that(&quot;complex wrappers are never mutated&quot;, {
+14	  expect_no_mutation(&quot;complex&quot;)
+15	})
+16	
+17	test_that(&quot;raw wrappers are never mutated&quot;, {
+18	  expect_no_mutation(&quot;raw&quot;)
+19	})
+20	
+21	test_that(&quot;character wrappers are never mutated&quot;, {
+22	  expect_no_mutation(&quot;character&quot;)
+23	})
+24	
+25	test_that(&quot;list wrappers are never mutated&quot;, {
+26	  expect_no_mutation(&quot;list&quot;)
+27	})
+28	
+29	test_that(&quot;wrappers of ALTREP integers are never mutated&quot;, {
+30	  x &lt;- mutation_vector(&quot;altrep_integer&quot;)
+31	  expect_identical(is_altrep(x), TRUE)
+32	  expect_no_mutation(&quot;altrep_integer&quot;)
+33	})
+34	
+35	test_that(&quot;wrappers of ALTREP characters are never mutated&quot;, {
+36	  x &lt;- mutation_vector(&quot;altrep_character&quot;)
+37	  expect_identical(is_altrep(x), TRUE)
+38	  expect_no_mutation(&quot;altrep_character&quot;)
+39	})
+40	</pre></details>
+<details class="tool"><summary>Read tests/testthat/test-view.R</summary>
+<pre class="output">1	# ------------------------------------------------------------------------------
+2	# wrap() basics
+3	</pre></details>
+<details class="tool"><summary>Read tests/testthat/helper-view-mutations.R</summary>
+<pre class="output">38	
+39	expect_no_mutation &lt;- function(type) {
+40	  cases &lt;- mutation_cases(type)
+41	
+42	  for (name in names(cases)) {
+43	    f &lt;- cases[[name]]
+44	
+45	    x &lt;- mutation_vector(type)
+46	    x_before &lt;- unserialize(serialize(x, NULL))
+47	
+48	    w &lt;- rray_set_dimensions(x, c(10L, 10L))
+49	    plain &lt;- unserialize(serialize(w, NULL))
+50	
+51	    expect_identical(f(w), f(plain), info = name)
+52	    expect_identical(x, x_before, info = name)
+53	    expect_identical(w, plain, info = name)
+54	    expect_identical(
+55	      obj_address(wrapper_data(w)),
+56	      obj_address(x),
+57	      info = name
+58	    )
+59	  }
+60	}
+61	
+62	mutation_cases_any &lt;- function() {
+63	  list(
+64	    print = function(w) utils::capture.output(print(w)),
+65	    format = function(w) format(w),
+66	    str = function(w) utils::capture.output(utils::str(w)),
+67	    summary = function(w) summary(w),</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-view-mutations.R</summary>
+<pre class="diff"><span class="del">-wrappers</span>
+<span class="ins">+views</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-view-mutations.R has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Write tests/testthat/helper-view-mutations.R</summary>
+<pre>mutation_vector &lt;- function(type) {
+  switch(
+    type,
+    logical = rep(c(TRUE, FALSE, NA, TRUE), 25L),
+    integer = 1:100 + 0L,
+    double = as.double(1:100) + 0.5,
+    complex = complex(real = 1:100, imaginary = 100:1),
+    raw = as.raw(1:100),
+    character = paste0(&quot;s&quot;, 1:100),
+    list = as.list(1:100 + 0L),
+    altrep_integer = 1:100,
+    altrep_character = as.character(1:100)
+  )
+}
+
+mutation_cases &lt;- function(type) {
+  cases &lt;- switch(
+    type,
+    logical = mutation_cases_logical(),
+    integer = mutation_cases_numeric(),
+    double = mutation_cases_numeric(),
+    complex = mutation_cases_complex(),
+    raw = mutation_cases_raw(),
+    character = mutation_cases_character(),
+    list = mutation_cases_list(),
+    altrep_integer = mutation_cases_numeric(),
+    altrep_character = mutation_cases_character()
+  )
+
+  cases &lt;- c(cases, mutation_cases_any())
+
+  if (type != &quot;raw&quot;) {
+    cases &lt;- c(cases, mutation_cases_missing())
+  }
+
+  cases
+}
+
+expect_no_mutation &lt;- function(type) {
+  cases &lt;- mutation_cases(type)
+
+  for (name in names(cases)) {
+    f &lt;- cases[[name]]
+
+    x &lt;- mutation_vector(type)
+    x_before &lt;- unserialize(serialize(x, NULL))
+
+    v &lt;- rray_set_dimensions(x, c(10L, 10L))
+    plain &lt;- unserialize(serialize(v, NULL))
+
+    expect_identical(f(v), f(plain), info = name)
+    expect_identical(x, x_before, info = name)
+    expect_identical(v, plain, info = name)
+    expect_identical(
+      obj_address(view_data(v)),
+      obj_address(x),
+      info = name
+    )
+  }
+}
+
+mutation_cases_any &lt;- function() {
+  list(
+    print = function(v) utils::capture.output(print(v)),
+    format = function(v) format(v),
+    str = function(v) utils::capture.output(utils::str(v)),
+    summary = function(v) summary(v),
+    head = function(v) utils::head(v),
+    identical = function(v) identical(v, v),
+    all_equal = function(v) all.equal(v, v),
+    dput = function(v) utils::capture.output(dput(v)),
+    serialize = function(v) unserialize(serialize(v, NULL)),
+    rds = function(v) {
+      path &lt;- tempfile()
+      on.exit(unlink(path))
+      saveRDS(v, path)
+      readRDS(path)
+    },
+    subset = function(v) v[1:5, 2],
+    subset2 = function(v) v[[3]],
+    split = function(v) split(v, rep(1:2, 50L)),
+    match = function(v) match(v[1:3], v),
+    in_op = function(v) v[1:3] %in% v,
+    rev = function(v) rev(v),
+    as_list = function(v) as.list(v),
+    lapply = function(v) lapply(1:3, function(i) v[[i]]),
+    do_call_c = function(v) do.call(c, list(v, v)),
+    assign_elt = function(v) {
+      y &lt;- v
+      y[1] &lt;- y[2]
+      y
+    },
+    assign_elt2 = function(v) {
+      y &lt;- v
+      y[[2]] &lt;- y[[3]]
+      y
+    },
+    assign_all = function(v) {
+      y &lt;- v
+      y[] &lt;- y[1]
+      y
+    },
+    assign_dim = function(v) {
+      y &lt;- v
+      dim(y) &lt;- c(20L, 5L)
+      y
+    },
+    assign_dim_null = function(v) {
+      y &lt;- v
+      dim(y) &lt;- NULL
+      y
+    },
+    assign_dimnames = function(v) {
+      y &lt;- v
+      dimnames(y) &lt;- list(letters[1:10], LETTERS[1:10])
+      y
+    },
+    assign_attr = function(v) {
+      y &lt;- v
+      attr(y, &quot;foo&quot;) &lt;- 1
+      y
+    },
+    assign_class = function(v) {
+      y &lt;- v
+      class(y) &lt;- &quot;foo&quot;
+      unclass(y)
+    },
+    assign_diag = function(v) {
+      y &lt;- v
+      diag(y) &lt;- y[1]
+      y
+    },
+    single_binding = function(v) {
+      local({
+        y &lt;- rray_set_dimensions(v, 100L)
+        y[1] &lt;- y[2]
+        y
+      })
+    },
+    rray = function(v) {
+      rray_slice(rray_reverse(v, axes = 1L), 1:3, 1:2)
+    }
+  )
+}
+
+mutation_cases_missing &lt;- function() {
+  list(
+    assign_is_na = function(v) {
+      y &lt;- v
+      is.na(y) &lt;- 3
+      y
+    }
+  )
+}
+
+mutation_cases_numeric &lt;- function() {
+  list(
+    plus = function(v) v + 1,
+    plus_rev = function(v) 1 + v,
+    times_self = function(v) v * v,
+    negate = function(v) -v,
+    power = function(v) v^2,
+    modulo = function(v) v %% 3,
+    int_divide = function(v) v %/% 3,
+    equal = function(v) v == 1,
+    temporary = function(v) (v + 0) + 1,
+    abs = function(v) abs(v),
+    sqrt = function(v) sqrt(abs(v)),
+    exp = function(v) exp(v / 1000),
+    round = function(v) round(v),
+    floor = function(v) floor(v),
+    sum = function(v) sum(v),
+    mean = function(v) mean(v),
+    range = function(v) range(v),
+    var = function(v) stats::var(as.vector(v)),
+    median = function(v) stats::median(v),
+    quantile = function(v) stats::quantile(v),
+    cumsum = function(v) cumsum(v),
+    cumprod = function(v) cumprod(v / 100),
+    cummax = function(v) cummax(v),
+    sort = function(v) sort(v),
+    sort_radix = function(v) sort(v, method = &quot;radix&quot;),
+    sort_partial = function(v) sort(as.vector(v), partial = 5),
+    order = function(v) order(v),
+    rank = function(v) rank(v),
+    unique = function(v) unique(as.vector(v)),
+    duplicated = function(v) duplicated(v),
+    table = function(v) table(v),
+    which_max = function(v) which.max(v),
+    find_interval = function(v) findInterval(as.vector(v), c(0, 50, 100)),
+    cut = function(v) cut(v, 3),
+    rle = function(v) rle(as.vector(v)),
+    is_na = function(v) is.na(v),
+    any_na = function(v) anyNA(v),
+    transpose = function(v) t(v),
+    aperm = function(v) aperm(v),
+    matrix_multiply = function(v) v %*% v,
+    crossprod = function(v) crossprod(v),
+    solve = function(v) solve(v + diag(1000, 10)),
+    qr = function(v) qr(v),</pre><p class="cut">115 more lines cut</p><pre class="output">The file ~/files/r/packages/rray/tests/testthat/helper-view-mutations.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>Now <code>test-view.R</code>.</p>
+
+<details class="tool"><summary>Write tests/testthat/test-view.R</summary>
+<pre># ------------------------------------------------------------------------------
+# view() basics
+
+test_that(&quot;view() produces an ALTREP view&quot;, {
+  expect_true(is_view(view(1L)))
+  expect_true(is_view(view(1)))
+  expect_true(is_view(view(&quot;a&quot;)))
+  expect_true(is_view(view(TRUE)))
+  expect_true(is_view(view(1i)))
+  expect_true(is_view(view(as.raw(1))))
+  expect_true(is_view(view(list(1))))
+})
+
+test_that(&quot;non-views are detected&quot;, {
+  expect_false(is_view(1L))
+  expect_false(is_view(1))
+  expect_false(is_view(&quot;a&quot;))
+  expect_false(is_view(TRUE))
+  expect_false(is_view(NULL))
+})
+
+test_that(&quot;view preserves length&quot;, {
+  expect_length(view(1:5), 5L)
+  expect_length(view(c(1.5, 2.5, 3.5)), 3L)
+  expect_length(view(c(&quot;a&quot;, &quot;b&quot;)), 2L)
+  expect_length(view(c(TRUE, FALSE, TRUE)), 3L)
+  expect_length(view(complex(3)), 3L)
+  expect_length(view(raw(4)), 4L)
+  expect_length(view(list(1, 2)), 2L)
+})
+
+test_that(&quot;view preserves type&quot;, {
+  expect_type(view(1L), &quot;integer&quot;)
+  expect_type(view(1), &quot;double&quot;)
+  expect_type(view(&quot;a&quot;), &quot;character&quot;)
+  expect_type(view(TRUE), &quot;logical&quot;)
+  expect_type(view(1i), &quot;complex&quot;)
+  expect_type(view(as.raw(1)), &quot;raw&quot;)
+  expect_type(view(list(1)), &quot;list&quot;)
+})
+
+# ------------------------------------------------------------------------------
+# Attributes
+
+test_that(&quot;view starts with no attributes&quot;, {
+  x &lt;- array(1:4, c(2L, 2L), dimnames = list(c(&quot;a&quot;, &quot;b&quot;), NULL))
+  attr(x, &quot;foo&quot;) &lt;- 1
+  v &lt;- view(x)
+  expect_null(attributes(v))
+  expect_view_of(v, x)
+})
+
+test_that(&quot;modifying dim on a view does not affect the original&quot;, {
+  x &lt;- array(1:6, c(2L, 3L))
+  v &lt;- view(x)
+  dim(v) &lt;- c(3L, 2L)
+  expect_identical(dim(x), c(2L, 3L))
+  expect_identical(dim(v), c(3L, 2L))
+})
+
+# ------------------------------------------------------------------------------
+# Read access
+
+test_that(&quot;view provides read access to integer data&quot;, {
+  x &lt;- 1:5
+  v &lt;- view(x)
+  expect_identical(v[1], 1L)
+  expect_identical(v[2:4], 2:4)
+})
+
+test_that(&quot;view provides read access to double data&quot;, {
+  x &lt;- c(1.5, 2.5, 3.5)
+  v &lt;- view(x)
+  expect_identical(v[1], 1.5)
+  expect_identical(v[3], 3.5)
+})
+
+test_that(&quot;view provides read access to logical data&quot;, {
+  x &lt;- c(TRUE, FALSE, NA)
+  v &lt;- view(x)
+  expect_identical(v[1], TRUE)
+  expect_identical(v[2:3], c(FALSE, NA))
+})
+
+test_that(&quot;view provides read access to complex data&quot;, {
+  x &lt;- c(1 + 2i, 3 + 4i)
+  v &lt;- view(x)
+  expect_identical(v[1], 1 + 2i)
+  expect_identical(v[2], 3 + 4i)
+})
+
+test_that(&quot;view provides read access to raw data&quot;, {
+  x &lt;- as.raw(1:3)
+  v &lt;- view(x)
+  expect_identical(v[1], as.raw(1))
+  expect_identical(v[2:3], as.raw(c(2, 3)))
+})
+
+test_that(&quot;view provides read access to character data&quot;, {
+  x &lt;- c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)
+  v &lt;- view(x)
+  expect_identical(v[1], &quot;a&quot;)
+  expect_identical(v[3], &quot;c&quot;)
+})
+
+test_that(&quot;view provides read access to list data&quot;, {
+  x &lt;- list(&quot;a&quot;, 1L, TRUE)
+  v &lt;- view(x)
+  expect_identical(v[[1]], &quot;a&quot;)
+  expect_identical(v[2:3], list(1L, TRUE))
+})
+
+# ------------------------------------------------------------------------------
+# Ownership
+
+test_that(&quot;view starts out sharing data&quot;, {
+  x &lt;- 1:3
+  v &lt;- view(x)
+  expect_view_of(v, x)
+})
+
+test_that(&quot;read-only access to a dimensioned view shares data&quot;, {
+  xs &lt;- list(
+    c(TRUE, FALSE),
+    c(1L, 2L),
+    c(1.5, 2.5),
+    c(1 + 2i, 3 + 4i)
+  )
+
+  for (x in xs) {
+    v &lt;- rray_set_dimensions(x, c(1L, 2L))
+
+    expect_identical(view_read_access(v), TRUE)
+    expect_view_of(v, x)
+  }
+})
+
+test_that(&quot;a read-only pointer stays valid after a writable request&quot;, {
+  xs &lt;- list(
+    c(TRUE, FALSE),
+    c(1L, 2L),
+    c(1.5, 2.5),
+    c(1 + 2i, 3 + 4i),
+    as.raw(c(1, 2)),
+    c(&quot;a&quot;, &quot;b&quot;),
+    list(1, &quot;a&quot;)
+  )
+
+  for (x in xs) {
+    x_before &lt;- unserialize(serialize(x, NULL))
+    v &lt;- view(x)
+
+    expect_identical(view_pointer_is_stable(v), TRUE)
+    expect_view_of(v, x)
+    expect_identical(x, x_before)
+  }
+})
+
+test_that(&quot;changing a view gives a plain vector&quot;, {
+  x &lt;- 1:3
+  v &lt;- view(x)
+  v[1] &lt;- 99L
+  expect_identical(is_view(v), FALSE)
+  expect_identical(v[1], 99L)
+  expect_identical(x, 1:3)
+
+  x &lt;- c(1, 2, 3)
+  v &lt;- view(x)
+  v[1] &lt;- 99
+  expect_identical(is_view(v), FALSE)
+  expect_identical(v[1], 99)
+  expect_identical(x, c(1, 2, 3))
+
+  x &lt;- c(TRUE, FALSE, TRUE)
+  v &lt;- view(x)
+  v[1] &lt;- FALSE
+  expect_identical(is_view(v), FALSE)
+  expect_identical(v[1], FALSE)
+  expect_identical(x, c(TRUE, FALSE, TRUE))
+
+  x &lt;- c(1 + 0i, 2 + 0i)
+  v &lt;- view(x)
+  v[1] &lt;- 99 + 0i
+  expect_identical(is_view(v), FALSE)
+  expect_identical(v[1], 99 + 0i)
+  expect_identical(x, c(1 + 0i, 2 + 0i))
+
+  x &lt;- as.raw(1:3)
+  v &lt;- view(x)
+  v[1] &lt;- as.raw(99)
+  expect_identical(is_view(v), FALSE)
+  expect_identical(v[1], as.raw(99))
+  expect_identical(x, as.raw(1:3))
+
+  x &lt;- c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;)
+  v &lt;- view(x)
+  v[1] &lt;- &quot;z&quot;
+  expect_identical(is_view(v), FALSE)
+  expect_identical(v[1], &quot;z&quot;)
+  expect_identical(x, c(&quot;a&quot;, &quot;b&quot;, &quot;c&quot;))</pre><p class="cut">238 more lines cut</p><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-view.R has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/5fa6488e-ece6-4ed0-9af8-b2f5e412…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/5fa6488e-ece6-4ed0-9af8-b2f5e4128900/scratchpad; cd ~/files/r/packages/rray &amp;&amp; for f in helper-view-mutations test-view test-view-mutations; do diff -q tests/testthat/$f.R $S/$f.R &amp;&amp; echo &quot;$f identical&quot;; done; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; git status --short &amp;&amp; git grep -n -i wrap -- ':!src/rlang' ':!plans'</pre><pre class="output">helper-view-mutations identical
+test-view identical
+test-view-mutations identical
+RM src/decl/wrapper-decl.h -&gt; src/decl/view-decl.h
+ M src/dimensionality.c
+ M src/dimensions.c
+ M src/init.c
+ M src/insert-axes.c
+ M src/names.c
+ M src/remove-axes.c
+ M src/titles.c
+ M src/utils.c
+RM src/wrapper.c -&gt; src/view.c
+RM src/wrapper.h -&gt; src/view.h
+D  tests/testthat/_snaps/wrapper.md
+RM tests/testthat/helper-wrapper-mutations.R -&gt; tests/testthat/helper-view-mutations.R
+RM tests/testthat/helper-wrapper.R -&gt; tests/testthat/helper-view.R
+RM tests/testthat/test-wrapper-mutations.R -&gt; tests/testthat/test-view-mutations.R
+RM tests/testthat/test-wrapper.R -&gt; tests/testthat/test-view.R
+AGENTS.md:102:- FFI wrappers: `ffi_rray_{name}()` — thin SEXP-to-C bridges. Go above internal functions in the `.c` file.
+AGENTS.md:106:- FFI wrapper parameters are also prefixed, i.e. `ffi_rray_axis_names(r_obj* ffi_x, r_obj* ffi_axis, r_obj* ffi_frame)`. This frees up the unprefixed name for the converted C value.
+AGENTS.md:107:- Headers only declare internal C functions, not FFI wrappers.
+AGENTS.md:110:- Always prefer rlang's C library wrappers over raw R API (e.g., `r_globals.na_int` over `NA_INTEGER`, `r_length()` over `Rf_length()`).
+AGENTS.md:112:- Any `r_obj*` returned by a C function that allocates must be protected with `KEEP()` / `FREE()` (rlang's wrappers around `PROTECT()` / `UNPROTECT()`) if used after any further allocation could occur.
+AGENTS.md:176:- Wrap roxygen comments at 80 characters.
+src/arg.c:86:struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg) {
+src/arg.c:88:    {.parent = parent, .fill = &amp;wrapper_arg_fill, .data = (void*) arg};
+src/arg.c:92:static r_ssize wrapper_arg_fill(void* data, char* buf, r_ssize remaining) {
+src/arg.c:208:  ARG = new_wrapper_arg(NULL, #ARG);                                           \
+src/arg.c:213:  ARG = new_wrapper_arg(NULL, STR);                                            \
+src/arg.h:44:struct rray_arg new_wrapper_arg(struct rray_arg* parent, const char* arg);
+src/decl/arg-decl.h:10:static r_ssize wrapper_arg_fill(void* data, char* buf, r_ssize remaining);
+src/if-else.c:23:  struct rray_arg condition_arg = new_wrapper_arg(NULL, &quot;condition&quot;);
+src/if-else.c:24:  struct rray_arg true_arg = new_wrapper_arg(NULL, &quot;true&quot;);
+src/if-else.c:25:  struct rray_arg false_arg = new_wrapper_arg(NULL, &quot;false&quot;);
+src/if-else.c:26:  struct rray_arg missing_arg = new_wrapper_arg(NULL, &quot;missing&quot;);
+src/int-128.h:19://   unsigned value. The low part wraps at 2^64.
+src/int-128.h:20:// - Add -1 to `hi` when `y` is negative, then add 1 if `lo` wrapped.
+src/int-128.h:22:// For example, with `x = {lo = 1, hi = 0}` and `y = -1`, `lo` wraps to 0.
+tests/testthat/test-roll.R:11:test_that(&quot;shifts wrap around the dimension&quot;, {</pre></details>
+<p>The grep matches the plan's Goal list exactly. Checking what clang-format changed in <code>view.c</code>, then running tests.</p>
+
+<details class="tool"><summary>Bash: git add -A src tests &amp;&amp; git diff --cached -M --stat &amp;&amp; git diff --cached -M src/view.c | head…</summary>
+<pre>git add -A src tests &amp;&amp; git diff --cached -M --stat &amp;&amp; git diff --cached -M src/view.c | head -150</pre><pre class="output"> src/decl/view-decl.h                               |   3 +
+ src/decl/wrapper-decl.h                            |   3 -
+ src/dimensionality.c                               |   4 +-
+ src/dimensions.c                                   |   4 +-
+ src/init.c                                         |  30 +-
+ src/insert-axes.c                                  |   4 +-
+ src/names.c                                        |   6 +-
+ src/remove-axes.c                                  |   4 +-
+ src/titles.c                                       |   6 +-
+ src/utils.c                                        |   6 +-
+ src/view.c                                         | 538 ++++++++++++++++++++
+ src/view.h                                         |   8 +
+ src/wrapper.c                                      | 548 ---------------------
+ src/wrapper.h                                      |   8 -
+ tests/testthat/_snaps/wrapper.md                   |  13 -
+ tests/testthat/helper-view-mutations.R             | 315 ++++++++++++
+ tests/testthat/helper-view.R                       |  25 +
+ tests/testthat/helper-wrapper-mutations.R          | 315 ------------
+ tests/testthat/helper-wrapper.R                    |  25 -
+ ...t-wrapper-mutations.R =&gt; test-view-mutations.R} |  18 +-
+ tests/testthat/test-view.R                         | 438 ++++++++++++++++
+ tests/testthat/test-wrapper.R                      | 438 ----------------
+ 22 files changed, 1368 insertions(+), 1391 deletions(-)
+diff --git a/src/view.c b/src/view.c
+new file mode 100644
+index 0000000..c5eca73
+--- /dev/null
++++ b/src/view.c
+@@ -0,0 +1,538 @@
++#include &quot;view.h&quot;
++
++#include &lt;R_ext/Altrep.h&gt;
++
++#include &quot;clone.h&quot;
++
++#include &quot;decl/view-decl.h&quot;
++
++static char* package = &quot;rray&quot;;
++
++// Create a read-only ALTREP view of an R object's data
++//
++// Useful when ONLY modifying the attributes of the new object, and NEVER the
++// underlying data.
++//
++// The ALTREP view itself is immediately marked as immutable with
++// `MARK_NOT_MUTABLE()`. This is extremely important! It ensures that R won't
++// ever ask for a writable `DATAPTR()` without first calling `Duplicate()`.
++//
++// Note that R will VERY often use `REAL()` instead of `REAL_RO()` when it only
++// needs a read-only pointer. This is due to `REAL_RO()` being a newer idea that
++// was only introduced with ALTREP, and a lot of historical code hasn't been
++// ported over. Because of that, our `DATAPTR()` ALTREP methods must return a
++// pointer even in the `writable` case, but we expect that R (and all packages)
++// hold up their side of the bargain by only actually writing to this pointer
++// when they fully own it or when there are `NO_REFERENCES()`, which won't be
++// the case since we've used `MARK_NOT_MUTABLE()`. The `NO_REFERENCES()` case is
++// relevant for `x + y + 1` where R will attempt to reuse `x + y`'s temporary
++// result since there aren't any other owners. We don't want
++// `rray_set_dimensions(x) + 1` to look reusable!
++r_obj* r_view(r_obj* x) {
++  R_altrep_class_t cls = view_class(r_typeof(x));
++
++  // If `x` is a view, take its original data and view that instead. This
++  // avoids a proliferation of nested views. Refcounts on `x` itself should also
++  // still be correct - each view looks like an individual user of `x`.
++  r_obj* data = is_view(x) ? view_data(x) : x;
++
++  // Reference count on `data` is bumped when we create the view here.
++  // It now looks at least &quot;referenced&quot;, but not necessarily &quot;shared&quot;.
++  r_obj* out = KEEP(R_new_altrep(cls, data, r_null));
++
++  // The all important immutable marking of `out`, preventing any downstream C
++  // code from requesting a writable pointer without duplicating first.
++  MARK_NOT_MUTABLE(out);
++
++  FREE(1);
++  return out;
++}
++
++// -----------------------------------------------------------------------------
++// Class
++
++static R_altrep_class_t view_logical_class;
++static R_altrep_class_t view_integer_class;
++static R_altrep_class_t view_double_class;
++static R_altrep_class_t view_complex_class;
++static R_altrep_class_t view_raw_class;
++static R_altrep_class_t view_character_class;
++static R_altrep_class_t view_list_class;
++
++static inline bool is_view(r_obj* x) {
++  if (!ALTREP(x)) {
++    return false;
++  }
++
++  switch (r_typeof(x)) {
++  case R_TYPE_logical:
++    return R_altrep_inherits(x, view_logical_class);
++  case R_TYPE_integer:
++    return R_altrep_inherits(x, view_integer_class);
++  case R_TYPE_double:
++    return R_altrep_inherits(x, view_double_class);
++  case R_TYPE_complex:
++    return R_altrep_inherits(x, view_complex_class);
++  case R_TYPE_raw:
++    return R_altrep_inherits(x, view_raw_class);
++  case R_TYPE_character:
++    return R_altrep_inherits(x, view_character_class);
++  case R_TYPE_list:
++    return R_altrep_inherits(x, view_list_class);
++  default:
++    return false;
++  }
++}
++
++static inline R_altrep_class_t view_class(enum r_type type) {
++  switch (type) {
++  case R_TYPE_logical:
++    return view_logical_class;
++  case R_TYPE_integer:
++    return view_integer_class;
++  case R_TYPE_double:
++    return view_double_class;
++  case R_TYPE_complex:
++    return view_complex_class;
++  case R_TYPE_raw:
++    return view_raw_class;
++  case R_TYPE_character:
++    return view_character_class;
++  case R_TYPE_list:
++    return view_list_class;
++  default:
++    r_abort(&quot;Can't create a view of a %s.&quot;, Rf_type2char(type));
++  }
++}
++
++// -----------------------------------------------------------------------------
++// Data
++
++static inline r_obj* view_data(r_obj* x) {
++  return R_altrep_data1(x);
++}
++
++// -----------------------------------------------------------------------------
++// Generic
++
++static r_obj* view_serialized_state(r_obj* x) {
++  // Full serialization, lose ALTREP-ness
++  return NULL;
++}
++
++// Powers `Rf_duplicate()` and `Rf_shallow_duplicate()`
++//
++// We only need to handle the data. Base R covers the attributes for us.
++// https://github.com/wch/r-source/blob/trunk/src/main/altrep.c#L740
++static r_obj* view_duplicate(r_obj* x, Rboolean deep) {
++  if (deep) {
++    return Rf_duplicate(view_data(x));
++  } else {
++    return r_clone_data(view_data(x));
++  }
++}
++
++static Rboolean view_inspect(
++  r_obj* x,
++  int pre,
++  int deep,
++  int pvec,
++  void (*inspect_subtree)(r_obj*, int, int, int)
++) {
++  Rprintf(&quot;&lt;view&gt;\n&quot;);
++  inspect_subtree(view_data(x), pre, deep, pvec);
++  return TRUE;</pre></details>
+<details class="tool"><summary>Bash: sed -n 410,438p src/view.c; git diff --cached src/init.c</summary>
+<pre>sed -n 410,438p src/view.c; git diff --cached src/init.c</pre><pre class="output">  default:
+    r_stop_unimplemented_type(r_typeof(ffi_x));
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Initializers
+
+static void init_view_logical(DllInfo* dll) {
+  R_altrep_class_t cls = R_make_altlogical_class(&quot;view_logical&quot;, package, dll);
+  view_logical_class = cls;
+
+  R_set_altrep_Serialized_state_method(cls, view_serialized_state);
+  R_set_altrep_Duplicate_method(cls, view_duplicate);
+  R_set_altrep_Inspect_method(cls, view_inspect);
+  R_set_altrep_Length_method(cls, view_length);
+
+  R_set_altvec_Dataptr_method(cls, view_logical_dataptr);
+  R_set_altvec_Dataptr_or_null_method(cls, view_logical_dataptr_or_null);
+
+  R_set_altlogical_Elt_method(cls, view_logical_elt);
+  R_set_altlogical_Get_region_method(cls, view_logical_get_region);
+}
+
+static void init_view_integer(DllInfo* dll) {
+  R_altrep_class_t cls = R_make_altinteger_class(&quot;view_integer&quot;, package, dll);
+  view_integer_class = cls;
+
+  R_set_altrep_Serialized_state_method(cls, view_serialized_state);
+diff --git a/src/init.c b/src/init.c
+index 94ce01b..995b88d 100644
+--- a/src/init.c
++++ b/src/init.c
+@@ -361,13 +361,13 @@ extern r_obj* ffi_rray_and(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+ extern r_obj* ffi_rray_or(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+ extern r_obj* ffi_rray_xor(r_obj* ffi_x, r_obj* ffi_y, r_obj* ffi_frame);
+ 
+-extern r_obj* ffi_test_wrap(r_obj* ffi_x);
+-extern r_obj* ffi_test_wrapper_data(r_obj* ffi_x);
+-extern r_obj* ffi_test_is_wrapper(r_obj* ffi_x);
++extern r_obj* ffi_test_view(r_obj* ffi_x);
++extern r_obj* ffi_test_view_data(r_obj* ffi_x);
++extern r_obj* ffi_test_is_view(r_obj* ffi_x);
+ extern r_obj* ffi_test_is_altrep(r_obj* ffi_x);
+-extern r_obj* ffi_test_wrapper_read_access(r_obj* ffi_x);
+-extern r_obj* ffi_test_wrapper_pointer_is_stable(r_obj* ffi_x);
+-extern r_obj* ffi_test_wrapper_set_elt(r_obj* ffi_x);
++extern r_obj* ffi_test_view_read_access(r_obj* ffi_x);
++extern r_obj* ffi_test_view_pointer_is_stable(r_obj* ffi_x);
++extern r_obj* ffi_test_view_set_elt(r_obj* ffi_x);
+ extern r_obj* ffi_test_rray_sum_forced_fallback(
+   r_obj* ffi_x,
+   r_obj* ffi_axes,
+@@ -480,15 +480,15 @@ static const R_CallMethodDef CallEntries[] = {
+   {&quot;ffi_rray_and&quot;, (DL_FUNC) &amp;ffi_rray_and, 3},
+   {&quot;ffi_rray_or&quot;, (DL_FUNC) &amp;ffi_rray_or, 3},
+   {&quot;ffi_rray_xor&quot;, (DL_FUNC) &amp;ffi_rray_xor, 3},
+-  {&quot;ffi_test_wrap&quot;, (DL_FUNC) &amp;ffi_test_wrap, 1},
+-  {&quot;ffi_test_wrapper_data&quot;, (DL_FUNC) &amp;ffi_test_wrapper_data, 1},
+-  {&quot;ffi_test_is_wrapper&quot;, (DL_FUNC) &amp;ffi_test_is_wrapper, 1},
++  {&quot;ffi_test_view&quot;, (DL_FUNC) &amp;ffi_test_view, 1},
++  {&quot;ffi_test_view_data&quot;, (DL_FUNC) &amp;ffi_test_view_data, 1},
++  {&quot;ffi_test_is_view&quot;, (DL_FUNC) &amp;ffi_test_is_view, 1},
+   {&quot;ffi_test_is_altrep&quot;, (DL_FUNC) &amp;ffi_test_is_altrep, 1},
+-  {&quot;ffi_test_wrapper_read_access&quot;, (DL_FUNC) &amp;ffi_test_wrapper_read_access, 1},
+-  {&quot;ffi_test_wrapper_pointer_is_stable&quot;,
+-   (DL_FUNC) &amp;ffi_test_wrapper_pointer_is_stable,
++  {&quot;ffi_test_view_read_access&quot;, (DL_FUNC) &amp;ffi_test_view_read_access, 1},
++  {&quot;ffi_test_view_pointer_is_stable&quot;,
++   (DL_FUNC) &amp;ffi_test_view_pointer_is_stable,
+    1},
+-  {&quot;ffi_test_wrapper_set_elt&quot;, (DL_FUNC) &amp;ffi_test_wrapper_set_elt, 1},
++  {&quot;ffi_test_view_set_elt&quot;, (DL_FUNC) &amp;ffi_test_view_set_elt, 1},
+   {&quot;ffi_test_rray_sum_forced_fallback&quot;,
+    (DL_FUNC) &amp;ffi_test_rray_sum_forced_fallback,
+    4},
+@@ -499,12 +499,12 @@ static const R_CallMethodDef CallEntries[] = {
+   {NULL, NULL, 0}
+ };
+ 
+-extern void r_init_wrapper(DllInfo* dll);
++extern void r_init_view(DllInfo* dll);
+ 
+ void R_init_rray(DllInfo* dll) {
+   R_registerRoutines(dll, NULL, CallEntries, NULL, NULL);
+   R_useDynamicSymbols(dll, FALSE);
+-  r_init_wrapper(dll);
++  r_init_view(dll);
+ }
+ 
+ extern void rray_init_args(r_obj* ns);</pre></details>
+<p>Good. Now the full test suite.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;r &lt;- as.data.frame(devtools::test(reporter = 'silent')); cat(sum(r\$nb), sum(r\$f…</summary>
+<pre>Rscript -e &quot;r &lt;- as.data.frame(devtools::test(reporter = 'silent')); cat(sum(r\$nb), sum(r\$failed), sum(r\$error), sum(r\$skipped), nrow(r), '\n')&quot; 2&gt;&amp;1 | tail -3; cat tests/testthat/_snaps/view.md; git status --short tests</pre><pre class="output">ℹ Testing rray
+7690 0 0 6 1280 
+# setting an element of a character or list view errors
+
+    Code
+      view_set_elt(view(c(&quot;a&quot;, &quot;b&quot;)))
+    Condition
+      Error in `view_set_elt()`:
+      ! Can't set an element of a character view.
+    Code
+      view_set_elt(view(list(1, 2)))
+    Condition
+      Error in `view_set_elt()`:
+      ! Can't set an element of a list view.
+
+D  tests/testthat/_snaps/wrapper.md
+A  tests/testthat/helper-view-mutations.R
+A  tests/testthat/helper-view.R
+D  tests/testthat/helper-wrapper-mutations.R
+D  tests/testthat/helper-wrapper.R
+R  tests/testthat/test-wrapper-mutations.R -&gt; tests/testthat/test-view-mutations.R
+A  tests/testthat/test-view.R
+D  tests/testthat/test-wrapper.R
+?? tests/testthat/_snaps/view.md</pre></details>
+<p>All green. The snapshot is new, and the expectation count is off by one (7690 vs 7689), which I'd expect from the &quot;adding new snapshot&quot; run. Re-running to confirm.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;r &lt;- as.data.frame(devtools::test(reporter = 'silent')); cat(sum(r\$nb), sum(r\$f…</summary>
+<pre>Rscript -e &quot;r &lt;- as.data.frame(devtools::test(reporter = 'silent')); cat(sum(r\$nb), sum(r\$failed), sum(r\$error), sum(r\$skipped), nrow(r), '\n')&quot; 2&gt;&amp;1 | tail -1</pre><pre class="output">7689 0 0 6 1280</pre></details>
+<p>Matches the baseline exactly. Protection pass: confirming no <code>KEEP()</code>/<code>FREE()</code> lines moved and nothing else changed beyond the renames.</p>
+
+<details class="tool"><summary>Bash: git diff --cached -M20% src | grep '^[-+]' | grep -v '^[-+][-+]' | grep -Ei 'KEEP|FREE|PROTEC…</summary>
+<pre>git diff --cached -M20% src | grep '^[-+]' | grep -v '^[-+][-+]' | grep -Ei 'KEEP|FREE|PROTECT'; echo &quot;---&quot;; git diff --cached -M20% src/view.c | grep '^[-+]' | grep -v '^[-+][-+]' | sed 's/wrapper/view/g; s/r_wrap/r_view/g; s/ffi_test_wrap(/ffi_test_view(/g' | sort | uniq -u | head -40</pre><pre class="output">-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+-  r_obj* out = KEEP(r_wrap(x));
++  r_obj* out = KEEP(r_view(x));
+---
++    const double* v_read = r_dbl_cbegin(ffi_x);
++    const double* v_write = r_dbl_begin(ffi_x);
++    const double* v_x = r_dbl_cbegin(ffi_x);
++    const int* v_read = r_int_cbegin(ffi_x);
++    const int* v_read = r_lgl_cbegin(ffi_x);
++    const int* v_write = r_int_begin(ffi_x);
++    const int* v_write = r_lgl_begin(ffi_x);
++    const int* v_x = r_int_cbegin(ffi_x);
++    const int* v_x = r_lgl_cbegin(ffi_x);
++    const r_complex elt = r_cpl_get(ffi_x, 0);
++    const r_complex* v_read = r_cpl_cbegin(ffi_x);
++    const r_complex* v_write = r_cpl_begin(ffi_x);
++    const r_complex* v_x = r_cpl_cbegin(ffi_x);
++    const void* v_read = r_raw_cbegin(ffi_x);
++    const void* v_write = r_raw_begin(ffi_x);
++    r_abort(&quot;Can't create a view of a %s.&quot;, Rf_type2char(type));
++    r_abort(&quot;Can't request a writable dataptr to a character view.&quot;);
++    r_abort(&quot;Can't request a writable dataptr to a list view.&quot;);
++    r_obj* const* v_read = r_chr_cbegin(ffi_x);
++    r_obj* const* v_read = r_list_cbegin(ffi_x);
++    r_obj* const* v_read2 = r_chr_cbegin(ffi_x);
++    r_obj* const* v_read2 = r_list_cbegin(ffi_x);
++    return (void*) r_chr_cbegin(view_data(x));
++    return (void*) r_list_cbegin(view_data(x));
++    return R_altrep_inherits(x, view_character_class);
++    return R_altrep_inherits(x, view_complex_class);
++    return R_altrep_inherits(x, view_double_class);
++    return R_altrep_inherits(x, view_integer_class);
++    return R_altrep_inherits(x, view_list_class);
++    return R_altrep_inherits(x, view_logical_class);
++    return R_altrep_inherits(x, view_raw_class);
++    return r_clone_data(view_data(x));
++    return r_lgl(v_read == v_read2 &amp;&amp; v_read == r_chr_cbegin(data));
++    return r_lgl(v_read == v_read2 &amp;&amp; v_read == r_list_cbegin(data));
++    return r_lgl(v_read == v_write &amp;&amp; v_read == r_cpl_cbegin(data));
++    return r_lgl(v_read == v_write &amp;&amp; v_read == r_dbl_cbegin(data));
++    return r_lgl(v_read == v_write &amp;&amp; v_read == r_int_cbegin(data));
++    return r_lgl(v_read == v_write &amp;&amp; v_read == r_lgl_cbegin(data));
++    return r_lgl(v_read == v_write &amp;&amp; v_read == r_raw_cbegin(data));
++    return r_lgl(v_x[0] == r_dbl_get(ffi_x, 0));</pre></details>
+<p>That check was noisy since git shows <code>view.c</code> as a new file. A cleaner check: apply the renames mechanically to the old <code>wrapper.c</code> and diff against the new <code>view.c</code>.</p>
+
+<details class="tool tool-error"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/5fa6488e-ece6-4ed0-9af8-b2f5e412…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/5fa6488e-ece6-4ed0-9af8-b2f5e4128900/scratchpad; cd ~/files/r/packages/rray &amp;&amp; git show HEAD:src/wrapper.c | perl -pe 's/wrapper_/view_/g; s/is_wrapper/is_view/g; s/\br_wrap\b/r_view/g; s/ffi_test_wrap\b/ffi_test_view/g; s/r_init_wrapper/r_init_view/g; s/&quot;wrapper\.h&quot;/&quot;view.h&quot;/; s/wrapper-decl/view-decl/' &gt; $S/expected.c &amp;&amp; cp $S/expected.c $S/expected-fmt.c &amp;&amp; clang-format -i --style=file:.clang-format $S/expected-fmt.c 2&gt;/dev/null || clang-format --assume-filename=src/x.c &lt; $S/expected.c &gt; $S/expected-fmt.c; diff $S/expected-fmt.c src/view.c</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is a shell redirect into a file. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Bash: diff &lt;(git show HEAD:src/wrapper.c | perl -pe 's/wrapper_/view_/g; s/is_wrapper/is_view/g; s/…</summary>
+<pre>diff &lt;(git show HEAD:src/wrapper.c | perl -pe 's/wrapper_/view_/g; s/is_wrapper/is_view/g; s/\br_wrap\b/r_view/g; s/ffi_test_wrap\b/ffi_test_view/g; s/r_init_wrapper/r_init_view/g; s/&quot;wrapper\.h&quot;/&quot;view.h&quot;/; s/wrapper-decl/view-decl/' | clang-format --assume-filename=src/view.c) src/view.c</pre><pre class="output">11c11
+&lt; // Wrap an R object's data in a read-only ALTREP wrapper
+---
+&gt; // Create a read-only ALTREP view of an R object's data
+16c16
+&lt; // The ALTREP wrapper itself is immediately marked as immutable with
+---
+&gt; // The ALTREP view itself is immediately marked as immutable with
+34,37c34,36
+&lt;   // If `x` is a wrapper, unwrap it to gain access to the original data and wrap
+&lt;   // that instead. This avoids a proliferation of nested wrappers. Refcounts on
+&lt;   // `x` itself should also still be correct - each wrapper looks like an
+&lt;   // individual user of `x`.
+---
+&gt;   // If `x` is a view, take its original data and view that instead. This
+&gt;   // avoids a proliferation of nested views. Refcounts on `x` itself should also
+&gt;   // still be correct - each view looks like an individual user of `x`.
+40c39
+&lt;   // Reference count on `data` is bumped when we wrap it here.
+---
+&gt;   // Reference count on `data` is bumped when we create the view here.
+105c104
+&lt;     r_abort(&quot;Can't wrap a %s.&quot;, Rf_type2char(type));
+---
+&gt;     r_abort(&quot;Can't create a view of a %s.&quot;, Rf_type2char(type));
+143c142
+&lt;   Rprintf(&quot;&lt;wrapper&gt;\n&quot;);
+---
+&gt;   Rprintf(&quot;&lt;view&gt;\n&quot;);
+177c176
+&lt;     r_abort(&quot;Can't request a writable dataptr to a character wrapper.&quot;);
+---
+&gt;     r_abort(&quot;Can't request a writable dataptr to a character view.&quot;);
+185c184
+&lt;     r_abort(&quot;Can't request a writable dataptr to a list wrapper.&quot;);
+---
+&gt;     r_abort(&quot;Can't request a writable dataptr to a list view.&quot;);
+302c301
+&lt;   r_abort(&quot;Can't set an element of a character wrapper.&quot;);
+---
+&gt;   r_abort(&quot;Can't set an element of a character view.&quot;);
+306c305
+&lt;   r_abort(&quot;Can't set an element of a list wrapper.&quot;);
+---
+&gt;   r_abort(&quot;Can't set an element of a list view.&quot;);
+318c317
+&lt;     r_abort(&quot;`x` must be a wrapper.&quot;);
+---
+&gt;     r_abort(&quot;`x` must be a view.&quot;);
+333c332
+&lt;     r_abort(&quot;`x` must be a wrapper.&quot;);
+---
+&gt;     r_abort(&quot;`x` must be a view.&quot;);</pre></details>
+<p>Only the reworded comments and the planned message changes differ. Checking <code>inspect()</code> output, whether any plan index links <code>view.md</code>, then running <code>R CMD check</code>.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::load_all(quiet = TRUE); .Internal(inspect(rray_set_dimensions(1:3, 3L))…</summary>
+<pre>Rscript -e &quot;devtools::load_all(quiet = TRUE); .Internal(inspect(rray_set_dimensions(1:3, 3L)))&quot; 2&gt;&amp;1 | tail -4; grep -rn &quot;view.md\|view\.md&quot; plans AGENTS.md README* 2&gt;/dev/null</pre><pre class="output">ATTRIB:
+  @1372480a8 02 LISTSXP g0c0 [REF(1)] 
+    TAG: @142812080 01 SYMSXP g1c0 [MARK,REF(6520),LCK,gp=0x4000] &quot;dim&quot; (has value)
+    @132e53478 13 INTSXP g0c1 [REF(65535)] (len=1, tl=0) 3
+plans/view.md:64:| `tests/testthat/_snaps/wrapper.md` | deleted, regenerated as `_snaps/view.md` |
+plans/view.md:324:      create `_snaps/view.md`. Review it: the calls read `view_set_elt(view(...))`</pre></details>
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::load_all(quiet = TRUE); .Internal(inspect(rray_set_dimensions(1:3, 3L))…</summary>
+<pre>Rscript -e &quot;devtools::load_all(quiet = TRUE); .Internal(inspect(rray_set_dimensions(1:3, 3L)))&quot; 2&gt;&amp;1 | head -3</pre><pre class="output">@143888038 13 INTSXP g0c0 [REF(65535),ATT] &lt;view&gt;
+  @143887dd0 13 INTSXP g0c0 [REF(65535)]  1 : 3 (compact)
+ATTRIB:</pre></details>
+<p>Shows <code>&lt;view&gt;</code>. Removing the plan and running <code>R CMD check</code>.</p>
+
+<details class="tool"><summary>Bash: git rm -q plans/view.md &amp;&amp; git add -A tests src &amp;&amp; Rscript -e &quot;devtools::check(quiet = TRUE)&quot;…</summary>
+<pre>git rm -q plans/view.md &amp;&amp; git add -A tests src &amp;&amp; Rscript -e &quot;devtools::check(quiet = TRUE)&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">ℹ Loading rray
+── R CMD check results ──────────────────────────────────── rray 0.0.0.9000 ────
+Duration: 1m 11.8s
+
+0 errors ✔ | 0 warnings ✔ | 0 notes ✔</pre></details>
+<p>Clean check. Committing and pushing.</p>
+
+<details class="tool"><summary>Bash: git status --short &amp;&amp; git commit -q -m &quot;Rename the ALTREP wrapper to a view&quot; &amp;&amp; git log --one…</summary>
+<pre>git status --short &amp;&amp; git commit -q -m &quot;Rename the ALTREP wrapper to a view&quot; &amp;&amp; git log --oneline -1 &amp;&amp; git push -u origin feature/view 2&gt;&amp;1 | tail -3</pre><pre class="output">D  plans/view.md
+A  src/decl/view-decl.h
+D  src/decl/wrapper-decl.h
+M  src/dimensionality.c
+M  src/dimensions.c
+M  src/init.c
+M  src/insert-axes.c
+M  src/names.c
+M  src/remove-axes.c
+M  src/titles.c
+M  src/utils.c
+A  src/view.c
+A  src/view.h
+D  src/wrapper.c
+D  src/wrapper.h
+A  tests/testthat/_snaps/view.md
+D  tests/testthat/_snaps/wrapper.md
+A  tests/testthat/helper-view-mutations.R
+A  tests/testthat/helper-view.R
+D  tests/testthat/helper-wrapper-mutations.R
+D  tests/testthat/helper-wrapper.R
+R  tests/testthat/test-wrapper-mutations.R -&gt; tests/testthat/test-view-mutations.R
+A  tests/testthat/test-view.R
+D  tests/testthat/test-wrapper.R
+30c8136 Rename the ALTREP wrapper to a view
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/view -&gt; feature/view
+branch 'feature/view' set up to track 'origin/feature/view'.</pre></details>
+<p>I've renamed the ALTREP wrapper to a view as <code>plans/view.md</code> describes, deleted the plan, and pushed one commit, <code>Rename the ALTREP wrapper to a view</code>, to the new <code>feature/view</code> branch.</p>
+<p><strong>Checks:</strong></p>
+<ul>
+<li>
+<p><strong>Goal grep:</strong> <code>git grep -n -i wrap -- ':!src/rlang' ':!plans'</code> prints exactly the list in the plan's Goal section and nothing else.</p>
+</li>
+<li>
+<p><strong>Tests:</strong> all pass, with the same counts as before the rename (1280 tests, 7689 expectations, 6 skipped). The new <code>_snaps/view.md</code> reads <code>view_set_elt(view(...))</code>, and its messages end in &quot;character view.&quot; and &quot;list view.&quot;.</p>
+</li>
+<li>
+<p><strong><code>devtools::check()</code>:</strong> 0 errors, 0 warnings, 0 notes.</p>
+</li>
+<li>
+<p><strong>Protection pass:</strong> I applied the renames to the old <code>wrapper.c</code> with a script and diffed it against the new <code>view.c</code>. The only differences are the reworded comments and the planned message changes. No <code>KEEP()</code> or <code>FREE()</code> moved, and all 9 callers still use <code>KEEP(r_view(x))</code>.</p>
+</li>
+<li>
+<p><strong><code>inspect()</code>:</strong> a view now prints as <code>&lt;view&gt;</code>.</p>
+</li>
+</ul>
+<p><strong>Where I changed the plan:</strong></p>
+<ul>
+<li>
+<p><strong>Comments:</strong> as you chose, I kept them all and only changed the word. The plan's list of comments to delete no longer matched the code after #151, so nothing was deleted. The rewritten ones in <code>src/view.c</code>:</p>
+<ul>
+<li>
+<p>&quot;Create a read-only ALTREP view of an R object's data&quot;</p>
+</li>
+<li>
+<p>&quot;The ALTREP view itself is immediately marked...&quot;</p>
+</li>
+<li>
+<p>&quot;If <code>x</code> is a view, take its original data and view that instead. This avoids a proliferation of nested views. Refcounts on <code>x</code> itself should also still be correct - each view looks like an individual user of <code>x</code>.&quot;</p>
+</li>
+<li>
+<p>&quot;Reference count on <code>data</code> is bumped when we create the view here.&quot;</p>
+</li>
+</ul>
+</li>
+<li>
+<p><strong>A test the plan missed:</strong> &quot;duplicating a wrapper keeps the wrapper's attributes&quot; became &quot;duplicating a view keeps the view's attributes&quot;.</p>
+</li>
+</ul>
+<p>Git only shows <code>test-view-mutations.R</code> as a rename. The other renamed files show up as a delete plus an add, because almost every line in them changed. I used <code>git mv</code> as the plan said, but git still decides renames by how similar the files are.</p>
+
+</section>
+</main>
+</body>
+</html>

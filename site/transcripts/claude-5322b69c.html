@@ -1,0 +1,2585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keeping the missing check off the multiply chain in product helpers</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="transcript.css">
+</head>
+<body class="claude">
+<header>
+<a class="back" href="../../#pr-145">rray timeline</a>
+<h1>Keeping the missing check off the multiply chain in product helpers</h1>
+<p class="facts">Claude · Oct 12, 2026 · 2 prompts · 34 replies · <a href="https://github.com/r-lib/rray/pull/145">#145</a></p>
+</header>
+<main>
+<p class="divider">Oct 12, 2026, 00:02 UTC</p>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p class="command"><code>/pr-finish</code></p>
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: git branch --show-current &amp;&amp; git status --porcelain &amp;&amp; gh pr view --json number,state,headRef…</summary>
+<pre>git branch --show-current &amp;&amp; git status --porcelain &amp;&amp; gh pr view --json number,state,headRefName,headRefOid,baseRefName,headRepositoryOwner &amp;&amp; git rev-parse HEAD</pre><pre class="output">feature/cumulative-prod
+{&quot;baseRefName&quot;:&quot;main&quot;,&quot;headRefName&quot;:&quot;feature/cumulative-prod&quot;,&quot;headRefOid&quot;:&quot;4c8318fdc778f218010bc43ef033862722a393b9&quot;,&quot;headRepositoryOwner&quot;:{&quot;id&quot;:&quot;MDEyOk9yZ2FuaXphdGlvbjIyNjE4NzE2&quot;,&quot;login&quot;:&quot;r-lib&quot;},&quot;number&quot;:143,&quot;state&quot;:&quot;MERGED&quot;}
+4c8318fdc778f218010bc43ef033862722a393b9</pre></details>
+<p>All checks pass. Cleaning up.</p>
+
+<details class="tool"><summary>Bash: git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/cumulative-prod …</summary>
+<pre>git checkout main &amp;&amp; git pull --ff-only origin main &amp;&amp; git branch -D feature/cumulative-prod &amp;&amp; git fetch --prune origin &amp;&amp; git log -1 --oneline</pre><pre class="output">Switched to branch 'main'
+Your branch is up to date with 'origin/main'.
+From https://github.com/r-lib/rray
+ * branch            main       -&gt; FETCH_HEAD
+   0dd7ce1..53d97b5  main       -&gt; origin/main
+Updating 0dd7ce1..53d97b5
+Fast-forward
+ NAMESPACE                                |   1 +
+ R/cumulative.R                           |  23 +++
+ bench/cumulative.R                       |   7 +-
+ man/rray-cumulative.Rd                   |  20 +++
+ plans/prod-performance.md                | 182 ++++++++++++++++++++++
+ src/cumulative-prod.c                    | 130 ++++++++++++++++
+ src/cumulative-prod.h                    |  15 ++
+ src/decl/cumulative-prod-decl.h          |  38 +++++
+ src/init.c                               |   6 +
+ tests/testthat/_snaps/cumulative-prod.md | 104 +++++++++++++
+ tests/testthat/test-cumulative-prod.R    | 252 +++++++++++++++++++++++++++++++
+ 11 files changed, 777 insertions(+), 1 deletion(-)
+ create mode 100644 plans/prod-performance.md
+ create mode 100644 src/cumulative-prod.c
+ create mode 100644 src/cumulative-prod.h
+ create mode 100644 src/decl/cumulative-prod-decl.h
+ create mode 100644 tests/testthat/_snaps/cumulative-prod.md
+ create mode 100644 tests/testthat/test-cumulative-prod.R
+Deleted branch feature/cumulative-prod (was 4c8318f).
+From https://github.com/r-lib/rray
+ - [deleted]         (none)     -&gt; origin/feature/cumulative-prod
+   0066386..6bbe331  gh-pages   -&gt; origin/gh-pages
+53d97b5 Add `rray_cumulative_prod()` (#143)</pre></details>
+<p>Cleanup finished for PR #143.</p>
+<ul>
+<li>
+<p><strong>PR:</strong> #143 is merged, and the branch head matched the PR head.</p>
+</li>
+<li>
+<p><strong>Deleted branch:</strong> <code>feature/cumulative-prod</code>. Pruning also removed <code>origin/feature/cumulative-prod</code>.</p>
+</li>
+<li>
+<p><strong>Base branch:</strong> <code>main</code> fast-forwarded to <code>53d97b5</code> (&quot;Add <code>rray_cumulative_prod()</code> (#143)&quot;).</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Create a branch feature/prod-perf</p>
+<p>Read the prod performance plan and implement it with benchmarking on all cases</p>
+<p>Think hard and do highest quality work<br />
+Take your time, double check as needed<br />
+Perform as many simplifications as possible to keep the code straightforward<br />
+Ask any questions before beginning<br />
+Remove the plan<br />
+Commit and push when finished</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>Bash: cat plans/prod-performance.md &amp;&amp; ls src bench &amp;&amp; git status --short</summary>
+<pre>cat plans/prod-performance.md &amp;&amp; ls src bench &amp;&amp; git status --short</pre><pre class="output"># Product helper performance
+
+## Summary
+
+While adding `rray_cumulative_prod()`, a one-line rewrite of
+`rray_prod_lgl_one()` and `rray_prod_int_one()` in `src/one-multiply.h` made
+logical and integer products 25% to 35% faster along a contiguous axis. This
+helped both `rray_cumulative_prod()` and `rray_prod()`. That change was made
+and then undone on the `feature/cumulative-prod` branch (commit `32aabcc`,
+reverted after it). It belongs in its own PR. That PR should check every
+helper in `src/one-multiply.h` at once.
+
+## The change
+
+Before:
+
+```c
+static inline double rray_prod_int_one(double out, int x) {
+  if (rray_int_is_missing(x)) {
+    return r_globals.na_dbl;
+  }
+
+  return out * x;
+}
+```
+
+After:
+
+```c
+static inline double rray_prod_int_one(double out, int x) {
+  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : (double) x);
+}
+```
+
+`rray_prod_lgl_one()` got the same rewrite.
+
+## Why it is faster
+
+Along axis 1, both `RRAY_REDUCE()` and `RRAY_CUMULATIVE()` take the fixed zero
+stride path. Every step feeds `out` into the next one:
+
+```c
+for (r_ssize i = start; i &lt; end; ++i) {
+  elt = ONE(elt, v_x[i]);
+  v_out[i] = elt;
+}
+```
+
+This is a chain. Each step must wait for the one before it to finish, so the
+loop runs at the speed of one step's latency, not its throughput.
+
+- Before: the select (`missing ? NA : out * x`) comes after the multiply, and
+  it uses the multiply's result. Each step in the chain costs a multiply plus
+  a select.
+
+- After: the select only depends on `x`, which is known ahead of time. The CPU
+  can work it out early, outside the chain. Each step in the chain costs a
+  single multiply.
+
+Doubles never had this problem. `rray_prod_dbl_one()` is a bare multiply, and
+that is why double was already faster than integer and logical before the
+change.
+
+Axes other than 1 do not benefit. There, the scan advances many independent
+lanes at once, so there is no single chain. Those cases are limited by memory.
+`rray_cumulative_prod()` over axis 2 of a 4000 x 4000 double took 16ms, against
+12.5ms for `rray_multiply(x, 1)` on the same data.
+
+## Measurements
+
+Apple Silicon (arm64), R's default compiler flags through
+`devtools::load_all()`, median of 10 iterations, a vector of 1.6e7 elements
+reduced or scanned along axis 1.
+
+| Call | Type | Before | After |
+|---|---|---|---|
+| `rray_cumulative_prod()` | integer | 33ms | 25ms |
+| `rray_cumulative_prod()` | logical | 33ms | 25ms |
+| `rray_prod()` | integer | 27ms | 18ms |
+| `rray_prod()` | logical | 28ms | 18ms |
+
+Doubles do not use the changed helpers. For reference, `rray_cumulative_prod()`
+took 24ms to 25ms on doubles and `rray_prod()` took 18ms. Base `cumprod()` took
+40ms on integers and 25ms on doubles. After the change, integer and logical
+match double. For comparison,
+`rray_cumulative_max()` on the same integer data took 12ms, because a
+comparison has a shorter latency than a multiply.
+
+The inputs were:
+
+```r
+set.seed(1)
+xi &lt;- sample(100L, 16e6, TRUE)
+xi[sample(16e6, 10)] &lt;- NA
+xl &lt;- sample(c(TRUE, FALSE, NA), 16e6, TRUE)
+x &lt;- runif(16e6, 0.5, 1.5)
+```
+
+This integer data overflows to `Inf` quickly, and the logical data becomes
+missing quickly. To rule out special values as the cause, the new form was
+also run on integers drawn from `-1L`, `1L`, and `2L`, which stay finite. It
+took 23.5ms, in line with the data above. The old form was not run on that
+data, so measure it in the new PR.
+
+## Behavior
+
+For logical input, results cannot change. A product of `0`, `1`, and `NA`
+values can never be `Inf` or `NaN`.
+
+For integer input, results can change in one case: the running product is
+already `NaN` and the next value is `NA`. This needs an overflow to `Inf`
+followed by a `0`:
+
+```r
+x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
+rray_prod(x, 1L)
+```
+
+Before, the result is always `NA`, because the helper returns `NA` without
+multiplying. After, it is `NaN * NA`, and which one wins depends on the
+platform and the compiler's operand order. On arm64 it still gave `NA`. The
+`rray_prod()` docs already say that the winner between `NA` and `NaN` is not
+promised for doubles. The new PR should say the same holds for logical and
+integer input, and test it with `is.na()` only.
+
+## Helpers to investigate
+
+Check every helper in `src/one-multiply.h` and change all that benefit in one
+PR.
+
+- `rray_prod_lgl_one()` and `rray_prod_int_one()`: the change above. Expect
+  the same results as the table.
+
+- `rray_prod_lgl_one_na_rm()` and `rray_prod_int_one_na_rm()`: these return
+  `out` unchanged for a missing value, so the select also sits on the chain.
+  Try `out * (missing ? 1.0 : (double) x)`. Multiplying by `1.0` returns `out`
+  exactly, including `-0`, `Inf`, `NA`, and `NaN`, so results should not
+  change. Confirm that with tests.
+
+- `rray_prod_dbl_one_na_rm()`: same idea, `out * (missing ? 1.0 : x)`. Same
+  expected outcome.
+
+- `rray_prod_cpl_one_na_rm()`: the same trick is not safe. Under C99 rules,
+  multiplying by `1+0i` is not exact. `(a + bi) * (1 + 0i)` computes `b * 0`
+  and `a * 0`, which gives `NaN` for an infinite part and can lose the sign of
+  a `-0` part. If this helper is worth speeding up, it needs a different form,
+  such as selecting the whole result after the multiply on both parts. That
+  puts the select back on the chain, so measure before keeping anything.
+
+- `rray_prod_dbl_one()`, `rray_prod_cpl_one()`, `rray_multiply_dbl_one()`, and
+  `rray_multiply_cpl_one()`: no branch, nothing to change. Leave them, but keep
+  them in the benchmark as the target that the other types should reach.
+
+- `rray_multiply_int_one()`: an elementwise helper, so it is not in a chain.
+  The rewrite does not apply. Its overflow error may still block
+  vectorization. Measure it, but do not expect a win from this change.
+
+## Benchmarks for the new PR
+
+Measure before and after for each changed helper:
+
+- `rray_prod()` with `na_rm = FALSE` and `na_rm = TRUE`, for logical, integer,
+  and double.
+
+- `rray_cumulative_prod()` for logical and integer.
+
+- Axis 1 of a long vector, axis 1 and axis 2 of a 4000 x 4000 matrix, and
+  axis 1 of a 10 x 1e6 matrix. Only axis 1 should move. The others are a check
+  that nothing got slower.
+
+`bench/reduce.R` and `bench/cumulative.R` cover most of these. Results on x86
+would also help, since its select and multiply latencies differ from arm64.
+
+## Tests for the new PR
+
+- `rray_prod()` and `rray_cumulative_prod()` on integer input with `NaN`
+  followed by `NA`: check with `is.na()` only.
+
+- The `na_rm` helpers keep `out` exactly for missing values: a running `-0`
+  stays `-0` (check with `1 / x`), and `Inf`, `NA`, and `NaN` are unchanged.
+
+- The full suite, since `rray_prod()` uses the same helpers.
+bench:
+binary.R
+broadcast.R
+combine.R
+cumulative.R
+extremum.R
+index.R
+iterator.R
+matrix-stats.R
+mean.R
+permute-axes.R
+reduce-logical.R
+reduce.R
+slice.R
+split.R
+stride-zero.R
+
+src:</pre><p class="cut">213 more lines cut</p></details>
+<details class="tool tool-error"><summary>Bash: cat src/one-multiply.h &amp;&amp; cat bench/reduce.R bench/cumulative.R &amp;&amp; grep -rn &quot;one_na_rm\|prod_…</summary>
+<pre>cat src/one-multiply.h &amp;&amp; cat bench/reduce.R bench/cumulative.R &amp;&amp; grep -rn &quot;one_na_rm\|prod_.*_one\|multiply_.*_one&quot; src --include=*.c --include=*.h | grep -v &quot;^src/one-multiply.h&quot; &amp;&amp; grep -n &quot;NaN\|NA&quot; R/reduce*.R R/cumulative.R | head -40</pre><pre class="output">Exit code 1
+#ifndef RRAY_ONE_MULTIPLY_H
+#define RRAY_ONE_MULTIPLY_H
+
+#include &lt;limits.h&gt;
+
+#include &quot;rlang.h&quot;
+
+#include &quot;missing.h&quot;
+#include &quot;utils.h&quot;
+
+// --------------------------------------------------------------------------
+// Elementwise
+
+// - `x = 2`, `y = 3`: returns `6`.
+// - `x = 2`, `y = NA`: returns `NA`.
+// - `x = NA`, `y = 0`: returns `NA`.
+// - `x = 2`, `y = INT_MAX`: errors.
+static inline int rray_multiply_int_one(
+  int x,
+  int y,
+  struct r_lazy error_call
+) {
+  if (rray_int_is_missing(x) || rray_int_is_missing(y)) {
+    return r_globals.na_int;
+  }
+
+  // Benchmarked and this is just as fast as R's `GOODIPROD()`
+  const double out = (double) x * (double) y;
+
+  if (out &gt; INT_MAX || out &lt; -INT_MAX) {
+    stop_int_overflow(error_call);
+  }
+
+  return (int) out;
+}
+
+static inline double rray_multiply_dbl_one(double x, double y) {
+  return x * y;
+}
+
+// Matching R with `_Complex` `*`, which &quot;recovers&quot; infinities
+static inline r_complex rray_multiply_cpl_one(r_complex x, r_complex y) {
+  return rray_c99_to_cpl(rray_cpl_to_c99(x) * rray_cpl_to_c99(y));
+}
+
+// --------------------------------------------------------------------------
+// Reduce
+
+// `out` is a double, `x` is a logical
+// - `out = 2`, `x = 1`: returns `2`.
+// - `out = 2`, `x = NA`: returns `NA`.
+static inline double rray_prod_lgl_one(double out, int x) {
+  if (rray_lgl_is_missing(x)) {
+    return r_globals.na_dbl;
+  }
+
+  return out * x;
+}
+
+// `out` is a double, `x` is a logical
+// - `out = 2`, `x = 1`: returns `2`.
+// - `out = 2`, `x = NA`: returns `2`.
+static inline double rray_prod_lgl_one_na_rm(double out, int x) {
+  if (rray_lgl_is_missing(x)) {
+    return out;
+  }
+
+  return out * x;
+}
+
+// `out` is a double, `x` is an integer
+// - `out = 2`, `x = 3`: returns `6`.
+// - `out = 2`, `x = NA`: returns `NA`.
+static inline double rray_prod_int_one(double out, int x) {
+  if (rray_int_is_missing(x)) {
+    return r_globals.na_dbl;
+  }
+
+  return out * x;
+}
+
+// `out` is a double, `x` is an integer
+// - `out = 2`, `x = 3`: returns `6`.
+// - `out = 2`, `x = NA`: returns `2`.
+static inline double rray_prod_int_one_na_rm(double out, int x) {
+  if (rray_int_is_missing(x)) {
+    return out;
+  }
+
+  return out * x;
+}
+
+// Purposefully choose to match `rray_multiply()` rather than `prod()`
+// regarding `c(NA, NaN)` behavior, see `rray_add_dbl_one()`.
+static inline double rray_prod_dbl_one(double out, double x) {
+  return rray_multiply_dbl_one(out, x);
+}
+
+// `out` is never missing
+// - `out = 2`, `x = 3`: returns `6`.
+// - `out = 2`, `x = NA`: returns `2`.
+// - `out = 2`, `x = NaN`: returns `2`.
+static inline double rray_prod_dbl_one_na_rm(double out, double x) {
+  if (rray_dbl_is_missing(x)) {
+    return out;
+  }
+
+  return out * x;
+}
+
+// Purposefully choose to match `rray_multiply()` rather than `prod()`, which
+// doesn't recover infinities
+static inline r_complex rray_prod_cpl_one(r_complex out, r_complex x) {
+  return rray_multiply_cpl_one(out, x);
+}
+
+// The whole element is removed
+// - `out = 1+1i`, `x = 2+0i`: returns `2+2i`.
+// - `out = 1+1i`, `x = NA`: returns `1+1i`.
+// - `out = 1+1i`, `x = complex(real = 2, imaginary = NaN)`: returns `1+1i`.
+static inline r_complex rray_prod_cpl_one_na_rm(r_complex out, r_complex x) {
+  if (rray_cpl_is_missing(x)) {
+    return out;
+  }
+
+  return rray_prod_cpl_one(out, x);
+}
+
+#endif
+devtools::load_all(quiet = TRUE)
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+operations &lt;- list(
+  sum = list(fn = rray_sum, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  max = list(fn = rray_max, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  max_na_rm = list(
+    fn = \(x, axes) rray_max(x, axes, na_rm = TRUE),
+    types = c(&quot;integer&quot;, &quot;double&quot;)
+  ),
+  min = list(fn = rray_min, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  all = list(fn = rray_all, types = &quot;logical&quot;),
+  any = list(fn = rray_any, types = &quot;logical&quot;),
+  mean = list(fn = rray_mean, types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)),
+  mean_na_rm = list(
+    fn = \(x, axes) rray_mean(x, axes, na_rm = TRUE),
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
+  )
+)
+
+shapes &lt;- list(
+  &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+  &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+  &quot;[4000, 4000] over 1, 2&quot; = list(c(4000L, 4000L), 1:2),
+  &quot;[200, 200, 200] over 1&quot; = list(c(200L, 200L, 200L), 1L),
+  &quot;[200, 200, 200] over 2&quot; = list(c(200L, 200L, 200L), 2L),
+  &quot;[200, 200, 200] over 3&quot; = list(c(200L, 200L, 200L), 3L),
+  &quot;[200, 200, 200] over 1, 3&quot; = list(c(200L, 200L, 200L), c(1L, 3L)),
+  &quot;[10, 1e6] over 1&quot; = list(c(10L, 1000000L), 1L),
+  &quot;[10, 1e6] over 2&quot; = list(c(10L, 1000000L), 2L)
+)
+
+make_array &lt;- function(dimensions, type) {
+  n &lt;- prod(dimensions)
+
+  values &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),
+    double = runif(n)
+  )
+
+  array(values, dimensions)
+}
+
+set.seed(1)
+
+results &lt;- list()
+
+for (operation in names(operations)) {
+  fn &lt;- operations[[operation]]$fn
+
+  for (type in operations[[operation]]$types) {
+    for (shape in names(shapes)) {
+      x &lt;- make_array(shapes[[shape]][[1L]], type)
+      axes &lt;- shapes[[shape]][[2L]]
+
+      measurement &lt;- bench::mark(
+        fn(x, axes),
+        iterations = iterations,
+        check = FALSE,
+        memory = FALSE,
+        filter_gc = FALSE
+      )
+
+      results[[length(results) + 1L]] &lt;- data.frame(
+        operation = operation,</pre><p class="cut">114 more lines cut</p></details>
+<details class="tool"><summary>Bash: grep -rn 'prod_[a-z]*_one\|multiply_[a-z]*_one' src | grep -v '^src/one-multiply.h\|\.o:\|rra…</summary>
+<pre>grep -rn 'prod_[a-z]*_one\|multiply_[a-z]*_one' src | grep -v '^src/one-multiply.h\|\.o:\|rray.so' ; echo ---; grep -n 'NaN' R/reduce.R R/cumulative.R R/*.R | head -30; echo ---; cat src/missing.h | head -60</pre><pre class="output">src/arithmetic-multiply.c:132:    rray_multiply_int_one,
+src/arithmetic-multiply.c:156:    rray_multiply_int_one,
+src/arithmetic-multiply.c:180:    rray_multiply_int_one,
+src/arithmetic-multiply.c:204:    rray_multiply_dbl_one,
+src/arithmetic-multiply.c:228:    rray_multiply_dbl_one,
+src/arithmetic-multiply.c:252:    rray_multiply_cpl_one,
+src/arithmetic-multiply.c:276:    rray_multiply_cpl_one,
+src/arithmetic-multiply.c:300:    rray_multiply_int_one,
+src/arithmetic-multiply.c:324:    rray_multiply_dbl_one,
+src/arithmetic-multiply.c:348:    rray_multiply_dbl_one,
+src/arithmetic-multiply.c:372:    rray_multiply_cpl_one,
+src/arithmetic-multiply.c:396:    rray_multiply_cpl_one,
+src/arithmetic-multiply.c:420:    rray_multiply_dbl_one,
+src/arithmetic-multiply.c:444:    rray_multiply_cpl_one,
+src/arithmetic-multiply.c:468:    rray_multiply_cpl_one,
+src/arithmetic-multiply.c:492:    rray_multiply_cpl_one,
+src/reduce-prod.c:75:      rray_prod_lgl_one_na_rm
+src/reduce-prod.c:85:      rray_prod_lgl_one
+src/reduce-prod.c:107:      rray_prod_int_one_na_rm
+src/reduce-prod.c:117:      rray_prod_int_one
+src/reduce-prod.c:139:      rray_prod_dbl_one_na_rm
+src/reduce-prod.c:149:      rray_prod_dbl_one
+src/reduce-prod.c:171:      rray_prod_cpl_one_na_rm
+src/reduce-prod.c:181:      rray_prod_cpl_one
+src/cumulative-prod.c:71:    rray_prod_lgl_one
+src/cumulative-prod.c:90:    rray_prod_int_one
+src/cumulative-prod.c:109:    rray_prod_dbl_one
+src/cumulative-prod.c:128:    rray_prod_cpl_one
+---
+R/cumulative.R:31:#' `x`. Once a line hits `NA` or `NaN`, the rest of it stays missing. A later
+R/cumulative.R:32:#' `NA` replaces an earlier `NaN`, like [max()] and [min()]:
+R/cumulative.R:35:#' rray_cumulative_max(c(1, NaN, 2, NA, 3), 1L) # 1, NaN, NaN, NA, NA
+R/cumulative.R:50:#' When `NA` and `NaN` are both present, you get one of them, but which one
+R/cumulative.R:55:#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN
+R/reduce.R:41:#' When `NA` and `NaN` are both present, you get one of them, but which one
+R/reduce.R:46:#' rray_mean(c(NA, NaN), 1L) # NA or NaN
+R/reduce.R:47:#' rray_mean(c(NaN, NA), 1L) # NA or NaN
+R/reduce.R:61:#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+R/reduce.R:64:#' rray_max(c(NA, NaN), 1L) # NA
+R/reduce.R:65:#' rray_max(c(NaN, NA), 1L) # NA
+R/cumulative.R:31:#' `x`. Once a line hits `NA` or `NaN`, the rest of it stays missing. A later
+R/cumulative.R:32:#' `NA` replaces an earlier `NaN`, like [max()] and [min()]:
+R/cumulative.R:35:#' rray_cumulative_max(c(1, NaN, 2, NA, 3), 1L) # 1, NaN, NaN, NA, NA
+R/cumulative.R:50:#' When `NA` and `NaN` are both present, you get one of them, but which one
+R/cumulative.R:55:#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN
+R/extremum.R:12:#' When `NA` and `NaN` are both present, `NA` wins, like [rray_max()],
+R/extremum.R:17:#' rray_pmax(NA, NaN) # NA
+R/extremum.R:18:#' rray_pmax(NaN, NA) # NA
+R/extremum.R:20:#' pmax(NA, NaN) # NaN
+R/locate.R:19:#' `axis` is `NA` or `NaN`. Use `na_rm = TRUE` to skip them:
+R/locate.R:22:#' rray_locate_max(c(1, NaN, 3), 1L) # NA
+R/locate.R:23:#' rray_locate_max(c(1, NaN, 3), 1L, na_rm = TRUE) # 3
+R/reduce.R:41:#' When `NA` and `NaN` are both present, you get one of them, but which one
+R/reduce.R:46:#' rray_mean(c(NA, NaN), 1L) # NA or NaN
+R/reduce.R:47:#' rray_mean(c(NaN, NA), 1L) # NA or NaN
+R/reduce.R:61:#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+R/reduce.R:64:#' rray_max(c(NA, NaN), 1L) # NA
+R/reduce.R:65:#' rray_max(c(NaN, NA), 1L) # NA
+---
+#ifndef RRAY_MISSING_H
+#define RRAY_MISSING_H
+
+#include &quot;rlang.h&quot;
+
+#include &quot;utils.h&quot;
+
+static inline bool rray_lgl_is_missing(int x) {
+  return x == r_globals.na_lgl;
+}
+
+static inline bool rray_int_is_missing(int x) {
+  return x == r_globals.na_int;
+}
+
+static inline bool rray_dbl_is_missing(double x) {
+  return ISNAN(x);
+}
+
+static inline bool rray_cpl_is_missing(r_complex x) {
+  // Purposefully bitwise, can help compiler perform vectorization
+  return bool_bitwise_or(ISNAN(x.r), ISNAN(x.i));
+}
+
+// -----------------------------------------------------------------------------
+
+#ifdef WORDS_BIGENDIAN
+static const int rray_dbl_indicator_pos = 1;
+#else
+static const int rray_dbl_indicator_pos = 0;
+#endif
+
+union rray_dbl_indicator {
+  double value;
+  unsigned int key[2];
+};
+
+enum rray_dbl_class {
+  RRAY_DBL_number,
+  RRAY_DBL_missing,
+  RRAY_DBL_nan
+};
+
+static inline enum rray_dbl_class rray_dbl_classify(double x) {
+  if (!isnan(x)) {
+    return RRAY_DBL_number;
+  }
+
+  union rray_dbl_indicator indicator;
+  indicator.value = x;
+
+  if (indicator.key[rray_dbl_indicator_pos] == 1954) {
+    return RRAY_DBL_missing;
+  } else {
+    return RRAY_DBL_nan;
+  }
+}
+
+#endif</pre></details>
+<details class="tool"><summary>Bash: sed -n 1,80p R/reduce.R; sed -n 40,70p R/cumulative.R; cat src/reduce-prod.c | sed -n 1,200p;…</summary>
+<pre>sed -n 1,80p R/reduce.R; sed -n 40,70p R/cumulative.R; cat src/reduce-prod.c | sed -n 1,200p; grep -n &quot;RRAY_REDUCE\b\|define RRAY_REDUCE&quot; -A60 src/reduce.h | head -150</pre><pre class="output">#' Reduce an array along axes
+#'
+#' @description
+#' - `rray_sum()` computes the sum along the specified `axes`.
+#'
+#' - `rray_prod()` computes the product along the specified `axes`.
+#'
+#' - `rray_mean()` computes the mean along the specified `axes`.
+#'
+#' - `rray_all()` checks if all values are `TRUE` along the specified `axes`.
+#'
+#' - `rray_any()` checks if any value is `TRUE` along the specified `axes`.
+#'
+#' - `rray_max()` computes the maximum along the specified `axes`.
+#'
+#' - `rray_min()` computes the minimum along the specified `axes`.
+#'
+#' @details
+#' The dimensionality of `x` is retained in the result, with the reduced axes
+#' collapsed to size 1.
+#'
+#' @section Sum:
+#' Logicals are summed as integers. If an integer sum doesn't fit in an
+#' integer, an error is thrown. Only the final sum is checked, and `NA` wins
+#' over an overflow:
+#'
+#' ```r
+#' x &lt;- c(.Machine$integer.max, 1L, -1L)
+#' rray_sum(x, 1L) # .Machine$integer.max
+#'
+#' x &lt;- c(.Machine$integer.max, 1L, NA)
+#' rray_sum(x, 1L) # NA
+#' ```
+#'
+#' @section Product:
+#' Logicals and integers are cast to double.
+#'
+#' @section Mean:
+#' Logicals and integers are cast to double.
+#'
+#' When `NA` and `NaN` are both present, you get one of them, but which one
+#' depends on the platform and the order of the values, like [mean()]. Either
+#' way, `is.na()` is `TRUE`:
+#'
+#' ```r
+#' rray_mean(c(NA, NaN), 1L) # NA or NaN
+#' rray_mean(c(NaN, NA), 1L) # NA or NaN
+#' ```
+#'
+#' @section Min / Max:
+#' `rray_max()` and `rray_min()` keep the type of `x`. With nothing to reduce,
+#' such as an axis of dimension 0, `rray_max()` returns the smallest value of
+#' that type and `rray_min()` returns the largest:
+#'
+#' | type    | `rray_max()`            | `rray_min()`           |
+#' |---------|-------------------------|------------------------|
+#' | logical | `FALSE`                 | `TRUE`                 |
+#' | integer | `-.Machine$integer.max` | `.Machine$integer.max` |
+#' | double  | `-Inf`                  | `Inf`                  |
+#'
+#' When `NA` and `NaN` are both present, `NA` wins, like [max()] and [min()]:
+#'
+#' ```r
+#' rray_max(c(NA, NaN), 1L) # NA
+#' rray_max(c(NaN, NA), 1L) # NA
+#' ```
+#'
+#' @inheritParams rlang::args_dots_empty
+#'
+#' @param x An array.
+#'
+#' @param axes An integer vector of axes to reduce over. `1` reduces
+#'   rows, `2` reduces columns, and so on.
+#'
+#' @param na_rm If `TRUE`, missing values are removed before reducing.
+#'
+#' @returns
+#' An array with the same dimensionality as `x`, but with the dimensions along
+#' `axes` reduced to 1.
+#'
+#'
+#' ```r
+#' rray_cumulative_max(c(NA, TRUE), 1L) # NA, NA
+#' rray_cumulative_any(c(NA, TRUE), 1L) # NA, TRUE
+#' ```
+#'
+#' @section Product:
+#' `x` must be logical, integer, double, or complex. Logicals and integers are
+#' cast to double.
+#'
+#' When `NA` and `NaN` are both present, you get one of them, but which one
+#' depends on the platform and the order of the values. Either way, `is.na()`
+#' is `TRUE` from that point on:
+#'
+#' ```r
+#' rray_cumulative_prod(c(2, NA, NaN), 1L) # 2, NA, NA or NaN
+#' ```
+#'
+#' @param x An array.
+#'
+#' @param axis A single integer. The axis to accumulate along. `1`
+#'   accumulates down rows, `2` accumulates across columns, and so on.
+#'
+#' @returns
+#' An array with the same dimensions and names as `x`.
+#'
+#' @name rray-cumulative
+#' @examples
+#' x &lt;- array(c(TRUE, TRUE, FALSE, TRUE, NA, TRUE), c(2L, 3L))
+#' x
+#'
+#include &quot;reduce-prod.h&quot;
+
+#include &quot;one-multiply.h&quot;
+#include &quot;reduce.h&quot;
+#include &quot;type.h&quot;
+#include &quot;utils.h&quot;
+
+#include &quot;decl/reduce-prod-decl.h&quot;
+
+r_obj* ffi_rray_prod(
+  r_obj* ffi_x,
+  r_obj* ffi_axes,
+  r_obj* ffi_na_rm,
+  r_obj* ffi_frame
+) {
+  struct r_lazy error_call = {.x = ffi_frame, .env = r_null};
+  const bool na_rm = r_arg_as_bool(ffi_na_rm, &quot;na_rm&quot;);
+  return rray_prod(ffi_x, ffi_axes, na_rm, rray_args.x, error_call);
+}
+
+r_obj* rray_prod(
+  r_obj* x,
+  r_obj* axes,
+  bool na_rm,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  return rray_reduce(x, axes, na_rm, rray_prod_switch, arg, error_call);
+}
+
+static rray_reduce_fn rray_prod_switch(
+  r_obj* x,
+  struct rray_arg* arg,
+  struct r_lazy error_call
+) {
+  switch (rray_typeof(x)) {
+  case RRAY_TYPE_logical:
+    return rray_prod_lgl;
+  case RRAY_TYPE_integer:
+    return rray_prod_int;
+  case RRAY_TYPE_double:
+    return rray_prod_dbl;
+  case RRAY_TYPE_complex:
+    return rray_prod_cpl;
+
+  case RRAY_TYPE_character:
+  case RRAY_TYPE_raw:
+  case RRAY_TYPE_list:
+    stop_unsupported_reduce(&quot;product&quot;, x, arg, error_call);
+
+  case RRAY_TYPE_scalar:
+    stop_scalar_input(x, arg, error_call);
+  }
+
+  r_stop_unreachable();
+}
+
+static r_obj* rray_prod_lgl(
+  r_obj* x,
+  bool na_rm,
+  r_ssize out_size,
+  const int* v_dimensions,
+  int dimensionality,
+  const r_ssize* v_out_broadcast_strides,
+  struct r_lazy error_call
+) {
+  if (na_rm) {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_double,
+      double,
+      r_dbl_begin,
+      1.0,
+      rray_prod_lgl_one_na_rm
+    );
+  } else {
+    RRAY_REDUCE(
+      int,
+      r_lgl_cbegin,
+      R_TYPE_double,
+      double,
+      r_dbl_begin,
+      1.0,
+      rray_prod_lgl_one
+    );
+  }
+}
+</pre><p class="cut">199 more lines cut</p></details>
+<details class="tool"><summary>Bash: sed -n 1,40p bench/binary.R; ls tests/testthat | grep -i 'prod\|reduce\|multiply'; grep -n 't…</summary>
+<pre>sed -n 1,40p bench/binary.R; ls tests/testthat | grep -i 'prod\|reduce\|multiply'; grep -n 'test_that' tests/testthat/test-reduce-prod.R 2&gt;/dev/null | head -50; uname -m; which R clang-format air</pre><pre class="output">devtools::load_all(quiet = TRUE)
+
+iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+
+operations &lt;- list(
+  greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+  pmax_na_rm = list(
+    fn = \(x, y) rray_pmax(x, y, na_rm = TRUE),
+    types = c(&quot;integer&quot;, &quot;double&quot;)
+  ),
+  and = list(fn = rray_and, types = &quot;logical&quot;)
+)
+
+shapes &lt;- list(
+  &quot;[4000, 4000] [4000, 4000]&quot; = list(c(4000L, 4000L), c(4000L, 4000L)),
+  &quot;[4000, 4000] [4000, 1]&quot; = list(c(4000L, 4000L), c(4000L, 1L)),
+  &quot;[4000, 4000] [1, 4000]&quot; = list(c(4000L, 4000L), c(1L, 4000L)),
+  &quot;[4000, 4000] [1, 1]&quot; = list(c(4000L, 4000L), c(1L, 1L)),
+  &quot;[4000, 1] [1, 4000]&quot; = list(c(4000L, 1L), c(1L, 4000L)),
+  &quot;[10, 1e6] [10, 1]&quot; = list(c(10L, 1000000L), c(10L, 1L)),
+  &quot;[10, 1e6] [1, 1e6]&quot; = list(c(10L, 1000000L), c(1L, 1000000L))
+)
+
+make_array &lt;- function(dimensions, type) {
+  n &lt;- prod(dimensions)
+
+  values &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),
+    double = runif(n)
+  )
+
+  array(values, dimensions)
+}
+
+set.seed(1)
+helper-reduce-mean.R
+helper-reduce-sum.R
+test-arithmetic-multiply.R
+test-cumulative-prod.R
+test-reduce-extremum.R
+test-reduce-logical.R
+test-reduce-mean.R
+test-reduce-names.R
+test-reduce-prod.R
+test-reduce-sum.R
+1:test_that(&quot;can compute product along axis 1&quot;, {
+7:test_that(&quot;can compute product along axis 2&quot;, {
+13:test_that(&quot;reduced axes become size 1&quot;, {
+19:test_that(&quot;can reduce over all axes&quot;, {
+26:test_that(&quot;reducing over no axes returns the input values unchanged&quot;, {
+33:test_that(&quot;can reduce over multiple axes of a 3D array&quot;, {
+40:test_that(&quot;can reduce axis 3&quot;, {
+50:test_that(&quot;dimension names are kept for non-reduced axes&quot;, {
+62:test_that(&quot;dimension names are dropped when all named axes are reduced&quot;, {
+67:test_that(&quot;output type is double, except complex&quot;, {
+74:test_that(&quot;logical values multiply like 0s and 1s&quot;, {
+80:test_that(&quot;integer NA propagates&quot;, {
+88:test_that(&quot;double NA / NaN propagates&quot;, {
+109:test_that(&quot;Inf matches base R prod&quot;, {
+152:test_that(&quot;complex prod works&quot;, {
+158:test_that(&quot;complex NA propagates regardless of order&quot;, {
+166:test_that(&quot;complex NaN in one component spreads to both components&quot;, {
+178:test_that(&quot;complex zero times Inf gives NaN, matching base R&quot;, {
+183:test_that(&quot;complex Inf combined with NA is missing&quot;, {
+189:test_that(&quot;complex infinities are recovered, like rray_multiply()&quot;, {
+196:test_that(&quot;na_rm removes integer NA&quot;, {
+202:test_that(&quot;na_rm removes double NA and NaN&quot;, {
+213:test_that(&quot;na_rm removes logical NA&quot;, {
+219:test_that(&quot;na_rm removes an entire complex NA element&quot;, {
+233:test_that(&quot;na_rm with all NA returns identity&quot;, {
+247:test_that(&quot;na_rm with no NA matches default&quot;, {
+255:test_that(&quot;plain vector input works&quot;, {
+261:test_that(&quot;scalar reduction works&quot;, {
+267:test_that(&quot;axes are coerced to integer&quot;, {
+275:test_that(&quot;reducing a zero-length axis gives identity value&quot;, {
+282:test_that(&quot;reducing over a non-zero-length axis with a zero-length axis&quot;, {
+289:test_that(&quot;reducing all axes of a zero-length array&quot;, {
+296:test_that(&quot;the identity of an empty reduction has the output type&quot;, {
+308:test_that(&quot;errors on axes out of range&quot;, {
+313:test_that(&quot;errors on axes not in strictly increasing order&quot;, {
+319:test_that(&quot;errors on axes less than 1&quot;, {
+324:test_that(&quot;errors on axes with NA&quot;, {
+329:test_that(&quot;`na_rm` must be `TRUE` or `FALSE`&quot;, {
+340:test_that(&quot;errors on non-numeric input&quot;, {
+351:test_that(&quot;errors on classed input&quot;, {
+arm64
+/usr/local/bin/R
+/opt/homebrew/bin/clang-format
+~/.local/bin/air</pre></details>
+<p>I've read the plan and the code. A few questions before I start:</p>
+
+<details class="tool"><summary>Question: Where should the new benchmark cases live?</summary>
+<p>Where should the new benchmark cases live?</p>
+<ul>
+<li>Extend existing (Recommended)</li>
+<li>New bench/prod.R</li>
+</ul>
+<p><code>rray_prod_cpl_one_na_rm()</code> can't use the multiply-by-1 trick. If a select-after-multiply form isn't clearly faster, what should happen?</p>
+<ul>
+<li>Leave unchanged (Recommended)</li>
+<li>Skip entirely</li>
+</ul>
+<p><code>rray_multiply_int_one()</code>: the plan says measure only. If I find a form that's clearly faster while keeping the overflow error, should I change it in this PR?</p>
+<ul>
+<li>Measure only (Recommended)</li>
+<li>Change if clear win</li>
+</ul>
+<p>Where should the before/after benchmark numbers end up? The commit message must be one sentence.</p>
+<ul>
+<li>My reply only (Recommended)</li>
+<li>A markdown file</li>
+</ul>
+<pre class="output">Your questions have been answered: &quot;Where should the new benchmark cases live?&quot;=&quot;Extend existing (Recommended)&quot;, &quot;`rray_prod_cpl_one_na_rm()` can't use the multiply-by-1 trick. If a select-after-multiply form isn't clearly faster, what should happen?&quot;=&quot;Leave unchanged (Recommended)&quot;, &quot;`rray_multiply_int_one()`: the plan says measure only. If I find a form that's clearly faster while keeping the overflow error, should I change it in this PR?&quot;=&quot;Measure only (Recommended)&quot;, &quot;Where should the before/after benchmark numbers end up? The commit message must be one sentence.&quot;=&quot;My reply only (Recommended)&quot;. You can now continue with these answers in mind.</pre></details>
+<details class="tool"><summary>Bash: git checkout -b feature/prod-perf &amp;&amp; sed -n 40,80p bench/binary.R</summary>
+<pre>git checkout -b feature/prod-perf &amp;&amp; sed -n 40,80p bench/binary.R</pre><pre class="output">Switched to a new branch 'feature/prod-perf'
+set.seed(1)
+
+results &lt;- list()
+
+for (operation in names(operations)) {
+  fn &lt;- operations[[operation]]$fn
+
+  for (type in operations[[operation]]$types) {
+    for (shape in names(shapes)) {
+      x &lt;- make_array(shapes[[shape]][[1L]], type)
+      y &lt;- make_array(shapes[[shape]][[2L]], type)
+
+      measurement &lt;- bench::mark(
+        fn(x, y),
+        iterations = iterations,
+        check = FALSE,
+        memory = FALSE,
+        filter_gc = FALSE
+      )
+
+      results[[length(results) + 1L]] &lt;- data.frame(
+        operation = operation,
+        type = type,
+        shape = shape,
+        median_ms = as.numeric(measurement$median) * 1000
+      )
+    }
+  }
+}
+
+results &lt;- do.call(rbind, results)
+
+print(results, row.names = FALSE)
+
+if (nzchar(output)) {
+  saveRDS(
+    list(
+      results = results,
+      iterations = iterations,
+      revision = system2(&quot;git&quot;, c(&quot;rev-parse&quot;, &quot;HEAD&quot;), stdout = TRUE)
+    ),</pre></details>
+<p>Now extending the bench scripts before touching C, so the same scripts measure before and after.</p>
+
+<details class="tool tool-error"><summary>Bash: python3 - &lt;&lt;'EOF'</summary>
+<pre>python3 - &lt;&lt;'EOF'
+import re
+p='bench/reduce.R'
+s=open(p).read()
+s=s.replace('''  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),
+''','''  prod = list(
+    fn = rray_prod,
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+  ),
+  prod_na_rm = list(
+    fn = \\(x, axes) rray_prod(x, axes, na_rm = TRUE),
+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
+  ),
+''')
+s=s.replace('''shapes &lt;- list(
+  &quot;[4000, 4000] over 1&quot;''','''shapes &lt;- list(
+  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+  &quot;[4000, 4000] over 1&quot;''')
+s=s.replace('''    double = runif(n)
+  )''','''    double = runif(n),
+    complex = complex(real = runif(n), imaginary = runif(n))
+  )''')
+open(p,'w').write(s)
+p='bench/binary.R'
+s=open(p).read()
+s=s.replace('''operations &lt;- list(
+''','''operations &lt;- list(
+  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),
+''')
+open(p,'w').write(s)
+EOF
+git diff --stat; air format bench; git diff --stat</pre><pre class="output">PreToolUse:Bash hook error: Blocked: this is an inline interpreter script that writes files. rray requires the Read, Edit and Write tools for all file access and edits. Use Edit instead, with replace_all for multi-site renames. Reading with cat, sed -n and grep is still fine, as is clang-format -i and air format.</pre></details>
+<details class="tool"><summary>Read bench/reduce.R</summary>
+<pre class="output">1	devtools::load_all(quiet = TRUE)
+2	
+3	iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+4	output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+5	
+6	operations &lt;- list(
+7	  sum = list(fn = rray_sum, types = c(&quot;integer&quot;, &quot;double&quot;)),
+8	  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),
+9	  max = list(fn = rray_max, types = c(&quot;integer&quot;, &quot;double&quot;)),
+10	  max_na_rm = list(
+11	    fn = \(x, axes) rray_max(x, axes, na_rm = TRUE),
+12	    types = c(&quot;integer&quot;, &quot;double&quot;)
+13	  ),
+14	  min = list(fn = rray_min, types = c(&quot;integer&quot;, &quot;double&quot;)),
+15	  all = list(fn = rray_all, types = &quot;logical&quot;),
+16	  any = list(fn = rray_any, types = &quot;logical&quot;),
+17	  mean = list(fn = rray_mean, types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)),
+18	  mean_na_rm = list(
+19	    fn = \(x, axes) rray_mean(x, axes, na_rm = TRUE),
+20	    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;)
+21	  )
+22	)
+23	
+24	shapes &lt;- list(
+25	  &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+26	  &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+27	  &quot;[4000, 4000] over 1, 2&quot; = list(c(4000L, 4000L), 1:2),
+28	  &quot;[200, 200, 200] over 1&quot; = list(c(200L, 200L, 200L), 1L),
+29	  &quot;[200, 200, 200] over 2&quot; = list(c(200L, 200L, 200L), 2L),
+30	  &quot;[200, 200, 200] over 3&quot; = list(c(200L, 200L, 200L), 3L),
+31	  &quot;[200, 200, 200] over 1, 3&quot; = list(c(200L, 200L, 200L), c(1L, 3L)),
+32	  &quot;[10, 1e6] over 1&quot; = list(c(10L, 1000000L), 1L),
+33	  &quot;[10, 1e6] over 2&quot; = list(c(10L, 1000000L), 2L)
+34	)
+35	
+36	make_array &lt;- function(dimensions, type) {
+37	  n &lt;- prod(dimensions)
+38	
+39	  values &lt;- switch(
+40	    type,
+41	    logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+42	    integer = sample(100L, n, replace = TRUE),
+43	    double = runif(n)
+44	  )
+45	</pre></details>
+<details class="tool"><summary>Read bench/binary.R</summary>
+<pre class="output">1	devtools::load_all(quiet = TRUE)
+2	
+3	iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+4	output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+5	
+6	operations &lt;- list(
+7	  greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+8	  equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+9	  pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+10	  pmax_na_rm = list(</pre></details>
+<details class="tool"><summary>Edit bench/reduce.R</summary>
+<pre class="diff"><span class="del">-  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),</span>
+<span class="ins">+  prod = list(</span>
+<span class="ins">+    fn = rray_prod,</span>
+<span class="ins">+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)</span>
+<span class="ins">+  ),</span>
+<span class="ins">+  prod_na_rm = list(</span>
+<span class="ins">+    fn = \(x, axes) rray_prod(x, axes, na_rm = TRUE),</span>
+<span class="ins">+    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)</span>
+<span class="ins">+  ),</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit bench/reduce.R</summary>
+<pre class="diff"><span class="del">-shapes &lt;- list(</span>
+<span class="del">-  &quot;[4000, 4000] over 1&quot;</span>
+<span class="ins">+shapes &lt;- list(</span>
+<span class="ins">+  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),</span>
+<span class="ins">+  &quot;[4000, 4000] over 1&quot;</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit bench/reduce.R</summary>
+<pre class="diff"><span class="del">-    double = runif(n)</span>
+<span class="del">-  )</span>
+<span class="ins">+    double = runif(n),</span>
+<span class="ins">+    complex = complex(real = runif(n), imaginary = runif(n))</span>
+<span class="ins">+  )</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/reduce.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit bench/binary.R</summary>
+<pre class="diff"><span class="del">-operations &lt;- list(</span>
+<span class="ins">+operations &lt;- list(</span>
+<span class="ins">+  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),</span></pre><pre class="output">The file ~/files/r/packages/rray/bench/binary.R has been updated successfully.</pre></details>
+<p>Bench scripts extended. Now writing a supplementary scratch benchmark with the plan's NA-heavy data (and the finite <code>-1, 1, 2</code> integers), since the committed scripts don't put NAs in integer data.</p>
+
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b6…</summary>
+<pre>devtools::load_all(&quot;~/files/r/packages/rray&quot;, quiet = TRUE)
+
+output &lt;- commandArgs(trailingOnly = TRUE)[[1L]]
+
+set.seed(1)
+n &lt;- 16e6
+xi &lt;- sample(100L, n, TRUE)
+xi[sample(n, 10)] &lt;- NA
+xf &lt;- sample(c(-1L, 1L, 2L), n, TRUE)
+xl &lt;- sample(c(TRUE, FALSE, NA), n, TRUE)
+xd &lt;- runif(n, 0.5, 1.5)
+xd[sample(n, 10)] &lt;- NA
+xc &lt;- complex(real = runif(n, 0.5, 1.5), imaginary = runif(n, -0.1, 0.1))
+xc[sample(n, 10)] &lt;- NA
+
+inputs &lt;- list(
+  &quot;integer, 10 NA&quot; = xi,
+  &quot;integer, -1/1/2&quot; = xf,
+  &quot;logical, 1/3 NA&quot; = xl,
+  &quot;double, 10 NA&quot; = xd,
+  &quot;complex, 10 NA&quot; = xc
+)
+
+calls &lt;- list(
+  prod = \(x) rray_prod(x, 1L),
+  prod_na_rm = \(x) rray_prod(x, 1L, na_rm = TRUE),
+  cumulative_prod = \(x) rray_cumulative_prod(x, 1L)
+)
+
+results &lt;- list()
+
+for (call in names(calls)) {
+  for (input in names(inputs)) {
+    x &lt;- inputs[[input]]
+    fn &lt;- calls[[call]]
+    m &lt;- bench::mark(
+      fn(x),
+      iterations = 20,
+      check = FALSE,
+      memory = FALSE,
+      filter_gc = FALSE
+    )
+    results[[length(results) + 1L]] &lt;- data.frame(
+      call = call,
+      input = input,
+      median_ms = as.numeric(m$median) * 1000
+    )
+  }
+}
+
+results &lt;- do.call(rbind, results)
+print(results, row.names = FALSE)
+saveRDS(results, output)</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/plan-data.R (file state is current in your context — no need to Read it back)</pre></details>
+<p>Running the &quot;before&quot; benchmarks on unchanged C (sequentially, so they don't interfere).</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; Rscript -e 'devtools::load_all(quiet=TRUE)' &gt;/dev/null 2&gt;&amp;1 &amp;&amp; \
+RRAY_BENCH_OUTPUT=$S/before-reduce.rds Rscript bench/reduce.R &gt; $S/before-reduce.txt 2&gt;&amp;1 &amp;&amp; \
+RRAY_BENCH_OUTPUT=$S/before-cumulative.rds Rscript bench/cumulative.R &gt; $S/before-cumulative.txt 2&gt;&amp;1 &amp;&amp; \
+RRAY_BENCH_OUTPUT=$S/before-binary.rds Rscript bench/binary.R &gt; $S/before-binary.txt 2&gt;&amp;1 &amp;&amp; \
+Rscript $S/plan-data.R $S/before-plan.rds &gt; $S/before-plan.txt 2&gt;&amp;1; echo done $?</pre><pre class="output">Command running in background with ID: b95424dz0. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b95424dz0.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>While that runs (I won't touch <code>src/</code> until it finishes, since each script recompiles on load), I'll look at the existing tests.</p>
+
+<details class="tool"><summary>Bash: sed -n 74,110p tests/testthat/test-reduce-prod.R; sed -n 196,255p tests/testthat/test-reduce-…</summary>
+<pre>sed -n 74,110p tests/testthat/test-reduce-prod.R; sed -n 196,255p tests/testthat/test-reduce-prod.R; grep -n 'test_that\|is.na\|NaN' tests/testthat/test-cumulative-prod.R | head -60</pre><pre class="output">test_that(&quot;logical values multiply like 0s and 1s&quot;, {
+  x &lt;- array(c(TRUE, FALSE, TRUE, TRUE), c(2L, 2L))
+  out &lt;- rray_prod(x, 1L)
+  expect_identical(as.vector(out), c(0, 1))
+})
+
+test_that(&quot;integer NA propagates&quot;, {
+  x &lt;- array(c(1L, NA_integer_), c(2L, 1L))
+  expect_identical(as.vector(rray_prod(x, 1L)), NA_real_)
+
+  x &lt;- array(c(NA_integer_, 1L), c(2L, 1L))
+  expect_identical(as.vector(rray_prod(x, 1L)), NA_real_)
+})
+
+test_that(&quot;double NA / NaN propagates&quot;, {
+  x &lt;- c(1, NA_real_)
+  expect_identical(as.vector(rray_prod(x, 1L)), NA_real_)
+
+  x &lt;- c(NA_real_, 1)
+  expect_identical(as.vector(rray_prod(x, 1L)), NA_real_)
+
+  x &lt;- c(1, NaN)
+  expect_identical(as.vector(rray_prod(x, 1L)), NaN)
+
+  x &lt;- c(NaN, 1)
+  expect_identical(as.vector(rray_prod(x, 1L)), NaN)
+
+  # Purposefully not comparing directly, as the result is implementation defined
+  x &lt;- c(NA, NaN)
+  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))
+
+  x &lt;- c(NaN, NA)
+  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))
+})
+
+test_that(&quot;Inf matches base R prod&quot;, {
+  expect_identical(
+test_that(&quot;na_rm removes integer NA&quot;, {
+  x &lt;- array(c(1L, NA_integer_, 3L, 4L), c(2L, 2L))
+  out &lt;- rray_prod(x, 1L, na_rm = TRUE)
+  expect_identical(as.vector(out), c(1, 12))
+})
+
+test_that(&quot;na_rm removes double NA and NaN&quot;, {
+  x &lt;- c(1, NA_real_, 3)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 3)
+
+  x &lt;- c(1, NaN, 3)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 3)
+
+  x &lt;- c(NA_real_, NaN)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)
+})
+
+test_that(&quot;na_rm removes logical NA&quot;, {
+  x &lt;- array(c(TRUE, NA, FALSE, TRUE), c(2L, 2L))
+  out &lt;- rray_prod(x, 1L, na_rm = TRUE)
+  expect_identical(as.vector(out), c(1, 0))
+})
+
+test_that(&quot;na_rm removes an entire complex NA element&quot;, {
+  x &lt;- c(1 + 2i, NA_complex_)
+  out &lt;- as.vector(rray_prod(x, 1L, na_rm = TRUE))
+  expect_identical(out, 1 + 2i)
+
+  x &lt;- c(complex(real = 1, imaginary = NaN), 1 + 1i)
+  out &lt;- as.vector(rray_prod(x, 1L, na_rm = TRUE))
+  expect_identical(out, 1 + 1i)
+
+  x &lt;- c(1 + 1i, complex(real = 1, imaginary = NaN), 2 + 2i)
+  out &lt;- as.vector(rray_prod(x, 1L, na_rm = TRUE))
+  expect_identical(out, prod(x, na.rm = TRUE))
+})
+
+test_that(&quot;na_rm with all NA returns identity&quot;, {
+  x &lt;- c(NA, NA)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)
+
+  x &lt;- c(NA_integer_, NA_integer_)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)
+
+  x &lt;- c(NA_real_, NA_real_)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)
+
+  x &lt;- c(NA_complex_, NA_complex_)
+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1 + 0i)
+})
+
+test_that(&quot;na_rm with no NA matches default&quot;, {
+  x &lt;- array(1:10, c(5L, 2L))
+  expect_identical(
+    rray_prod(x, 1L, na_rm = TRUE),
+    rray_prod(x, 1L)
+  )
+})
+
+test_that(&quot;plain vector input works&quot;, {
+1:test_that(&quot;can accumulate along axis 1&quot;, {
+10:test_that(&quot;can accumulate along axis 2&quot;, {
+19:test_that(&quot;can accumulate along every axis of a 3D array&quot;, {
+31:test_that(&quot;each line starts fresh&quot;, {
+43:test_that(&quot;logicals and integers become doubles&quot;, {
+62:test_that(&quot;integers do not overflow&quot;, {
+70:test_that(&quot;matches base R for simple lines&quot;, {
+83:test_that(&quot;products can overflow to infinity and underflow to zero&quot;, {
+94:test_that(&quot;zero times infinity is `NaN`&quot;, {
+97:    c(0, NaN, NaN)
+101:    c(Inf, NaN, NaN)
+105:test_that(&quot;zero keeps its sign&quot;, {
+110:test_that(&quot;missing values persist through the rest of a line&quot;, {
+124:    as.vector(rray_cumulative_prod(c(2, NaN, 0), 1L)),
+125:    c(2, NaN, NaN)
+128:    is.na(as.vector(rray_cumulative_prod(c(1i, NA, 0i), 1L))),
+133:test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+135:    is.na(as.vector(rray_cumulative_prod(c(2, NA, NaN, 3), 1L))),
+139:    is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),
+144:test_that(&quot;last position matches the reducer&quot;, {
+158:test_that(&quot;an axis of dimension 1 still casts to double&quot;, {
+165:  x &lt;- array(c(-Inf, 2, NA, NaN), c(1L, 4L))
+169:test_that(&quot;zero-size arrays keep their shape&quot;, {
+185:test_that(&quot;names are kept on every axis&quot;, {
+201:test_that(&quot;titles are kept&quot;, {
+213:test_that(&quot;vectors become 1D arrays&quot;, {
+224:test_that(&quot;`axis` can be a whole double&quot;, {
+229:test_that(&quot;`axis` is validated&quot;, {
+243:test_that(&quot;errors on unsupported input types&quot;, {
+249:test_that(&quot;errors on classed input&quot;, {</pre></details>
+<details class="tool"><summary>Bash: sed -n 105,145p tests/testthat/test-cumulative-prod.R</summary>
+<pre>sed -n 105,145p tests/testthat/test-cumulative-prod.R</pre><pre class="output">test_that(&quot;zero keeps its sign&quot;, {
+  out &lt;- as.vector(rray_cumulative_prod(c(-1, 0, 2, -3), 1L))
+  expect_identical(1 / out, c(-1, -Inf, -Inf, Inf))
+})
+
+test_that(&quot;missing values persist through the rest of a line&quot;, {
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(TRUE, NA, FALSE), 1L)),
+    c(1, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(2L, NA, 0L), 1L)),
+    c(2, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(2, NA, 0), 1L)),
+    c(2, NA, NA)
+  )
+  expect_identical(
+    as.vector(rray_cumulative_prod(c(2, NaN, 0), 1L)),
+    c(2, NaN, NaN)
+  )
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(c(1i, NA, 0i), 1L))),
+    c(FALSE, TRUE, TRUE)
+  )
+})
+
+test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(c(2, NA, NaN, 3), 1L))),
+    c(FALSE, TRUE, TRUE, TRUE)
+  )
+  expect_identical(
+    is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),
+    c(FALSE, TRUE, TRUE, TRUE)
+  )
+})
+
+test_that(&quot;last position matches the reducer&quot;, {
+  x &lt;- array(c(2, -1, 0.5, 4, -3, 0.25), c(2L, 3L))</pre></details>
+<p>Adding the tests now (R files only, safe while the benchmark runs).</p>
+
+<details class="tool"><summary>Edit tests/testthat/test-reduce-prod.R</summary>
+<pre class="diff"><span class="del">-  x &lt;- c(NaN, NA)</span>
+<span class="del">-  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))</span>
+<span class="del">-})</span>
+<span class="ins">+  x &lt;- c(NaN, NA)</span>
+<span class="ins">+  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;integer NA after an overflow to NaN is missing&quot;, {</span>
+<span class="ins">+  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)</span>
+<span class="ins">+  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-reduce-prod.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-reduce-prod.R</summary>
+<pre class="diff"><span class="del">-  x &lt;- c(NA_real_, NaN)</span>
+<span class="del">-  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)</span>
+<span class="del">-})</span>
+<span class="ins">+  x &lt;- c(NA_real_, NaN)</span>
+<span class="ins">+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)</span>
+<span class="ins">+})</span>
+<span class="ins">+</span>
+<span class="ins">+test_that(&quot;na_rm keeps the running product exactly&quot;, {</span>
+<span class="ins">+  x &lt;- c(-1, 0, NA)</span>
+<span class="ins">+  expect_identical(1 / as.vector(rray_prod(x, 1L, na_rm = TRUE)), -Inf)</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(-1L, 0L, NA)</span>
+<span class="ins">+  expect_identical(1 / as.vector(rray_prod(x, 1L, na_rm = TRUE)), -Inf)</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(Inf, NA)</span>
+<span class="ins">+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), Inf)</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(rep(.Machine$integer.max, 40L), NA)</span>
+<span class="ins">+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), Inf)</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(Inf, 0, NA)</span>
+<span class="ins">+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), NaN)</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)</span>
+<span class="ins">+  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), NaN)</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-reduce-prod.R has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit tests/testthat/test-cumulative-prod.R</summary>
+<pre class="diff"><span class="del">-    is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),</span>
+<span class="del">-    c(FALSE, TRUE, TRUE, TRUE)</span>
+<span class="del">-  )</span>
+<span class="del">-})</span>
+<span class="ins">+    is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),</span>
+<span class="ins">+    c(FALSE, TRUE, TRUE, TRUE)</span>
+<span class="ins">+  )</span>
+<span class="ins">+</span>
+<span class="ins">+  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)</span>
+<span class="ins">+  expect_identical(</span>
+<span class="ins">+    is.na(as.vector(rray_cumulative_prod(x, 1L))),</span>
+<span class="ins">+    c(rep(FALSE, 40L), TRUE, TRUE)</span>
+<span class="ins">+  )</span>
+<span class="ins">+})</span></pre><pre class="output">The file ~/files/r/packages/rray/tests/testthat/test-cumulative-prod.R has been updated successfully.</pre></details>
+<p>Now the <code>rray_prod()</code> docs, which don't yet mention the <code>NA</code>/<code>NaN</code> winner.</p>
+
+<details class="tool"><summary>Edit R/reduce.R</summary>
+<pre class="diff"><span class="del">-#' @section Product:</span>
+<span class="del">-#' Logicals and integers are cast to double.</span>
+<span class="del">-#'</span>
+<span class="del">-#' @section Mean:</span>
+<span class="ins">+#' @section Product:</span>
+<span class="ins">+#' Logicals and integers are cast to double.</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' When `NA` and `NaN` are both present, you get one of them, but which one</span>
+<span class="ins">+#' depends on the platform and the order of the values. Either way, `is.na()`</span>
+<span class="ins">+#' is `TRUE`. Integers can hit this too, since a product that overflows to</span>
+<span class="ins">+#' `Inf` becomes `NaN` when multiplied by `0`:</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' ```r</span>
+<span class="ins">+#' rray_prod(c(NA, NaN), 1L) # NA or NaN</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)</span>
+<span class="ins">+#' rray_prod(x, 1L) # NA or NaN</span>
+<span class="ins">+#' ```</span>
+<span class="ins">+#'</span>
+<span class="ins">+#' @section Mean:</span></pre><pre class="output">The file ~/files/r/packages/rray/R/reduce.R has been updated successfully.</pre></details>
+<p>Tests and docs are drafted. Waiting on the &quot;before&quot; run to finish before editing C.</p>
+
+<details class="tool"><summary>ToolSearch: select:Monitor</summary>
+<pre>{
+  &quot;query&quot;: &quot;select:Monitor&quot;,
+  &quot;max_results&quot;: 1
+}</pre><pre class="output">Monitor</pre></details>
+<details class="tool"><summary>Bash: ls -la /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b2…</summary>
+<pre>ls -la /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/; tail -5 /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/before-*.txt</pre><pre class="output">total 8
+drwx------@ 4 davis  wheel   128 Oct 11 20:06 .
+drwx------@ 3 davis  wheel    96 Oct 11 20:02 ..
+-rw-r--r--@ 1 davis  wheel     0 Oct 11 20:06 before-reduce.txt
+-rw-r--r--@ 1 davis  wheel  1228 Oct 11 20:06 plan-data.R</pre></details>
+<p>Still on the first script (<code>reduce.R</code>). The background job notifies me when all four finish, so I'll wait for that.</p>
+
+<details class="tool"><summary>Bash: until [ -f /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646…</summary>
+<pre>until [ -f /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/before-plan.rds ] || ! pgrep -f &quot;bench/|plan-data.R&quot; &gt;/dev/null; do sleep 5; done; echo finished</pre><pre class="output">Command running in background with ID: blu61vgzv. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/blu61vgzv.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>The &quot;before&quot; benchmarks are still running, and I'm waiting for them to finish before changing any C code.</p>
+<p>So far on the new branch <code>feature/prod-perf</code>:</p>
+<ul>
+<li>
+<p><strong>Bench scripts:</strong></p>
+<ul>
+<li><code>bench/reduce.R</code> now covers <code>rray_prod()</code> with and without <code>na_rm</code> for logical, integer, double and complex, plus a new <code>[1.6e7] over 1</code> shape.</li>
+<li><code>bench/binary.R</code> now covers <code>rray_multiply()</code>.</li>
+<li><code>bench/cumulative.R</code> already had every <code>rray_cumulative_prod()</code> case.</li>
+</ul>
+</li>
+<li>
+<p><strong>Extra benchmark:</strong> a scratch script runs the plan's own data along axis 1. That's integers with a few <code>NA</code>s, integers drawn from <code>-1</code>, <code>1</code> and <code>2</code> (which stay finite), logicals with <code>NA</code>, and double and complex with a few <code>NA</code>s. The committed scripts have no <code>NA</code>s in their integer data, so this covers the case they miss.</p>
+</li>
+<li>
+<p><strong>Tests:</strong></p>
+<ul>
+<li>An integer product that is already <code>NaN</code> and then meets <code>NA</code> is checked with <code>is.na()</code> only, for both <code>rray_prod()</code> and <code>rray_cumulative_prod()</code>.</li>
+<li>With <code>na_rm = TRUE</code>, a running <code>-0</code>, <code>Inf</code> or <code>NaN</code> must come through unchanged, for double and integer input.</li>
+</ul>
+</li>
+<li>
+<p><strong>Docs:</strong> the Product section of the <code>rray_prod()</code> docs now says that when <code>NA</code> and <code>NaN</code> are both present, which one you get isn't promised. It includes the integer overflow example.</p>
+</li>
+</ul>
+<p>Once the run finishes, the next steps are:</p>
+<ol>
+<li>Rewrite the five helpers in <code>src/one-multiply.h</code>.</li>
+<li>Try the complex <code>na_rm</code> form, and keep it only if it's clearly faster.</li>
+<li>Re-run every benchmark on the same scripts.</li>
+<li>Run the full test suite, <code>clang-format</code>, <code>air format</code> and <code>document()</code>.</li>
+<li>Remove the plan, then commit and push.</li>
+</ol>
+
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b21532…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/ &amp;&amp; cat /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b95424dz0.output; ls; grep -E 'prod|multiply' before-reduce.txt before-cumulative.txt before-binary.txt | head -5; cat before-plan.txt</pre><pre class="output">done 0
+
+[exited with code 0]
+before-binary.rds
+before-binary.txt
+before-cumulative.rds
+before-cumulative.txt
+before-plan.rds
+before-plan.txt
+before-reduce.rds
+before-reduce.txt
+plan-data.R
+before-binary.txt:     multiply integer [4000, 4000] [4000, 4000]  28.41392
+before-binary.txt:     multiply integer    [4000, 4000] [4000, 1]  25.75323
+before-binary.txt:     multiply integer    [4000, 4000] [1, 4000]  23.84591
+before-binary.txt:     multiply integer       [4000, 4000] [1, 1]  23.76083
+before-binary.txt:     multiply integer       [4000, 1] [1, 4000]  23.69398
+            call           input median_ms
+            prod  integer, 10 NA  29.04840
+            prod integer, -1/1/2  28.99629
+            prod logical, 1/3 NA  29.02189
+            prod   double, 10 NA  19.36082
+            prod  complex, 10 NA  63.78095
+      prod_na_rm  integer, 10 NA  28.93659
+      prod_na_rm integer, -1/1/2  29.07771
+      prod_na_rm logical, 1/3 NA  28.99704
+      prod_na_rm   double, 10 NA  28.96476
+      prod_na_rm  complex, 10 NA  47.06716
+ cumulative_prod  integer, 10 NA  52.76975
+ cumulative_prod integer, -1/1/2  52.87626
+ cumulative_prod logical, 1/3 NA  52.68117
+ cumulative_prod   double, 10 NA  43.43503
+ cumulative_prod  complex, 10 NA 110.28020
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<p>Baseline captured. Now the C rewrite in <code>src/one-multiply.h</code>.</p>
+
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-static inline double rray_prod_lgl_one(double out, int x) {</span>
+<span class="del">-  if (rray_lgl_is_missing(x)) {</span>
+<span class="del">-    return r_globals.na_dbl;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out * x;</span>
+<span class="del">-}</span>
+<span class="ins">+static inline double rray_prod_lgl_one(double out, int x) {</span>
+<span class="ins">+  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : (double) x);</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-static inline double rray_prod_lgl_one_na_rm(double out, int x) {</span>
+<span class="del">-  if (rray_lgl_is_missing(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out * x;</span>
+<span class="del">-}</span>
+<span class="ins">+static inline double rray_prod_lgl_one_na_rm(double out, int x) {</span>
+<span class="ins">+  return out * (rray_lgl_is_missing(x) ? 1.0 : (double) x);</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-static inline double rray_prod_int_one(double out, int x) {</span>
+<span class="del">-  if (rray_int_is_missing(x)) {</span>
+<span class="del">-    return r_globals.na_dbl;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out * x;</span>
+<span class="del">-}</span>
+<span class="ins">+static inline double rray_prod_int_one(double out, int x) {</span>
+<span class="ins">+  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : (double) x);</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-static inline double rray_prod_int_one_na_rm(double out, int x) {</span>
+<span class="del">-  if (rray_int_is_missing(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out * x;</span>
+<span class="del">-}</span>
+<span class="ins">+static inline double rray_prod_int_one_na_rm(double out, int x) {</span>
+<span class="ins">+  return out * (rray_int_is_missing(x) ? 1.0 : (double) x);</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully.</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-static inline double rray_prod_dbl_one_na_rm(double out, double x) {</span>
+<span class="del">-  if (rray_dbl_is_missing(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return out * x;</span>
+<span class="del">-}</span>
+<span class="ins">+static inline double rray_prod_dbl_one_na_rm(double out, double x) {</span>
+<span class="ins">+  return out * (rray_dbl_is_missing(x) ? 1.0 : x);</span>
+<span class="ins">+}</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully.</pre></details>
+<p>Those diagnostics are expected: decl headers have no includes by design. Running the prod tests first.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test(filter = 'prod')&quot; 2&gt;&amp;1 | tail -15</summary>
+<pre>Rscript -e &quot;devtools::test(filter = 'prod')&quot; 2&gt;&amp;1 | tail -15</pre><pre class="output">ℹ Testing rray
+[ FAIL 0 | WARN 0 | SKIP 0 | PASS 163 ]</pre></details>
+<p>Passing. Quick check that the new tests really reach the <code>NaN</code> then <code>NA</code> path, and what arm64 now returns:</p>
+
+<details class="tool"><summary>Bash: Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA); o…</summary>
+<pre>Rscript -e 'devtools::load_all(quiet=TRUE); x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA); out &lt;- as.vector(rray_cumulative_prod(x, 1L)); print(out[39:42]); print(c(is.nan(out[41]), is.nan(out[42]))); print(rray_prod(x, 1L))'</pre><pre class="output">[1] Inf Inf NaN  NA
+[1]  TRUE FALSE
+[1] NA</pre></details>
+<p>Paths confirmed (still <code>NA</code> on arm64). Running the &quot;after&quot; benchmarks with the identical setup.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; Rscript -e 'devtools::load_all(quiet=TRUE)' &gt;/dev/null 2&gt;&amp;1 &amp;&amp; \
+RRAY_BENCH_OUTPUT=$S/after-reduce.rds Rscript bench/reduce.R &gt; $S/after-reduce.txt 2&gt;&amp;1 &amp;&amp; \
+RRAY_BENCH_OUTPUT=$S/after-cumulative.rds Rscript bench/cumulative.R &gt; $S/after-cumulative.txt 2&gt;&amp;1 &amp;&amp; \
+RRAY_BENCH_OUTPUT=$S/after-binary.rds Rscript bench/binary.R &gt; $S/after-binary.txt 2&gt;&amp;1 &amp;&amp; \
+Rscript $S/plan-data.R $S/after-plan.rds &gt; $S/after-plan.txt 2&gt;&amp;1; echo done $?</pre><pre class="output">Command running in background with ID: bpxkgfw9d. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/bpxkgfw9d.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>While that runs, writing a comparison script.</p>
+
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b6…</summary>
+<pre>dir &lt;- &quot;/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad&quot;
+args &lt;- commandArgs(trailingOnly = TRUE)
+before_tag &lt;- if (length(args) &gt;= 1L) args[[1L]] else &quot;before&quot;
+after_tag &lt;- if (length(args) &gt;= 2L) args[[2L]] else &quot;after&quot;
+
+compare &lt;- function(name, keys, pattern) {
+  before &lt;- readRDS(file.path(dir, paste0(before_tag, &quot;-&quot;, name, &quot;.rds&quot;)))
+  after &lt;- readRDS(file.path(dir, paste0(after_tag, &quot;-&quot;, name, &quot;.rds&quot;)))
+  if (!is.data.frame(before)) before &lt;- before$results
+  if (!is.data.frame(after)) after &lt;- after$results
+  out &lt;- merge(before, after, by = keys, suffixes = c(&quot;_before&quot;, &quot;_after&quot;), sort = FALSE)
+  out &lt;- out[grepl(pattern, out[[keys[[1L]]]]), ]
+  out$change &lt;- sprintf(&quot;%+.0f%%&quot;, 100 * (out$median_ms_after / out$median_ms_before - 1))
+  out$median_ms_before &lt;- round(out$median_ms_before, 1)
+  out$median_ms_after &lt;- round(out$median_ms_after, 1)
+  cat(&quot;\n==&quot;, name, &quot;==\n&quot;)
+  print(out, row.names = FALSE)
+}
+
+compare(&quot;reduce&quot;, c(&quot;operation&quot;, &quot;type&quot;, &quot;shape&quot;), &quot;^prod&quot;)
+compare(&quot;cumulative&quot;, c(&quot;operation&quot;, &quot;type&quot;, &quot;shape&quot;), &quot;^prod&quot;)
+compare(&quot;binary&quot;, c(&quot;operation&quot;, &quot;type&quot;, &quot;shape&quot;), &quot;^multiply&quot;)
+compare(&quot;plan&quot;, c(&quot;call&quot;, &quot;input&quot;), &quot;.&quot;)</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/compare.R (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: until [ -f /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646…</summary>
+<pre>until [ -f /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/after-plan.rds ] || ! pgrep -f &quot;bench/|plan-data.R&quot; &gt;/dev/null; do sleep 5; done; echo finished</pre><pre class="output">Command running in background with ID: btzi3cm8g. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/btzi3cm8g.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>The &quot;after&quot; benchmarks are running in the background. I'll compare the two runs once they finish.</p>
+
+<details class="tool"><summary>Bash: Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b…</summary>
+<pre>Rscript /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/compare.R 2&gt;&amp;1</pre><pre class="output">== reduce ==
+  operation    type                     shape median_ms_before median_ms_after
+       prod logical            [1.6e7] over 1             28.8            19.4
+       prod logical       [4000, 4000] over 1             28.4            19.2
+       prod logical       [4000, 4000] over 2              3.8             3.6
+       prod logical    [4000, 4000] over 1, 2             29.1            19.4
+       prod logical    [200, 200, 200] over 1             11.7             7.9
+       prod logical    [200, 200, 200] over 2              1.9             1.9
+       prod logical    [200, 200, 200] over 3              2.1             2.0
+       prod logical [200, 200, 200] over 1, 3             11.4             7.9
+       prod logical          [10, 1e6] over 1              7.4             6.4
+       prod logical          [10, 1e6] over 2              5.8             4.6
+       prod integer            [1.6e7] over 1             28.9            19.4
+       prod integer       [4000, 4000] over 1             28.8            19.2
+       prod integer       [4000, 4000] over 2              3.6             3.7
+       prod integer    [4000, 4000] over 1, 2             28.7            19.4
+       prod integer    [200, 200, 200] over 1             11.6             7.8
+       prod integer    [200, 200, 200] over 2              1.9             2.0
+       prod integer    [200, 200, 200] over 3              2.1             2.0
+       prod integer [200, 200, 200] over 1, 3             11.4             7.7
+       prod integer          [10, 1e6] over 1              6.9             7.9
+       prod integer          [10, 1e6] over 2              5.8             4.6
+       prod  double            [1.6e7] over 1             19.4            19.4
+       prod  double       [4000, 4000] over 1             19.0            19.1
+       prod  double       [4000, 4000] over 2              2.4             2.5
+       prod  double    [4000, 4000] over 1, 2             19.3            18.6
+       prod  double    [200, 200, 200] over 1              7.8             7.8
+       prod  double    [200, 200, 200] over 2              1.3             1.3
+       prod  double    [200, 200, 200] over 3              1.8             1.9
+       prod  double [200, 200, 200] over 1, 3              7.7             7.7
+       prod  double          [10, 1e6] over 1              5.1             5.9
+       prod  double          [10, 1e6] over 2              4.2             4.1
+       prod complex            [1.6e7] over 1             46.6            46.7
+       prod complex       [4000, 4000] over 1             46.5            46.4
+       prod complex       [4000, 4000] over 2             16.0            16.0
+       prod complex    [4000, 4000] over 1, 2             46.6            46.5
+       prod complex    [200, 200, 200] over 1             22.3            22.4
+       prod complex    [200, 200, 200] over 2              7.5             7.7
+       prod complex    [200, 200, 200] over 3              7.6             7.8
+       prod complex [200, 200, 200] over 1, 3             22.3            22.8
+       prod complex          [10, 1e6] over 1             17.2            17.0
+       prod complex          [10, 1e6] over 2             10.1            10.2
+ prod_na_rm logical            [1.6e7] over 1             28.9            19.5
+ prod_na_rm logical       [4000, 4000] over 1             28.7            18.7
+ prod_na_rm logical       [4000, 4000] over 2              3.5             3.4
+ prod_na_rm logical    [4000, 4000] over 1, 2             29.0            19.3
+ prod_na_rm logical    [200, 200, 200] over 1             11.0             7.6
+ prod_na_rm logical    [200, 200, 200] over 2              1.9             1.9
+ prod_na_rm logical    [200, 200, 200] over 3              1.8             1.8
+ prod_na_rm logical [200, 200, 200] over 1, 3             11.3             7.7
+ prod_na_rm logical          [10, 1e6] over 1              6.9             6.0
+ prod_na_rm logical          [10, 1e6] over 2              8.0             7.0
+ prod_na_rm integer            [1.6e7] over 1             28.7            19.3
+ prod_na_rm integer       [4000, 4000] over 1             28.7            19.2
+ prod_na_rm integer       [4000, 4000] over 2              3.5             3.4
+ prod_na_rm integer    [4000, 4000] over 1, 2             28.3            19.4
+ prod_na_rm integer    [200, 200, 200] over 1             11.0             7.6
+ prod_na_rm integer    [200, 200, 200] over 2              1.9             1.9
+ prod_na_rm integer    [200, 200, 200] over 3              1.8             1.9
+ prod_na_rm integer [200, 200, 200] over 1, 3             11.2             7.5
+ prod_na_rm integer          [10, 1e6] over 1              6.7             5.8
+ prod_na_rm integer          [10, 1e6] over 2              8.3             7.2
+ prod_na_rm  double            [1.6e7] over 1             29.0            19.3
+ prod_na_rm  double       [4000, 4000] over 1             28.4            19.1
+ prod_na_rm  double       [4000, 4000] over 2              2.4             2.5
+ prod_na_rm  double    [4000, 4000] over 1, 2             29.0            19.3
+ prod_na_rm  double    [200, 200, 200] over 1             11.2             7.8
+ prod_na_rm  double    [200, 200, 200] over 2              1.3             1.3
+ prod_na_rm  double    [200, 200, 200] over 3              1.8             1.8
+ prod_na_rm  double [200, 200, 200] over 1, 3             11.4             7.8
+ prod_na_rm  double          [10, 1e6] over 1              6.2             5.4
+ prod_na_rm  double          [10, 1e6] over 2              5.1             4.3
+ prod_na_rm complex            [1.6e7] over 1             47.1            47.2
+ prod_na_rm complex       [4000, 4000] over 1             46.9            47.0
+ prod_na_rm complex       [4000, 4000] over 2             16.1            16.5
+ prod_na_rm complex    [4000, 4000] over 1, 2             47.0            47.2
+ prod_na_rm complex    [200, 200, 200] over 1             22.3            22.5
+ prod_na_rm complex    [200, 200, 200] over 2              7.5             7.5
+ prod_na_rm complex    [200, 200, 200] over 3              7.7             7.5
+ prod_na_rm complex [200, 200, 200] over 1, 3             22.4            22.4
+ prod_na_rm complex          [10, 1e6] over 1             16.3            16.2
+ prod_na_rm complex          [10, 1e6] over 2              9.6             9.8
+ change
+   -33%
+   -32%
+    -4%
+   -33%
+   -32%
+    +3%
+    -6%
+   -30%
+   -14%
+   -21%
+   -33%
+   -33%
+    +3%
+   -32%
+   -32%
+    +2%
+    -3%
+   -32%
+   +14%
+   -21%
+    +0%
+    +0%
+    +4%
+    -4%
+    -0%
+    +0%
+    +5%
+    -0%
+   +17%
+    -2%
+    +0%
+    -0%
+    +0%
+    -0%
+    +1%
+    +2%
+    +2%
+    +2%
+    -1%
+    +1%
+   -33%
+   -35%
+    -3%
+   -34%
+   -31%
+    +1%
+    +3%
+   -31%
+   -13%
+   -12%
+   -33%
+   -33%
+    -1%
+   -32%
+   -32%
+    +0%
+    +5%
+   -33%
+   -13%
+   -14%
+   -33%
+   -33%
+    +6%
+   -33%
+   -30%
+    -0%
+    -1%
+   -31%
+   -12%
+   -17%
+    +0%
+    +0%
+    +3%
+    +0%
+    +1%
+    -0%
+    -3%
+    -0%
+    -1%
+    +2%
+
+== cumulative ==
+ operation    type                  shape median_ms_before median_ms_after
+      prod logical         [1.6e7] over 1             36.2            46.2
+      prod logical    [4000, 4000] over 1             35.9            43.5
+      prod logical    [4000, 4000] over 2             15.6            33.0
+      prod logical [200, 200, 200] over 1             14.2            20.0
+      prod logical [200, 200, 200] over 2             10.7            15.9
+      prod logical [200, 200, 200] over 3              8.4            16.2
+      prod logical       [10, 1e6] over 1             14.7            23.6
+      prod logical       [10, 1e6] over 2             10.0            21.1
+      prod integer         [1.6e7] over 1             35.7            43.5
+      prod integer    [4000, 4000] over 1             36.6            43.7
+      prod integer    [4000, 4000] over 2             17.9            19.2
+      prod integer [200, 200, 200] over 1             14.3            20.2
+      prod integer [200, 200, 200] over 2              6.6            16.0
+      prod integer [200, 200, 200] over 3              7.1            16.6
+      prod integer       [10, 1e6] over 1             11.6            24.0
+      prod integer       [10, 1e6] over 2             11.6            21.6
+      prod  double         [1.6e7] over 1             24.8            43.1
+      prod  double    [4000, 4000] over 1             26.8            43.4
+      prod  double    [4000, 4000] over 2             15.4            33.0
+      prod  double [200, 200, 200] over 1             10.3            19.6
+      prod  double [200, 200, 200] over 2              6.7            15.9
+      prod  double [200, 200, 200] over 3              7.0            16.3
+      prod  double       [10, 1e6] over 1             10.1            22.1
+      prod  double       [10, 1e6] over 2              9.2            21.1
+      prod complex         [1.6e7] over 1             67.2            93.3
+      prod complex    [4000, 4000] over 1             57.6            94.1
+      prod complex    [4000, 4000] over 2             43.5            76.0
+      prod complex [200, 200, 200] over 1             26.9            44.9
+      prod complex [200, 200, 200] over 2             19.2            37.7
+      prod complex [200, 200, 200] over 3             18.6            38.7
+      prod complex       [10, 1e6] over 1             22.7            47.5
+      prod complex       [10, 1e6] over 2             27.8            43.1
+ change
+   +28%</pre><p class="cut">81 more lines cut</p></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Reduce results look solid—about 33% faster on axis 1, other axes unchanged, and the unmodified double control stayed flat as expected. But the cumulative run looks noisy, since double and complex got 40-130% slower despite unchanged helper code, so I'll check machine load and re-run cumulative alone, alternating builds.</p>
+</details>
+<details class="tool"><summary>Bash: top -l 1 -o cpu -n 8 | sed -n 1,25p; memory_pressure | tail -3</summary>
+<pre>top -l 1 -o cpu -n 8 | sed -n 1,25p; memory_pressure | tail -3</pre><pre class="output">Processes: 940 total, 5 running, 935 sleeping, 5198 threads 
+2026/10/11 20:14:59
+Load Avg: 3.84, 3.90, 3.50 
+CPU usage: 17.89% user, 12.23% sys, 69.86% idle 
+SharedLibs: 687M resident, 126M data, 91M linkedit.
+MemRegions: 826378 total, 8059M resident, 393M private, 2194M shared.
+PhysMem: 29G used (2442M wired, 9504M compressor), 2467M unused.
+VM: 430T vsize, 5703M framework vsize, 0(0) swapins, 0(0) swapouts.
+Networks: packets: 41159951/30G in, 28883578/15G out.
+Disks: 392207594/7085G read, 64836555/1378G written.
+
+PID    COMMAND          %CPU TIME     #TH #WQ #PORTS MEM   PURG CMPRS PGRP  PPID  STATE    BOOSTS  %CPU_ME %CPU_OTHRS UID FAULTS COW MSGSENT MSGRECV SYSBSD  SYSMACH CSW     PAGEINS IDLEW POWER INSTRS CYCLES JETPRI USER  #MREGS RPRVT VPRVT VSIZE KPRVT KSHRD
+99694  homeenergyd      0.0  00:00.39 2   1   90     10M   0B   10M   99694 1     sleeping *0[4]   0.00000 0.00000    502 4329   347 492     198     11824   2218    1842    135     0     0.0   0      0      0      davis N/A    N/A   N/A   N/A   N/A   N/A  
+98020  package_script_s 0.0  00:00.05 2   1   34     2561K 0B   2224K 98020 1     sleeping *0[6]   0.00000 0.00000    0   1362   134 332     82      4491    820     417     2       0     0.0   0      0      0      root  N/A    N/A   N/A   N/A   N/A   N/A  
+94299  PerfPowerService 0.0  01:42.59 9   6   579    15M   544K 3664K 94299 1     sleeping *0[564] 0.00000 0.00000    0   27243  232 907977  462904  2835386 799893  1118058 131     4     0.0   0      0      180    root  N/A    N/A   N/A   N/A   N/A   N/A  
+84164  clangd           0.0  00:04.79 44  0   65     85M   0B   28M   56627 56707 sleeping *0[1]   0.00000 0.00000    502 53285  89  650     21      159690  456     13327   911     0     0.0   0      0      180    davis N/A    N/A   N/A   N/A   N/A   N/A  
+80286  VTDecoderXPCServ 0.0  00:00.14 2   1   66     3841K 0B   3424K 80286 1     sleeping *0[13]  0.00000 0.00000    502 3748   187 951     615     3220    2469    821     2       0     0.0   0      0      0      davis N/A    N/A   N/A   N/A   N/A   N/A  
+79849  rust-analyzer-pr 0.0  00:00.55 1   0   11     20M   0B   19M   56318 71904 sleeping *0[1]   0.00000 0.00000    502 10368  587 72      7       27418   3596    3774    0       0     0.0   0      0      180    davis N/A    N/A   N/A   N/A   N/A   N/A  
+79848  rust-analyzer-pr 0.0  00:01.19 1   0   11     23M   0B   22M   56318 71904 sleeping *0[1]   0.00000 0.00000    502 17927  587 210     7       57530   7214    7861    19      0     0.0   0      0      180    davis N/A    N/A   N/A   N/A   N/A   N/A  
+79458  MTLCompilerServi 0.0  00:01.66 2   1   33     16M   0B   16M   79458 1     sleeping *0[35]  0.00000 0.00000    502 13841  316 5342    2695    4520    3022    1424    702     0     0.0   0      0      0      davis N/A    N/A   N/A   N/A   N/A   N/A  
+Pageouts: 2446597 
+
+System-wide memory free percentage: 62%</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The machine's under heavy load (load average ~3.8, 9.5 GB in the memory compressor), which affects <code>rray_cumulative_prod()</code> since it allocates 128 MB per call. Before rerunning, I'll check what compiler flags <code>load_all()</code> actually uses.</p>
+</details>
+<details class="tool"><summary>Bash: cat src/Makevars; Rscript -e 'print(pkgbuild:::compiler_flags(TRUE)); print(pkgbuild:::compil…</summary>
+<pre>cat src/Makevars; Rscript -e 'print(pkgbuild:::compiler_flags(TRUE)); print(pkgbuild:::compiler_flags(FALSE)); print(packageVersion(&quot;pkgbuild&quot;))'; R CMD config CFLAGS; cat ~/.R/Makevars 2&gt;/dev/null</pre><pre class="output">PKG_CPPFLAGS = -I./rlang
+                           CFLAGS                          CXXFLAGS 
+&quot;-UNDEBUG -Wall -pedantic -g -O0&quot; &quot;-UNDEBUG -Wall -pedantic -g -O0&quot; 
+                       CXX11FLAGS                        CXX14FLAGS 
+&quot;-UNDEBUG -Wall -pedantic -g -O0&quot; &quot;-UNDEBUG -Wall -pedantic -g -O0&quot; 
+                       CXX17FLAGS                        CXX20FLAGS 
+&quot;-UNDEBUG -Wall -pedantic -g -O0&quot; &quot;-UNDEBUG -Wall -pedantic -g -O0&quot; 
+                           FFLAGS                           FCFLAGS 
+                         &quot;-g -O0&quot;                          &quot;-g -O0&quot; 
+           CFLAGS          CXXFLAGS        CXX11FLAGS        CXX14FLAGS 
+&quot;-Wall -pedantic&quot; &quot;-Wall -pedantic&quot; &quot;-Wall -pedantic&quot; &quot;-Wall -pedantic&quot; 
+       CXX17FLAGS        CXX20FLAGS 
+&quot;-Wall -pedantic&quot; &quot;-Wall -pedantic&quot; 
+[1] ‘1.4.8’
+-O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always
+# -02 for normal compilation optimization
+# -g for debugging symbols (with Instruments)
+# -fno-common to ensure that on gcc10 we avoid multiple definition warnings
+#  by forgetting to add `extern` declarations
+# -Wstrict-prototypes to ensure functions with 0 arguments use `(void)` signatures
+# -fno-omit-frame-pointer possibly makes debugging easier?
+# -ftime-trace for tracing information in chrome://tracing/. See https://aras-p.info/blog/2019/01/16/time-trace-timeline-flame-chart-profiler-for-Clang/
+CFLAGS=-O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always
+CXXFLAGS=-O2 -g -Wall -pedantic -fdiagnostics-color=always</pre></details>
+<details class="tool"><summary>Bash: touch src/reduce-prod.c &amp;&amp; Rscript -e 'devtools::load_all()' 2&gt;&amp;1 | grep -m2 'reduce-prod'</summary>
+<pre>touch src/reduce-prod.c &amp;&amp; Rscript -e 'devtools::load_all()' 2&gt;&amp;1 | grep -m2 'reduce-prod'</pre><pre class="output">clang -arch arm64 -I&quot;/Library/Frameworks/R.framework/Versions/4.6/Resources/include&quot; -DNDEBUG -I./rlang  -I/opt/R/arm64/include    -fPIC  -O2 -g -fno-common -Wall -pedantic -fdiagnostics-color=always -c reduce-prod.c -o reduce-prod.o
+clang -arch arm64 -dynamiclib -Wl,-headerpad_max_install_names -undefined dynamic_lookup -L/Library/Frameworks/R.framework/Versions/4.6/Resources/lib -L/opt/R/arm64/lib -o rray.so arg.o arithmetic-add.o arithmetic-divide.o arithmetic-exponentiate.o arithmetic-multiply.o arithmetic-subtract.o arithmetic.o axes.o broadcast-names.o broadcast.o cast-common.o cast.o clone.o combine.o compare.o cumulative-extremum.o cumulative-logical.o cumulative-prod.o cumulative.o dimensionality.o dimensions.o equal.o extract-assign.o extract-subscript.o extract.o extremum.o if-else.o index.o init.o insert-axes.o locate.o logical.o move-axes.o names.o permute-axes.o ptype-common.o ptype.o reduce-extremum.o reduce-logical.o reduce-mean.o reduce-names.o reduce-prod.o reduce-sum.o reduce.o remove-axes.o rep-each.o rep.o reverse.o rlang.o roll-each.o roll.o size.o slice-assign.o slice-axis.o slice-subscript.o slice.o split.o stack.o strides.o subscript.o syms.o titles.o type.o typeof2.o unstack.o utils.o wrapper.o -F/Library/Frameworks/R.framework/Versions/4.6 -framework R</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The clean rebuild confirms the reduce numbers hold with <code>-O2</code>. Next I'll install three builds—original helpers (A), new helpers (B), and B with a trial select-after-multiply variant of the complex <code>na_rm</code> helper (C)—and alternate A, B, C runs for a fair cumulative comparison.</p>
+</details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b6…</summary>
+<pre>args &lt;- commandArgs(trailingOnly = TRUE)
+lib &lt;- args[[1L]]
+label &lt;- args[[2L]]
+output &lt;- args[[3L]]
+
+library(rray, lib.loc = lib)
+
+shapes &lt;- list(
+  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+  &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+  &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+  &quot;[200, 200, 200] over 1&quot; = list(c(200L, 200L, 200L), 1L),
+  &quot;[200, 200, 200] over 2&quot; = list(c(200L, 200L, 200L), 2L),
+  &quot;[200, 200, 200] over 3&quot; = list(c(200L, 200L, 200L), 3L),
+  &quot;[10, 1e6] over 1&quot; = list(c(10L, 1000000L), 1L),
+  &quot;[10, 1e6] over 2&quot; = list(c(10L, 1000000L), 2L)
+)
+
+make_array &lt;- function(dimensions, type) {
+  n &lt;- prod(dimensions)
+  values &lt;- switch(
+    type,
+    logical = sample(c(TRUE, FALSE, NA), n, replace = TRUE),
+    integer = sample(100L, n, replace = TRUE),
+    double = runif(n),
+    complex = complex(real = runif(n), imaginary = runif(n))
+  )
+  array(values, dimensions)
+}
+
+cases &lt;- list(
+  list(call = &quot;cumulative_prod&quot;, fn = rray_cumulative_prod, types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)),
+  list(call = &quot;prod_na_rm&quot;, fn = \(x, axis) rray_prod(x, axis, na_rm = TRUE), types = &quot;complex&quot;)
+)
+
+set.seed(1)
+results &lt;- list()
+
+for (case in cases) {
+  for (type in case$types) {
+    for (shape in names(shapes)) {
+      x &lt;- make_array(shapes[[shape]][[1L]], type)
+      axis &lt;- shapes[[shape]][[2L]]
+      fn &lt;- case$fn
+      m &lt;- bench::mark(
+        fn(x, axis),
+        iterations = 20,
+        check = FALSE,
+        memory = FALSE,
+        filter_gc = FALSE
+      )
+      results[[length(results) + 1L]] &lt;- data.frame(
+        build = label,
+        call = case$call,
+        type = type,
+        shape = shape,
+        median_ms = as.numeric(m$median) * 1000
+      )
+    }
+  }
+}
+
+saveRDS(do.call(rbind, results), output)</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/ab.R (file state is current in your context — no need to Read it back)</pre></details>
+<p>Building the three libraries now: &quot;after&quot; first, then &quot;before&quot; via a stash of just the header.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; mkdir -p $S/lib-after $S/lib-before $S/lib-cpl &amp;&amp; \
+R CMD INSTALL --preclean --no-test-load --library=$S/lib-after . &gt;$S/install-after.log 2&gt;&amp;1 &amp;&amp; echo after-ok &amp;&amp; \
+git stash push -- src/one-multiply.h &amp;&amp; \
+R CMD INSTALL --preclean --no-test-load --library=$S/lib-before . &gt;$S/install-before.log 2&gt;&amp;1 &amp;&amp; echo before-ok; \
+git stash pop &amp;&amp; git diff --stat src/</pre><pre class="output">after-ok
+Saved working directory and index state WIP on feature/prod-perf: 53d97b5 Add `rray_cumulative_prod()` (#143)
+before-ok
+On branch feature/prod-perf
+Changes not staged for commit:
+  (use &quot;git add &lt;file&gt;...&quot; to update what will be committed)
+  (use &quot;git restore &lt;file&gt;...&quot; to discard changes in working directory)
+	modified:   R/reduce.R
+	modified:   bench/binary.R
+	modified:   bench/reduce.R
+	modified:   src/one-multiply.h
+	modified:   tests/testthat/test-cumulative-prod.R
+	modified:   tests/testthat/test-reduce-prod.R
+
+no changes added to commit (use &quot;git add&quot; and/or &quot;git commit -a&quot;)
+Dropped refs/stash@{0} (b7f367dc0bd08bacde8f165dad2af6e19cedbbfc)
+ src/one-multiply.h | 30 +++++-------------------------
+ 1 file changed, 5 insertions(+), 25 deletions(-)</pre></details>
+<p>Now the trial complex form, for build C only.</p>
+
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-  if (rray_cpl_is_missing(x)) {</span>
+<span class="del">-    return out;</span>
+<span class="del">-  }</span>
+<span class="del">-</span>
+<span class="del">-  return rray_prod_cpl_one(out, x);</span>
+<span class="ins">+  const r_complex prod = rray_prod_cpl_one(out, x);</span>
+<span class="ins">+  return rray_cpl_is_missing(x) ? out : prod;</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; R CMD INSTALL --preclean --no-test-load --library=$S/lib-cpl . &gt;$S/install-cpl.log 2&gt;&amp;1 &amp;&amp; echo cpl-ok</pre><pre class="output">cpl-ok</pre></details>
+<p>Reverting the trial edit right away so the working tree holds only the intended change, then starting the alternating runs.</p>
+
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-  const r_complex prod = rray_prod_cpl_one(out, x);</span>
+<span class="del">-  return rray_cpl_is_missing(x) ? out : prod;</span>
+<span class="ins">+  if (rray_cpl_is_missing(x)) {</span>
+<span class="ins">+    return out;</span>
+<span class="ins">+  }</span>
+<span class="ins">+</span>
+<span class="ins">+  return rray_prod_cpl_one(out, x);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; for r in 1 2 3; do for b in before after cpl; do Rscript $S/ab.R $S/lib-$b $b $S/ab-$b-$r.rds || exit 1; done; done; echo done</pre><pre class="output">Command running in background with ID: b2egeno7w. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/b2egeno7w.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>While the rounds run, I'm reviewing the C diff (reading only, no CPU-heavy work).</p>
+
+<details class="tool"><summary>Bash: git diff src/ R/</summary>
+<pre>git diff src/ R/</pre><pre class="output">diff --git a/R/reduce.R b/R/reduce.R
+index 5b2dabf..f7915c7 100644
+--- a/R/reduce.R
++++ b/R/reduce.R
+@@ -35,6 +35,18 @@
+ #' @section Product:
+ #' Logicals and integers are cast to double.
+ #'
++#' When `NA` and `NaN` are both present, you get one of them, but which one
++#' depends on the platform and the order of the values. Either way, `is.na()`
++#' is `TRUE`. Integers can hit this too, since a product that overflows to
++#' `Inf` becomes `NaN` when multiplied by `0`:
++#'
++#' ```r
++#' rray_prod(c(NA, NaN), 1L) # NA or NaN
++#'
++#' x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++#' rray_prod(x, 1L) # NA or NaN
++#' ```
++#'
+ #' @section Mean:
+ #' Logicals and integers are cast to double.
+ #'
+diff --git a/src/one-multiply.h b/src/one-multiply.h
+index 5a4259c..81a621e 100644
+--- a/src/one-multiply.h
++++ b/src/one-multiply.h
+@@ -50,44 +50,28 @@ static inline r_complex rray_multiply_cpl_one(r_complex x, r_complex y) {
+ // - `out = 2`, `x = 1`: returns `2`.
+ // - `out = 2`, `x = NA`: returns `NA`.
+ static inline double rray_prod_lgl_one(double out, int x) {
+-  if (rray_lgl_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
++  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : (double) x);
+ }
+ 
+ // `out` is a double, `x` is a logical
+ // - `out = 2`, `x = 1`: returns `2`.
+ // - `out = 2`, `x = NA`: returns `2`.
+ static inline double rray_prod_lgl_one_na_rm(double out, int x) {
+-  if (rray_lgl_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_lgl_is_missing(x) ? 1.0 : (double) x);
+ }
+ 
+ // `out` is a double, `x` is an integer
+ // - `out = 2`, `x = 3`: returns `6`.
+ // - `out = 2`, `x = NA`: returns `NA`.
+ static inline double rray_prod_int_one(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
++  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : (double) x);
+ }
+ 
+ // `out` is a double, `x` is an integer
+ // - `out = 2`, `x = 3`: returns `6`.
+ // - `out = 2`, `x = NA`: returns `2`.
+ static inline double rray_prod_int_one_na_rm(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_int_is_missing(x) ? 1.0 : (double) x);
+ }
+ 
+ // Purposefully choose to match `rray_multiply()` rather than `prod()`
+@@ -101,11 +85,7 @@ static inline double rray_prod_dbl_one(double out, double x) {
+ // - `out = 2`, `x = NA`: returns `2`.
+ // - `out = 2`, `x = NaN`: returns `2`.
+ static inline double rray_prod_dbl_one_na_rm(double out, double x) {
+-  if (rray_dbl_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_dbl_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // Purposefully choose to match `rray_multiply()` rather than `prod()`, which</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>The diff looks correct, though the <code>(double) x</code> casts seem redundant since C already promotes via the ternary. I'll check how the sibling <code>one-add.h</code> helpers handle this for consistency before removing them.</p>
+</details>
+<details class="tool"><summary>Bash: grep -n '?' src/one-*.h | head -20; grep -n -B2 -A8 'sum_lgl_one\b\|sum_dbl_one_na_rm' src/on…</summary>
+<pre>grep -n '?' src/one-*.h | head -20; grep -n -B2 -A8 'sum_lgl_one\b\|sum_dbl_one_na_rm' src/one-add.h | head -40</pre><pre class="output">src/one-logical.h:45:  return missing ? r_globals.na_lgl : elt;
+src/one-multiply.h:53:  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : (double) x);
+src/one-multiply.h:60:  return out * (rray_lgl_is_missing(x) ? 1.0 : (double) x);
+src/one-multiply.h:67:  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : (double) x);
+src/one-multiply.h:74:  return out * (rray_int_is_missing(x) ? 1.0 : (double) x);
+src/one-multiply.h:88:  return out * (rray_dbl_is_missing(x) ? 1.0 : x);
+src/one-extremum.h:21:  const int out = x &lt; y ? y : x;
+src/one-extremum.h:24:  return has_na ? r_globals.na_lgl : out;
+src/one-extremum.h:29:  return x &lt; y ? y : x;
+src/one-extremum.h:38:  const int out = x &lt; y ? y : x;
+src/one-extremum.h:41:  return has_na ? r_globals.na_int : out;
+src/one-extremum.h:50:  return x &lt; y ? y : x;
+src/one-extremum.h:58:      return x &lt; y ? y : x;
+src/one-extremum.h:87:      return x &lt; y ? y : x;
+src/one-extremum.h:120:  return x &gt; y ? y : x;
+src/one-extremum.h:125:  int out = x &gt; y ? y : x;
+src/one-extremum.h:126:  out = rray_lgl_is_missing(y) ? x : out;
+src/one-extremum.h:127:  out = rray_lgl_is_missing(x) ? y : out;
+src/one-extremum.h:137:  return x &gt; y ? y : x;
+src/one-extremum.h:147:  int out = x &gt; y ? y : x;</pre></details>
+<p>No explicit casts anywhere in the siblings, and the old code relied on implicit conversion too, so I'm dropping them. This doesn't affect the running benchmark, which uses the installed libraries.</p>
+
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : (double) x);</span>
+<span class="ins">+  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : x);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-  return out * (rray_lgl_is_missing(x) ? 1.0 : (double) x);</span>
+<span class="ins">+  return out * (rray_lgl_is_missing(x) ? 1.0 : x);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : (double) x);</span>
+<span class="ins">+  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : x);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Edit src/one-multiply.h</summary>
+<pre class="diff"><span class="del">-  return out * (rray_int_is_missing(x) ? 1.0 : (double) x);</span>
+<span class="ins">+  return out * (rray_int_is_missing(x) ? 1.0 : x);</span></pre><pre class="output">The file ~/files/r/packages/rray/src/one-multiply.h has been updated successfully. (file state is current in your context — no need to Read it back)</pre></details>
+<p>That change is semantically identical: C's usual arithmetic conversions turn <code>x</code> into a double either way. I'll confirm the machine code is byte-identical after the benchmark finishes.</p>
+
+<details class="tool"><summary>Bash: until ! pgrep -f &quot;scratchpad/ab.R&quot; &gt;/dev/null &amp;&amp; [ -f /private/tmp/claude-502/-Users-davis-fi…</summary>
+<pre>until ! pgrep -f &quot;scratchpad/ab.R&quot; &gt;/dev/null &amp;&amp; [ -f /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/ab-cpl-3.rds ]; do sleep 10; pgrep -f &quot;scratchpad/ab.R&quot; &gt;/dev/null || [ -f /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/ab-cpl-3.rds ] || { sleep 5; pgrep -f &quot;scratchpad/ab.R&quot; &gt;/dev/null || break; }; done; ls /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/ab-*</pre><pre class="output">Command running in background with ID: bsp9qm1p5. Output is being written to: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/41fef5bd-705d-5ba9-98fc-153ff8092813/tasks/bsp9qm1p5.output. You will be notified when it completes. To check interim output, use Read on that file path.</pre></details>
+<p>I'm waiting on the alternating benchmark rounds (three rounds of three builds). I'll summarize the results when they finish.</p>
+
+<details class="tool tool-error"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b21532…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; Rscript -e '
+fs &lt;- list.files(&quot;.&quot;, &quot;^ab-.*rds$&quot;); d &lt;- do.call(rbind, lapply(fs, function(f) { x &lt;- readRDS(f); x$round &lt;- sub(&quot;.*-(\\d)\\.rds$&quot;, &quot;\\1&quot;, f); x }))
+w &lt;- aggregate(median_ms ~ build + call + type + shape, d, median)
+spread &lt;- aggregate(median_ms ~ build + call + type + shape, d, function(v) round(diff(range(v)), 1))
+w &lt;- reshape(w, idvar = c(&quot;call&quot;,&quot;type&quot;,&quot;shape&quot;), timevar = &quot;build&quot;, direction = &quot;wide&quot;)
+names(w) &lt;- sub(&quot;median_ms.&quot;, &quot;&quot;, names(w))
+w$after_vs_before &lt;- sprintf(&quot;%+.0f%%&quot;, 100*(w$after/w$before-1))
+w$cpl_vs_before &lt;- sprintf(&quot;%+.0f%%&quot;, 100*(w$cpl/w$before-1))
+w[c(&quot;before&quot;,&quot;after&quot;,&quot;cpl&quot;)] &lt;- round(w[c(&quot;before&quot;,&quot;after&quot;,&quot;cpl&quot;)], 1)
+w &lt;- w[order(w$call, match(w$type, c(&quot;logical&quot;,&quot;integer&quot;,&quot;double&quot;,&quot;complex&quot;))),]
+options(width=200); print(w, row.names=FALSE)
+cat(&quot;max range across rounds (ms):&quot;, max(spread$median_ms), &quot;\n&quot;)'</pre><pre class="output">Exit code 1
+Error: '\d' is an unrecognized escape in character string (&lt;input&gt;:1:85)
+Execution halted</pre></details>
+<details class="tool"><summary>Bash: cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b21532…</summary>
+<pre>cd /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; Rscript -e '
+fs &lt;- list.files(&quot;.&quot;, &quot;^ab-.*rds$&quot;); d &lt;- do.call(rbind, lapply(fs, readRDS))
+w &lt;- aggregate(median_ms ~ build + call + type + shape, d, median)
+spread &lt;- aggregate(median_ms ~ build + call + type + shape, d, function(v) diff(range(v)) / median(v))
+w &lt;- reshape(w, idvar = c(&quot;call&quot;,&quot;type&quot;,&quot;shape&quot;), timevar = &quot;build&quot;, direction = &quot;wide&quot;)
+names(w) &lt;- sub(&quot;median_ms.&quot;, &quot;&quot;, names(w))
+w$after_vs_before &lt;- sprintf(&quot;%+.0f%%&quot;, 100*(w$after/w$before-1))
+w$cpl_vs_before &lt;- sprintf(&quot;%+.0f%%&quot;, 100*(w$cpl/w$before-1))
+w[c(&quot;before&quot;,&quot;after&quot;,&quot;cpl&quot;)] &lt;- round(w[c(&quot;before&quot;,&quot;after&quot;,&quot;cpl&quot;)], 1)
+w &lt;- w[order(w$call, match(w$type, c(&quot;logical&quot;,&quot;integer&quot;,&quot;double&quot;,&quot;complex&quot;))),]
+options(width=200); print(w, row.names=FALSE)
+cat(&quot;max relative range across rounds:&quot;, round(max(spread$median_ms), 2), &quot; median:&quot;, round(median(spread$median_ms), 3), &quot;\n&quot;)'</pre><pre class="output">            call    type                  shape after before  cpl after_vs_before cpl_vs_before
+ cumulative_prod logical         [1.6e7] over 1  45.3   54.7 45.3            -17%          -17%
+ cumulative_prod logical       [10, 1e6] over 1  23.4   23.8 24.9             -1%           +5%
+ cumulative_prod logical       [10, 1e6] over 2  21.5   21.5 21.2             -0%           -1%
+ cumulative_prod logical [200, 200, 200] over 1  20.0   23.6 19.9            -15%          -16%
+ cumulative_prod logical [200, 200, 200] over 2  16.0   16.3 15.5             -2%           -5%
+ cumulative_prod logical [200, 200, 200] over 3  16.1   16.2 16.4             -1%           +1%
+ cumulative_prod logical    [4000, 4000] over 1  45.0   54.5 44.7            -17%          -18%
+ cumulative_prod logical    [4000, 4000] over 2  35.0   34.9 34.8             +0%           -0%
+ cumulative_prod integer         [1.6e7] over 1  45.3   54.8 45.2            -17%          -18%
+ cumulative_prod integer       [10, 1e6] over 1  24.5   25.2 24.7             -3%           -2%
+ cumulative_prod integer       [10, 1e6] over 2  21.5   21.6 21.1             -1%           -3%
+ cumulative_prod integer [200, 200, 200] over 1  19.8   23.7 20.0            -16%          -16%
+ cumulative_prod integer [200, 200, 200] over 2  15.9   16.0 16.0             -0%           +0%
+ cumulative_prod integer [200, 200, 200] over 3  16.4   16.1 16.1             +2%           -0%
+ cumulative_prod integer    [4000, 4000] over 1  45.1   54.7 45.0            -17%          -18%
+ cumulative_prod integer    [4000, 4000] over 2  35.2   35.0 34.7             +1%           -1%
+ cumulative_prod  double         [1.6e7] over 1  44.8   44.7 45.0             +0%           +1%
+ cumulative_prod  double       [10, 1e6] over 1  21.8   21.7 21.7             +1%           +0%
+ cumulative_prod  double       [10, 1e6] over 2  21.7   21.3 21.0             +2%           -1%
+ cumulative_prod  double [200, 200, 200] over 1  19.6   19.7 19.4             -0%           -1%
+ cumulative_prod  double [200, 200, 200] over 2  16.1   16.0 15.7             +0%           -2%
+ cumulative_prod  double [200, 200, 200] over 3  16.6   16.6 16.6             +0%           -0%
+ cumulative_prod  double    [4000, 4000] over 1  43.8   42.8 43.7             +2%           +2%
+ cumulative_prod  double    [4000, 4000] over 2  33.3   33.4 33.7             -0%           +1%
+ cumulative_prod complex         [1.6e7] over 1  93.1   94.6 92.8             -2%           -2%
+ cumulative_prod complex       [10, 1e6] over 1  46.1   46.8 46.8             -2%           -0%
+ cumulative_prod complex       [10, 1e6] over 2  42.5   42.6 42.6             -0%           -0%
+ cumulative_prod complex [200, 200, 200] over 1  45.3   45.8 46.4             -1%           +1%
+ cumulative_prod complex [200, 200, 200] over 2  37.4   36.3 37.5             +3%           +3%
+ cumulative_prod complex [200, 200, 200] over 3  38.0   37.6 37.9             +1%           +1%
+ cumulative_prod complex    [4000, 4000] over 1  92.8   92.6 93.2             +0%           +1%
+ cumulative_prod complex    [4000, 4000] over 2  76.7   75.8 76.4             +1%           +1%
+      prod_na_rm complex         [1.6e7] over 1  47.1   47.2 48.4             -0%           +3%
+      prod_na_rm complex       [10, 1e6] over 1  16.5   16.5 19.2             -0%          +16%
+      prod_na_rm complex       [10, 1e6] over 2   9.7    9.8 15.1             -0%          +55%
+      prod_na_rm complex [200, 200, 200] over 1  22.5   22.5 23.4             -0%           +4%
+      prod_na_rm complex [200, 200, 200] over 2   7.7    7.5 12.4             +2%          +65%
+      prod_na_rm complex [200, 200, 200] over 3   7.5    7.5 12.4             -1%          +64%
+      prod_na_rm complex    [4000, 4000] over 1  46.9   47.0 48.4             -0%           +3%
+      prod_na_rm complex    [4000, 4000] over 2  16.2   16.2 24.9             -0%          +53%
+max relative range across rounds: 0.49  median: 0.018
+Shell cwd was reset to ~/files/r/packages/rray</pre></details>
+<details class="thinking"><summary>Thinking</summary>
+<p>Cumulative/logical/integer gains hold at 15-17% faster (matching double), unchanged axes serve as flat controls, and the trial complex <code>na_rm</code> variant is up to 65% slower so it's discarded. Now I'll confirm dropping the casts produces identical machine code to the benchmarked build.</p>
+</details>
+<details class="tool tool-error"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; R CMD INSTALL --preclean --no-test-load --library=$S/lib-nocast . &gt;$S/install-nocast.log 2&gt;&amp;1 &amp;&amp; otool -tV $S/lib-after/rray/libs/rray.so | tail -n +2 &gt; $S/after.s &amp;&amp; otool -tV $S/lib-nocast/rray/libs/rray.so | tail -n +2 &gt; $S/nocast.s &amp;&amp; wc -l $S/after.s $S/nocast.s &amp;&amp; cmp $S/after.s $S/nocast.s &amp;&amp; echo IDENTICAL</pre><pre class="output">Exit code 1</pre></details>
+<details class="tool tool-error"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad; tail -5 $S/install-nocast.log; ls $S/lib-nocast</pre><pre class="output">Exit code 1
+Error: ERROR: cannot cd to directory ‘/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/lib-nocast’
+ls: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/lib-nocast: No such file or directory</pre></details>
+<p>Forgot to create the library directory. Retrying.</p>
+
+<details class="tool"><summary>Bash: S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322…</summary>
+<pre>S=/private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad &amp;&amp; mkdir -p $S/lib-nocast &amp;&amp; R CMD INSTALL --preclean --no-test-load --library=$S/lib-nocast . &gt;$S/install-nocast.log 2&gt;&amp;1 &amp;&amp; otool -tV $S/lib-after/rray/libs/rray.so | tail -n +2 &gt; $S/after.s &amp;&amp; otool -tV $S/lib-nocast/rray/libs/rray.so | tail -n +2 &gt; $S/nocast.s &amp;&amp; wc -l $S/after.s $S/nocast.s &amp;&amp; cmp $S/after.s $S/nocast.s &amp;&amp; echo IDENTICAL</pre><pre class="output">  151344 /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/after.s
+  151344 /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/nocast.s
+  302688 total
+IDENTICAL</pre></details>
+<p>The machine code is byte-identical to the benchmarked build, so all the numbers apply to the final code. Next: remove the plan, format, re-document, and run the full suite.</p>
+
+<details class="tool"><summary>Bash: git rm -q plans/prod-performance.md &amp;&amp; ls plans 2&gt;/dev/null; clang-format -i src/*.c src/*.h …</summary>
+<pre>git rm -q plans/prod-performance.md &amp;&amp; ls plans 2&gt;/dev/null; clang-format -i src/*.c src/*.h &amp;&amp; air format . &amp;&amp; Rscript -e 'devtools::document()' 2&gt;&amp;1 | tail -3 &amp;&amp; git status --short</pre><pre class="output">cumulative.md
+extensions.md
+implementation.md
+index.md
+mod-and-idiv.md
+n-ary.md
+null.md
+slice.md
+ℹ Updating rray documentation
+ℹ Loading rray
+Writing 'rray-reduce.Rd'
+ M R/reduce.R
+ M bench/binary.R
+ M bench/reduce.R
+ M man/rray-reduce.Rd
+D  plans/prod-performance.md
+ M src/one-multiply.h
+ M tests/testthat/test-cumulative-prod.R
+ M tests/testthat/test-reduce-prod.R</pre></details>
+<p>Formatting changed nothing else. Checking whether any other file references the removed plan.</p>
+
+<details class="tool"><summary>Bash: grep -rn &quot;prod-performance\|prod_performance&quot; --exclude-dir=.git . ; echo &quot;exit $?&quot;</summary>
+<pre>grep -rn &quot;prod-performance\|prod_performance&quot; --exclude-dir=.git . ; echo &quot;exit $?&quot;</pre><pre class="output">exit 1</pre></details>
+<p>No references. Running the full test suite.</p>
+
+<details class="tool"><summary>Bash: Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8</summary>
+<pre>Rscript -e &quot;devtools::test()&quot; 2&gt;&amp;1 | tail -8</pre><pre class="output">SKIP: 'test-reduce-sum.R:468:3' -------------------
+Reason: Not testing long vectors
+
+SKIP: 'test-reduce-sum.R:476:3' -------------------
+Reason: Not testing long vectors
+
+[ FAIL 0 | WARN 0 | SKIP 6 | PASS 5318 ]</pre></details>
+<p>All 5318 tests pass. The 6 skips are the existing long-vector tests. Final look at the full diff before committing:</p>
+
+<details class="tool"><summary>Bash: git diff -- src bench tests man | head -200</summary>
+<pre>git diff -- src bench tests man | head -200</pre><pre class="output">diff --git a/bench/binary.R b/bench/binary.R
+index b98ccc8..c6b62da 100644
+--- a/bench/binary.R
++++ b/bench/binary.R
+@@ -4,6 +4,7 @@ iterations &lt;- as.integer(Sys.getenv(&quot;RRAY_BENCH_ITERATIONS&quot;, &quot;20&quot;))
+ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
++  multiply = list(fn = rray_multiply, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   greater_than = list(fn = rray_greater_than, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   equal = list(fn = rray_equal, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   pmax = list(fn = rray_pmax, types = c(&quot;integer&quot;, &quot;double&quot;)),
+diff --git a/bench/reduce.R b/bench/reduce.R
+index 7b2861c..f58e73a 100644
+--- a/bench/reduce.R
++++ b/bench/reduce.R
+@@ -5,7 +5,14 @@ output &lt;- Sys.getenv(&quot;RRAY_BENCH_OUTPUT&quot;, &quot;&quot;)
+ 
+ operations &lt;- list(
+   sum = list(fn = rray_sum, types = c(&quot;integer&quot;, &quot;double&quot;)),
+-  prod = list(fn = rray_prod, types = c(&quot;integer&quot;, &quot;double&quot;)),
++  prod = list(
++    fn = rray_prod,
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++  ),
++  prod_na_rm = list(
++    fn = \(x, axes) rray_prod(x, axes, na_rm = TRUE),
++    types = c(&quot;logical&quot;, &quot;integer&quot;, &quot;double&quot;, &quot;complex&quot;)
++  ),
+   max = list(fn = rray_max, types = c(&quot;integer&quot;, &quot;double&quot;)),
+   max_na_rm = list(
+     fn = \(x, axes) rray_max(x, axes, na_rm = TRUE),
+@@ -22,6 +29,7 @@ operations &lt;- list(
+ )
+ 
+ shapes &lt;- list(
++  &quot;[1.6e7] over 1&quot; = list(16000000L, 1L),
+   &quot;[4000, 4000] over 1&quot; = list(c(4000L, 4000L), 1L),
+   &quot;[4000, 4000] over 2&quot; = list(c(4000L, 4000L), 2L),
+   &quot;[4000, 4000] over 1, 2&quot; = list(c(4000L, 4000L), 1:2),
+@@ -40,7 +48,8 @@ make_array &lt;- function(dimensions, type) {
+     type,
+     logical = sample(c(TRUE, FALSE), n, replace = TRUE),
+     integer = sample(100L, n, replace = TRUE),
+-    double = runif(n)
++    double = runif(n),
++    complex = complex(real = runif(n), imaginary = runif(n))
+   )
+ 
+   array(values, dimensions)
+diff --git a/man/rray-reduce.Rd b/man/rray-reduce.Rd
+index 315322d..145e8ca 100644
+--- a/man/rray-reduce.Rd
++++ b/man/rray-reduce.Rd
+@@ -71,6 +71,17 @@ rray_sum(x, 1L) # NA
+ \section{Product}{
+ 
+ Logicals and integers are cast to double.
++
++When \code{NA} and \code{NaN} are both present, you get one of them, but which one
++depends on the platform and the order of the values. Either way, \code{is.na()}
++is \code{TRUE}. Integers can hit this too, since a product that overflows to
++\code{Inf} becomes \code{NaN} when multiplied by \code{0}:
++
++\if{html}{\out{&lt;div class=&quot;sourceCode r&quot;&gt;}}\preformatted{rray_prod(c(NA, NaN), 1L) # NA or NaN
++
++x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++rray_prod(x, 1L) # NA or NaN
++}\if{html}{\out{&lt;/div&gt;}}
+ }
+ 
+ \section{Mean}{
+diff --git a/src/one-multiply.h b/src/one-multiply.h
+index 5a4259c..ada964e 100644
+--- a/src/one-multiply.h
++++ b/src/one-multiply.h
+@@ -50,44 +50,28 @@ static inline r_complex rray_multiply_cpl_one(r_complex x, r_complex y) {
+ // - `out = 2`, `x = 1`: returns `2`.
+ // - `out = 2`, `x = NA`: returns `NA`.
+ static inline double rray_prod_lgl_one(double out, int x) {
+-  if (rray_lgl_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
++  return out * (rray_lgl_is_missing(x) ? r_globals.na_dbl : x);
+ }
+ 
+ // `out` is a double, `x` is a logical
+ // - `out = 2`, `x = 1`: returns `2`.
+ // - `out = 2`, `x = NA`: returns `2`.
+ static inline double rray_prod_lgl_one_na_rm(double out, int x) {
+-  if (rray_lgl_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_lgl_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // `out` is a double, `x` is an integer
+ // - `out = 2`, `x = 3`: returns `6`.
+ // - `out = 2`, `x = NA`: returns `NA`.
+ static inline double rray_prod_int_one(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return r_globals.na_dbl;
+-  }
+-
+-  return out * x;
++  return out * (rray_int_is_missing(x) ? r_globals.na_dbl : x);
+ }
+ 
+ // `out` is a double, `x` is an integer
+ // - `out = 2`, `x = 3`: returns `6`.
+ // - `out = 2`, `x = NA`: returns `2`.
+ static inline double rray_prod_int_one_na_rm(double out, int x) {
+-  if (rray_int_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_int_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // Purposefully choose to match `rray_multiply()` rather than `prod()`
+@@ -101,11 +85,7 @@ static inline double rray_prod_dbl_one(double out, double x) {
+ // - `out = 2`, `x = NA`: returns `2`.
+ // - `out = 2`, `x = NaN`: returns `2`.
+ static inline double rray_prod_dbl_one_na_rm(double out, double x) {
+-  if (rray_dbl_is_missing(x)) {
+-    return out;
+-  }
+-
+-  return out * x;
++  return out * (rray_dbl_is_missing(x) ? 1.0 : x);
+ }
+ 
+ // Purposefully choose to match `rray_multiply()` rather than `prod()`, which
+diff --git a/tests/testthat/test-cumulative-prod.R b/tests/testthat/test-cumulative-prod.R
+index 30e0ce2..c56be53 100644
+--- a/tests/testthat/test-cumulative-prod.R
++++ b/tests/testthat/test-cumulative-prod.R
+@@ -139,6 +139,12 @@ test_that(&quot;`NA` and `NaN` together are missing in either order&quot;, {
+     is.na(as.vector(rray_cumulative_prod(c(2, NaN, NA, 3), 1L))),
+     c(FALSE, TRUE, TRUE, TRUE)
+   )
++
++  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++  expect_identical(
++    is.na(as.vector(rray_cumulative_prod(x, 1L))),
++    c(rep(FALSE, 40L), TRUE, TRUE)
++  )
+ })
+ 
+ test_that(&quot;last position matches the reducer&quot;, {
+diff --git a/tests/testthat/test-reduce-prod.R b/tests/testthat/test-reduce-prod.R
+index c411628..a01f16d 100644
+--- a/tests/testthat/test-reduce-prod.R
++++ b/tests/testthat/test-reduce-prod.R
+@@ -106,6 +106,11 @@ test_that(&quot;double NA / NaN propagates&quot;, {
+   expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))
+ })
+ 
++test_that(&quot;integer NA after an overflow to NaN is missing&quot;, {
++  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++  expect_identical(is.na(rray_prod(x, 1L)), array(TRUE, 1L))
++})
++
+ test_that(&quot;Inf matches base R prod&quot;, {
+   expect_identical(
+     as.vector(rray_prod(c(Inf, 1), 1L)),
+@@ -210,6 +215,26 @@ test_that(&quot;na_rm removes double NA and NaN&quot;, {
+   expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), 1)
+ })
+ 
++test_that(&quot;na_rm keeps the running product exactly&quot;, {
++  x &lt;- c(-1, 0, NA)
++  expect_identical(1 / as.vector(rray_prod(x, 1L, na_rm = TRUE)), -Inf)
++
++  x &lt;- c(-1L, 0L, NA)
++  expect_identical(1 / as.vector(rray_prod(x, 1L, na_rm = TRUE)), -Inf)
++
++  x &lt;- c(Inf, NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), Inf)
++
++  x &lt;- c(rep(.Machine$integer.max, 40L), NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), Inf)
++
++  x &lt;- c(Inf, 0, NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), NaN)
++
++  x &lt;- c(rep(.Machine$integer.max, 40L), 0L, NA)
++  expect_identical(as.vector(rray_prod(x, 1L, na_rm = TRUE)), NaN)
++})
++
+ test_that(&quot;na_rm removes logical NA&quot;, {
+   x &lt;- array(c(TRUE, NA, FALSE, TRUE), c(2L, 2L))
+   out &lt;- rray_prod(x, 1L, na_rm = TRUE)</pre></details>
+<p>Diff is clean. Committing (one sentence, no trailer, per AGENTS.md) and pushing.</p>
+
+<details class="tool"><summary>Bash: git add -A R bench man src/one-multiply.h tests plans &amp;&amp; git status --short &amp;&amp; git commit -q …</summary>
+<pre>git add -A R bench man src/one-multiply.h tests plans &amp;&amp; git status --short &amp;&amp; git commit -q -m &quot;Keep the missing check off the multiply chain in all product helpers&quot; &amp;&amp; git log -1 --format='%h %s%n%b' &amp;&amp; git push -u origin feature/prod-perf 2&gt;&amp;1 | tail -3</pre><pre class="output">M  R/reduce.R
+M  bench/binary.R
+M  bench/reduce.R
+M  man/rray-reduce.Rd
+D  plans/prod-performance.md
+M  src/one-multiply.h
+M  tests/testthat/test-cumulative-prod.R
+M  tests/testthat/test-reduce-prod.R
+9c4903f Keep the missing check off the multiply chain in all product helpers
+
+To https://github.com/r-lib/rray.git
+ * [new branch]      feature/prod-perf -&gt; feature/prod-perf
+branch 'feature/prod-perf' set up to track 'origin/feature/prod-perf'.</pre></details>
+<p>The plan is implemented, committed as <code>9c4903f</code> (&quot;Keep the missing check off the multiply chain in all product helpers&quot;), and pushed to <code>feature/prod-perf</code>. All 5318 tests pass; the 6 skips are the existing long-vector tests. No PR opened.</p>
+<h2>What changed</h2>
+<ul>
+<li>
+<p><strong><code>src/one-multiply.h</code>:</strong> five helpers are now one line each, of the form <code>out * (missing ? NA or 1.0 : x)</code>. Those are the logical and integer helpers, with and without <code>na_rm</code>, plus the double <code>na_rm</code> helper. I left out the <code>(double)</code> casts from the plan because C converts <code>x</code> to double anyway. The compiled code is byte-identical to the version I benchmarked.</p>
+</li>
+<li>
+<p><strong>Complex <code>na_rm</code> helper: unchanged.</strong> I tried the &quot;multiply, then pick the result&quot; form. It was up to 65% slower on axes other than 1, and no faster on axis 1.</p>
+</li>
+<li>
+<p><strong><code>rray_multiply()</code> for integers:</strong> measured only. It was flat, within ±4%.</p>
+</li>
+<li>
+<p><strong>Docs:</strong> the Product section of the <code>rray_prod()</code> docs now says that when <code>NA</code> and <code>NaN</code> are both present, which one you get isn't promised. It includes the integer overflow example.</p>
+</li>
+<li>
+<p><strong>Tests:</strong></p>
+<ul>
+<li><code>rray_prod()</code> and <code>rray_cumulative_prod()</code> on integers that overflow to <code>Inf</code>, then hit <code>0</code> (giving <code>NaN</code>), then <code>NA</code>. Checked with <code>is.na()</code> only. I confirmed the running value really is <code>NaN</code> before the <code>NA</code>.</li>
+<li>With <code>na_rm = TRUE</code>, a running <code>-0</code>, <code>Inf</code> or <code>NaN</code> comes through unchanged, for double and integer input. A running <code>NA</code> can't happen there, since the <code>NA</code>s are removed.</li>
+</ul>
+</li>
+<li>
+<p><strong>Benchmarks:</strong></p>
+<ul>
+<li><code>bench/reduce.R</code> gains <code>prod_na_rm</code>, logical and complex types, and a <code>[1.6e7] over 1</code> shape.</li>
+<li><code>bench/binary.R</code> gains <code>multiply</code>.</li>
+</ul>
+</li>
+<li>
+<p><strong>Plan:</strong> <code>plans/prod-performance.md</code> is removed.</p>
+</li>
+</ul>
+<h2>Results</h2>
+<p>Apple Silicon (arm64), <code>-O2</code>, median of 20 iterations, axis 1 of a 1.6e7 vector, before → after:</p>
+<table>
+<thead>
+<tr>
+<th>Call</th>
+<th>logical</th>
+<th>integer</th>
+<th>double</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rray_prod()</code></td>
+<td>28.8 → 19.4ms (−33%)</td>
+<td>28.9 → 19.4ms (−33%)</td>
+<td>19.4 → 19.4ms (control)</td>
+</tr>
+<tr>
+<td><code>rray_prod(na_rm = TRUE)</code></td>
+<td>28.9 → 19.5ms (−33%)</td>
+<td>28.7 → 19.3ms (−33%)</td>
+<td>29.0 → 19.3ms (−33%)</td>
+</tr>
+<tr>
+<td><code>rray_cumulative_prod()</code></td>
+<td>54.7 → 45.3ms (−17%)</td>
+<td>54.8 → 45.3ms (−17%)</td>
+<td>44.7 → 44.8ms (control)</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li>
+<p><strong>Other shapes:</strong> <code>[4000, 4000] over 1</code> and <code>[200, 200, 200] over 1</code> move by the same amounts. Every other axis and every complex case stays within a few percent.</p>
+</li>
+<li>
+<p><strong>The plan's own data</strong> (integers with <code>NA</code>s, integers drawn from <code>-1</code>, <code>1</code> and <code>2</code>, logicals with one third <code>NA</code>) gives the same gains. So the win does not depend on values that overflow or turn into <code>NA</code>.</p>
+</li>
+<li>
+<p><strong>The first cumulative run was noisy.</strong> Double and complex got 40% to 130% slower even though their code hadn't changed, and the machine had a load average near 4. The cumulative numbers above come from a re-run, three rounds alternating separately installed before and after builds, with a median spread of 1.8%. The gain is smaller than the plan's 25% because each call allocates a 128 MB result, and on this busier machine that cost is a bigger share of the total. Integer and logical now match double, which was the plan's target.</p>
+</li>
+<li>
+<p><strong>x86 is not measured.</strong> I only have arm64 here.</p>
+</li>
+</ul>
+
+</section>
+<section class="turn turn-user">
+<p class="who">Davis</p>
+<p>Add the results table as a comment on the GitHub pr I just opened. It nicely shows how everything converges to double performance</p>
+
+</section>
+<section class="turn turn-assistant">
+<p class="who">Claude</p>
+<details class="tool"><summary>ToolSearch: github pull request comment</summary>
+<pre>{
+  &quot;query&quot;: &quot;github pull request comment&quot;,
+  &quot;max_results&quot;: 5
+}</pre><pre class="output">ArtifactComments
+Monitor
+WebFetch
+CronCreate
+DesignSync</pre></details>
+<p>No GitHub MCP tools are available here, but <code>gh</code> worked earlier, so I'll use it. Finding the PR:</p>
+
+<details class="tool"><summary>Bash: gh pr view feature/prod-perf --json number,title,state,url,headRefOid &amp;&amp; git rev-parse HEAD</summary>
+<pre>gh pr view feature/prod-perf --json number,title,state,url,headRefOid &amp;&amp; git rev-parse HEAD</pre><pre class="output">{&quot;headRefOid&quot;:&quot;9c4903f574a0bf410c2b105ced1939733f3e1251&quot;,&quot;number&quot;:145,&quot;state&quot;:&quot;OPEN&quot;,&quot;title&quot;:&quot;Implement the prod performance plan!&quot;,&quot;url&quot;:&quot;https://github.com/r-lib/rray/pull/145&quot;}
+9c4903f574a0bf410c2b105ced1939733f3e1251</pre></details>
+<details class="tool"><summary>Write /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b6…</summary>
+<pre>Logical and integer now run at the same speed as double.
+
+Apple Silicon (arm64), `-O2`, median of 20 iterations, axis 1 of a 1.6e7 vector, before → after:
+
+| Call | logical | integer | double |
+|---|---|---|---|
+| `rray_prod()` | 28.8 → 19.4ms (−33%) | 28.9 → 19.4ms (−33%) | 19.4 → 19.4ms (control) |
+| `rray_prod(na_rm = TRUE)` | 28.9 → 19.5ms (−33%) | 28.7 → 19.3ms (−33%) | 29.0 → 19.3ms (−33%) |
+| `rray_cumulative_prod()` | 54.7 → 45.3ms (−17%) | 54.8 → 45.3ms (−17%) | 44.7 → 44.8ms (control) |
+
+The double cells marked control use helpers that did not change.
+
+---
+_Generated by [Claude Code](https://claude.ai/code)_</pre><pre class="output">File created successfully at: /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/pr-comment.md (file state is current in your context — no need to Read it back)</pre></details>
+<details class="tool"><summary>Bash: gh pr comment 145 --body-file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d209…</summary>
+<pre>gh pr comment 145 --body-file /private/tmp/claude-502/-Users-davis-files-r-packages-rray/d2094b0e-66da-44e8-8646-3b215322b69c/scratchpad/pr-comment.md</pre><pre class="output">https://github.com/r-lib/rray/pull/145#issuecomment-6115600634</pre></details>
+<p>I posted the results table as a comment on PR #145: <a href="https://github.com/r-lib/rray/pull/145#issuecomment-6115600634">https://github.com/r-lib/rray/pull/145#issuecomment-6115600634</a></p>
+<p>The comment has three parts:</p>
+<ul>
+<li>
+<p><strong>A lead line:</strong> logical and integer now run at the same speed as double.</p>
+</li>
+<li>
+<p><strong>The test setup:</strong> arm64, <code>-O2</code>, median of 20 iterations, axis 1 of a 1.6e7 vector.</p>
+</li>
+<li>
+<p><strong>The before → after table,</strong> followed by a note that the double cells marked &quot;control&quot; use helpers that didn't change.</p>
+</li>
+</ul>
+<p>It ends with the Claude Code footer, as the comment setup here requires.</p>
+
+</section>
+</main>
+</body>
+</html>
