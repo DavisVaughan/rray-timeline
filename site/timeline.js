@@ -700,22 +700,19 @@ class Timeline {
       for (const { from, to } of pr.renamed) changes.append("code").text(`${fn(from)} → ${fn(to)}`);
     }
 
-    const complexity = panel.append("p").attr("class", "tl-complexity");
-    complexity.append("span").attr("class", "tl-swatch").style("background", fill(pr));
+    const complexity = panel.append("p");
 
     if (pr.score === null) {
-      complexity.append("span").text("Complexity unknown, the transcripts were lost");
+      complexity.text("Complexity unknown, the transcripts were lost");
     } else {
-      complexity
-        .append("span")
-        .text(
-          [
-            `Complexity ${pr.score.toFixed(2)}`,
-            plural(pr.parts.review_comments, "review thread"),
-            plural(pr.parts.messages, "prompt"),
-            `${formatTokens(pr.context.tokens)} tokens`,
-          ].join(" · "),
-        );
+      complexity.text(
+        [
+          `Complexity ${pr.score.toFixed(2)}`,
+          plural(pr.parts.review_comments, "review thread"),
+          plural(pr.parts.messages, "prompt"),
+          `${formatTokens(pr.context.tokens)} tokens`,
+        ].join(" · "),
+      );
     }
 
     if (!pr.sessions.length) return;
