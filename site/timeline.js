@@ -387,6 +387,14 @@ class Timeline {
         else if (event.pointerType === "mouse") this.hover(this.nearest(event));
       })
       .on("pointerup", () => this.dragEnd())
+      .on(
+        "touchmove",
+        (event) => {
+          // Keeps the page from scrolling once a drag has started
+          if (this.drag?.moved) event.preventDefault();
+        },
+        { passive: false },
+      )
       .on("lostpointercapture", () => this.dragCancel())
       .on("pointerleave", () => this.hover(null))
       .on("click", (event) => {
@@ -470,7 +478,7 @@ class Timeline {
     if (!event.isPrimary || event.button !== 0) return;
 
     const x = this.dragX(event);
-    this.drag = { x0: x, x1: x, moved: false };
+    this.drag = { x0: x, x1: x, start: [event.clientX, event.clientY], moved: false };
     this.dragged = false;
     event.currentTarget.setPointerCapture(event.pointerId);
   }
@@ -480,7 +488,16 @@ class Timeline {
     drag.x1 = this.dragX(event);
 
     if (!drag.moved) {
-      if (Math.abs(drag.x1 - drag.x0) < DRAG_THRESHOLD) return;
+      const dx = Math.abs(event.clientX - drag.start[0]);
+      const dy = Math.abs(event.clientY - drag.start[1]);
+      if (Math.max(dx, dy) < DRAG_THRESHOLD) return;
+
+      // A mostly vertical swipe is left to scroll the page
+      if (event.pointerType === "touch" && dy > dx) {
+        this.dragCancel();
+        return;
+      }
+
       drag.moved = true;
       this.hover(null);
     }
