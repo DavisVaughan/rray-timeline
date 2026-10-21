@@ -24,6 +24,9 @@ const MIN_WINDOW = 2 * DAY;
 // How far the pointer can be from a dot and still hover it
 const HOVER_RADIUS = 16;
 
+// How far the pointer moves before a press becomes a zoom drag
+const DRAG_THRESHOLD = 4;
+
 const BAND_MIN_WIDTH = 2;
 const REVIEW_TICK = 6;
 
@@ -150,6 +153,10 @@ class Timeline {
     this.width = 0;
     this.scrollPending = false;
 
+    // The zoom drag in progress, and whether the click that ends it should be ignored
+    this.drag = null;
+    this.dragged = false;
+
     root.append("div").attr("class", "tl-title").text("Number of exported functions over time");
     const legend = root.append("div").attr("class", "tl-legend");
     renderLegend(legend);
@@ -263,6 +270,7 @@ class Timeline {
     };
 
     this.hover(null);
+    this.drag = null;
     this.figure.selectAll("*").remove();
     this.buildMain();
     this.buildStrip();
@@ -308,6 +316,13 @@ class Timeline {
       .attr("transform", `translate(0,${height - MARGIN.bottom})`);
 
     const body = svg.append("g").attr("clip-path", `url(#${clip})`);
+
+    this.zoomRect = body
+      .append("rect")
+      .attr("class", "tl-zoom")
+      .attr("y", plot.y0)
+      .attr("height", plot.y1 - plot.y0)
+      .attr("display", "none");
 
     this.bands = selectionLayers(body);
 
@@ -366,11 +381,19 @@ class Timeline {
       .attr("x", plot.x0)
       .attr("width", plot.x1 - plot.x0)
       .attr("height", plot.y1)
+      .on("pointerdown", (event) => this.dragStart(event))
       .on("pointermove", (event) => {
-        if (event.pointerType === "mouse") this.hover(this.nearest(event));
+        if (this.drag) this.dragMove(event);
+        else if (event.pointerType === "mouse") this.hover(this.nearest(event));
       })
+      .on("pointerup", () => this.dragEnd())
+      .on("lostpointercapture", () => this.dragCancel())
       .on("pointerleave", () => this.hover(null))
       .on("click", (event) => {
+        if (this.dragged) {
+          this.dragged = false;
+          return;
+        }
         const pr = this.nearest(event);
         this.select(pr === this.selected ? null : pr);
       });
@@ -441,6 +464,53 @@ class Timeline {
     }
 
     this.update();
+  }
+
+  dragStart(event) {
+    if (!event.isPrimary || event.button !== 0) return;
+
+    const x = this.dragX(event);
+    this.drag = { x0: x, x1: x, moved: false };
+    this.dragged = false;
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  dragMove(event) {
+    const drag = this.drag;
+    drag.x1 = this.dragX(event);
+
+    if (!drag.moved) {
+      if (Math.abs(drag.x1 - drag.x0) < DRAG_THRESHOLD) return;
+      drag.moved = true;
+      this.hover(null);
+    }
+
+    const [x0, x1] = d3.sort([drag.x0, drag.x1]);
+    this.zoomRect.attr("display", null).attr("x", x0).attr("width", x1 - x0);
+  }
+
+  // The domain only changes once the pointer is released
+  dragEnd() {
+    const drag = this.drag;
+    this.dragCancel();
+    if (!drag?.moved) return;
+
+    this.dragged = true;
+    if (Math.abs(drag.x1 - drag.x0) < DRAG_THRESHOLD) return;
+
+    this.domain = clampDomain(d3.sort([drag.x0, drag.x1]).map(this.x.invert), this.extent);
+    this.moveBrush();
+    this.update();
+  }
+
+  dragCancel() {
+    this.drag = null;
+    this.zoomRect.attr("display", "none");
+  }
+
+  dragX(event) {
+    const [px] = d3.pointer(event, this.svg.node());
+    return Math.max(this.plot.x0, Math.min(px, this.plot.x1));
   }
 
   moveBrush() {
@@ -781,7 +851,9 @@ class Timeline {
       panel
         .append("p")
         .attr("class", "tl-hint")
-        .text("Select a dot to see the conversations behind that pull request.");
+        .text(
+          "Select a dot to see the conversations behind that pull request, or drag across the chart to zoom.",
+        );
       return;
     }
 
