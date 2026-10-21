@@ -22,6 +22,36 @@ codex_cwds <- c(
 )
 pr_link_repos <- c("r-lib/rray", "DavisVaughan/rray4")
 
+# API list prices in USD per million tokens, as of 2026-10-21, from
+# https://platform.claude.com/docs/en/about-claude/pricing and
+# https://developers.openai.com/api/docs/pricing
+prices <- list(
+  "claude-opus-5-5" = c(
+    input = 4,
+    cache_write_5m = 5,
+    cache_write_1h = 8,
+    cache_read = 0.2,
+    output = 20
+  ),
+  "claude-opus-5" = c(
+    input = 5,
+    cache_write_5m = 6.25,
+    cache_write_1h = 10,
+    cache_read = 0.5,
+    output = 25
+  ),
+  "gpt-6-sol" = c(input = 2, cache_read = 0.2, output = 10),
+  "gpt-6-astra" = c(input = 10, cache_read = 1, output = 50),
+  "gpt-5.6-sol" = c(input = 4, cache_read = 0.4, output = 20),
+  "gpt-5.6-terra" = c(input = 2, cache_read = 0.2, output = 12),
+  # Auto-review runs on gpt-5.6-luna
+  "codex-auto-review" = c(input = 0.2, cache_read = 0.02, output = 1.2)
+)
+
+# OpenAI prices requests with more input than this higher
+codex_long_context <- 272000
+codex_long_multipliers <- c(input = 2, cache_read = 2, output = 1.5)
+
 segment_gap <- 30 * 60
 
 # Prompts too empty to title a session with
@@ -293,8 +323,13 @@ read_sessions <- function() {
     list_jsonl(claude_dirs, recursive = FALSE),
     read_claude_session
   )
-  codex <- lapply(list_jsonl(codex_dirs, recursive = TRUE), read_codex_session)
-  sessions <- c(compact(claude), compact(codex))
+  codex <- compact(lapply(
+    list_jsonl(codex_dirs, recursive = TRUE),
+    read_codex_session
+  ))
+  reviews <- Filter(function(session) !is.null(session$parent), codex)
+  codex <- Filter(function(session) is.null(session$parent), codex)
+  sessions <- c(compact(claude), codex)
 
   ids <- vapply(sessions, function(session) session$id, character(1))
   if (anyDuplicated(ids)) {
@@ -304,6 +339,14 @@ read_sessions <- function() {
   }
 
   names(sessions) <- ids
+
+  for (review in reviews) {
+    if (review$parent %in% ids) {
+      parent <- sessions[[review$parent]]
+      sessions[[review$parent]]$usage <- parent$usage + review$usage
+    }
+  }
+
   sessions[order(vapply(
     sessions,
     function(session) as.numeric(session$start),
@@ -337,15 +380,12 @@ read_claude_session <- function(path) {
     assistants
   )
 
-  # Streamed replies repeat the same usage once per content block
-  usage <- lapply(assistants, function(entry) entry$message$usage)
-  usage <- usage[
-    !duplicated(vapply(
-      assistants,
-      function(entry) entry$message$id %||% NA_character_,
-      character(1)
-    ))
-  ]
+  subagents <- unlist(
+    lapply(claude_subagents(path), function(subagent) {
+      Filter(function(entry) is_type(entry, "assistant"), read_jsonl(subagent))
+    }),
+    recursive = FALSE
+  )
 
   links <- Filter(
     function(entry) {
@@ -371,15 +411,7 @@ read_claude_session <- function(path) {
       function(entry) entry$message$id,
       character(1)
     ))),
-    input_tokens = sum_field(
-      usage,
-      c(
-        "input_tokens",
-        "cache_creation_input_tokens",
-        "cache_read_input_tokens"
-      )
-    ),
-    output_tokens = sum_field(usage, "output_tokens"),
+    usage = claude_usage(c(assistants, subagents)),
     pr_links = vapply(
       links,
       function(entry) as.integer(entry$prNumber),
@@ -393,11 +425,16 @@ read_codex_session <- function(path) {
   entries <- read_jsonl(path)
 
   meta <- Find(function(entry) is_type(entry, "session_meta"), entries)$payload
-  if (
-    !isTRUE(meta$cwd %in% codex_cwds) ||
-      identical(meta$thread_source, "guardian_review")
-  ) {
+  if (!isTRUE(meta$cwd %in% codex_cwds)) {
     return(NULL)
+  }
+
+  # Auto-reviews only count toward the usage of the session they reviewed
+  if (identical(meta$thread_source, "guardian_review")) {
+    return(list(
+      parent = session_id("codex", meta$parent_thread_id),
+      usage = codex_usage(entries)
+    ))
   }
 
   messages <- Filter(
@@ -441,19 +478,6 @@ read_codex_session <- function(path) {
     character(1)
   )
 
-  usage <- Filter(
-    function(entry) {
-      identical(entry$payload$type, "token_count") &&
-        !is.null(entry$payload$info)
-    },
-    entries
-  )
-  usage <- if (length(usage)) {
-    usage[[length(usage)]]$payload$info$total_token_usage
-  } else {
-    list()
-  }
-
   new_session(
     tool = "codex",
     uuid = meta$id,
@@ -467,8 +491,7 @@ read_codex_session <- function(path) {
     ),
     prompts = Filter(is_prompt, texts[roles == "user"]),
     replies = sum(roles == "assistant"),
-    input_tokens = usage$input_tokens %||% 0,
-    output_tokens = usage$output_tokens %||% 0,
+    usage = codex_usage(entries),
     pr_links = integer(),
     # `codex exec` sessions were started by Claude to review plans
     agent = identical(meta$source, "exec")
@@ -484,8 +507,7 @@ new_session <- function(
   branches,
   prompts,
   replies,
-  input_tokens,
-  output_tokens,
+  usage,
   pr_links,
   agent
 ) {
@@ -499,8 +521,7 @@ new_session <- function(
   }
 
   list(
-    # The tail is random in both UUIDv4 (Claude) and UUIDv7 (Codex)
-    id = paste0(tool, "-", substr(uuid, nchar(uuid) - 7L, nchar(uuid))),
+    id = session_id(tool, uuid),
     tool = tool,
     agent = agent,
     path = path,
@@ -512,9 +533,138 @@ new_session <- function(
     segments = segment(times),
     prompts = length(prompts),
     replies = replies,
-    tokens = input_tokens + output_tokens,
+    usage = usage,
     pr_links = unique(pr_links)
   )
+}
+
+# The tail is random in both UUIDv4 (Claude) and UUIDv7 (Codex)
+session_id <- function(tool, uuid) {
+  paste0(tool, "-", substr(uuid, nchar(uuid) - 7L, nchar(uuid)))
+}
+
+# ------------------------------------------------------------------------------
+# Usage
+
+claude_usage <- function(assistants) {
+  # Streamed replies repeat the same usage once per content block
+  ids <- vapply(
+    assistants,
+    function(entry) entry$message$id %||% NA_character_,
+    character(1)
+  )
+  assistants <- assistants[!duplicated(ids)]
+
+  usage_sum(lapply(assistants, function(entry) {
+    usage <- entry$message$usage
+    model <- entry$message$model
+
+    if (
+      !identical(usage$speed %||% "standard", "standard") ||
+        identical(usage$inference_geo, "us")
+    ) {
+      cli::cli_abort(
+        "A {.val {model}} call ran at premium rates that {.var prices} lacks."
+      )
+    }
+
+    writes <- usage$cache_creation
+    tokens <- c(
+      input = usage$input_tokens %||% 0,
+      cache_write_5m = writes$ephemeral_5m_input_tokens %||% 0,
+      cache_write_1h = writes$ephemeral_1h_input_tokens %||% 0,
+      cache_read = usage$cache_read_input_tokens %||% 0,
+      output = usage$output_tokens %||% 0
+    )
+
+    if (
+      tokens[["cache_write_5m"]] + tokens[["cache_write_1h"]] !=
+        (usage$cache_creation_input_tokens %||% 0)
+    ) {
+      cli::cli_abort(
+        "A {.val {model}} call doesn't split its cache writes by duration."
+      )
+    }
+
+    call_usage(model, tokens)
+  }))
+}
+
+codex_usage <- function(entries) {
+  turns <- Filter(function(entry) is_type(entry, "turn_context"), entries)
+  turns <- stats::setNames(
+    lapply(turns, function(entry) entry$payload),
+    vapply(turns, function(entry) entry$payload$turn_id, character(1))
+  )
+
+  records <- Filter(
+    function(entry) is_type(entry, "token_usage_record"),
+    entries
+  )
+
+  usage_sum(lapply(records, function(entry) {
+    usage <- entry$payload$usage
+    turn <- turns[[entry$payload$turn_id]]
+
+    if (is.null(turn)) {
+      cli::cli_abort("A Codex call has no turn to name its model.")
+    }
+    if (!is.null(turn$service_tier)) {
+      cli::cli_abort(
+        "A {.val {turn$model}} call ran in the {.val {turn$service_tier}} tier, which {.var prices} lacks."
+      )
+    }
+    # Codex doesn't record whether a write lasts 30 minutes or 12 hours
+    if ((usage$cache_write_input_tokens %||% 0) > 0) {
+      cli::cli_abort("A {.val {turn$model}} call wrote to the cache.")
+    }
+
+    multipliers <- if (usage$input_tokens > codex_long_context) {
+      codex_long_multipliers
+    }
+
+    # Cached input is part of `input_tokens`
+    tokens <- c(
+      input = usage$input_tokens - usage$cached_input_tokens,
+      cache_read = usage$cached_input_tokens,
+      output = usage$output_tokens
+    )
+
+    call_usage(turn$model, tokens, multipliers)
+  }))
+}
+
+# Tokens and USD cost of one API call
+call_usage <- function(model, tokens, multipliers = NULL) {
+  tokens <- tokens[tokens > 0]
+  if (length(tokens) == 0L) {
+    return(c(tokens = 0, cost = 0))
+  }
+
+  rates <- prices[[model]]
+  if (is.null(rates)) {
+    cli::cli_abort(c(
+      "There is no price for {.val {model}}.",
+      "i" = "Add it to {.var prices} in {.file build.R}."
+    ))
+  }
+  unpriced <- setdiff(names(tokens), names(rates))
+  if (length(unpriced)) {
+    cli::cli_abort(
+      "There is no {.val {model}} price for {.field {unpriced}} tokens."
+    )
+  }
+
+  rates <- rates[names(tokens)]
+  if (!is.null(multipliers)) {
+    rates <- rates * multipliers[names(tokens)]
+  }
+
+  c(tokens = sum(tokens), cost = sum(tokens * rates) / 1e6)
+}
+
+usage_sum <- function(usages) {
+  Reduce(`+`, usages, c(tokens = 0, cost = 0))
 }
 
 # Some sessions carry copies of other sessions' entries
@@ -782,7 +932,8 @@ build_timeline <- function(commits, prs, sessions, links, labels) {
       page = page_path(session$id),
       segments = lapply(session$segments, format_time),
       messages = list(user = session$prompts, assistant = session$replies),
-      tokens = session$tokens,
+      tokens = session$usage[["tokens"]],
+      cost = round(session$usage[["cost"]], 4),
       prs = I(links[[session$id]])
     )
   })
@@ -813,13 +964,9 @@ compute_complexity <- function(prs, sessions, session_prs) {
     },
     integer(1)
   )
-  tokens <- vapply(
-    linked,
-    function(group) {
-      sum(vapply(group, function(session) session$tokens, numeric(1)))
-    },
-    numeric(1)
-  )
+  usage <- lapply(linked, function(group) {
+    usage_sum(lapply(group, function(session) session$usage))
+  })
   hours <- vapply(
     prs,
     function(pr) as.numeric(difftime(pr$merged, pr$opened, units = "hours")),
@@ -835,7 +982,7 @@ compute_complexity <- function(prs, sessions, session_prs) {
     2
 
   Map(
-    function(known, score, review_comments, messages, tokens, hours) {
+    function(known, score, review_comments, messages, usage, hours) {
       list(
         score = if (known) round(score, 3) else NULL,
         parts = list(
@@ -843,7 +990,8 @@ compute_complexity <- function(prs, sessions, session_prs) {
           messages = if (known) messages else NULL
         ),
         context = list(
-          tokens = if (known) tokens else NULL,
+          tokens = if (known) usage[["tokens"]] else NULL,
+          cost = if (known) round(usage[["cost"]], 2) else NULL,
           open_hours = round(hours, 1)
         )
       )
@@ -852,7 +1000,7 @@ compute_complexity <- function(prs, sessions, session_prs) {
     score,
     review_comments,
     messages,
-    tokens,
+    usage,
     hours
   )
 }
@@ -1310,7 +1458,9 @@ codex_outputs <- function(entries) {
     }
     payload <- entry$payload
 
-    if (payload$type %in% c("function_call_output", "custom_tool_call_output")) {
+    if (
+      payload$type %in% c("function_call_output", "custom_tool_call_output")
+    ) {
       outputs[[payload$call_id]] <- codex_output_text(payload$output)
       next
     }
@@ -1433,7 +1583,11 @@ codex_tool_input <- function(name, input) {
 codex_patches <- function(code) {
   patches <- regmatches(
     code,
-    gregexpr("(?s)\\*\\*\\* Begin Patch.*?\\*\\*\\* End Patch", code, perl = TRUE)
+    gregexpr(
+      "(?s)\\*\\*\\* Begin Patch.*?\\*\\*\\* End Patch",
+      code,
+      perl = TRUE
+    )
   )[[1L]]
 
   out <- character()
@@ -1704,20 +1858,6 @@ ellipsize <- function(x, width) {
 
 plural <- function(n, one, many) {
   paste(n, if (n == 1L) one else many)
-}
-
-sum_field <- function(entries, fields) {
-  sum(vapply(
-    entries,
-    function(entry) {
-      sum(vapply(
-        fields,
-        function(field) as.numeric(entry[[field]] %||% 0),
-        numeric(1)
-      ))
-    },
-    numeric(1)
-  ))
 }
 
 is_type <- function(entry, type) {

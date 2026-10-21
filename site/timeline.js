@@ -37,6 +37,7 @@ const TOOLS = { claude: "Claude", codex: "Codex" };
 const formatDate = d3.timeFormat("%B %-d, %Y");
 const formatDay = d3.timeFormat("%b %-d");
 const formatTokens = d3.format(".3~s");
+const formatDollars = d3.format("$,.2f");
 
 let clips = 0;
 
@@ -66,6 +67,7 @@ function buildModel(data, base) {
         page: session.page ? new URL(session.page, base).href : null,
         segments: session.segments.map((segment) => segment.map((time) => new Date(time))),
         prompts: session.messages.user,
+        cost: session.cost,
         prs: session.prs,
       },
     ]),
@@ -912,6 +914,7 @@ class Timeline {
           plural(pr.parts.review_comments, "review thread"),
           plural(pr.parts.messages, "prompt"),
           `${formatTokens(pr.context.tokens)} tokens`,
+          `${formatCost(pr.context.cost)} at API prices`,
         ].join(" · "),
       );
     }
@@ -946,9 +949,14 @@ class Timeline {
           duration(active),
         ];
         if (!session.agent) facts.push(plural(session.prompts, "prompt"));
+        facts.push(formatCost(session.cost));
         return facts.join(" · ");
       });
   }
+}
+
+function formatCost(cost) {
+  return cost > 0 && cost < 0.01 ? "<$0.01" : formatDollars(cost);
 }
 
 function selectionLayers(parent) {
