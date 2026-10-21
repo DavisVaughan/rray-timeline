@@ -150,6 +150,7 @@ class Timeline {
     this.width = 0;
     this.scrollPending = false;
 
+    root.append("div").attr("class", "tl-title").text("Number of exported functions over time");
     const legend = root.append("div").attr("class", "tl-legend");
     renderLegend(legend);
     this.renderSearch(legend);
