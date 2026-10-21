@@ -33,7 +33,7 @@ review_title <- "/gh-pr-review"
 
 title_width <- 72L
 
-# Relative to a transcript page
+# Relative to a transcript page, assuming the chart's page sits one level above `site/`
 chart_url <- "../../"
 
 me_label <- "Davis"

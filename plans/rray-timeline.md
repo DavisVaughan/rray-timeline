@@ -194,16 +194,18 @@ The detail panel shows both parts, plus a few numbers for context only: conversa
 ```
 rray-timeline/
   build.R
+  index.html
   overrides.yml
   site/
-    index.html
     timeline.js
     timeline.css
     timeline.json
     transcripts/
 ```
 
-`site/` is the folder that gets copied into the Quarto post's directory. Everything outside it is build tooling and stays here.
+`site/` is the folder that gets copied into the Quarto post's directory as `timeline/`. Everything outside it is build tooling and stays here.
+
+`index.html` mounts `site/` from one level above, the same way the post mounts `timeline/`, so links between the chart and transcripts resolve identically in both.
 
 ## Phases
 

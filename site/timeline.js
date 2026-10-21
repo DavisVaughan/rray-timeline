@@ -39,7 +39,9 @@ let clips = 0;
 
 export async function mount(target, url) {
   const root = d3.select(target).classed("rray-timeline", true);
-  const timeline = new Timeline(root, buildModel(await d3.json(url)));
+  // Transcript pages are relative to the JSON, not the page hosting the chart
+  const base = new URL(url, document.baseURI);
+  const timeline = new Timeline(root, buildModel(await d3.json(url), base));
 
   new ResizeObserver(([entry]) => {
     timeline.resize(Math.round(entry.contentRect.width));
@@ -49,7 +51,7 @@ export async function mount(target, url) {
   addEventListener("hashchange", () => timeline.followHash());
 }
 
-function buildModel(data) {
+function buildModel(data, base) {
   const sessions = new Map(
     Object.entries(data.sessions).map(([id, session]) => [
       id,
@@ -58,7 +60,7 @@ function buildModel(data) {
         tool: session.tool,
         agent: session.agent,
         title: session.title,
-        page: session.page ?? null,
+        page: session.page ? new URL(session.page, base).href : null,
         segments: session.segments.map((segment) => segment.map((time) => new Date(time))),
         prompts: session.messages.user,
         prs: session.prs,
